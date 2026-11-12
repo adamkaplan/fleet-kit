@@ -31,6 +31,10 @@ What the file must be (anything else refuses, naming the file and the problem, b
 
 Known limits (not checked): only the file's own directory is checked for owner and write bits, so a group-writable grandparent such as `~/.config` at `0770`, and a symlink in the directory path (it is followed), are not caught; and with `CW_CLUSTER_TOKEN_CMD` set the two vault settings are still required, validated and then unused.
 
+To point `CW_CLOUD_IMAGE` at a newly published image, run `bin/cloud_image_roll.py SOURCE@sha256:DIGEST REGISTRY TAG` (`cw-image-roll`; `--dry-run` shows the change): it copies with `crane`, compares the destination digest, and changes the one line of the file (with a backup) only when both agree.
+
+Before a roll, prove the image: `bin/cloud_image_proof.py DIGEST` (ask #2418) launches one proof pod on exactly that digest with `cloud-worker create --image` (the settings file is not touched), runs the proof set of `cloud/worker/proof-set.md`, retires the pod and writes a receipt (mode 0600) in your state directory; `bin/cloud_image_roll.py` then refuses, before any copy, an image without a revision label reachable from `origin/integration` or without a passing receipt for its digest younger than 6 hours (there is no flag to skip this).
+
 Create it so that nobody else can ever read it (the template is below; fill in your own values):
 
 ```sh
@@ -512,7 +516,7 @@ The launcher reads the live model credential from OpenCode's own store with `ope
 
 What to know before you run it:
 
-- **A worker can read the credential.** For the life of its pod, the worker can read the one-entry array (the access entry and its refresh token) at `/run/cw/model-auth` and the store under `XDG_DATA_HOME`. The worker's shell deny rules are not a guard against that. Whether it could send the value out depends on the pod's network egress, which this change does not restrict.
+- **A worker can read the credential.** For the life of its pod, the worker can read the one-entry array (the access entry and its refresh token) at `/run/cw/model-auth` and the store under `XDG_DATA_HOME`. The pod's rules are not a guard against that. Whether it could send the value out depends on the pod's network egress, which this change does not restrict.
 - **The pod holds a snapshot taken at launch.** Nothing re-reads your store. A credential that is revoked or rotated ends that pod's turns; a refresh token you rotate afterwards is not pushed to a running pod. Launch a new run to pick it up.
 - **A stale `CW_MODEL_AUTH_FILE` is retired, and what happens depends on where it is.** In a settings file it is refused as an unknown setting. In the process environment it is silently ignored (the launcher drops it), so the credential that is active in your store is used with no message.
 - **Image and launcher must match.** An old image with the new launcher answers on the free model (it never imports the credential). The old launcher with the new image refuses at the import (`worker: the model credential import failed; refusing to start`).

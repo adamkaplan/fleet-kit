@@ -11,6 +11,7 @@ the send, as the minute-40 note does; when the send reached nobody the mark is m
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
+A pod that has finished (the progress file's last line is `done` or `STATUS: done`, or /work/results.txt's last line is `STATUS: done`; any case) is not stalled for progress-stale and failed-run-idle (refusal still fires).
 A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass line names it (pod and reason, no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
@@ -39,7 +40,7 @@ REALERT_SECONDS = 60 * 60          # once per condition per pod per this long
 EVIDENCE_MAX = 300
 CONDITIONS = ("progress-stale", "refusal", "failed-run-idle")
 ALERT_ACTION = "stall-alert"       # the audit action of one alert; the switchboard daemon reads it and sends the messages (bin/cloud_end_alert.py scan_stall)
-REFUSAL_WORDS = re.compile(r"permission denied|refused|not allowed|blocked", re.I)
+REFUSAL_WORDS = re.compile(r"Permission denied: shell|permission\.rejected|^\s*(?:refused:|Blocked:|Blocked at)")
 ERROR_LINE = re.compile(r"error|fail|exception|denied|refused|cannot|unable|not found", re.I)
 
 # Run INSIDE the pod by `kubectl exec python3 -c <this>`. Reads only: the progress file (mtime, last 10 lines), /work/runs (per file name, mtime and the last
@@ -53,12 +54,13 @@ def tail(p, n):
             return [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()][-n:]
     except OSError:
         return None
-out = {"now": time.time(), "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None, "updated": None, "activity": None, "running": None}
+out = {"now": time.time(), "results": "", "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None, "updated": None, "activity": None, "running": None}
 try:
     p = "/work/progress.txt"
     out["progress"] = {"mtime": os.path.getmtime(p), "tail": [l[:400] for l in (tail(p, 10) or [])]}
 except OSError:
     pass
+out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]
 rd = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 try:
     names = sorted(os.listdir(rd))[:200]
@@ -205,10 +207,14 @@ def decide(data):
     stime = _num(data.get("msg_time"))
     if stime is not None and not (stime <= now + 60 and abs(stime) != float("inf")):   # a future or non-finite session time is read as missing (a pod could write any value)
         stime = None
+    # A pod that declared itself finished is not stalled for (a) and (c): its progress file's last line is `done` or `STATUS: done`, or results.txt's last line is `STATUS: done`.
+    # (b) refusal is unchanged and still fires for a finished pod.
+    last_p = tail[-1].strip().lower() if tail else ""
+    finished = last_p in ("done", "status: done") or str(data.get("results") or "").strip().lower() == "status: done"
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
-    if times and not active and now - max(times) >= STALE_SECONDS:
+    if not finished and times and not active and now - max(times) >= STALE_SECONDS:
         working, why = session_state(data, now, STALE_SECONDS)
         if not working:
             found["progress-stale"] = "no change for %d minutes%s; last progress line: %s" % ((now - max(times)) // 60, "" if working is False else " (decided from the files: %s)" % why, tail[-1] if tail else "(none)")
@@ -231,7 +237,7 @@ def decide(data):
                 bad.append(e)
         except ValueError:
             continue
-    if bad:
+    if bad and not finished:
         e = max(bad, key=lambda x: _num(x["mtime"]))
         moved = max([t for t in (_num(e["mtime"]), ptime, stime) if t is not None])
         working, why = session_state(data, now, FAILED_IDLE_SECONDS) if now - moved >= FAILED_IDLE_SECONDS else (True, "")

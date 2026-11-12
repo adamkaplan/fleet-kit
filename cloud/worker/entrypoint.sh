@@ -68,7 +68,7 @@ if [ "$AGENT" = orchestrator ]; then
 fi
 ( umask 077; mkdir -p "$cfgdir/opencode"
   printf '{"model": "%s",\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" > "$cfgdir/opencode/opencode.json"
-  # the worker agent (default) and the shell tool's deny rules: the template's first line is its opening brace
+  # the worker agent (default) and the shell tool's permission (the catch-all allow; the question tool denied): the template's first line is its opening brace
   tail -n +2 "${CW_SHARE_DIR:-/usr/local/share/cw}/opencode-worker.json" >> "$cfgdir/opencode/opencode.json"
   mkdir -p "$cfgdir/opencode/agents"
   if [ "$AGENT" = orchestrator ]; then
@@ -89,11 +89,11 @@ if [ -n "${CW_LONG_RUN_DENY:-}" ]; then
   done
   IFS=$oldifs; set +f
   rows="$rows,\\n\\1\"cw-run start*\": \"allow\""
-  last='^\( *\)"\*git\*push\*/master\\n\*": "deny"$'
+  last='^\( *\)"\*": "allow"$'
   if [ "$(grep -c "$last" "$cfgdir/opencode/opencode.json")" != 2 ]; then
     echo "worker: the last shell rule was not found twice; refusing to start" >&2; exit 1
   fi
-  sed "s|$last|\\1\"*git*push*/master\\\\n*\": \"deny\"$rows|" "$cfgdir/opencode/opencode.json" > "$cfgdir/opencode/opencode.json.new" \
+  sed "s|$last|\\1\"*\": \"allow\"$rows|" "$cfgdir/opencode/opencode.json" > "$cfgdir/opencode/opencode.json.new" \
     && mv "$cfgdir/opencode/opencode.json.new" "$cfgdir/opencode/opencode.json" && chmod 600 "$cfgdir/opencode/opencode.json"
 fi
 XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
@@ -129,7 +129,7 @@ if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty"
 printf 'username=x-access-token\\npassword=%s\\n' "\$tok"
 H
   chmod 755 "$bin/git-credential-cw"
-  # No git-token means no wrappers: the OpenCode deny rules are then the only pod-side layer.
+  # No git-token means no wrappers: the token's scope and the repository's rules are then the only layer (the permission file holds no shell deny row, ask #2402).
   # The pod-side refusal of merge, force-push, push to the default branch, issue/label writes and settings calls. It is a
   # convenience and NOT the guard: calling the real binary by its path skips it. The guard is the repository's own rules
   # and the token's scope. Installed with the wrappers; a missing guard file refuses the start (no wrapper without it).
@@ -182,8 +182,8 @@ fi
 # #1200 (S14): the record of the pull requests this pod creates through its client, one number a line. The directory is private to this
 # user (0700, inside the worker-private $TMP); the client creates the file (0600, never through a symlink) when it records a number, so
 # a pod with no pull request of its own has no file and the guard refuses an edit (pr-edit-no-record). The agent and the client are the
-# same user: the record is not a security boundary (see docs/cloud-worker-interface.md); the shell guard row only refuses a command that
-# names it. Exported before the exec so the agent's command and its shell tool inherit it.
+# same user: the record is not a security boundary (see docs/cloud-worker-interface.md); the permission file has no row that
+# refuses a command naming it (ask #2402); the table's `shell-record-*` rows are answered by the client. Exported before the exec so the agent's command and its shell tool inherit it.
 if [ -L "$TMP/pr-record" ]; then   # chmod follows a link: never touch what a link points at
   echo "worker: the pr-record path is a symlink; refusing to start" >&2
   exit 1

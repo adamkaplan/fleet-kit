@@ -35,6 +35,7 @@ class Hook(unittest.TestCase):
         os.mkdir(cls.repo)
         cls.env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": cls.d, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
                    "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@x.invalid", "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@x.invalid"}
+        cls.env["CW_NOTES_LOG"] = os.path.join(cls.d, "notes.log")   # ask #2426: the hook records pushes; a test never writes the pod's own notes file
         cls.git("init", "-q", "-b", "main", ".")
         cls.base = cls.commit("base", "")
         cls.git("branch", "side")
@@ -232,7 +233,7 @@ class Hook(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     # the files around the hook
-    def test_the_image_entrypoint_and_permission_file_register_the_hook(self):
+    def test_the_image_and_entrypoint_register_the_hook_and_the_permission_file_holds_no_bypass_rows(self):
         d = read(os.path.join(WORKER, "Dockerfile"))
         self.assertIn("COPY worker/pod-hooks/pre-push /usr/local/lib/cw-hooks/pre-push", d)
         self.assertIn("chown -R root:root /usr/local/lib/cw-hooks && chmod 0755 /usr/local/lib/cw-hooks /usr/local/lib/cw-hooks/pre-push", d)
@@ -242,7 +243,7 @@ class Hook(unittest.TestCase):
         self.assertTrue(e[i[0] + 1].startswith("  git config --global core.hooksPath /usr/local/lib/cw-hooks"))
         conf = read(os.path.join(WORKER, "opencode-worker.json"))
         for row in ('"git*push*--no-verif*": "deny"', '"*push*--no-verif*": "deny"', '"*core.hooksPath*": "deny"', '"*hooksPath=*": "deny"'):
-            self.assertEqual(conf.count(row), 2, row)   # the top-level block and the worker agent's copy
+            self.assertEqual(conf.count(row), 0, row)   # ask #2402: the permission file holds no shell rows
 
     def test_the_wrapper_no_longer_parses_a_push(self):
         text = read(GUARD)

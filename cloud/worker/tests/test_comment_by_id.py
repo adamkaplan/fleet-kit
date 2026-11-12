@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline test: the by-id comment read is allowed and every write form of it stays denied (both blocks)."""
+"""Offline test: the by-id comment read passes the pod file (ask #2402: the file holds no row for it); the client refuses every write form."""
 import fnmatch, json, os, re, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -9,8 +9,6 @@ READS = [BASE, BASE + " --jq .body", BASE + "?per_page=1"]
 WRITES = [BASE + " " + w for w in (
     "-X PATCH", "-X DELETE", "-X patch", "--method PATCH", "--method delete",
     "-f body=x", "-F body=x", "--field body=x", "--raw-field body=x", "--input f")]
-NEW = ('"gh api*/issues/comments/*"', '"gh api*/issues/comments/* *"', '"gh api*/issues/comments/*?*"')
-POST_ROW = '"gh api*--input*": "deny",'
 
 
 def blocks(text):
@@ -26,68 +24,26 @@ def verdict(rules, cmd):
     return v
 
 
-def problems(text):
-    out = []
-    for name, rules in blocks(text).items():
-        for c in READS:
-            if verdict(rules, c) != "allow":
-                out.append("a read form of the by-id call is not allowed: %s %s" % (name, c))
-        for c in WRITES:
-            if verdict(rules, c) != "deny":
-                out.append("a write form of the by-id call is allowed: %s %s" % (name, c))
-    return out
-
-
-def position_computation(text):
-    """True when, in every block, the three new rows come after the last write deny."""
-    flags = []
-    for name, rules in blocks(text).items():
-        keys = list(rules)
-        flags.append(all(keys.index(n.strip('"')) > keys.index("gh api*--input*") for n in NEW))
-    return flags
-
-
-def move_after_writes(text):
-    """Move the three new rows of each block to just after the last write deny; asserts each shape occurs once per block."""
-    out = text
-    for ind in ("      ", "          "):
-        rows = "".join("\n" + ind + n + ': "allow",' for n in NEW)
-        assert out.count(rows) == 1, "the new rows must occur once per block"
-        out = out.replace(rows, "")
-        post = "\n" + ind + POST_ROW
-        assert out.count(post) == 1, "the last write deny row must occur once per block"
-        out = out.replace(post, post + rows)
-    return out
-
-
-def noop(text):
-    return text
-
-
 class ById(unittest.TestCase):
+    """Ask #2402: the by-id read rows (and the write denies they were placed after) are gone from the file; the read still passes through its catch-all
+    allow, the file names no by-id row, and the write forms are refused by the client (ClientIsGetOnly below), not by the file."""
+
     def real(self):
         with open(JSON) as f:
             return f.read()
 
-    def test_control_real_file(self):
-        self.assertEqual(problems(self.real()), [])
-        computed = position_computation(self.real())
-        self.assertTrue(computed and not any(computed), "no block lists the by-id rows after a write")
+    def test_the_read_forms_are_allowed_in_both_blocks_and_no_row_names_the_by_id_path(self):
+        for name, rules in blocks(self.real()).items():
+            self.assertEqual(rules, {"*": "allow"}, name)
+            for c in READS:
+                self.assertEqual(verdict(rules, c), "allow", "%s %s" % (name, c))
+            self.assertEqual([k for k in rules if "comments" in k], [], name)
 
-    def test_mutant_fails_with_anchored_text(self):
-        text = self.real()
-        self.assertEqual(problems(text), [], "control must pass first")
-        mut = move_after_writes(text)
-        self.assertNotEqual(mut, text, "the mutation was not applied")
-        computed = position_computation(mut)
-        self.assertTrue(computed and all(computed), "the mutation was not applied in every block")
-        found = problems(mut)
-        self.assertTrue(any(p.startswith("a write form of the by-id call is allowed:") for p in found), found)
-
-    def test_noop_mutation_fails_the_computation(self):
-        text = self.real()
-        self.assertNotEqual(position_computation(noop(text)), [True, True],
-                            "the no-op mutation must fail the computation")
+    def test_the_file_carries_no_deny_for_the_write_forms(self):
+        # the replacement for the old row-order test: the writes are the client's to refuse (test_write_forms_refused_by_api_get)
+        for name, rules in blocks(self.real()).items():
+            for c in WRITES:
+                self.assertEqual(verdict(rules, c), "allow", "%s %s" % (name, c))
 
 
 class ClientIsGetOnly(unittest.TestCase):

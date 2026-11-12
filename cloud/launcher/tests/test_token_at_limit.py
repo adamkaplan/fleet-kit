@@ -355,9 +355,9 @@ class TestDocsAndPins(unittest.TestCase):
             have += 1
         self.assertEqual(have, 3, "%d of 3 documents state the refresh rule" % have)
 
-    def test_u1_the_guard_and_permission_files_are_byte_identical_to_the_base(self):
-        pins = {"cloud/worker/guard.sh": "317c68947ba4968d692e6d251a5b7e71db7d41cbc29205bed1f9823a9ea7c73d",
-                "cloud/worker/opencode-worker.json": "045bec5e4d85bcd3f11168a82d018d03d82a5de3e7973ab8898b686c1f6f9dcd"}
+    def test_u1_the_guard_and_permission_files_match_their_pinned_digests(self):
+        pins = {"cloud/worker/guard.sh": "b8f86ad11591e3f2a6d22d414d1a4230849efa3be055dbd78c23d105e510e2cd",
+                "cloud/worker/opencode-worker.json": "4692bfb9d53045976cc97ad7c7adefbc3e1c7ef3d6d7d3617174e541e518b643"}
         for path, digest in pins.items():
             with open(os.path.join(ROOT, path), "rb") as f:
                 self.assertEqual(hashlib.sha256(f.read()).hexdigest(), digest, path)

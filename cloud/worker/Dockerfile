@@ -204,6 +204,9 @@ USER root
 # so the image sets no PG* variable. The directory name is a REQUIRED build argument (no default): the operator passes --build-arg CW_BUNDLE_CACHE_NAME=<name>.
 ARG CW_BUNDLE_CACHE_NAME
 RUN test -n "$CW_BUNDLE_CACHE_NAME"
+# ask #2418: the git commit the image tree was taken from (the operator passes --build-arg CW_IMAGE_REVISION=<commit>); cw-image-roll reads this label and refuses an empty one.
+ARG CW_IMAGE_REVISION
+LABEL org.opencontainers.image.revision="${CW_IMAGE_REVISION}"
 RUN set -eu; b="/home/worker/.cache/${CW_BUNDLE_CACHE_NAME}"; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
  && mkdir -p "$l" "$e" \
  && cp -a /opt/pg/bin /opt/pg/lib "$l/" \

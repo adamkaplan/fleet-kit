@@ -1,0 +1,2 @@
+bin/cloud_image_roll.py
+check_gate is the image-roll proof gate (ask #2418): it refuses to copy a worker image whose revision label is missing, not reachable from the integration tip, or without a fresh passing proof receipt for exactly that digest; it decides nothing about a caller, role, tier, verdict, hold or clear. Trace: its only caller is roll in bin/cloud_image_roll.py, run by the operator on their own machine and never in the image; its outcome only stops or allows one crane copy and the settings-file edit, and no value of it feeds an authority function.

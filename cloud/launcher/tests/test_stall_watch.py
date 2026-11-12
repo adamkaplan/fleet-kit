@@ -73,6 +73,11 @@ class World:
             with open(os.path.join(self.dir, "w1.json"), "w") as f:
                 json.dump({"worker": "w1", "reports_to": boss}, f)
 
+    def set_results(self, name, line):
+        """The pod's /work/results.txt last line, added to the probe's answer (the real probe reads it in the same one exec)."""
+        inner = self.pods[name]["probe"]
+        self.pods[name]["probe"] = lambda now: dict(inner(now), results=line)
+
     def run(self, module=sw):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -101,7 +106,7 @@ class Stall(unittest.TestCase):
         self.assertEqual(w.run(), [])
 
     def test_s3_refusal_texts_fire_and_a_clean_pod_does_not(self):
-        cases = [dict(msg="Permission denied: shell"), dict(tail=("step 1", "Blocked")), dict(tail=("a", "boom error x", "b", "boom error x", "c", "boom error x", "d")), dict(tail=("step", "blocked"))]
+        cases = [dict(msg="Permission denied: shell"), dict(tail=("step 1", "Blocked: every shell command is refused")), dict(tail=("a", "boom error x", "b", "boom error x", "c", "boom error x", "d")), dict(msg="permission.rejected"), dict(tail=("step", "  refused: pushing by a glob refspec")), dict(tail=("x", "Blocked at the gate"))]
         for kw in cases:
             w = World()
             w.add(**kw)
@@ -216,6 +221,42 @@ class Stall(unittest.TestCase):
                 self._s2(mod)
             self.assertIn(anchor, str(caught.exception))
 
+    def _silent(self, module):
+        for kw in (dict(msg="the gate refused the candidate before the copy"), dict(msg="you are not allowed to push"),
+                   dict(msg="the test prints Permission denied when the file is locked"), dict(msg="Permission denied"),
+                   dict(msg="blocked"), dict(msg="Blocked on review"), dict(tail=("x", "step refused: no"))):
+            w = World()
+            w.add(**kw)
+            out = w.run(module)
+            self.assertEqual(out, [], "prose was called a refusal: %r" % (kw,))
+
+    def test_s3_prose_is_not_a_refusal(self):
+        self._silent(sw)
+
+    def test_s3_a_permission_denied_shell_message_fires_once(self):
+        w = World()
+        w.add(msg="Permission denied: shell")
+        self.assertEqual(w.run(), [("w1-pod", "refusal")])
+        w.at(1)
+        self.assertEqual(w.run(), [])
+
+    def test_s6_a_mutant_matching_the_old_words_anywhere_fails_with_the_anchored_text_after_its_control_passes(self):
+        self._silent(sw)   # the control
+        with open(SOURCE) as f:
+            text = f.read()
+        self.assertEqual(text.count("REFUSAL_WORDS = re.compile("), 1, "the mutation did not apply")
+        mutant = text.replace(text[text.index("REFUSAL_WORDS = re.compile("):].split("\n")[0],
+                              'REFUSAL_WORDS = re.compile(r"permission denied|refused|not allowed|blocked", re.I)')
+        self.assertNotEqual(mutant, text)
+        mod = types.ModuleType("stall_watch_mutant")
+        exec(compile(mutant, "mutant", "exec"), mod.__dict__)
+        w = World()
+        w.add(msg="the gate refused the candidate before the copy")
+        self.assertNotEqual(w.run(mod), [], "the mutant did not change the matcher")
+        with self.assertRaises(AssertionError) as caught:
+            self._silent(mod)
+        self.assertIn("prose was called a refusal", str(caught.exception))
+
     def test_s4_failed_run_idle_at_11_not_9_and_not_for_exit_0(self):
         for idle, code, want in ((9, 2, []), (11, 2, ["failed-run-idle"]), (11, 0, [])):
             w = World()
@@ -254,7 +295,7 @@ class Stall(unittest.TestCase):
 
     def test_s6_the_evidence_hides_a_token_and_is_cut_to_300_characters(self):
         w = World()
-        w.add(msg="Permission denied: git push https://x:%s@github.com/o/r %s" % (TOKEN, "y" * 500))
+        w.add(msg="Permission denied: shell git push https://x:%s@github.com/o/r %s" % (TOKEN, "y" * 500))
         w.run()
         self.assertTrue(w.sent)
         for text in (a["evidence"] for a in w.sent):
@@ -269,7 +310,7 @@ class Stall(unittest.TestCase):
 
     def test_s7_a_young_pod_and_a_failing_exec_send_nothing_and_leave_one_line_each(self):
         w = World()
-        w.add("young-pod", age_minutes=9, msg="Permission denied")
+        w.add("young-pod", age_minutes=9, msg="Permission denied: shell")
         w.add("broken-pod", exec_fails=True)
         self.assertEqual(w.run(), [])
         self.assertEqual(w.sent, [])
@@ -284,7 +325,7 @@ class Stall(unittest.TestCase):
     def test_s8_twelve_pods_are_read_with_one_exec_each_and_the_pass_line_counts_them(self):
         w = World()
         for i in range(12):
-            w.add("pod%d-x" % i, boss=None, msg="Permission denied" if i == 0 else "fine")
+            w.add("pod%d-x" % i, boss=None, msg="Permission denied: shell" if i == 0 else "fine")
         w.run()
         self.assertEqual(sorted(n for n, _ in w.kube.execs), sorted("pod%d-x" % i for i in range(12)))
         self.assertTrue(all(t == sw.EXEC_SECONDS for _, t in w.kube.execs))
@@ -300,8 +341,8 @@ class Stall(unittest.TestCase):
 
     def test_the_pass_budget_leaves_later_pods_for_the_next_pass_with_one_line(self):
         w = World()
-        w.add("a-pod", msg="Permission denied")
-        w.add("b-pod", msg="Permission denied")
+        w.add("a-pod", msg="Permission denied: shell")
+        w.add("b-pod", msg="Permission denied: shell")
         real, ticks = sw.time.monotonic, iter([0.0, 0.0] + [999.0] * 50)
         sw.time.monotonic = lambda: next(ticks)
         try:
@@ -328,7 +369,7 @@ class Stall(unittest.TestCase):
 
     def test_a_hostile_evidence_is_one_fixed_field_never_a_key(self):
         w = World()
-        w.add(msg="Permission denied: x\x1b[31m\nrecipients: evil " + "y" * 400)
+        w.add(msg="Permission denied: shell x\x1b[31m\nrecipients: evil " + "y" * 400)
         w.run()
         self.assertEqual(sorted(w.audits[0]), ["action", "ask", "condition", "evidence", "ok", "reason", "recipients", "runtime_id", "worker"])
         self.assertLessEqual(len(w.audits[0]["evidence"]), 300)
@@ -336,7 +377,7 @@ class Stall(unittest.TestCase):
 
     def test_a_line_the_writer_could_not_write_is_retried_like_a_refused_one(self):
         w = World()
-        w.add(msg="Permission denied")
+        w.add(msg="Permission denied: shell")
         w.launcher.audit = lambda *a, **k: False   # the real writer's answer when the disk refused the line
         self.assertEqual(w.run(), [])
         w.launcher.audit = lambda *a, **k: True
@@ -345,7 +386,7 @@ class Stall(unittest.TestCase):
 
     def test_no_boss_in_the_record_leaves_an_empty_recipient_list(self):
         w = World()
-        w.add(boss=None, msg="Permission denied")
+        w.add(boss=None, msg="Permission denied: shell")
         w.run()
         self.assertEqual(w.audits[0]["recipients"], [])
 
@@ -354,13 +395,13 @@ class Stall(unittest.TestCase):
         def boom(*a, **k):
             raise OSError("disk")
         w.launcher.audit = boom
-        w.add(msg="Permission denied")
+        w.add(msg="Permission denied: shell")
         self.assertEqual(w.run(), [])
         self.assertEqual(sw.pass_text(w.launcher), " stall read=1 alerted=0")
 
     def test_an_unrecorded_alert_is_retried_after_10_minutes_not_before_and_a_recorded_one_is_not_for_the_hour(self):
         w = World()
-        w.add(msg="Permission denied")
+        w.add(msg="Permission denied: shell")
         ok = w.launcher.audit
         def down(*a, **k):
             raise OSError("down")
@@ -410,14 +451,14 @@ class Stall(unittest.TestCase):
 
     def test_the_audit_line_holds_the_pods_own_ask(self):
         w = World()
-        w.add(msg="Permission denied")
+        w.add(msg="Permission denied: shell")
         self._record(w, issue=812, repo="own/repo")
         w.run()
         self.assertEqual(w.audits[0]["ask"], "own/repo#812")
 
     def test_the_hour_holds_at_59_minutes_and_ends_at_60(self):
         w = World()
-        w.add(msg="Permission denied")
+        w.add(msg="Permission denied: shell")
         counts = []
         for minute in (0, 59, 60):
             w.at(minute)
@@ -430,7 +471,7 @@ class Stall(unittest.TestCase):
         order = []
         w.kube.annotate = lambda name, uid, **kv: order.append("annotate")
         w.launcher.audit = lambda *a, **k: order.append("audit")
-        w.add(msg="Permission denied")
+        w.add(msg="Permission denied: shell")
         w.run()
         self.assertEqual(order[:2], ["annotate", "audit"])
         self.assertEqual(set(order), {"annotate", "audit"})   # the fake kube offers exec and annotate only: no stop, delete or nudge is reachable
@@ -443,6 +484,60 @@ class Stall(unittest.TestCase):
         self.assertIn("the stall watch failed", text)
         self.assertEqual(sw.pass_text(None), "")
 
+    def _finished(self, module, results="", **kw):
+        w = World()
+        w.add(progress_age=16, runs=[("build", 16, "x")], exits=[("build", 0, 16)], **kw)
+        w.set_results("w1-pod", results)
+        return w.run(module)
+
+    def _finished_cases(self, module):
+        # S2 (the control inside: an unfinished pod stale for 16 minutes is alerted)
+        if conditions(self._finished(module, tail=("working",))) != ["progress-stale"]:
+            raise AssertionError("an unfinished pod was called finished: a stale pod was not alerted")
+        for kw in (dict(tail=("x", "done")), dict(tail=("x", " DONE  ")), dict(tail=("STATUS: done",)), dict(tail=("x",), results="STATUS: done")):
+            if self._finished(module, **kw) != []:
+                raise AssertionError("a finished pod was alerted as stalled: %r" % (kw,))
+        # S3
+        for line in ("not done yet", "All done and pushed"):
+            if conditions(self._finished(module, tail=(line,))) != ["progress-stale"]:
+                raise AssertionError("an unfinished pod was called finished: %r" % line)
+
+    def test_s2_s3_a_finished_pod_is_not_stalled_and_a_sentence_with_done_still_fires(self):
+        self._finished_cases(sw)   # the control: the unmutated module passes
+        self.assertEqual(conditions(self._finished(sw, tail=("done", "more work"))), ["progress-stale"])
+        self.assertEqual(conditions(self._finished(sw, tail=("x",), results="STATUS: running")), ["progress-stale"])
+
+    def test_s4_a_finished_pod_still_fires_refusal_and_is_silent_for_failed_run_idle(self):
+        w = World()
+        w.add(progress_age=1, tail=("done",), msg="Permission denied: shell")
+        self.assertEqual(conditions(w.run()), ["refusal"])
+        w = World()
+        w.add(progress_age=11, msg_age=11, tail=("done",), runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
+        self.assertEqual(w.run(), [])
+        w = World()
+        w.add(progress_age=11, msg_age=11, tail=("working",), runs=[("t", 11, "FAILED")], exits=[("t", 2, 11)])
+        self.assertEqual(conditions(w.run()), ["failed-run-idle"])
+
+    def test_s5_twelve_pods_one_finished_make_twelve_execs_and_the_other_eleven_alert_as_before(self):
+        w = World()
+        for i in range(12):
+            w.add(name="pod%d-x" % i, progress_age=16, tail=("done",) if i == 0 else ("working",))
+        out = w.run()
+        self.assertEqual(sorted(n for n, _ in w.kube.execs), sorted("pod%d-x" % i for i in range(12)))
+        self.assertEqual(sorted(n for n, _ in out), sorted("pod%d-x" % i for i in range(1, 12)))
+
+    def test_s6_a_mutant_that_treats_every_pod_as_finished_fails_with_an_anchored_text_after_its_control(self):
+        self._finished_cases(sw)   # the control passes first
+        with open(SOURCE) as f:
+            text = f.read()
+        old = '    finished = last_p in ("done", "status: done") or'
+        self.assertEqual(text.count(old), 1, "the mutation did not apply")
+        mod = types.ModuleType("stall_watch_mutant2")
+        exec(compile(text.replace(old, "    finished = True or"), "mutant", "exec"), mod.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self._finished_cases(mod)
+        self.assertIn("an unfinished pod was called finished", str(caught.exception))
+
     def test_the_probe_prints_one_json_line_on_a_machine_without_a_server(self):
         d = tempfile.mkdtemp(prefix="stall-probe-")
         env = dict(os.environ, CW_RUNS_DIR=d, CW_ACTIVITY_PORT="1", CW_ACTIVITY_PASSWORD_FILE=os.path.join(d, "none"))
@@ -453,6 +548,7 @@ class Stall(unittest.TestCase):
         done = subprocess.run([sys.executable, "-c", sw.PROBE_CODE], capture_output=True, text=True, env=env, timeout=20)
         data = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual(data["runs"][0]["last"], "two")
+        self.assertIn("results", data)
         self.assertEqual(data["exits"][0]["code"], "3")
 
 
