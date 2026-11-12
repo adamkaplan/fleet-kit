@@ -225,6 +225,8 @@ The script runs each entry once, stops at the first red with `RESULT: FAIL`, and
 
 Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
 
+CI shards (ask #2500): `bin/test-cloud-launcher --shard K/N` (or `CLOUD_LAUNCHER_SHARD=K/N`, which CI sets) runs only the entries at positions K, K+N, K+2N ... of the non-blank lines of the chain, so the chain stays the one list of files; `--shard K/N --list` prints a shard's entries. `bin/check-launcher-shards` reads the shard jobs of the workflow and fails, naming each file, when a chain entry is in no job or in two. The workflow change is waiting as `ci/proposed/test.yml.patch` (a worker token cannot push workflow files): `git apply ci/proposed/test.yml.patch` once, then delete that file.
+
 A test that is not yet measured is named by one line in cloud/launcher/tests/chain_unmeasured.list (sorted, at its alphabetical place), never on the `Not yet measured:` README line; the residual risk is the same as above: two names at the same sorted place still conflict, and only names far apart merge cleanly.
 
 ## Chain times (ask #1390)

@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""check-launcher-shards: every cloud launcher test file is in exactly one CI job (ask #2500).
+
+    bin/check-launcher-shards                    read the shard jobs from .github/workflows/test.yml
+    bin/check-launcher-shards --workflow PATH    read another copy of the workflow
+    bin/check-launcher-shards --of N --ids 1,2   check the shard ids IDS of N, no workflow read
+
+The chain file bin/test-cloud-launcher.chain is the one list of files. A launcher job runs `bin/test-cloud-launcher --shard K/N` (or with the environment variable CLOUD_LAUNCHER_SHARD=K/N), which takes the entries of
+group K from that list (`--list` prints them). A file is in NO job when a group number from 1 to N is missing from the job's matrix, and in TWO jobs when a
+group number is listed twice (or a second step runs the same group). The check prints the files and exits 1. A workflow whose launcher step has no
+shard runs the whole chain in one step: every file is in that one job, and the check passes. Standard library only. The last line is RESULT: PASS or RESULT: FAIL."""
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+RUNNER = "bin/test-cloud-launcher"
+WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
+
+
+def chain_entries(root=REPO):
+    return [l.strip() for l in (Path(root) / "bin" / "test-cloud-launcher.chain").read_text().splitlines() if l.strip()]
+
+
+def list_group(k, n, root=REPO):
+    done = subprocess.run([str(Path(root) / RUNNER), "--shard", "%d/%d" % (k, n), "--list"], capture_output=True, text=True, cwd=str(root))
+    if done.returncode != 0:
+        raise ValueError("bin/test-cloud-launcher --shard %d/%d --list failed: %s" % (k, n, (done.stdout + done.stderr).strip()))
+    return [l for l in done.stdout.splitlines() if l.strip()]
+
+
+def problems(entries, n, ids, group_of):
+    """The list of problems: every entry must be run by exactly one of the jobs named by `ids` (group numbers of n groups). `group_of(k)` lists group k's entries."""
+    out = []
+    count = {e: 0 for e in entries}
+    for k in ids:
+        if not 1 <= k <= n:
+            out.append("shard %d is outside 1..%d" % (k, n))
+            continue
+        for e in group_of(k):
+            count[e] = count.get(e, 0) + 1
+    for e in sorted(count):
+        if count[e] == 0:
+            out.append("in no job: %s" % e)
+        elif count[e] > 1:
+            out.append("in %d jobs: %s" % (count[e], e))
+    return out
+
+
+def shard_runs(text):
+    """The (K-expression, N) of every `bin/test-cloud-launcher --shard K/N` line of the workflow, and the matrix shard lists of the jobs that have one."""
+    k = r"(\$\{\{\s*matrix\.shard\s*\}\}|\d+)/(\d+)"
+    return re.findall(r"%s\s+--shard\s+%s" % (re.escape(RUNNER), k), text) + re.findall(r"CLOUD_LAUNCHER_SHARD:\s*\"?%s" % k, text)
+
+
+def matrix_ids(text):
+    """The shard ids of the job that runs the launcher shards: the `shard: [..]` line of the job holding the `--shard` line."""
+    jobs = re.split(r"^  (?=[A-Za-z0-9_-]+:\s*$)", text, flags=re.M)
+    for job in jobs:
+        if re.search(r"%s\s+--shard|CLOUD_LAUNCHER_SHARD:" % re.escape(RUNNER), job):
+            m = re.search(r"^\s+shard:\s*\[([^\]]*)\]", job, re.M)
+            if not m:
+                raise ValueError("the job that runs the launcher shards has no `shard: [..]` matrix line")
+            return [int(x) for x in m.group(1).split(",") if x.strip()]
+    return None
+
+
+def main(argv):
+    workflow, of, ids = WORKFLOW, None, None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--workflow" and i + 1 < len(argv):
+            workflow = Path(argv[i + 1]); i += 2
+        elif argv[i] == "--of" and i + 1 < len(argv):
+            of = int(argv[i + 1]); i += 2
+        elif argv[i] == "--ids" and i + 1 < len(argv):
+            ids = [int(x) for x in argv[i + 1].split(",") if x.strip()]; i += 2
+        else:
+            print("usage: bin/check-launcher-shards [--workflow PATH | --of N --ids 1,2,..]")
+            print("RESULT: FAIL")
+            return 2
+    try:
+        if of is None:
+            text = Path(workflow).read_text()
+            runs = shard_runs(text)
+            if not runs:
+                print("the workflow runs the whole launcher chain in one step: every file is in one job")
+                print("RESULT: PASS")
+                return 0
+            counts = {n for _, n in runs}
+            if len(counts) != 1:
+                raise ValueError("the shard steps name different shard counts: %s" % sorted(counts))
+            of = int(counts.pop())
+            ids = [int(e) for e, _ in runs if e.isdigit()]   # a step with a fixed K is one job
+            if any(not e.isdigit() for e, _ in runs):
+                ids += matrix_ids(text)   # a step that takes its K from the job's matrix runs once per listed id
+        found = problems(chain_entries(), of, ids or [], lambda k: list_group(k, of))
+    except (ValueError, OSError) as err:
+        print("NOT RUN: %s" % err)
+        print("RESULT: FAIL")
+        return 1
+    for line in found:
+        print(line)
+    print("RESULT: %s" % ("FAIL" if found else "PASS"))
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
