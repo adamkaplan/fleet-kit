@@ -46,7 +46,7 @@ Then END YOUR TURN (no other command, no waiting). The helper's wake message arr
 
 ### tests
 
-The repository the pod was launched with must be the spire-venue repository these files belong to; its checkout is `/work/repo`. If `/work/repo` is absent, clone that repository there and check out its default branch first. Install the dependencies once, then run the eight files one at a time (each alone), each through `cw-run start` and `cw-run wait`; repeat a `cw-run wait` until it prints `exited`, and `exited 0` is a pass for that file. Two files need the ephemeral database wrapper, the others none. The `tests` item is `pass` only when all eight exit 0.
+The repository the pod was launched with must be the repository these files belong to; its checkout is `/work/repo`. If `/work/repo` is absent, clone that repository there and check out its default branch first. Install the dependencies once, then run the eight files one at a time (each alone), each through `cw-run start` and `cw-run wait`; repeat a `cw-run wait` until it prints `exited`, and `exited 0` is a pass for that file. Two files need the ephemeral database wrapper, the others none. The `tests` item is `pass` only when all eight exit 0.
 
 ```
 cw-run start --name proof-npm -- sh -c 'cd /work/repo/server && { [ -d node_modules ] || npm ci --ignore-scripts; }'
