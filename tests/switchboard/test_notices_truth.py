@@ -584,9 +584,9 @@ class TestTheProductionWiring(unittest.TestCase):
         self.assertIn("Last head: feat/own@bbbbbbbb", text)
         self.assertEqual(asked, ["repos/o/r/git/ref/heads/feat/own"])
 
-    def test_control_the_end_tick_without_the_branch_read_says_nothing_pushed(self):
+    def test_control_the_end_tick_without_the_branch_read_says_pushes_unknown(self):   # ask #2470: this fixture's refs read fails and its record has no `made`: no proof, no `nothing pushed`
         text, _asked = self.end_tick(tip=lambda engine, repo, branch: None)
-        self.assertIn("Last head: nothing pushed.", text)
+        self.assertIn("Last head: pushes unknown.", text)
 
     def test_the_hubs_catch_up_hands_the_owner_read_to_the_red_ci_judge(self):
         import ast

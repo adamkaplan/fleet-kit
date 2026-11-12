@@ -3916,6 +3916,7 @@ class Launcher:
             raw = res.get("skipped")
             return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
                     "head_on": text(res.get("head_on"), 100) or None,
+                    "made": [x for x in res["made"][:100] if isinstance(x, str) and re.fullmatch(r"[0-9a-f]{40}", x)] if isinstance(res.get("made"), list) else None,
                     "pr_note": text(res.get("pr_note"), 120),
                     "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
