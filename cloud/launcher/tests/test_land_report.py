@@ -333,5 +333,112 @@ class S8(unittest.TestCase):
         self.assertIsNone(real.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: type("R", (), {"returncode": 1, "stdout": ""})()))
 
 
+WORKER = os.path.join(os.path.dirname(HERE), "cloud_worker.py")
+
+
+class FakeRecorder:
+    def __init__(self, root, boom=False):
+        self._root, self._boom = root, boom
+
+    def root(self):
+        if self._boom:
+            raise OSError("no root")
+        return self._root
+
+
+class FakeLauncher:
+    def __init__(self, root, env, boom=False):
+        self.recorder, self.env = FakeRecorder(root, boom), env
+
+
+class RunCall(unittest.TestCase):
+    """The reaper's one call, land_report.run(launcher, now), through a fake launcher (a stub recorder.root(), an env)."""
+
+    def check(self, mod):
+        tmp = Root(self)
+        elsewhere = Root(self)
+        tmp.add(sha="a" * 40)
+        launcher = FakeLauncher(tmp.dir, {"CW_LAND_REPORT_ISSUE": "o/r#7"})
+        empty = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, empty)
+        old, os.environ["PATH"] = os.environ.get("PATH", ""), empty   # the senders find no program: the pass still writes its state
+        try:
+            mod.run(launcher, NOW)
+        finally:
+            os.environ["PATH"] = old
+        self.assertTrue(os.path.isfile(os.path.join(tmp.dir, ".land-report.json")), "RUN state path")
+        self.assertEqual(os.listdir(elsewhere.dir), [])
+        with open(os.path.join(tmp.dir, ".land-report.json")) as f:
+            self.assertEqual(json.load(f)["day"], "2026-11-12", "RUN env reached the pass")
+
+    def check_raise(self, mod):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mod.run(FakeLauncher("/nonexistent", {}, boom=True), NOW)
+        self.assertEqual(err.getvalue(), "cloud-worker: the land report failed: OSError\n", "RUN stderr line")
+
+    def test_control(self):
+        self.check(real)
+        self.check_raise(real)
+
+    def test_mutant_state_path(self):
+        self.check(real)
+        m = mutant('os.path.join(root, ".land-report.json")', 'os.path.join(root, "land-report.json")')
+        with self.assertRaises(AssertionError) as cm:
+            self.check(m)
+        self.assertIn("RUN state path", str(cm.exception))
+
+    def test_mutant_env_dropped(self):
+        self.check(real)
+        m = mutant("daily_pass(launcher.env, now, root", "daily_pass({}, now, root")
+        with self.assertRaises(AssertionError) as cm:
+            self.check(m)
+        self.assertIn("RUN state path", str(cm.exception))
+
+    def test_mutant_exception_escapes(self):
+        self.check_raise(real)
+        m = mutant("    except Exception as err:\n        print(\"cloud-worker: the land report failed", "    except ZeroDivisionError as err:\n        print(\"cloud-worker: the land report failed")
+        with self.assertRaises(OSError):
+            self.check_raise(m)
+
+
+def reaper_module_name(src):
+    """The module name the reaper loads by name: found by ast as the constant in `__import__("<name>").run(...)` (the call site, not a copied string)."""
+    import ast
+    names = []
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run" and isinstance(node.func.value, ast.Call)
+                and isinstance(node.func.value.func, ast.Name) and node.func.value.func.id == "__import__"
+                and node.func.value.args and isinstance(node.func.value.args[0], ast.Constant) and "now" in [getattr(a, "id", None) for a in node.args]):
+            names.append(node.func.value.args[0].value)
+    assert len(names) == 1, names
+    return names[0]
+
+
+class ReaperLoad(unittest.TestCase):
+    def check(self, src):
+        name = reaper_module_name(src)
+        spec = importlib.util.find_spec(name)
+        self.assertIsNotNone(spec, "REAPER load %s" % name)
+        self.assertEqual(os.path.realpath(spec.origin), os.path.realpath(SOURCE), "REAPER load target")
+        self.assertTrue(callable(getattr(importlib.import_module(name), "run", None)), "REAPER run")
+
+    def test_control(self):
+        with open(WORKER) as f:
+            self.check(f.read())
+
+    def test_mutant_renamed(self):
+        with open(WORKER) as f:
+            src = f.read()
+        self.check(src)
+        old = '__import__("land_report").run('
+        self.assertEqual(src.count(old), 1)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(src.replace(old, '__import__("land_reports").run('))
+        self.assertIn("REAPER load land_reports", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
