@@ -10946,6 +10946,8 @@ class GitHubHub:
                 why = "no lane owns the issue and the marker rule did not apply"
         mine = self._chief_lanes(item, agents)
         if not mine:
+            if why.startswith("no lane owns"):
+                return None, None, False   # nobody can receive it and nothing is known of it: the ordinary unowned path drops it and audits it in counts, not a line per comment
             self._chief_audit_once(item, why + " (and no Chief of Staff lane is running)")
             return None, None, True
         lane = mine[0]   # more than one lane: the first by name; the reason names the lanes
@@ -10955,7 +10957,9 @@ class GitHubHub:
         return self._deliver_summary(item, lane, "chief", "no lane could be decided (%s)" % why)
 
     def _chief_lanes(self, item, agents):
-        return [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
+        lanes = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
+        own = [n for n in lanes if (agents[n].fleet or {}).get("repo") == item.repo]
+        return own or lanes   # a lane bound to this repository comes before one bound to none: two Chiefs of different organisations never share an issue
 
     def _deliver_summary(self, item, lane, how, what):
         who = _one_line(re.sub(r"[\x00-\x1f\x7f]", "", item.sender or "someone"), 60)

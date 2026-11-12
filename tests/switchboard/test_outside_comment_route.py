@@ -84,6 +84,15 @@ class TestOutsideCommentRoute(Base):
         self.assertEqual(len(self.audit("github.comment.chief_unknown")), 2)   # once per comment
         self.assertEqual(self.audit("github.unrouted"), [])
 
+    def test_s4_a_chief_lane_of_this_repository_is_chosen_before_a_lane_of_none_or_another(self):
+        agents = dict(ONE_CHIEF, aaa={"role": "orchestrator", "charter": 2, "repo": "org-other/scratch"},
+                      bbb={"role": "orchestrator", "charter": 3})
+        agents["chief"] = dict(agents["chief"], repo=SCRATCH)
+        self.rig(agents=agents)
+        self.issue(41, "lane-zz", FLEET)
+        self.gh.comment(41, "hello", 6020, login="outsider-1")
+        self.assertEqual([t[:2] for t in self.told()], [("github.comment:6020", "chief")])   # not `aaa` (another repository), not `bbb` (none), though both sort first
+
     def test_s4_an_unreadable_author_is_delivered_to_the_chief(self):
         self.rig()
         self.issue(35, "lane-a", FLEET)
@@ -156,3 +165,39 @@ class TestOutsideCommentRoute(Base):
         self.gh.issues[12]["user"]["login"] = FLEET
         self.gh.comment(12, "a question", 6015, login="outsider-1")
         self.assertEqual([t[:2] for t in self.told()], [("github.comment:6015", "lane-a")])
+
+
+class TestNobodyCanReceiveIt(Base):
+    """The documented exception of ask #2484, and the many-comments case: where a Chief-of-Staff lane runs, every unowned comment reaches it and is audited once;
+    where none runs, nothing can receive it and it is dropped and audited (in counts)."""
+
+    def rig(self, agents, items=40):
+        rig = GithubRig(self, agents=agents, config={"triage": False})
+        for number in range(100, 100 + items):
+            rig.gh.issue(number)
+        rig.hub.tick()
+        for number in range(100, 100 + items):
+            rig.gh.comment(number, "nobody owns this", 7000 + number, login="outsider-1")
+        return rig
+
+    def audit(self, rig, event):
+        return [e for e in rig.world.audit() if e["event"] == event]
+
+    def test_with_a_chief_lane_each_unowned_comment_is_delivered_to_it_and_audited_once(self):
+        rig = self.rig({"chief": {"role": "orchestrator", "charter": 1}})
+        facts = rig.hub.facts()
+        self.assertEqual({f.recipient for f in facts}, {"chief"})
+        self.assertEqual(len({f.key for f in facts}), 40)
+        self.assertEqual(len(self.audit(rig, "github.comment.chief_unknown")), 40)
+        self.assertEqual(self.audit(rig, "github.unrouted"), [])
+        rig.hub.facts()
+        self.assertEqual(len(self.audit(rig, "github.comment.chief_unknown")), 40, "once per comment, never again")
+
+    def test_with_no_chief_lane_it_is_dropped_and_audited_in_counts(self):
+        rig = self.rig({"coder": {"role": "coder", "issue": 12}})
+        self.assertEqual(rig.hub.facts(), [])
+        self.assertEqual(rig.keys(), [])
+        lines = self.audit(rig, "github.unrouted")
+        self.assertEqual(sum(e["detail"]["count"] for e in lines), 40)
+        self.assertLess(len(lines), 40 // 4)
+        self.assertEqual(self.audit(rig, "github.comment.chief_unknown"), [])
