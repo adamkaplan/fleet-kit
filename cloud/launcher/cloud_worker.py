@@ -50,8 +50,7 @@ DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape 
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 
 # Per-shape requests (#1978): ONE table, shapes S and M; a shape with no row has no requests key. The limits stay the SHAPES rows.
-SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"},
-                  "L": {"cpu": "6", "memory": "16Gi"}}
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}, "L": {"cpu": "6", "memory": "16Gi"}}
 
 
 def capacity_shapes():
