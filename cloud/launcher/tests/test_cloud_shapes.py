@@ -77,7 +77,7 @@ class Shapes(base.Base):
 
     # U2: an unknown name is refused before any call
     def test_u2_an_unknown_shape_is_refused_before_any_call_and_lists_the_table(self):
-        for bad in ("Z", "xs", "s", "L", "", "XS ", "XS,S"):
+        for bad in ("Z", "xs", "s", "LL", "", "XS ", "XS,S"):
             with self.subTest(shape=bad):
                 if os.path.exists(self.env["FAKE_KUBE_CALLS"]):
                     os.remove(self.env["FAKE_KUBE_CALLS"])

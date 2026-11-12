@@ -116,7 +116,7 @@ if command == "create":
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
     shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
-    if shape not in ("XS", "O", "S", "M"):
+    if shape not in ("XS", "O", "S", "M", "L"):
         sys.stderr.write("error: shape must be XS, S or M\\n")
         sys.exit(2)
 if command == "create":
@@ -1627,7 +1627,7 @@ class TestLaunchStack(Base):
 
     FIXTURES = BIN.parent / "cloud" / "tests" / "fixtures"
     SHAPES = (None, "S", "M")
-    BAD_SHAPES = ("L", "m", "s", "XL", "2", "SM", "S M", "S\n", "--privileged", "S --stack", "/etc/passwd", "S=1")
+    BAD_SHAPES = ("LL", "m", "s", "XL", "2", "SM", "S M", "S\n", "--privileged", "S --stack", "/etc/passwd", "S=1")
 
     def create_argv(self):
         calls = [c for c in self.stub_calls() if c[0] == "create"]
@@ -1753,9 +1753,9 @@ class TestLaunchStack(Base):
         self.nothing_was_called()
 
     def test_s10_a_bad_shape_is_handed_on_without_stack_as_before(self):
-        code, out, err = self.launch_with("--cloud", "--shape", "L")
+        code, out, err = self.launch_with("--cloud", "--shape", "LL")
         self.assertNotEqual(code, 0)   # the launcher (here its fake) refuses it: the switchboard does not validate it without --stack
-        self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "L")
+        self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "LL")
 
     def test_family_every_flag_combination_with_stack(self):
         """The table of flag combinations is the product of the launch flags the code reads (cloud, mode, timing, shape); the oracle is stated once."""
