@@ -113,3 +113,45 @@ class TestDelegatedClearRepo(unittest.TestCase):
         self.assertEqual(module.charter_repo({}, INTENT), INTENT)
         self.assertEqual(module.charter_repo({"delegated_clear": {"orders": [], "repo": CHARTER_REPO}}, INTENT), INTENT)
         self.assertEqual(module.charter_repo(make_config(repo=CHARTER_REPO), INTENT), CHARTER_REPO)
+
+
+class TestDelegatedClearRepoOwnerFile(unittest.TestCase):
+    """Added under #2483: the `repo` key changes nothing for an order whose source is `owner-file` (the owner-file branch returns before the charter is read)."""
+    LINE = "lane-a may clear ordinary held pull requests, up to Serious"
+
+    def config(self, **extra):
+        module = sb.load_module("delegated_clear")
+        entry = {"number": 100, "sha256": module.line_hash(self.LINE), "max_level": "Serious", "source": "owner-file"}
+        return {"intent_repo": INTENT, "delegated_clear": dict({"orders": [entry]}, **extra)}
+
+    def check(self, config, number=100):
+        reads = Reads()
+        engine = types.SimpleNamespace(config=config)
+        with mock.patch.object(sb, "fetch_orders", reads), mock.patch.object(sb, "_intent_reader", lambda runner, now: object()), \
+                mock.patch.object(sb, "read_cos_orders", lambda cfg=None, path=None: {"raw": "x"}), mock.patch.object(sb, "cos_orders_text_of", lambda raw: "first line\n%s\n" % self.LINE):
+            return sb.delegated_clear_checks(engine, None, 0, KIND, number), reads
+
+    def test_an_owner_file_order_resolves_with_and_without_repo_and_never_reads_the_charter(self):
+        for label, config in (("control: no repo", self.config()), ("repo set", self.config(repo=CHARTER_REPO)), ("repo and charter", self.config(repo=CHARTER_REPO, charter=34))):
+            with self.subTest(label):
+                (order, why), reads = self.check(config)
+                self.assertIsNone(why)
+                self.assertEqual((order["number"], order["threshold"], order["source"], order["text"]), (100, "Serious", "owner-file", self.LINE))
+                self.assertEqual(reads.repos, [], "the owner-file branch does not read a charter")
+
+    def test_validate_accepts_repo_next_to_charter_and_with_a_mix_of_sources(self):
+        module = sb.load_module("delegated_clear")
+        mixed = self.config(repo=CHARTER_REPO, charter=34)["delegated_clear"]
+        mixed["orders"] = mixed["orders"] + [{"number": 2, "sha256": module.order_hash(TEXT)}]
+        module.validate(mixed, "config")
+        self.assertIsNotNone(module.settings({"delegated_clear": mixed}))
+        module.validate(self.config(repo=CHARTER_REPO)["delegated_clear"], "config")   # owner-file only: no charter needed
+        self.assertEqual(module.charter_repo({"delegated_clear": mixed}, INTENT), CHARTER_REPO)
+        self.assertEqual(module.entry_of({"delegated_clear": mixed}, 100)["source"], "owner-file")
+        sb.validate_config({"delegated_clear": mixed}, "config.json")
+
+    def test_a_malformed_repo_still_refuses_beside_an_owner_file_order(self):
+        module = sb.load_module("delegated_clear")
+        with self.assertRaises(ValueError) as caught:
+            module.validate(self.config(repo="nope")["delegated_clear"], "config")
+        self.assertIn("delegated_clear.repo", str(caught.exception))
