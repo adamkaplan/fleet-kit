@@ -12,6 +12,16 @@ def load(path, name):
     return mod
 
 
+# The limit of one scan entry (#2387). A bin/test-switchboard selector is bound by loading ~155 test modules (20 s cold alone, the selected test 1.5 s);
+# under the CPU sharing of a full CI run 140 s was exceeded, so that entry gets 20 s x 30 = 600 s; the others keep 140 s. A limit only a hung scan reaches.
+SWITCHBOARD_LIMIT_S = 20 * 30
+SCAN_LIMIT_S = 140
+
+
+def limit_for(rel):
+    return SWITCHBOARD_LIMIT_S if rel == "bin/test-switchboard" else SCAN_LIMIT_S
+
+
 class TestScansRun(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -31,7 +41,7 @@ class TestScansRun(unittest.TestCase):
         pre = load(os.path.join(ROOT, "bin", "cloud-pr-preflight"), "pre_ok")
         for rel, sel in pre.cloud_quick.SCAN_TESTS:
             with self.subTest(scan=rel, selector=sel):
-                self.assertEqual(pre.run_one(self.wt, rel, 140, sel), 0)
+                self.assertEqual(pre.run_one(self.wt, rel, limit_for(rel), sel), 0)
 
     def test_mutant_running_shell_with_python_fails(self):
         with open(os.path.join(ROOT, "bin", "cloud-pr-preflight")) as fh:

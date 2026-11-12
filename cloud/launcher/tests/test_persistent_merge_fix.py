@@ -19,6 +19,13 @@ import test_persistent_orchestrator as po  # noqa: E402
 
 cw, mutant, ROOT = po.cw, po.mutant, po.ROOT
 BIN_SWITCHBOARD_TEST = os.path.join(ROOT, "bin", "test-switchboard")
+# The time limit of ONE nested run is derived, not guessed (#2387). A nested run of bin/test-switchboard is bound by loading its ~155 test modules, not by the
+# test: measured alone in a pod with 4 CPUs, 10 s with warm bytecode and 20 s cold (PYTHONDONTWRITEBYTECODE, the CI case); the one selected test takes 1.5 s.
+# A full CI run shares the CPUs among 3 lanes and many processes and a limit of 300 s was still exceeded, so the limit is 20 s x 30 = 600 s: a bound
+# that only a hung run reaches (a failing assertion returns at once). It is not an assertion.
+NESTED_COLD_LOAD_S = 20
+NESTED_LOAD_FACTOR = 30
+NESTED_LIMIT_S = NESTED_COLD_LOAD_S * NESTED_LOAD_FACTOR
 ROW_LINE = '''            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),'''   # the row alone: another row now follows it on the same line (#2365)
 RESULT = "refused before any pod exists: it says nothing was created"
 ENTRY_LINES = ["        '--persistent is only for --age': '%s',\n" % RESULT, "        '--persistent does not combine ': '%s',\n" % RESULT]
@@ -54,7 +61,7 @@ class CopyRun(unittest.TestCase):
             f.write(text)
         os.chmod(target, 0o755)
         p = stub_support.start(self, [sys.executable, target, "-k", k], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        out, _ = p.communicate(timeout=90)
+        out, _ = p.communicate(timeout=NESTED_LIMIT_S)
         return p.returncode, out
 
     def source(self):
