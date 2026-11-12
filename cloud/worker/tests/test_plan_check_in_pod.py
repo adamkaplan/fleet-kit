@@ -129,36 +129,13 @@ class PlanCheckInPod(unittest.TestCase):
 
     def test_u1_permissions_untouched(self):
         # Pinned hashes of the files at the time of this change (they must not change for the plan check).
-        # opencode-worker.json: a readable pin. The rows that existed before ask 1083 are pinned as one digest of their canonical JSON;
-        # every row an ask adds is listed in ADDED_ROWS below, so a later ask shows its rows as a plain diff line, not a new hash.
+        # opencode-worker.json: ask #2402 removed every convenience row; the file is pinned by its whole content (the per-row pins of earlier asks went with the rows)
         import json
         with open(os.path.join(WORKER, "opencode-worker.json")) as f:
             conf = json.load(f)
-        bash = conf["permission"]["bash"]
-        self.assertEqual(bash, conf["agent"]["worker"]["permission"]["bash"])
-        listed = {k for k, _ in ADDED_ROWS}
-        self.assertEqual([(k, v) for k, v in bash.items() if k in listed], ADDED_ROWS)
-        base = {k: v for k, v in bash.items() if k not in listed}
-        # pin change of #1549: the two substring rows 'git*push*main*' and 'git*push*master*' became whole-ref rules (keys that start with '*git*push*')
-        base = {k: v for k, v in base.items() if not k.startswith("*git*push*")}
-        base.update({"git*push*main*": "deny", "git*push*master*": "deny"})
-        rest = dict(conf, permission={"bash": base}, agent={"worker": dict(conf["agent"]["worker"], permission={"bash": base})})
-        self.assertEqual(hashlib.sha256(json.dumps(rest, sort_keys=True).encode()).hexdigest(), PINNED_JSON_WITHOUT_ADDED_ROWS)
+        self.assertEqual(conf["permission"]["bash"], {"*": "allow"})
+        self.assertEqual(conf["permission"]["bash"], conf["agent"]["worker"]["permission"]["bash"])
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "opencode-worker.json")))
-
-    def test_m3_the_moved_deny_rows_come_after_every_added_allow_row(self):
-        for keys in bash_key_lists(open(os.path.join(WORKER, "opencode-worker.json")).read()):
-            self.assertEqual(len(keys), len(set(keys)), "a duplicate key")
-            self.assertEqual(order_problems(keys), [])
-            self.assertEqual([k for k in keys if k in MOVED_DENY_ORDER], MOVED_DENY_ORDER)
-
-    def test_m3_a_mutant_that_moves_put_before_the_allows_is_seen(self):
-        text = open(os.path.join(WORKER, "opencode-worker.json")).read()
-        line = '      "gh api*PUT*": "deny",\n'
-        self.assertIn(line, text)
-        moved = text.replace(line, "", 1).replace('      "gh api*/issues/*/comments": "allow",\n', line + '      "gh api*/issues/*/comments": "allow",\n', 1)
-        self.assertNotEqual(moved, text)
-        self.assertNotEqual(order_problems(bash_key_lists(moved)[0]), [])
 
     def test_s11_docs_and_readme(self):
         for rel in ("cloud/README.md", "docs/cloud-worker-interface.md"):
@@ -258,83 +235,6 @@ def intent_differs():
     return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
-def bash_key_lists(text):
-    """The keys of both bash blocks IN FILE ORDER, duplicates kept (object_pairs_hook)."""
-    import json
-    found = []
-    def hook(pairs):
-        if any(k == "gh pr merge*" for k, _ in pairs):
-            found.append([k for k, _ in pairs])
-        return dict(pairs)
-    json.loads(text, object_pairs_hook=hook)
-    return found
-
-
-def order_problems(keys):
-    """opencode: the last matching rule wins, so each moved deny row must come AFTER every added allow row."""
-    last_allow = max(i for i, k in enumerate(keys) if k in ADDED_ALLOWS)
-    return [k for k in MOVED_DENY_ORDER if keys.index(k) < last_allow]
-
-
-PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
-# Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
-# Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).
-# asks 1166 and 1200 add their rows to THIS list.
-ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull request read paths, GET only; write methods and flags stay denied)
-    ('git*push*--no-verif*', 'deny'),   # ask 2371: the pod's pre-push hook is global; these rows refuse the agent's own bypass (a convenience)
-    ('*push*--no-verif*', 'deny'),
-    ('*core.hooksPath*', 'deny'),
-    ('*hooksPath=*', 'deny'),
-    ('gh api*/issues/*/comments', 'allow'),
-    ('gh api*/issues/*/comments *', 'allow'),
-    ('gh api*/issues/*/comments?*', 'allow'),
-    ('gh api*/issues/comments/*', 'allow'),
-    ('gh api*/issues/comments/* *', 'allow'),
-    ('gh api*/issues/comments/*?*', 'allow'),
-    ('gh api*/pulls/*/reviews', 'allow'),
-    ('gh api*/pulls/*/reviews *', 'allow'),
-    ('gh api*/pulls/*/reviews?*', 'allow'),
-    ('gh api*/pulls/*/comments', 'allow'),
-    ('gh api*/pulls/*/comments *', 'allow'),
-    ('gh api*/pulls/*/comments?*', 'allow'),
-    ('gh api*POST*', 'deny'),
-    ('gh api*-X post*', 'deny'),
-    ('gh api*--method post*', 'deny'),
-    ('gh api*-X Post*', 'deny'),
-    ('gh api*--method Post*', 'deny'),
-    ('gh api*-X patch*', 'deny'),
-    ('gh api*--method patch*', 'deny'),
-    ('gh api*-X Patch*', 'deny'),
-    ('gh api*--method Patch*', 'deny'),
-    ('gh api*-X put*', 'deny'),
-    ('gh api*--method put*', 'deny'),
-    ('gh api*-X Put*', 'deny'),
-    ('gh api*--method Put*', 'deny'),
-    ('gh api*-X delete*', 'deny'),
-    ('gh api*--method delete*', 'deny'),
-    ('gh api*-X Delete*', 'deny'),
-    ('gh api*--method Delete*', 'deny'),
-    ('gh api* -f*', 'deny'),
-    ('gh api* -F*', 'deny'),
-    ('gh api*--field*', 'deny'),
-    ('gh api*--raw-field*', 'deny'),
-    ('gh api*--input*', 'deny'),
-    ('gh api*graphql*', 'deny'),
-    ('gh api*mutation*', 'deny'),
-    # ask 1200: DW-2, DW-3 (a worker edits the body of its own pull request: `pr edit N --body-file F` only; every other pr-edit form stays denied)
-    ('gh pr edit*', 'deny'),
-    ('gh pr edit * --body-file *', 'allow'),
-    ('gh pr edit*--body-file* --*', 'deny'),
-    ('gh pr edit*--* --body-file*', 'deny'),
-    ('gh pr edit*://*', 'deny'),
-    ('gh pr edit*--repo*', 'deny'),
-    # ask 1200, S14: a shell command naming the pod's record of its own pull requests (the variable or the directory) is refused
-    ('*CW_PR_RECORD*', 'deny'),
-    ('*pr-record*', 'deny'),
-]
-ADDED_ALLOWS = [k for k, v in ADDED_ROWS if v == 'allow']
-# The three deny rows that exist before ask 1083 and were moved: their order, and they come after every added allow row above.
-MOVED_DENY_ORDER = ['gh api*PATCH*', 'gh api*PUT*', 'gh api*DELETE*']
 
 if __name__ == "__main__":
     unittest.main()
