@@ -8154,13 +8154,14 @@ class TestGithubRouting(Base):
         rig.gh.comment(40, "hi", 5001)
         self.assertEqual({f.key: f.recipient for f in rig.hub.facts()}, {"github.comment:5001": "coder"})
 
-    def test_an_issue_nobody_owns_is_dropped_and_audited_once(self):
+    def test_an_issue_nobody_owns_goes_to_the_chief_of_staff_and_is_audited_once(self):
+        # ask #2484: two Chief lanes here (no repository of their own): delivered to the first by name, the reason names both
         self.gh.comment(20, "hi", 5001)
-        self.assertEqual(self.routed(), {})
-        self.assertEqual(self.rig.keys(), [])
+        self.assertEqual(self.routed(), {"github.comment:5001": "platform"})
         self.hub.facts()
-        unrouted = [e for e in self.rig.world.audit() if e["event"] == "github.unrouted"]
-        self.assertEqual([e["detail"]["keys"][0] for e in unrouted], ["github.comment:5001"])
+        self.assertEqual([e for e in self.rig.world.audit() if e["event"] == "github.unrouted"], [])
+        lines = [e for e in self.rig.world.audit() if e["event"] == "github.comment.chief_unknown"]
+        self.assertEqual(len(lines), 1)
 
     def test_nothing_is_dropped_while_the_fleet_cannot_be_read(self):
         self.gh.comment(12, "hi", 5001)
@@ -45063,8 +45064,8 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
 
     ITEMS = 1200
 
-    def rig(self):
-        rig = GithubRig(self, config={"triage": False})  # the pass budget under test is the routing's; triage has its own (pass_seconds)
+    def rig(self, agents=None):
+        rig = GithubRig(self, agents=agents, config={"triage": False})  # the pass budget under test is the routing's; triage has its own (pass_seconds)
         self.calls = 0
         original = rig.gh.runner
 
@@ -45103,7 +45104,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
             self.assertFalse(sb.decisions_report(rig.world.state, rig.world.clock.now())["stale"])
 
     def test_it_drains_over_passes_and_audits_the_unowned_in_counts_not_one_line_each(self):
-        rig = self.rig()
+        rig = self.rig(agents={})   # no Chief-of-Staff lane runs: nobody can receive an unowned comment (ask #2484's documented exception)
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         kept = len(rig.hub.queue)
         for _ in range(kept):
@@ -67123,6 +67124,7 @@ TestDaemonSummary = importlib.import_module("test_pod_silence").TestDaemonSummar
 TestUnreadableSummary = importlib.import_module("test_pod_silence").TestUnreadableSummary   # the unreadable summary of #2173
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 _cos_issue_comments = importlib.import_module("test_cos_issue_comments"); _cos_issue_comments.GithubRig = GithubRig; TestCosIssueComments = _cos_issue_comments.TestCosIssueComments   # ask #2445
+_outside_comment_route = importlib.import_module("test_outside_comment_route"); _outside_comment_route.GithubRig = GithubRig; TestOutsideCommentRoute = _outside_comment_route.TestOutsideCommentRoute   # ask #2484
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
