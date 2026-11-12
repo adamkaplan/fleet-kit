@@ -35,11 +35,11 @@ A long command (one that may run longer than a few minutes) is never run in the 
 
 ## How this is enforced, and what it is not
 
-The shell tool's permission rules in this pod's configuration deny these commands (the wrappers that once refused them were removed). The real `gh` is not in this image: `gh` is a small client of our own that
+The pod's permission file holds no shell deny row and no wrapper refuses these commands any more; the token's scope and the repository's rules are what stop them. The real `gh` is not in this image: `gh` is a small client of our own that
 covers only `gh pr create|view|list|comment|checks|diff|ready|edit`, `gh repo view`, `gh issue view|list`, `gh run view|list|logs`
 and a GET-only `gh api`. Any other verb answers that it is not available.
 
-The deny rules, this prompt and that client are a convenience, never a boundary. A worker can still reach
+This prompt and that client are a convenience, never a boundary. A worker can still reach
 GitHub with `curl`, `python3` or the git credential helper, using the token. The boundaries are the token's scope and the
 repository's own rules. A refusal is a final answer, not an obstacle to work around: do not use another route to do what
 was refused.
