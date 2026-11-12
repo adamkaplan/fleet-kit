@@ -9,7 +9,7 @@ from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-UNTIL = 1794412647   # 2026-11-11T15:57:27Z
+UNTIL = 1794412648   # 2026-11-11T15:57:28Z
 OLD_CUTOFF = 1793310807
 ISO = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -59,8 +59,12 @@ class TestClaimHandMerge(unittest.TestCase):
         self.assertGreater(self.sb.CLAIM_HAND_MERGE_UNTIL, self.sb.CLAIM_LEDGER_SINCE)
 
     def test_a_recorded_claim_of_a_sibling_in_the_window_is_read_as_a_normal_claim(self):
-        self.fx.merged_iso = lambda after=0: iso(self.fx.world.clock.now() + after)
-        self.assertIn("S3", self.fx.refusal([("merged", "S2 U1")]))   # recorded and narrowing: S3 stays uncovered, as for any claim
+        self.fx.merged_iso = lambda after=0: "2026-11-10T02:31:43Z"   # inside the window (the clock of the fixture is later)
+        sb = self.sb   # the claim line is written AT the time of the gate, before the merge (the fixture clock is later than the window)
+        sb.plan_ledger.append_checked(self.fx.world.state, 1794000000, lambda have, seq: {"kind": "claim", "pr": "acme/app#100", "head": "a" * 40, "claim_text": "S2 U1"})
+        why = self.fx.refusal([("merged", "S2 U1")], record=False)
+        self.assertIsNotNone(why)
+        self.assertIn("S3", why)   # recorded and narrowing: S3 stays uncovered, not read as no claim line
 
     def test_s5_control_without_the_rule_the_sibling_blocks(self):
         with mock.patch.object(self.sb, "CLAIM_HAND_MERGE_UNTIL", OLD_CUTOFF):   # the gate as it stood: only the older cutoff
@@ -73,4 +77,4 @@ class TestClaimHandMerge(unittest.TestCase):
         self.assertEqual(src.count("CLAIM_HAND_MERGE_UNTIL = %d " % UNTIL), 1)
         self.assertEqual(src.count("merged <= CLAIM_HAND_MERGE_UNTIL:"), 1)
         self.assertEqual(src.count(str(UNTIL)), 1)
-        self.assertEqual(iso(UNTIL), "2026-11-11T15:57:27Z")
+        self.assertEqual(iso(UNTIL), "2026-11-11T15:57:28Z")

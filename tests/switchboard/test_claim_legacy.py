@@ -104,7 +104,7 @@ class TestClaimLegacy(unittest.TestCase):
                 copy_entry(directory)
                 text = (directory / "fleet-switchboard").read_text()
                 self.assertEqual(text.count(old), 1, "the mutant applies exactly once")
-                for label, source in (("control", text), (name, text.replace(old, new, 1).replace("CLAIM_HAND_MERGE_UNTIL = 1794412647 ", "CLAIM_HAND_MERGE_UNTIL = 0 "))):   # #2454: the second cutoff is neutralised, so each mutant tests the older rule alone
+                for label, source in (("control", text), (name, text.replace(old, new, 1).replace("CLAIM_HAND_MERGE_UNTIL = 1794412648 ", "CLAIM_HAND_MERGE_UNTIL = 0 "))):   # #2454: the second cutoff is neutralised, so each mutant tests the older rule alone
                     (directory / "fleet-switchboard").write_text(source)
                     loader = importlib.machinery.SourceFileLoader("sb_legacy_%s_%d" % (label.replace(" ", "_"), id(directory)), str(directory / "fleet-switchboard"))
                     copy = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
