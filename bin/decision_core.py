@@ -746,6 +746,47 @@ def notice_entry(repo, number, tag, facts, stale, sender, created, note, hold_mi
             "merge_after": iso(created + hold_minutes * 60) if hold_minutes > 0 else None}
 
 
+def captain_escalation_key(repo, number, head):
+    """The key of a merge-captain PR's escalation record: one pull request at ONE head (`captain:<repo>#<n>@<head>`), or None without a head.
+    The daemon (when it derives the row) and `decisions list` (when it reads the record) both build the key here."""
+    return "captain:%s#%d@%s" % (repo, number, head) if head else None
+
+
+def request_escalation_key(session, request):
+    """The key of a permission request's or question's escalation record (`<session>:<request id>`)."""
+    return "%s:%s" % (session, request)
+
+
+def is_escalated(key, escalated):
+    """True when the escalation record `escalated` ({key: time}) names `key`: the ONE test of the daemon's tier and the list's. An exact key, so a record for another head never matches."""
+    return bool(key) and key in escalated
+
+
+def entry_escalation_key(entry):
+    """The record key an already derived decision row would be named by (None when none can name it): a `captain` row by repo, number and head, a request row by session and request."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        if entry.get("kind") == "captain":
+            return captain_escalation_key(entry["repo"], int(entry["number"]), entry.get("head"))
+        if entry.get("session") and entry.get("request"):
+            return request_escalation_key(entry["session"], entry["request"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def apply_escalations(decisions, escalated):
+    """(rows, moved): the decision rows with the tier of every `cos` row that the record names put at `human`, by `is_escalated` on the row's key. A new list of new row dicts only
+    where one moved; nothing is written and a row the record does not name is returned as it was. Never lowers a tier."""
+    rows, moved = [], 0
+    for entry in decisions:
+        if isinstance(entry, dict) and entry.get("tier") == "cos" and is_escalated(entry_escalation_key(entry), escalated):
+            entry, moved = dict(entry, tier="human"), moved + 1
+        rows.append(entry)
+    return rows, moved
+
+
 def captain_entry(notice, facts, escalated, evidence, labels_unread=False):
     """A merge-captain PR as a decision (kind `captain`, same id as its notice, tier `cos`; `human` once the Chief
     of Staff escalated it for this head). `evidence` is who reviewed it at the exact head ([{"by", "kind", "state"}]:
