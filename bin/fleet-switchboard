@@ -11766,7 +11766,9 @@ class GitHubHub:
 
     def _remove_hook(self, repo, env, hook_id):
         try:
-            self._hook_api(repo, env, ["--method", "DELETE", "repos/%s/hooks/%d" % (repo, hook_id)])
+            endpoint = "repos/%s/hooks/%d" % (repo, hook_id)
+            with github_write(self.audit, self.actor, "DELETE", endpoint, repo):   # the ONE audit of a GitHub write (#2260): the intent line first; no audit log, no delete
+                self._hook_api(repo, env, ["--method", "DELETE", endpoint])
         except GitHubUnavailable as err:
             if err.status != 404:
                 raise
