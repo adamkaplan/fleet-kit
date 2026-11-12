@@ -22,6 +22,7 @@ PREVIOUS = {"ca-certificates", "curl", "gnupg", "git", "openssh-client", "python
             "iptables", "jq", "procps", "docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "docker-buildx-plugin", "xz-utils"}
 NAME, EMAIL = "Example Bot", "1+example-bot@users.noreply.example.invalid"   # dummy values: the build arguments are passed at build time
 IDFILE = "/etc/cw-default-identity"
+EXPECTED_ADDED = {"make", "tini"} | set(BROWSER_PACKAGES)   # tini: the init (ask #2353), added after this test
 
 
 def guard_diff(base_ref, run, three_dot=True):
@@ -86,17 +87,17 @@ def wrote_gitconfig(path):
 
 class Identity(unittest.TestCase):
     def test_s2_only_make_is_added_to_the_apt_list(self):
-        self.assertEqual(apt_packages(read(DOCKERFILE)) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
+        self.assertEqual(apt_packages(read(DOCKERFILE)) - PREVIOUS, EXPECTED_ADDED)
         self.assertLessEqual(PREVIOUS, apt_packages(read(DOCKERFILE)))
 
     def test_s2_the_pin_fails_for_a_package_outside_make_and_the_tuple(self):
         text = read(DOCKERFILE)
         pkgs = apt_packages(text)
-        self.assertEqual(pkgs - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))  # control first
+        self.assertEqual(pkgs - PREVIOUS, EXPECTED_ADDED)  # control first
         mutant = text.replace("libnss3 ", "libnss3 zz-extra ", 1)
         extra = apt_packages(mutant) - apt_packages(text)
         self.assertEqual(extra, {"zz-extra"}, "the mutation was not applied")
-        self.assertNotEqual(apt_packages(mutant) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
+        self.assertNotEqual(apt_packages(mutant) - PREVIOUS, EXPECTED_ADDED)
         noop = text.replace("zz-absent-zz", "", 1)
         self.assertEqual(apt_packages(noop) - apt_packages(text), set())  # a no-op fails the computation above
 

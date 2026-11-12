@@ -24,7 +24,7 @@ def flat(text):
 
 
 def guard_line(text):
-    lines = [l for l in flat(text).splitlines() if l.startswith("RUN test -n")]
+    lines = [l for l in flat(text).splitlines() if l.startswith('RUN test -n "$CW_DEFAULT_IDENT_NAME"')]
     assert len(lines) == 1, lines
     return lines[0][4:]
 
@@ -35,6 +35,11 @@ def run_guard(text, **args):
 
 
 class Required(unittest.TestCase):
+    def test_guard_line_is_the_default_identity_one_not_the_bundle_cache_one(self):
+        text = read(DOCKERFILE)
+        self.assertIn("CW_DEFAULT_IDENT_NAME", guard_line(text))
+        self.assertNotIn("CW_BUNDLE_CACHE_NAME", guard_line(text))
+
     def check_no_default(self, text):
         self.assertEqual(re.findall(r"^ARG CW_DEFAULT_IDENT_\w+=", text, re.M), [], "the default identity has a built-in value")
         self.assertEqual(re.findall(r"^ARG (CW_DEFAULT_IDENT_\w+)$", text, re.M), [N, E])
