@@ -77,6 +77,7 @@ cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_secret_dir.py
 cloud/launcher/tests/test_secret_dir_publish.py
 cloud/launcher/tests/test_stall_watch.py
+cloud/launcher/tests/test_startup_taint.py
 cloud/launcher/tests/test_stop_failed_pod.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
