@@ -111,6 +111,7 @@ RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit 
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/wip_save.py",)   # #2304: the save step is part of the reaper's code identity
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/stall_watch.py",)   # #2399
+CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/land_report.py",)   # #2448
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -3173,6 +3174,15 @@ def _stall(call, *args):   # #2399: a stall_watch function, never raising (the m
     except Exception as err:
         return "" if call == "pass_text" else print("cloud-worker: the stall watch failed: %s" % type(err).__name__, file=sys.stderr)
 
+def _land_report(launcher, now):   # #2448: the daily land report (land_report.py), loaded by name; a failure is one stderr line, never a failed pass
+    try:
+        import land_report
+        root = launcher.recorder.root()
+        land_report.daily_pass(launcher.env, now, root, os.path.join(root, ".land-report.json"), log=lambda t: print("cloud-worker: " + t, file=sys.stderr))
+    except Exception as err:
+        print("cloud-worker: the land report failed: %s" % type(err).__name__, file=sys.stderr)
+
+
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
@@ -4671,6 +4681,7 @@ class Launcher:
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
+        _land_report(self, now)   # #2448: once a day after 13:00Z, one message and one comment line; read-only, never raises
         _stall("watch_pass", self, live, now, NAME_RE.fullmatch)   # #2399: one read of each pod older than 10 minutes; an alert only, never a stop
         try:
             out.extend(self.label_pod_prs(live, now))   # #2269: the pull requests a pod recorded get the labels its launch named
@@ -5249,6 +5260,10 @@ SETTINGS = (
     ("CW_SECRET_DIR", False, "path"),               # the private directory (0700, under the home) of 0600 files named as the vault's secrets; the vault reads then read the files, no az
     ("CW_AZURE_CONFIG_DIR", False, "path"),        # the az sign-in directory every vault read of a launch uses (replaces the caller's AZURE_CONFIG_DIR); an absolute existing directory
     ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
+    ("CW_LAND_REPORT_ISSUE", False, "name"),       # owner/repo#N of the pinned issue that gets the daily land report line (ask #2448); unset: nothing is sent
+    ("CW_LAND_REPORT_SMALL_LINES", False, "number"),  # the small bound of the land report in changed lines (default 50)
+    ("CW_LAND_REPORT_GIT_DIR", False, "path"),     # the checkout whose default branch the land report reads landed commits from
+    ("CW_LAND_REPORT_BRANCH", False, "name"),      # that branch (default origin/main)
     ("CW_LONG_RUN_DENY", False, "name"),           # 1 to 8 comma-separated shell patterns (letters, digits . - / _ * ?, each at most 80 characters): a worker pod refuses a foreground shell command matching one and lets it run through cw-run; operator settings only
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -5425,6 +5440,10 @@ VALIDATORS = {
     "CW_AZURE_CONFIG_DIR": ("an absolute path of an existing directory, with no .. segment", _dir_ok),
     "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
     "CW_LONG_RUN_DENY": ("1 to 8 comma-separated patterns of letters, digits, dot, dash, slash, underscore, * and ?, each at most 80 characters", lambda v: 1 <= len(v.split(",")) <= 8 and all(re.fullmatch(r"[A-Za-z0-9./_*?][A-Za-z0-9./_*?-]{0,79}", x) for x in v.split(","))),
+    "CW_LAND_REPORT_ISSUE": ("an issue as owner/repo#N", lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}#[1-9][0-9]{0,8}", v))),   # ask #2448
+    "CW_LAND_REPORT_SMALL_LINES": ("a whole number from 1 to 999999", lambda v: bool(re.fullmatch(r"[1-9][0-9]{0,5}", v))),
+    "CW_LAND_REPORT_GIT_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_LAND_REPORT_BRANCH": ("a branch name of letters, digits, dot, dash, slash and underscore, not starting with a dash", lambda v: bool(re.fullmatch(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,99}", v))),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
