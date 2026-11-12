@@ -168,11 +168,13 @@ def prove(args, env, now=None, sleep=time.sleep):
     worker = "proof-%s-%s" % (digest[7:19], now().strftime("%d%H%M%S"))
     remove_stale_scratch(env)
     scratch = None
+    previous = signal.getsignal(signal.SIGTERM)
     try:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # SIGTERM runs the same cleanup below
         scratch = make_scratch(env, args.digest)
         return _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard, kubectl)
     finally:
+        signal.signal(signal.SIGTERM, previous)
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)   # removed whatever the verdict
 

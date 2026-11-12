@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -48,6 +50,7 @@ exit 0
 """
 KUBECTL = """#!/bin/sh
 echo "$@" >> "$FAKE_DIR/kubectl.log"
+case "$*" in *"-- cat "*) [ -f "$FAKE_DIR/sigterm" ] && kill -TERM $PPID; sleep 1;; esac
 case "$*" in *proof-results*) cat "$FAKE_DIR/results"; exit 0;; esac
 cat > /dev/null 2>&1 || true
 exit 0
@@ -276,6 +279,33 @@ class Receipt(Base):
         # the receipt just written is the one the gate reads: a fail receipt for this digest is refused (it is dated 2026, so it is also old)
         code, out, err = self.roll(load(ROLL))
         self.assertNotEqual(code, 0)
+
+    def sigterm_run(self, source):
+        """Run `source` as a child python process whose fake kubectl sends it SIGTERM mid-proof; the scratch directory must be gone and the pod retired."""
+        Path(self.fake, "sigterm").write_text("")
+        src = os.path.join(self.tmp, "proof_under_test.py")
+        Path(src).write_text(source)
+        harness = ("import sys,types,datetime\nm=types.ModuleType('m');m.__dict__['__file__']=%r\nexec(compile(open(%r).read(),'m','exec'),m.__dict__)\n"
+                   "a=types.SimpleNamespace(digest=%r,repo='acme/widget',branch='integration',wait=60)\n"
+                   "m.prove(a,dict(__import__('os').environ),now=lambda: datetime.datetime(2026,11,11,12,tzinfo=datetime.timezone.utc),sleep=lambda s: None)\n") % (str(ROOT / "bin" / "cloud_image_proof.py"), src, SRC)
+        done = subprocess.run([sys.executable, "-c", harness], env=dict(self.env), capture_output=True, text=True, timeout=60)
+        base = os.path.join(self.state, "fl" + "eet-switchboard", "cloud")
+        left = [n for n in os.listdir(base) if n != "image-proof"] if os.path.isdir(base) else []
+        if left or not [l for l in self.log("launcher") if l.startswith("retire ")]:
+            raise AssertionError("SIGTERM left a scratch copy or no retire: %s %s" % (left, done.returncode))
+        return done.returncode
+
+    def test_sigterm_mid_proof_removes_the_scratch_copy_and_retires_the_pod_and_a_mutant_without_the_handler_fails(self):
+        self.assertEqual(self.sigterm_run(PROOF), 143)   # control first
+        self.tearDown_fake()
+        mutated = "\n".join(l for l in PROOF.splitlines() if "signal.signal(signal.SIGTERM, lambda" not in l)
+        self.assertNotEqual(mutated, PROOF)
+        with self.assertRaises(AssertionError):
+            self.sigterm_run(mutated)
+
+    def tearDown_fake(self):
+        for n in ("launcher.log", "kubectl.log"):
+            Path(self.fake, n).unlink(missing_ok=True)
 
     def test_a_launch_that_fails_writes_no_receipt_and_still_retires(self):
         Path(self.fake, "launchexit").write_text("1")
