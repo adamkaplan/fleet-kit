@@ -21,6 +21,9 @@ data:
     CFG=${CFG:-/host/etc/containerd/config.toml}
     HOST=${HOST:-nsenter -t 1 -m -u -i -n -p --}
     LABEL_CMD=${LABEL_CMD:-kubectl label node $NODE_NAME sysbox-runtime=running --overwrite}
+    # The startup taint (ask #2489): put on a new node by the pool, removed here, only after the runtime is verified.
+    # Test hook: TAINT_CMD. Without it and without NODE_NAME (a test) nothing is removed.
+    TAINT_KEY="startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready"
     NEW="io.containerd.cri.v1.runtime"
     OLD="io.containerd.grpc.v1.cri"
     bad=0
@@ -48,6 +51,17 @@ data:
         sleep "$POLL"
       done
       return 1
+    }
+    # Remove the startup taint from this node. An absent taint is not an error. A failure warns and does not
+    # stop the script: the next pass (already-right path) tries again. Called only after the runtime was verified.
+    remove_startup_taint() {
+      if [ -z "${TAINT_CMD:-}" ]; then
+        [ -n "${NODE_NAME:-}" ] || return 0
+        TAINT_CMD="kubectl taint node $NODE_NAME $TAINT_KEY=true:NoSchedule-"
+      fi
+      if tout=$($TAINT_CMD 2>&1); then echo "startup taint removed"; return 0; fi
+      case "$tout" in *"not found"*) echo "startup taint already absent"; return 0 ;; esac
+      echo "WARNING: could not remove the startup taint (the next pass retries): $tout" >&2; return 0
     }
     # Restart containerd and check it is healthy: any failure of either is a failure.
     restart_and_check() { $HOST systemctl restart containerd || return 1; healthy_after_restart; }
@@ -143,6 +157,7 @@ data:
         echo "sysbox-runc already under $NEW: nothing to do"
         # label only a node whose containerd answers and which is Ready
         healthy_after_restart || { echo "sysbox-runc is registered but containerd or the node is not healthy: not labelling" >&2; exit 1; }
+        remove_startup_taint
         $LABEL_CMD >/dev/null
       else
         cp "$CFG" "$CFG.sysbox-fix.bak"
@@ -192,6 +207,7 @@ data:
           restart_and_check || rollback
           armed=0; rm -f "$INPROG"   # the health check passed: the critical section ends HERE, before labelling
           rm -f "$MARKER"
+          remove_startup_taint   # the runtime is verified (restart and check passed): free the node
           # The label is not a health signal (the stock installer sets sysbox-runtime=running before containerd knows
           # the runtime); this script's own health check above is. Nothing may schedule on the label.
           # Labelling is outside the rollback window: a failed label or a signal during it must not undo a healthy
@@ -260,6 +276,11 @@ spec:
       hostPID: true
       nodeSelector:
         sysbox-install: "yes"
+      tolerations:
+        - key: startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
       containers:
         - name: fix
           # a small image with sh, sed, nsenter (util-linux) and kubectl
