@@ -480,10 +480,10 @@ def mint_from_service(target, role, keep=False):
         die("refusing: the token holds a character that a token does not", "GitHub error")
     MINTED.append(token)
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
-        die("refusing: the token does not cover exactly the one target repository", "permissions")
+        die("refusing: the token does not cover exactly the one target repository", "installation")
     full = repos[0].get("full_name")
     if not (isinstance(full, str) and full.lower() == target.lower()):
-        die("refusing: the token does not cover exactly the one target repository", "permissions")
+        die("refusing: the token does not cover exactly the one target repository", "installation")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
     except (KeyError, ValueError, TypeError):
