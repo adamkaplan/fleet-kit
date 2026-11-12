@@ -500,6 +500,13 @@ polled on a timer.
   item that was routed is audited in `github.routed` with `routed_by` (`closing`, `notice`, `reference`), the
   recipient and the keys.
 
+  Ask #2445, a fifth link for a comment no lane owns (`routed_by` `chief`): a comment by someone else on an issue the Chief of Staff
+  authored goes to the Chief of Staff, once per comment, as the commenter, the issue and a clipped, redacted excerpt (untrusted text, no
+  instruction). The Chief of Staff's account is the `gh_users` account of THAT repository (it differs per repository), never a typed login;
+  where the repository has none, a `from=` marker in the issue body written by a fleet login stands in. When neither tells, the issue is just one nobody owns (dropped, audited in counts as `github.unrouted`). When the issue
+  cannot be read, or has no readable author, nothing is routed and one `github.comment.chief_unknown` line is audited per comment. Its own comments and pull
+  request comments are never routed this way.
+
   **Which events reach the agent.** Everything routed by `closing` is delivered as before (a passing check
   included). For an agent found by `notice` or `reference` only these are delivered: a check or workflow run
   that failed, was cancelled or timed out; a review that requests changes; a merge conflict; a comment written

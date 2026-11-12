@@ -67121,6 +67121,7 @@ TestSummaryCluster = importlib.import_module("test_pod_silence").TestSummaryClus
 TestDaemonSummary = importlib.import_module("test_pod_silence").TestDaemonSummary   # the daemon summary of #2173
 TestUnreadableSummary = importlib.import_module("test_pod_silence").TestUnreadableSummary   # the unreadable summary of #2173
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
+_cos_issue_comments = importlib.import_module("test_cos_issue_comments"); _cos_issue_comments.GithubRig = GithubRig; TestCosIssueComments = _cos_issue_comments.TestCosIssueComments   # ask #2445
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
