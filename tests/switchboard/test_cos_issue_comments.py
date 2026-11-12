@@ -82,11 +82,12 @@ class TestCosIssueComments(Base):
         self.assertEqual(self.told(), [])
         self.assertEqual(len(self.audit("github.comment.chief_unknown")), 1)
 
-    def test_s3_no_account_and_no_signature_routes_nothing_and_audits(self):
+    def test_s3_no_account_and_no_signature_routes_nothing_and_audits_as_unowned(self):
         self.start({})
         self.gh.comment(30, "hello", 5008, login="reviewer-1")
         self.assertEqual(self.told(), [])
-        self.assertEqual(len(self.audit("github.comment.chief_unknown")), 1)
+        self.assertEqual(self.audit("github.comment.chief_unknown"), [])
+        self.assertEqual([e["detail"]["keys"][0] for e in self.audit("github.unrouted")], ["github.comment:5008"])
 
     def test_s4_control_the_current_routing_sends_the_first_case_to_nobody(self):
         with mock.patch.object(sb.GitHubHub, "_chief_route", lambda hub, item, agents, now: (None, None, False)):

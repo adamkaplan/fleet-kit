@@ -10930,8 +10930,7 @@ class GitHubHub:
         elif facts["signer"] and self._fleet_login(facts["author"]):
             chief_issue, own = True, self._fleet_login(item.sender)
         else:
-            self._chief_audit_once(item, "no account is configured for the repository and the issue carries no trusted signature")
-            return None, None, True
+            return None, None, False   # no account and no trusted signature: nobody is known to own it, so the ordinary unowned path audits it (in counts), not a line per comment
         if not chief_issue or own:
             return None, None, False
         mine = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
