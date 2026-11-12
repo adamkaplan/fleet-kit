@@ -11,7 +11,8 @@ the send, as the minute-40 note does; when the send reached nobody the mark is m
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
-A pod that has finished (the progress file's last line is `done` or `STATUS: done`, or /work/results.txt's last line is `STATUS: done`; any case) is not stalled for progress-stale and failed-run-idle (refusal still fires).
+A pod that has finished (ask #2443: its server reports the session idle, the last turn succeeded with finish stop, no cw-run job active, and /work/results.txt exists; see `classify`) is not stalled for progress-stale and
+failed-run-idle (refusal still fires). The text lines `done` and `STATUS: done` decide nothing.
 A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass line names it (pod and reason, no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
@@ -46,7 +47,7 @@ ERROR_LINE = re.compile(r"error|fail|exception|denied|refused|cannot|unable|not 
 # Run INSIDE the pod by `kubectl exec python3 -c <this>`. Reads only: the progress file (mtime, last 10 lines), /work/runs (per file name, mtime and the last
 # line of a log, the number of an exit file) and the agent session's last non-user message (at most 400 characters) from the pod's own server. Prints ONE JSON line.
 PROBE_CODE = r'''
-import base64, json, os, sys, time, urllib.parse, urllib.request
+import base64, json, os, re, sys, time, urllib.parse, urllib.request
 def tail(p, n):
     try:
         with open(p, "rb") as f:
@@ -54,13 +55,14 @@ def tail(p, n):
             return [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()][-n:]
     except OSError:
         return None
-out = {"now": time.time(), "results": "", "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None}
+out = {"now": time.time(), "results": "", "results_exists": False, "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None, "turn": {"turn": "unknown", "outcome": None, "finish": None}}
 try:
     p = "/work/progress.txt"
     out["progress"] = {"mtime": os.path.getmtime(p), "tail": [l[:400] for l in (tail(p, 10) or [])]}
 except OSError:
     pass
-out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]
+out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]   # text for humans: decides nothing
+out["results_exists"] = os.path.isfile("/work/results.txt") and not os.path.islink("/work/results.txt")   # the deliverable as structure
 rd = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 try:
     names = sorted(os.listdir(rd))[:200]
@@ -112,6 +114,23 @@ try:
                 break
             q = "?cursor=" + urllib.parse.quote(str(nxt))
         out["msg"] = best[-400:]
+        # ask #2443: the structural turn state, as cloud/worker/activity.py turn_state reads it (the same three answers; anything odd stays unknown)
+        def newest(kind):
+            it = get("/api/session/%s/message?limit=1&order=desc&type=%s" % (ss[-1]["id"], kind)).get("data")
+            if not it:
+                return None
+            if not isinstance(it, list) or not isinstance(it[0], dict) or it[0].get("type") != kind or not isinstance((it[0].get("time") or {}).get("created"), (int, float)):
+                raise ValueError("odd")
+            return it[0]
+        act = get("/api/session/active").get("data")
+        if isinstance(act, (dict, list)) and re.fullmatch(r"[A-Za-z0-9_]{1,80}", str(ss[-1]["id"])):
+            if (act if isinstance(act, list) else [v for v in act.values() if not isinstance(v, dict) or v.get("type") in (None, "running")]):
+                out["turn"] = {"turn": "running", "outcome": None, "finish": None}
+            else:
+                idle, asst = newest("idle"), newest("assistant")
+                fin = asst.get("finish") if asst else None
+                if idle and idle.get("outcome") in ("succeeded", "failed", "interrupted") and (fin is None or fin in ("stop", "length", "tool-calls", "content-filter", "error", "unknown")) and not (asst and asst["time"]["created"] > idle["time"]["created"]):
+                    out["turn"] = {"turn": "idle", "outcome": idle["outcome"], "finish": fin}
 except Exception:
     pass
 print(json.dumps(out))
@@ -153,6 +172,29 @@ def _num(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+TURN_VALUES = {"turn": ("running", "idle", "unknown"), "outcome": ("succeeded", "failed", "interrupted", None), "finish": ("stop", "length", "tool-calls", "content-filter", "error", "unknown", None)}
+
+
+def classify(data, job_active=False):
+    """The pod's class from the structural state the probe read (ask #2443): "finished", "failed", "stranded", "running" or "unknown". Text lines decide nothing.
+    finished = session idle, last turn succeeded with finish stop, no active cw-run job, and the deliverable exists (the results file; the branch-ahead-of-base test
+    needs the base, which the pod reader does not hold, so only the file test is used). failed = idle after outcome failed or finish error, content-filter or length.
+    stranded = idle after a succeeded turn, no active job, no deliverable (stalled once past the threshold, see decide). running = the session is running.
+    Anything unreadable or off the schema's values is unknown, never finished."""
+    turn = data.get("turn")
+    if not isinstance(turn, dict) or any(turn.get(k) not in TURN_VALUES[k] for k in TURN_VALUES):
+        return "unknown"
+    if turn["turn"] == "running":
+        return "running"
+    if turn["turn"] != "idle":
+        return "unknown"
+    if turn["outcome"] == "failed" or turn["finish"] in ("error", "content-filter", "length"):
+        return "failed"
+    if turn["outcome"] != "succeeded" or turn["finish"] != "stop" or job_active:
+        return "unknown"
+    return "finished" if data.get("results_exists") is True else "stranded"
+
+
 def decide(data):
     """{condition: evidence text} for the three conditions, from the probe's answer. Pure: times are the pod's own clock (`now` in the answer)."""
     now = _num(data.get("now"))
@@ -166,13 +208,11 @@ def decide(data):
     ptime = _num(prog.get("mtime")) if prog else None
     tail = [str(x) for x in (prog.get("tail") or [])] if prog else []
     stime = _num(data.get("msg_time"))
-    # A pod that declared itself finished is not stalled for (a) and (c): its progress file's last line is `done` or `STATUS: done`, or results.txt's last line is `STATUS: done`.
-    # (b) refusal is unchanged and still fires for a finished pod.
-    last_p = tail[-1].strip().lower() if tail else ""
-    finished = last_p in ("done", "status: done") or str(data.get("results") or "").strip().lower() == "status: done"
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
+    # Ask #2443: a pod is finished by what its server reports (see classify), never by a text line. A finished pod is not stalled for (a) and (c); (b) refusal still fires.
+    finished = classify(data, active) == "finished"
     if not finished and times and not active and now - max(times) >= STALE_SECONDS:
         found["progress-stale"] = "no change for %d minutes; last progress line: %s" % ((now - max(times)) // 60, tail[-1] if tail else "(none)")
     # (b)

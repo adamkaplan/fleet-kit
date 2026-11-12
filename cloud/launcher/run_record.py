@@ -356,6 +356,18 @@ class Recorder:
             return None
         return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[-RESULTS_KEEP:]}
 
+    def turn_state(self, pod):
+        """Ask #2443: {"turn", "outcome", "finish"} as the pod's `cw-worker-activity` reports them (the server's own turn state), each a value of the server's schema; None when
+        unreadable or off the schema. The end notice says "a succeeded turn" from this, not from the results file's text. Never raises an Exception."""
+        try:
+            turn = json.loads(self._exec(pod, "cw-worker-activity", keep_stdout=True)).get("turn")
+        except Exception:
+            return None
+        ok = {"turn": ("running", "idle", "unknown"), "outcome": ("succeeded", "failed", "interrupted", None), "finish": ("stop", "length", "tool-calls", "content-filter", "error", "unknown", None)}
+        if not isinstance(turn, dict) or set(turn) != set(ok) or any(turn[k] not in ok[k] for k in ok):
+            return None
+        return {k: turn[k] for k in ok}
+
     def notes_file(self, pod):
         """The scrubbed last NOTES_LINES lines of the pod's /work/.pod-notes.log (ask #2426: one line per push to the default branch, force-push, merge, issue or ref write), or None when it has
         none, is not a regular file or cannot be read. Read and scrubbed like `results_file`. Never raises an Exception."""
@@ -398,6 +410,9 @@ class Recorder:
                 found = self.results_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
                 if found is not None:
                     info["results"] = found
+                turn = self.turn_state(pod)   # ask #2443: the server's own turn state, for the end notice's wording
+                if turn is not None:
+                    info["turn"] = turn
                 notes = self.notes_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2426: the pod's notes file, for the final message
                 if notes is not None:
                     info["pod_notes"] = notes

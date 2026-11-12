@@ -147,15 +147,16 @@ def valid_pr_note(hook):
 
 
 def reported_done(record_dir, parse):
-    """Ask #2392: True when the run record holds the pod's results file and its last non-empty line was exactly `STATUS: done` (a bool the launcher wrote; nothing of the text is read)."""
+    """Ask #2443: True when the run record holds the structural turn state the launcher read from the pod's own server (run.json `turn`, from cw-worker-activity)
+    and it says idle, outcome succeeded, finish stop. The results file's text decides nothing here (ask #2392 read its last line)."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
-    results = run.get("results") if isinstance(run, dict) else None
-    return isinstance(results, dict) and results.get("done") is True
+    turn = run.get("turn") if isinstance(run, dict) else None
+    return isinstance(turn, dict) and turn.get("turn") == "idle" and turn.get("outcome") == "succeeded" and turn.get("finish") == "stop"
 
 
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None, done=False):
     if done:   # a pod that finished and sat idle is not a failure
-        text = ("[cloud worker ended] %s ended idle after reporting done (its results file says STATUS: done); the launcher stopped it at its %s; at %s; %s; run record: %s."
+        text = ("[cloud worker ended] %s ended idle after a succeeded turn (the server reported the last turn succeeded with finish stop); the launcher stopped it at its %s; at %s; %s; run record: %s."
                 % (worker, label, when, pushed, record_name or "unknown"))
     else:
         text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; %s; run record: %s."

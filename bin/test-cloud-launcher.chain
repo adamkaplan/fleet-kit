@@ -119,6 +119,7 @@ cloud/launcher/tests/test_secret_dir_publish.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
+cloud/launcher/tests/test_stall_structural.py
 cloud/launcher/tests/test_stall_watch.py
 cloud/launcher/tests/test_stop_cause.py
 cloud/launcher/tests/test_stop_failed_pod.py
