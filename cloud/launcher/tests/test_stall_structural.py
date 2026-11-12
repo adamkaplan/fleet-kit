@@ -160,7 +160,8 @@ class Structural(unittest.TestCase):
         self.assertEqual(s2_wrong(), 0)
 
     def test_s2_the_probe_reads_the_same_turn_as_the_helper(self):
-        for kw in (dict(running=True), dict(), dict(idle="idle_failed"), dict(idle=None)):
+        for kw in (dict(running=True), dict(), dict(idle="idle_failed"), dict(idle=None), dict(idle_body={"id": "msg_x", "time": {"created": 1}, "type": "idle", "outcome": "succeeded"}),
+                   dict(idle_body={"id": "msg_x", "time": {"created": 1}, "type": "idle", "outcome": "bogus"}), dict(assistant="assistant_in_flight")):
             s = Server(**kw)
             try:
                 self.assertEqual(probe_turn(s), helper_turn(s), kw)

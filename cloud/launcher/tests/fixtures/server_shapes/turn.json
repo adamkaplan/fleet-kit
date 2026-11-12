@@ -18,7 +18,7 @@
     "type": "text"
    }
   ],
-  "id": "msg_1cdaa7f1d001chPegzHD2P5Xq9",
+  "id": "msg_example0001",
   "model": {
    "id": "claude-sonnet-5.5",
    "providerID": "github-copilot",
@@ -40,7 +40,7 @@
   ],
   "cost": 0.0204185,
   "finish": "stop",
-  "id": "msg_1cdaa5e86001Twe73eEpEdzAB8",
+  "id": "msg_example0002",
   "model": {
    "id": "claude-sonnet-5.5",
    "providerID": "github-copilot",
@@ -73,7 +73,7 @@
   ],
   "cost": 0.0204185,
   "finish": "tool-calls",
-  "id": "msg_1cdaa5e86001Twe73eEpEdzAB8",
+  "id": "msg_example0003",
   "model": {
    "id": "claude-sonnet-5.5",
    "providerID": "github-copilot",
@@ -101,7 +101,7 @@
    "message": "neutral example error",
    "name": "example"
   },
-  "id": "msg_idle0002",
+  "id": "msg_example0004",
   "outcome": "failed",
   "time": {
    "created": 1794451862042
@@ -109,7 +109,7 @@
   "type": "idle"
  },
  "idle_interrupted": {
-  "id": "msg_idle0003",
+  "id": "msg_example0005",
   "outcome": "interrupted",
   "time": {
    "created": 1794451862042
@@ -117,7 +117,7 @@
   "type": "idle"
  },
  "idle_succeeded": {
-  "id": "msg_idle0001",
+  "id": "msg_example0006",
   "outcome": "succeeded",
   "time": {
    "created": 1794451862042
