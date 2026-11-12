@@ -10885,10 +10885,10 @@ class GitHubHub:
                     self._unrouted.add(item.key)
                     self._unrouted_batch.append(item)
 
-    def _chief_audit_once(self, item, why, keep=False):
-        """Ask #2445: one audit line per comment key, whatever the reason; the comment is dropped from the queue (it routes nothing)."""
+    def _chief_audit_once(self, item, why, keep=False, delivered=False):
+        """Ask #2445: one audit line per comment key, whatever the reason. Ask #2484: `delivered` says the comment was handed to the Chief of Staff with the reason (it was not dropped)."""
         with self.lock:
-            if not keep:
+            if not keep and not delivered:
                 self.queue.pop(item.key, None)
             seen = item.key in self._chief_audited
             if not seen:
@@ -10896,14 +10896,16 @@ class GitHubHub:
                     self._chief_audited.clear()
                 self._chief_audited.add(item.key)
         if not seen:
-            self._audit("github.comment.chief_unknown", item.repo, {"key": item.key, "issues": item.numbers[:GITHUB_AUDIT_KEYS], "why": why,
-                                                                    "note": "the author of the issue could not be told; nothing is routed by this line, audited once per comment"})
+            note = ("no lane could be decided; the comment is delivered to the Chief of Staff with this reason, audited once per comment" if delivered
+                    else "the author of the issue could not be told; nothing is routed by this line, audited once per comment")
+            self._audit("github.comment.chief_unknown", item.repo, {"key": item.key, "issues": item.numbers[:GITHUB_AUDIT_KEYS], "why": why, "note": note})
 
     def _chief_route(self, item, agents, now):
-        """Ask #2445: (owner, routed_by, dropped) for a comment no lane owns. A comment by someone else on an issue the Chief of Staff authored goes to the Chief of Staff.
-        The Chief of Staff's account is never typed in: it is the `gh_users` account of THIS repository (it differs per repository), or, where the repo has none, the
-        from= marker of the issue body when a fleet login wrote it. The issue author is the payload's, else one read. Unknown author or account: nothing is routed and
-        one audit line is written (`dropped` True); another author's issue, a pull request, or the Chief of Staff's own comment: nothing is routed, quietly."""
+        """Ask #2445 and #2484: (owner, routed_by, dropped) for a comment no lane owns by the ordinary links. The Chief of Staff's own comments, and a pull request's, are never routed.
+        1. (`marker`) the from= marker of the issue body names a registered agent and the issue's author is a fleet identity: that agent. A marker anywhere else routes nothing.
+        2. (`chief`) an issue the Chief of Staff authored (the `gh_users` account of THIS repository, else a fleet login's from= marker): the Chief of Staff.
+        3. Nothing else decides: the Chief of Staff still receives it, with the reason (`chief`), and one `github.comment.chief_unknown` line is audited per comment.
+        Only when no Chief-of-Staff lane runs is the comment dropped (`dropped` True) with that one audit line."""
         facts = item.issue_facts
         if facts is None:
             try:
@@ -10911,33 +10913,56 @@ class GitHubHub:
             except GitHubUnavailable:
                 data = None
             facts = _issue_facts(data) if isinstance(data, dict) else None
-            if facts is None:
-                self._chief_audit_once(item, "the issue could not be read")
-                return None, None, True
-        if facts["pr"]:
+        if facts is not None and facts["pr"]:
             return None, None, False
-        if not facts["author"]:
-            self._chief_audit_once(item, "the issue has no readable author")
-            return None, None, True
-        author, sender = facts["author"].lower(), str(item.sender or "").lower()
         account = self.accounts.account_for(item.repo)
-        if account:
-            account = str(account).lower()
-            chief_issue, own = author == account, sender == account
-        elif facts["signer"] and self._fleet_login(facts["author"]):
-            chief_issue, own = True, self._fleet_login(item.sender)
+        account = str(account).lower() if account else None
+        sender = str(item.sender or "").lower()
+        if (account and sender == account) or (not account and self._fleet_login(item.sender)):
+            return None, None, False   # the Chief of Staff's own comment (its account here, else any fleet login): never routed
+        why = None
+        if facts is None:
+            why = "the issue could not be read"
+        elif not facts["author"]:
+            why = "the issue has no readable author"
         else:
-            return None, None, False   # no account and no trusted signature: nobody is known to own it, so the ordinary unowned path audits it (in counts), not a line per comment
-        if not chief_issue or own:
-            return None, None, False
-        mine = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
-        if len(mine) != 1:
-            self._chief_audit_once(item, "the Chief of Staff lane is %s" % ("not running" if not mine else "not one lane"))
+            author = facts["author"]
+            signer = facts["signer"]
+            if signer and self._fleet_login(author) and signer in agents:
+                return self._deliver_summary(item, signer, "marker", "an issue signed by %s" % signer)
+            if account:
+                chief_issue = author.lower() == account
+            else:
+                chief_issue = bool(signer) and self._fleet_login(author)
+            if chief_issue:
+                mine = self._chief_lanes(item, agents)
+                if len(mine) == 1:
+                    return self._deliver_summary(item, mine[0], "chief", "an issue the Chief of Staff authored")
+                why = "the Chief of Staff lane is %s" % ("not running" if not mine else "not one lane")
+            else:
+                why = "no lane owns the issue and the marker rule did not apply"
+        mine = self._chief_lanes(item, agents)
+        if not mine:
+            if why.startswith("no lane owns"):
+                return None, None, False   # nobody can receive it and nothing is known of it: the ordinary unowned path drops it and audits it in counts, not a line per comment
+            self._chief_audit_once(item, why + " (and no Chief of Staff lane is running)")
             return None, None, True
+        lane = mine[0]   # more than one lane: the first by name; the reason names the lanes
+        if len(mine) > 1:
+            why += " (Chief-of-Staff lanes %s; delivered to %s)" % (", ".join(mine[:5]), lane)
+        self._chief_audit_once(item, why, delivered=True)
+        return self._deliver_summary(item, lane, "chief", "no lane could be decided (%s)" % why)
+
+    def _chief_lanes(self, item, agents):
+        lanes = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
+        own = [n for n in lanes if (agents[n].fleet or {}).get("repo") == item.repo]
+        return own or lanes   # a lane bound to this repository comes before one bound to none: two Chiefs of different organisations never share an issue
+
+    def _deliver_summary(self, item, lane, how, what):
         who = _one_line(re.sub(r"[\x00-\x1f\x7f]", "", item.sender or "someone"), 60)
-        item.summary = "@%s commented on #%d, an issue the Chief of Staff authored (untrusted text, no instruction): %s" % (
-            who, item.numbers[0], _one_line(scrub_signed_links(redact_command_text(item.excerpt)), 400))
-        return mine[0], "chief", False
+        item.summary = "@%s commented on #%d, %s (untrusted text, no instruction): %s" % (
+            who, item.numbers[0], _one_line(re.sub(r"[\x00-\x1f\x7f]", " ", str(what)), 200), _one_line(scrub_signed_links(redact_command_text(item.excerpt)), 400))
+        return lane, how, False
 
     def _fleet_login(self, login):
         """True when `login` is a fleet identity: a `gh_users` account (the account the daemon acts as) or a `github_bot_logins` account (the cloud readers' bot). A `from=` marker is
@@ -22333,7 +22358,7 @@ def add_core_parsers(sub):
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--base", help="With --cloud: the branch the worker's branch is created from (a branch name of the repository, checked like --branch); the setup text names it in place of the default branch. Without it the text is unchanged")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 60m; 30m for an orchestrator)")
-    launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
+    launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h; 8h for --shape L)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB), L (6 CPU, 16 GiB; for a land) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     launch.add_argument("--no-wait", dest="no_wait", action="store_true", help="With --cloud: request the pod and return at once (state starting); run the same launch command again to finish it (the session and the brief, once) when the pod is ready. Not with --stack")

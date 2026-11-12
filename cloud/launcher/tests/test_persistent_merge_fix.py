@@ -19,7 +19,7 @@ import test_persistent_orchestrator as po  # noqa: E402
 
 cw, mutant, ROOT = po.cw, po.mutant, po.ROOT
 BIN_SWITCHBOARD_TEST = os.path.join(ROOT, "bin", "test-switchboard")
-ROW_LINE = '''            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),\n'''
+ROW_LINE = '''            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),'''   # the row alone: another row now follows it on the same line (#2365)
 RESULT = "refused before any pod exists: it says nothing was created"
 ENTRY_LINES = ["        '--persistent is only for --age': '%s',\n" % RESULT, "        '--persistent does not combine ': '%s',\n" % RESULT]
 INTEGRATION_KEYS = ["'the stack model secret %s coul'", "'%s; nothing was created'"]   # what the scan names for the raise integration added (#1435): the text is cut at 30 characters, and its second form is the bare tail
@@ -82,7 +82,12 @@ class S21Entries(CopyRun):
         head = "    CREATED_EXEMPT = {\n"
         self.assertEqual(src.count(head), 1)
         added = "".join("        %s: '%s',\n" % (key, RESULT) for key in INTEGRATION_KEYS if key not in src)
-        return src.replace(head, head + added)
+        src = src.replace(head, head + added)
+        # The scan now also passes a raise whose own words say "nothing was created" (so the two entries are no longer what keeps it quiet):
+        # the copy switches that rule off, so the table entries are again the only thing that exempts the two persistent raises.
+        rule = '            if re.search(r"nothing was created", text):'
+        self.assertEqual(src.count(rule), 1)
+        return src.replace(rule, "            if False:")
 
     def test_s21_the_control_passes_and_the_copy_without_the_two_entries_names_the_stray_raise(self):
         src = self.source()
