@@ -18185,7 +18185,7 @@ def _merged_body_claim(ctx, runner, now, number, merged):
         done = runner(argv, capture_output=True, text=True, timeout=ctx.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
         if done.returncode != 0:
             raise ValueError("the read failed")
-        pull = json.loads(done.stdout)["data"]["repository"]["pullRequest"]
+        pull = load_module("record_json").parse_bounded(done.stdout)["data"]["repository"]["pullRequest"]
         body, merged_at, edited = pull["body"], _measure_time(pull["mergedAt"]), pull["lastEditedAt"]
     except Exception:
         raise unknown("the pull request could not be read") from None
