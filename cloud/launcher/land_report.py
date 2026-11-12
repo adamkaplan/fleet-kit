@@ -29,6 +29,7 @@ SMALL_LINES_DEFAULT = 50      # the small bound, a setting (CW_LAND_REPORT_SMALL
 SEND_HOUR = 13                # UTC: the report goes on the first pass at or after this hour
 WINDOW = dt.timedelta(hours=24)
 CALL_SECONDS = 60
+MAX_TRIES = 3                 # tries of one part per day
 MESSAGE_MAX = 3500
 EXIT_REASON = {0: "landed", 18: "council", 13: "tests", 3: "environment", 124: "time limit", 137: "time limit"}
 REASONS = ("council", "tests", "environment", "time limit", "other")
@@ -319,8 +320,10 @@ def daily_pass(env, now, root, state_path, git_dir=None, send=send_message, comm
         landed = git(git_dir or (env or {}).get("CW_LAND_REPORT_GIT_DIR"), (env or {}).get("CW_LAND_REPORT_BRANCH") or "origin/main", start)
         text, line = build(records, unread, landed, small_bound(env), earlier, day)
         for part, call, body in (("message", send, text), ("comment", comment, line)):
-            if state.get(part) is True:
+            if state.get(part) is True or state.get(part + "_tries", 0) >= MAX_TRIES:
                 continue
+            state[part + "_tries"] = state.get(part + "_tries", 0) + 1
+            write_state(state_path, state)   # BEFORE the call: a state that cannot be written sends nothing; tries are bounded per day and survive a restart
             try:
                 state[part] = bool(call(body, issue))
             except Exception as err:
