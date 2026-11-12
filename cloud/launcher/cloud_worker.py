@@ -2362,6 +2362,14 @@ def _not_found_exactly(stderr, what):
     return bool(what) and text == "Error from server (NotFound): %s not found" % what
 
 
+def render_pdb(name, worker, run_id=None):
+    """The budget of one worker pod (ask #2446): minAvailable 1 and a selector that matches exactly that pod (its app and cw/worker labels, the
+    worker name being unique), so a node drain waits for the pod to end. Name, namespace-less metadata, labels, selector and minAvailable only."""
+    return {"apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
+            "metadata": {"name": name + "-pdb", "labels": {"app": LABEL, "cw/pod": name, **({"cw/run-id": run_id} if run_id else {})}},
+            "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": LABEL, "cw/worker": worker}}}}
+
+
 class Kube:
     """The only door to the cloud: one kubectl call per method. Never puts a secret on a command line."""
 
@@ -2584,6 +2592,19 @@ class Kube:
         out = self.run(["get", "events", "--field-selector", "involvedObject.kind=Pod,involvedObject.name=" + name, "-o", "json"])
         return json.loads(out)["items"]
 
+    def list_pdbs(self):
+        """The budgets of the launcher's label: [(name, cw/pod, creationTimestamp)]. An answer that cannot be read raises."""
+        tmpl = r'{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.cw/pod}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}'
+        out = self.run(["get", "poddisruptionbudgets", "-l", "app=" + LABEL, "-o", "jsonpath=" + tmpl])
+        rows = []
+        for line in out.splitlines():
+            if line.strip():
+                f = line.split("\t")
+                if len(f) != 3 or not f[0]:
+                    raise CloudError("kubectl get: the budget list could not be read")
+                rows.append(tuple(f))
+        return rows
+
     def list_secrets(self, selector):
         """The Secrets that match a label selector, WITHOUT any value: an output form that names only the name, the labels cw/pod and app and
         the creation time (never the whole object). Returns [(name, cw/pod, app, creationTimestamp)]; an answer that cannot be read raises."""
@@ -2606,6 +2627,14 @@ class Kube:
     def delete_run_secret(self, name):
         self.run(["delete", "secret", name + "-run", "--ignore-not-found"])
 
+    def get_pdb(self, name):
+        full = name + "-pdb"
+        out = self.run(["get", "poddisruptionbudget", full, "-o", "json"], ok_missing=True, missing_what='poddisruptionbudgets.policy "%s"' % full)
+        return json.loads(out) if out else None
+
+    def delete_pdb(self, name):
+        self.run(["delete", "poddisruptionbudget", name + "-pdb", "--ignore-not-found"])
+
     def delete(self, name, uid=None):
         """Delete the pod and both Secrets, each attempted even if another fails; names what REMAINS and how to delete it.
         With a uid the pod delete is bound to the pod that was read; a pod that changed leaves all three whole (PodChanged)."""
@@ -2616,7 +2645,7 @@ class Kube:
         else:
             pod_fn = self.delete_pod
         for kind, obj, fn in (("pod", name, pod_fn), ("secret", name + "-pw", self.delete_secret),
-                              ("secret", name + "-run", self.delete_run_secret)):
+                              ("secret", name + "-run", self.delete_run_secret), ("poddisruptionbudget", name + "-pdb", self.delete_pdb)):
             try:
                 fn(name)
             except CloudError:
@@ -3273,7 +3302,7 @@ class Launcher:
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
         self.run_id, self.foreign = getattr(a, "run_id", None), []   # what this call proved is another's is never deleted
-        made = {"secret": False, "run": False, "pod": False, "reg": None, "sts": False}  # set before the call that may create it: an interrupt may land after
+        made = {"secret": False, "run": False, "pdb": False, "pod": False, "reg": None, "sts": False}  # set before the call that may create it: an interrupt may land after
         persistent = bool(getattr(a, "persistent", False))
 
         def go(info):
@@ -3329,6 +3358,8 @@ class Launcher:
                                  "type": "Opaque", "stringData": {"password": password}})
                 if run_values:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
+                if not persistent:   # the budget BEFORE the pod: a refusal ends the launch with no pod (ask #2446)
+                    self._make(made, "pdb", self.kube.apply, render_pdb(name, worker, getattr(a, "run_id", None)))
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec if not persistent else {"metadata": {"name": name + "-0"}},
@@ -3473,6 +3504,8 @@ class Launcher:
             obj, where = self.kube.get_pod(name), "annotations"
         elif kind == "sts":
             obj, where = self.kube.get_workload(name), "annotations"
+        elif kind == "pdb":
+            obj, where = self.kube.get_pdb(name), "labels"
         else:
             obj, where = self.kube.get_secret(name + ("-pw" if kind == "secret" else "-run")), "labels"
         if not obj:
@@ -3501,9 +3534,10 @@ class Launcher:
                         self.kube.delete_pod(name + "-0")
                 except CloudError:
                     left.append("statefulset/" + name)
-            for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name),
+            for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("pdb", self.kube.delete_pdb, "poddisruptionbudget/%s-pdb" % name),
+                                  ("secret", self.kube.delete_secret, "secret/%s-pw" % name),
                                   ("run", self.kube.delete_run_secret, "secret/%s-run" % name)):
-                if made[kind]:
+                if made.get(kind):
                     try:
                         mine = self._mine(kind, name)
                         if mine is False:
@@ -3537,7 +3571,7 @@ class Launcher:
     def _abort(self, worker, name, made, exc):
         interrupted = isinstance(exc, (Interrupted, KeyboardInterrupt))
         left = self._cleanup(name, made)
-        cleaned = [l for k, l in (("sts", "statefulset/" + name), ("pod", "pod/" + name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made.get(k) and l not in left and l not in self.foreign]
+        cleaned = [l for k, l in (("sts", "statefulset/" + name), ("pod", "pod/" + name), ("pdb", "poddisruptionbudget/%s-pdb" % name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made.get(k) and l not in left and l not in self.foreign]
         reason = "%s; cleaned: %s" % ("interrupted" if interrupted else "failed: %s" % str(exc)[:200], ", ".join(cleaned) or "nothing")
         if left:
             reason += "; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left))
@@ -3750,6 +3784,8 @@ class Launcher:
                             fn(name)
                             removed.append(full)
                     info["removed"] = removed
+                    if self.kube.get_pdb(name):   # this worker's budget (exact name), the pod being gone
+                        self.kube.delete_pdb(name)
                 if getattr(a, "hub_entry", False) and not self._unregister(worker):   # the same call the live path uses; a failure is reported
                     raise CloudError("the hub registry entry of %s could not be removed (the Secrets are); retire again to finish" % worker)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True, "secrets_removed": removed}
@@ -3878,7 +3914,8 @@ class Launcher:
         self.run_id = nonce
         left = []
         changed = False
-        for kind, label, fn in (("pod", "pod/" + name, lambda n: self.kube.delete_pod(n, uid)), ("secret", "secret/%s-pw" % name, self.kube.delete_secret),
+        for kind, label, fn in (("pod", "pod/" + name, lambda n: self.kube.delete_pod(n, uid)), ("pdb", "poddisruptionbudget/%s-pdb" % name, self.kube.delete_pdb),
+                                ("secret", "secret/%s-pw" % name, self.kube.delete_secret),
                                 ("run", "secret/%s-run" % name, self.kube.delete_run_secret)):
             try:
                 mine = self._mine(kind, name)
@@ -4724,12 +4761,39 @@ class Launcher:
             if gone:
                 self.audit(worker, rid, "stop", 0.0, True, "pod gone; no stop was recorded", None, "pod_gone")
 
+    def remove_orphan_pdbs(self, pods, now):
+        """A budget (`<pod>-pdb`, label cw/pod) whose pod is absent from this pass's list and that is older than ORPHAN_SECRET_AFTER_SECONDS is
+        removed by its exact name (a budget with no pod would block a drain for ever). Unreadable: nothing deleted, said once."""
+        if not hasattr(self.kube, "list_pdbs"):
+            return []
+        try:
+            rows = self.kube.list_pdbs()
+        except (CloudError, ValueError, OSError) as e:
+            print("cloud-worker: orphan budgets: the list could not be read: %s" % scrub(str(e), (), 120).replace("\n", " "), file=sys.stderr)
+            return []
+        names = {(p.get("metadata") or {}).get("name") for p in pods}
+        done = []
+        for name, pod, created in rows:
+            if not pod or name != pod + "-pdb" or pod in names:
+                continue
+            try:
+                if int((now - parse_iso(created)).total_seconds()) <= ORPHAN_SECRET_AFTER_SECONDS:
+                    continue
+                self.kube.delete_pdb(pod)
+            except (CloudError, ValueError, TypeError) as e:
+                print("cloud-worker: orphan budgets: %s was not removed: %s" % (name, scrub(str(e), (), 120).replace("\n", " ")), file=sys.stderr)
+                continue
+            self.audit(pod, REAPER_RUNTIME_ID, "orphan-budget-removed", 0.0, True, "%s: its pod is absent" % name)
+            done.append(name)
+        return done
+
     def remove_orphan_secrets(self, pods, now):
         """Remove each per-run Secret (`<pod>-run`, label cw/pod; `<pod>-pw`, label app=cw-worker) whose pod is absent from THIS pass's pod list and
         that is more than ORPHAN_SECRET_AFTER_SECONDS old by its creation time (an upper bound of how long the pod has been gone). Each goes by its
         exact name through the launcher's own delete, with ONE audit line. A kept Secret: its pod is listed (or that name plus `-0`, a persistent
         orchestrator's pod; this branch has no workload list, so that rule alone stands in for the workload), a Secret younger than the time, any
         Secret without the launcher's label (the hub's). An unreadable list deletes nothing and is said once. No value is ever read."""
+        self.remove_orphan_pdbs(pods, now)
         if not hasattr(self.kube, "list_secrets"):
             return []   # a cluster object that cannot list Secrets (an earlier test's fake): the step does not run; the real Kube always can
         try:

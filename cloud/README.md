@@ -350,6 +350,31 @@ A pod ended by its deadline or by a retire lost its unpushed work unless a fresh
 
 Not run in a cluster: the live check (a real pod with an ended token, and the note reaching a real session) is the operator's, after merge.
 
+## Node upgrades never end a running worker (ask #2446)
+
+A worker is a bare pod, and a node drain (an upgrade, a repair) evicts it. The launcher therefore makes ONE PodDisruptionBudget per worker pod, `<pod>-pdb`, with `minAvailable: 1` (a bare pod takes only an integer) and a selector on that pod's own `app` and `cw/worker` labels, BEFORE the pod; a refused budget create ends the launch with one line, no pod and no Secret. The budget carries the run's identity label and is deleted with the pod on every ending path (stop, by-name stop, the reaper's hard and idle stops, a failed launch) by the same run-identity check the Secrets use; the reaper also removes a budget whose pod is absent and that is over an hour old, because a budget with no pod would block a drain for ever. Persistent orchestrators (StatefulSet pods) get no budget (follow-up, with the system pool's hub and bridge). The launcher's Role (`cloud/k8s/operator-rbac.yaml`) gains `get`, `list`, `create`, `delete` on `poddisruptionbudgets` in the `policy` group; the administrator applies it.
+
+Table of every input and outside call of the change, each with its test and mutant:
+
+| Input or outside call | Failure handled | Test | Mutant |
+| --- | --- | --- | --- |
+| budget `create` before the pod | forbidden, odd answer: launch ends, 0 pods, 0 Secrets | `test_s8_*` | not run (a launch that creates the pod anyway fails `test_s8_*`) |
+| budget selector | matches exactly its own pod | `test_s2_*` | `test_mutant_selector_on_the_shared_label_fails_s2` |
+| budget `delete` on stop, by-name stop, reaper, failed launch | own budget removed, another's left | `test_s3_*` | `test_mutant_budget_not_deleted_by_stop_fails_s3` |
+| budget `get` for the run-identity check | missing: nothing to do; another run's: left whole | `test_s3_a_stop_with_another_run_id_leaves_the_budget` | covered by the control run |
+| budget list in the reaper pass | unreadable: nothing deleted, one line | `test_s3_the_reaper_pass_removes_a_budget_*` | none (a young budget is kept) |
+| the rendered object | name, labels, selector, `minAvailable` only | `test_s4_*` | none |
+
+Each mutant has a control run first (`test_control_*`) and an anchored failure text.
+
+### The Saturday window stays as a backstop
+
+The Saturday 07:00 to 11:00 UTC window stays: upgrades start only inside it, and the budgets protect a worker inside it. Without the window an upgrade could start at any time and meet the same budgets, so the window is the second line, not the first.
+
+A node that cannot be drained because a worker still runs is cordoned after the drain timeout (`undrainableNodeBehavior=Cordon`) and the upgrade goes on with other nodes. A cordoned node needs the operator to act once its worker has ended: look at `kubectl get nodes`, and delete the cordoned node or uncordon it. A platform-initiated action may still override a budget; if every node of a pool holds a protected worker, the upgrade stalls until a worker ends (not yet measured: stated as unknown).
+
+Cost: an upgrade adds one surge node per pool step, about 0.45 dollars per hour for the workers' size, and a cordoned node stays (and is paid for) until its worker ends.
+
 ## The stall watch (ask #2399)
 
 **Cause.** A worker pod wrote that every shell command was refused and then sat idle for 75 minutes: nothing read a live pod's progress file, run logs or the agent's last words, and the idle nudge fires once. Now the reaper's pass (`cloud/launcher/stall_watch.py`, one call after the idle nudges) reads each running pod older than 10 minutes with ONE `kubectl exec` (3 seconds at most): `/work/progress.txt` (modification time, last lines), every file under `/work/runs` (log name, time, last line; exit number and time) and the agent session's last message (at most 400 characters, through the pod's own server). It sends an alert for three conditions:
