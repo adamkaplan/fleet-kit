@@ -167,6 +167,9 @@ def kube_run(argv, env, stdin=None, fds=(), config=None):
         rfd, wfd = os.pipe()
         try:
             os.write(wfd, config.encode())
+        except OSError:
+            os.close(rfd)
+            raise KubeUnusable("kubectl could not be given its login") from None
         finally:
             os.close(wfd)
         cfd = rfd
@@ -222,6 +225,8 @@ def mint_token(env):
         raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig is empty or too large")
     mint = kube_run(["kubectl", "-n", env.get("CW_CLOUD_NAMESPACE") or "cw"] + MINT.split(), dict(env, KUBECONFIG=os.devnull), config=config)
     done = mint
+    if not (mint.stdout or "").strip() or mint.returncode != 0:
+        raise KubeUnusable("no cluster login for kubectl: the token for cw-operator was refused")
     view = kube_run(["kubectl", "config", "view", "--minify", "--raw", "-o", "json"], dict(env, KUBECONFIG=os.devnull), config=config)
     token = (done.stdout or "").strip() if done is not None and done.returncode == 0 else ""
     if not token or re.search(r"\s", token):
