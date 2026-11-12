@@ -1,5 +1,6 @@
 bin/test-cloud-cost-report
 bin/test-cloud-retired
+cloud/launcher/tests/test_all_reds.py
 cloud/launcher/tests/test_app_token.py
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
