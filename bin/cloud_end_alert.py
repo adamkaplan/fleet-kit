@@ -461,3 +461,85 @@ def scan_turns(workers, activity, state_file, audit_file, send, parse, now, memo
             except Exception:
                 pass
     return due
+
+
+# ---- ask #2399: the stall watch's alerts. The reaper has no agent identity and cannot run `send`: it writes ONE `stall-alert` audit line per alert and this
+# pass (the daemon's own send path) tells the recorded boss and the Chief of Staff, once per line. The audit file is UNTRUSTED text: every field is checked. ----
+STALL_ACTION = "stall-alert"
+STALL_CONDITIONS = ("progress-stale", "refusal", "failed-run-idle")   # the fixed three (cloud/launcher/stall_watch.py CONDITIONS)
+STALL_ASK = "adamkaplan/fleet-kit#2399"
+STALL_EVIDENCE_MAX = 300
+ASK_SHAPE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}#)?[1-9][0-9]{0,9}")
+
+
+def stall_evidence(value):
+    """The evidence as one printable line of at most STALL_EVIDENCE_MAX characters (control characters and line breaks become spaces); '' when it is not text."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join("".join(c if c.isprintable() else " " for c in value).split())[:STALL_EVIDENCE_MAX]
+
+
+def stall_text(worker, condition, evidence, when, ask):
+    return "[stall] %s %s: %s; at %s; read it with: fleet-switchboard read %s; ask %s" % (worker, condition, evidence, when, worker, ask)
+
+
+def scan_stall(audit_file, state_file, send, parse):
+    """One pass over the NEW `stall-alert` audit lines (own cursor and sent keys in state_file, as scan_audit): per valid line ONE message to the Chief of Staff and
+    ONE to the boss the line names (when a valid agent name and not the Chief), through `send(recipient, text)`. The state is saved BEFORE the messages go: a crash loses
+    a message and never sends one twice. A line with a bad worker, time, condition or evidence sends nothing. Returns [(recipient, text)] handed to send."""
+    try:
+        size = os.stat(str(audit_file)).st_size
+    except OSError:
+        return []
+    offset, keys, fresh = load_state(state_file, size, parse)
+    if fresh:
+        save_state(state_file, size, keys)
+        return []
+    if offset >= size:
+        if offset != size:
+            save_state(state_file, offset, keys)
+        return []
+    try:
+        with open(str(audit_file), "rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read(READ_BYTES)
+    except OSError:
+        return []
+    cut = chunk.rfind(b"\n") + 1
+    if cut == 0:
+        cut = len(chunk) if len(chunk) >= READ_BYTES else 0
+    out = []
+    for raw in chunk[:cut].split(b"\n"):
+        if b"stall-alert" not in raw:
+            continue
+        try:
+            line = parse(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(line, dict) or line.get("action") != STALL_ACTION or line.get("ok") is not True:
+            continue
+        worker, condition, ts, rid = line.get("worker"), line.get("condition"), line.get("ts"), line.get("runtime_id")
+        if not isinstance(worker, str) or not WORKER_NAME.fullmatch(worker) or condition not in STALL_CONDITIONS:
+            continue
+        if when_text(ts) == "unknown" or not isinstance(rid, str) or not re.fullmatch(r"pod/[A-Za-z0-9._-]{1,80}", rid):
+            continue
+        ev = stall_evidence(line.get("evidence"))
+        if not ev:
+            continue
+        key = ("%s@%s" % (rid, ts), condition)
+        if any(key == k for k in keys):
+            continue
+        keys.append(key)
+        ask = line.get("ask")
+        ask = ask if isinstance(ask, str) and ASK_SHAPE.fullmatch(ask) else STALL_ASK
+        names = line.get("recipients") if isinstance(line.get("recipients"), list) else []
+        boss = next((n for n in names if isinstance(n, str) and AGENT_NAME.fullmatch(n) and n != CHIEF), None)
+        text = stall_text(worker, condition, ev, ts, ask)
+        out.extend((to, text) for to in [CHIEF] + ([boss] if boss else []))
+    save_state(state_file, offset + cut, keys)
+    for to, text in out:
+        try:
+            send(to, text)
+        except Exception:
+            pass
+    return out

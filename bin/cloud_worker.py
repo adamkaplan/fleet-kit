@@ -943,7 +943,7 @@ def _print_capacity(runner, cluster):
             body = body if code == 0 else None
         except CloudError:
             body = None
-        lines = capacity_block(body, lib.SHAPES, lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
+        lines = capacity_block(body, getattr(lib, "capacity_shapes", lambda: lib.SHAPES)(), lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
         print("\n".join(lines), file=sys.stderr)
     except Exception:
         print("cloud capacity before the create: not read", file=sys.stderr)

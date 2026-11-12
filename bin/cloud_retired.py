@@ -446,6 +446,44 @@ def _last_worker_text_at(directory, ident):
     return found, None
 
 
+NOTES_LINES = 20       # ask #2426: the last lines of the pod's notes file that go with the final message
+NOTES_CHARS = 2000     # and at most this many characters of them (whole lines)
+_NOTES_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_NOTES_KEY_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+
+
+def pod_notes_tail(directory):
+    """THE ONE READER of the run record's `pod_notes` (a string: the pod's /work/.pod-notes.log as the launcher kept it, ask #2426): its last NOTES_LINES lines, the pod's
+    endpoint address removed, redacted by shape (the switchboard's redaction, then the launcher's scrub: the launcher redacted it too and this runs again; the field is not trusted),
+    printable ASCII, no backtick, whole lines, at most NOTES_CHARS characters. None when the record has none or cannot be read. Never raises."""
+    try:
+        info, _ = D["read_record_file"](Path(directory) / "run.json", 65536)
+        raw = info.get("pod_notes") if isinstance(info, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        text = "\n".join(raw[-LAST_SCRUB_MAX:].splitlines()[-NOTES_LINES:])
+        for _ in range(21):
+            stripped = _remove_hosts(text)
+            done, text = stripped == text, stripped
+            if done:
+                break
+        else:
+            return None
+        scrub = D["_scrub_lib"]()
+        end = _NOTES_KEY_END.search(text)
+        if end and not _NOTES_KEY_BEGIN.search(text[:end.start()]):
+            text = "[redacted key body]" + text[end.end():]   # a key block whose first line was cut away: all of it up to its end marker goes
+        text = D["redact_command_text"](text)
+        lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'").replace("@", "(at)") for line in text.splitlines()]   # no mention can fire
+        out = "\n".join(lines)
+        if len(out) > NOTES_CHARS:
+            cut = out[-NOTES_CHARS:]
+            out = cut.split("\n", 1)[1] if "\n" in cut else ""   # whole lines only: a token is never cut into an unrecognisable suffix
+        return out if out.strip() else None
+    except Exception:
+        return None
+
+
 def last_message(directory, state, pod, clock=None):
     """(block, None) or (None, why). The block is the framing line `[last message of <pod>, untrusted text]`, the first 3,000 characters of the pod's last
     assistant text and, when there is more, the path of the file with the next (at most 20,000) characters and the count left out. The text is cut at the
@@ -493,6 +531,9 @@ def last_message(directory, state, pod, clock=None):
             kept = rest[:LAST_FILE]
             path = _write_last(base, name, kept)
             lines.append("[%d more characters in %s; %d characters left out]" % (len(kept), path, len(rest) - len(kept)))
+        notes = pod_notes_tail(directory)   # ask #2426: the pod's notes (pushes to the default branch, merges, ref and issue writes), when it has any
+        if notes:
+            lines += ["[last lines of /work/.pod-notes.log, untrusted text]", notes]
         return "\n".join(lines), None
     except _LastUnsafe:
         return None, "cloud last unsafe"

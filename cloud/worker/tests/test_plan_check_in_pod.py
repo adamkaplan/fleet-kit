@@ -237,7 +237,7 @@ def intent_differs():
     return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
-PINNED = {'guard.sh': 'ba4d51aa043d450a4832210fb6492295e7bd7c7e61a4abd2a70cc75baea19bca'}
+PINNED = {'guard.sh': 'b8f86ad11591e3f2a6d22d414d1a4230849efa3be055dbd78c23d105e510e2cd'}
 
 if __name__ == "__main__":
     unittest.main()

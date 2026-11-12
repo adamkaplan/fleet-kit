@@ -1,5 +1,5 @@
 # ---- ask #2320: the repositories that land by `spire land` (no pull request). One switch, the top-level config key `land_repos`.
-# A list of "owner/repo" or "owner/*" globs; absent or null means LAND_REPOS_DEFAULT, which is EMPTY: no repository lands by `spire land` until the key names one, e.g. ["janus-infra/*"] (the owner's order: OFF until he says so); an empty list is the same.
+# A list of "owner/repo" or "owner/*" globs; absent or null means LAND_REPOS_DEFAULT, which is EMPTY: no repository lands by `spire land` until the key names one, e.g. ["acme-org/*"] (the owner's order: OFF until he says so); an empty list is the same.
 # This part reads no name of the entry except ConfigError (validate_land_repos); `uses_spire_land` is pure and is the one reader of the key.
 import re
 

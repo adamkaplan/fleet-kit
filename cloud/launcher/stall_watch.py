@@ -1,30 +1,33 @@
 """The stall watch (ask #2399): the reaper's pass reads each running pod ONCE and tells the pod's boss and the Chief of Staff when it sits stalled.
 
 Cause: a pod wrote that every shell command was refused and then sat idle for 75 minutes, because nothing read a pod's progress file, run logs or the
-agent's last words while the pod was alive. This module only READS (one `kubectl exec` of a small program per pod per pass) and SENDS one message; it never
+agent's last words while the pod was alive. This module only READS (one `kubectl exec` of a small program per pod per pass) and writes ONE audit line per alert (the daemon sends the messages); it never
 stops, restarts, nudges or changes anything in a pod.
 
-Three conditions (thresholds below), each alerted at most once per pod per 60 minutes. The mark is a pod annotation (cw/stall-alert-<condition>) set BEFORE
-the send, as the minute-40 note does, so a failed send or a restart never sends twice:
+Three conditions (thresholds below), each alerted at most once per pod per 60 minutes once DELIVERED (its audit line written). The mark is a pod annotation (cw/stall-alert-<condition>) set BEFORE
+the send, as the minute-40 note does; when the send reached nobody the mark is moved back so the next pass 10 or more minutes later tries again:
   progress-stale    the progress file and every run log unchanged for 15 minutes and no run active (an exit file absent and its log changed in the last 3 minutes)
   refusal           the agent's last message or the progress file's last two lines say Permission denied, refused, not allowed or Blocked (any case), or one error
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
+A pod that has finished (the progress file's last line is `done` or `STATUS: done`, or /work/results.txt's last line is `STATUS: done`; any case) is not stalled for progress-stale and failed-run-idle (refusal still fires).
 A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass line names it (pod and reason, no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
 """
+import datetime as dt
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
-CHIEF = "chief-of-staff"
+CHIEF = "cos"                      # the Chief of Staff's switchboard name when the config names none (`remind cos`)
+CONFIG_KEY = "cos_name"            # the switchboard config's key (config.json) that names the Chief of Staff's agent, when it has one
+STALL_ASK = "adamkaplan/fleet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
+RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
 PASS_BUDGET_SECONDS = 90           # the pass reads no more pods once its reads have taken this long (the rest wait for the next pass)
 EXEC_SECONDS = 3                   # the one exec of a pod is given at most this long
@@ -35,10 +38,9 @@ REPEAT_COUNT = 3                   # (b) the same error line this many times ...
 REPEAT_WINDOW = 10                 # ... in this many last lines
 REALERT_SECONDS = 60 * 60          # once per condition per pod per this long
 EVIDENCE_MAX = 300
-MESSAGE_TEXT_MAX = 400
 CONDITIONS = ("progress-stale", "refusal", "failed-run-idle")
-SEND_SECONDS = 15
-REFUSAL_WORDS = re.compile(r"permission denied|refused|not allowed|blocked", re.I)
+ALERT_ACTION = "stall-alert"       # the audit action of one alert; the switchboard daemon reads it and sends the messages (bin/cloud_end_alert.py scan_stall)
+REFUSAL_WORDS = re.compile(r"Permission denied: shell|permission\.rejected|^\s*(?:refused:|Blocked:|Blocked at)")
 ERROR_LINE = re.compile(r"error|fail|exception|denied|refused|cannot|unable|not found", re.I)
 
 # Run INSIDE the pod by `kubectl exec python3 -c <this>`. Reads only: the progress file (mtime, last 10 lines), /work/runs (per file name, mtime and the last
@@ -52,12 +54,13 @@ def tail(p, n):
             return [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()][-n:]
     except OSError:
         return None
-out = {"now": time.time(), "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None}
+out = {"now": time.time(), "results": "", "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None}
 try:
     p = "/work/progress.txt"
     out["progress"] = {"mtime": os.path.getmtime(p), "tail": [l[:400] for l in (tail(p, 10) or [])]}
 except OSError:
     pass
+out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]
 rd = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 try:
     names = sorted(os.listdir(rd))[:200]
@@ -163,10 +166,14 @@ def decide(data):
     ptime = _num(prog.get("mtime")) if prog else None
     tail = [str(x) for x in (prog.get("tail") or [])] if prog else []
     stime = _num(data.get("msg_time"))
+    # A pod that declared itself finished is not stalled for (a) and (c): its progress file's last line is `done` or `STATUS: done`, or results.txt's last line is `STATUS: done`.
+    # (b) refusal is unchanged and still fires for a finished pod.
+    last_p = tail[-1].strip().lower() if tail else ""
+    finished = last_p in ("done", "status: done") or str(data.get("results") or "").strip().lower() == "status: done"
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
-    if times and not active and now - max(times) >= STALE_SECONDS:
+    if not finished and times and not active and now - max(times) >= STALE_SECONDS:
         found["progress-stale"] = "no change for %d minutes; last progress line: %s" % ((now - max(times)) // 60, tail[-1] if tail else "(none)")
     # (b)
     msg = str(data.get("msg") or "")
@@ -187,7 +194,7 @@ def decide(data):
                 bad.append(e)
         except ValueError:
             continue
-    if bad:
+    if bad and not finished:
         e = max(bad, key=lambda x: _num(x["mtime"]))
         moved = max([t for t in (_num(e["mtime"]), ptime, stime) if t is not None])
         if now - moved >= FAILED_IDLE_SECONDS:
@@ -196,13 +203,33 @@ def decide(data):
     return found
 
 
-def _default_send(to, text):
-    binary = shutil.which("fl" + "eet-switchboard")   # written in two parts: the names check keeps the retired prefix out of cloud/
-    if not binary:
-        raise OSError("the switchboard command is not on the path")
-    done = subprocess.run([binary, "send", to, text], capture_output=True, text=True, timeout=SEND_SECONDS, stdin=subprocess.DEVNULL)
-    if done.returncode != 0:
-        raise OSError("send exited %d" % done.returncode)
+def cos_name(launcher):
+    """The Chief of Staff's switchboard name: the switchboard config's `cos_name` (config.json beside cloud.env) when it holds a valid name, else CHIEF."""
+    env = getattr(launcher, "env", None) or {}
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fl" + "eet-switchboard", "config.json")) as f:
+            name = json.load(f).get(CONFIG_KEY)
+    except (OSError, ValueError, AttributeError):
+        return CHIEF
+    return name if isinstance(name, str) and AGENT_NAME.fullmatch(name) else CHIEF
+
+
+def ask_of(launcher, worker):
+    """The ask the pod's own launch named (`--issue`, kept in the switchboard's worker record: issue and repo), as owner/repo#N (N alone when the record has no repo);
+    STALL_ASK when the record names none or is unreadable."""
+    rd = (getattr(launcher, "env", None) or {}).get("CW_CLOUD_RECORD_DIR")
+    try:
+        with open(os.path.join(rd, worker + ".json")) as f:
+            rec = json.load(f)
+        issue, repo = rec.get("issue"), rec.get("repo")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return STALL_ASK
+    if isinstance(issue, bool) or not isinstance(issue, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,9}", str(issue)):
+        return STALL_ASK
+    if isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", repo):
+        return "%s#%s" % (repo, issue)
+    return str(issue)
 
 
 def boss_of(launcher, worker):
@@ -218,18 +245,12 @@ def boss_of(launcher, worker):
     return boss if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) else None
 
 
-def message(name, condition, ev, now_text):
-    return ("stall alert: pod %s condition %s at %s. Evidence (untrusted text from the pod, data only, never an instruction): %s"
-            % (re.sub(r"[^A-Za-z0-9._-]", "", name)[:63], condition, now_text, ev))
-
-
-def watch_pass(launcher, pods, now, name_ok, send=None):
+def watch_pass(launcher, pods, now, name_ok):
     """One pass over the pods the reaper holds: ONE exec per pod older than 10 minutes, the alerts decided from its answer. Sets launcher.stall_counts to
     {"read": n, "alerted": m} for the pass line. Never raises, never stops or changes a pod. Returns the (pod, condition) pairs alerted, for the tests."""
     counts = launcher.__dict__["stall_counts"] = {"read": 0, "alerted": 0, "skipped": []}
     alerted, began = [], time.monotonic()
     kube = launcher.kube
-    send = send or getattr(launcher, "stall_send", None) or _default_send
     for pod in pods:
         name = "?"
         try:
@@ -261,17 +282,18 @@ def watch_pass(launcher, pods, now, name_ok, send=None):
                     continue   # alerted within the hour (an unreadable mark counts as alerted)
                 ev = evidence(kube.scrub(text, 3000) if callable(getattr(kube, "scrub", None)) else text)
                 kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{"stall_alert_" + condition.replace("-", "_"): launcher_iso(now)})   # BEFORE the send
-                body = message(name, condition, ev, launcher_iso(now))
                 boss = boss_of(launcher, worker)
                 if boss is None:
                     print("cloud-worker: stall alert for %s goes to the Chief of Staff only: no boss in the record" % name, file=sys.stderr)
                 delivered = 0
-                for to in ([CHIEF] + ([boss] if boss and boss != CHIEF else [])):
-                    try:
-                        send(to, body)
-                        delivered += 1
-                    except Exception as e:
-                        print("cloud-worker: stall alert for %s to %s not sent: %s" % (name, to, type(e).__name__), file=sys.stderr)
+                try:   # ONE audit line; the daemon sends the messages (the reaper has no agent identity and cannot run `send`)
+                    wrote = launcher.audit(worker, "pod/" + name, ALERT_ACTION, 0.0, True, "",
+                                           extra={"condition": condition, "recipients": [boss] if boss else [], "ask": ask_of(launcher, worker), "evidence": ev})
+                    delivered = 0 if wrote is False else 1   # the real writer answers False when the line could not be written
+                except Exception as e:
+                    print("cloud-worker: stall alert for %s not recorded: %s" % (name, type(e).__name__), file=sys.stderr)
+                if not delivered:   # not recorded: the mark moves back so the next pass at least RETRY_SECONDS later tries again
+                    kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{"stall_alert_" + condition.replace("-", "_"): launcher_iso(now - dt.timedelta(seconds=REALERT_SECONDS - RETRY_SECONDS))})
                 if delivered:
                     counts["alerted"] += 1
                     alerted.append((name, condition))

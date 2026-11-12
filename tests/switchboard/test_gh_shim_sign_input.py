@@ -2235,13 +2235,31 @@ class TestGhShimMethodFlagBeforeApi(unittest.TestCase):
     def test_s39_a_method_flag_before_api_is_refused(self):
         self.assertEqual(early_flag_failures(self.rig), [])
 
-    def test_s39_a_mutant_ignoring_the_early_flag_is_seen(self):
-        self.assertEqual(early_flag_failures(self.rig), [])   # control first
-        old = "    if early_method_flag(args[:at]):"
-        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the early flag refusal of api_parsed)")
-        rig = Rig(self.source.replace(old, "    if False:", 1))
+    def mutant_rig(self, shim_old=None, body_old=None):
+        """A scratch copy of the shim with the early-flag refusal of shims/gh (`shim_old`) and/or the lead-flag refusal of shims/gh_body.py (`body_old`) switched off."""
+        rig = Rig(self.source.replace(shim_old, "    if False:", 1) if shim_old else None)
         self.addCleanup(rig.close)
-        self.assertIn("a method flag before api went out unsigned", early_flag_failures(rig), "a method flag before api went out unsigned")
+        if body_old:
+            body = rig.shims / "gh_body.py"
+            text = body.read_text()
+            self.assertEqual(text.count(body_old), 1, "the mutant's anchor is gone (the lead-flag refusal of gh_body.guard)")
+            body.write_text(text.replace(body_old, "        if False and lead:", 1))
+        return rig
+
+    def test_s39_a_mutant_ignoring_the_early_flag_is_seen(self):
+        """Two independent layers refuse a method flag before api (#2398 added the second, in shims/gh_body.py): the shim's own early-flag refusal, and the body guard, which reads
+        the method from every flag before api and refuses anything but a GET. The property is that the flag never goes out unsigned, so the mutant that matters switches BOTH off;
+        each layer off alone must still be refused (the other holds), and only the pair off must be seen."""
+        self.assertEqual(early_flag_failures(self.rig), [])   # control first
+        shim_old = "    if early_method_flag(args[:at]):"
+        self.assertEqual(self.source.count(shim_old), 1, "the mutant's anchor is gone (the early flag refusal of api_parsed)")
+        body_old = "        if lead and all(a.startswith(\"-\") or (j > 0 and lead[j - 1].startswith(\"-\")) for j, a in enumerate(lead)):"
+        both = self.mutant_rig(shim_old, body_old)
+        self.assertIn("a method flag before api went out unsigned", early_flag_failures(both), "both layers off: the flag went out unsigned and the test must see it")
+        only_shim = self.mutant_rig(shim_old)
+        self.assertEqual(early_flag_failures(only_shim), [], "the body guard alone still refuses")
+        only_body = self.mutant_rig(None, body_old)
+        self.assertEqual(early_flag_failures(only_body), [], "the shim's early-flag refusal alone still refuses")
 
 
 if __name__ == "__main__":

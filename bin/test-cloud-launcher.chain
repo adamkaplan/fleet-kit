@@ -46,6 +46,7 @@ cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_end_hook_pr_ready.py
+cloud/launcher/tests/test_end_hook_run_files.py
 cloud/launcher/tests/test_failed_pod_record.py
 cloud/launcher/tests/test_final_note.py
 cloud/launcher/tests/test_fixture_root.py
@@ -58,6 +59,8 @@ cloud/launcher/tests/test_idle_default_60.py
 cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_idle_nudge_skipped.py
+cloud/launcher/tests/test_image_gate.py
+cloud/launcher/tests/test_image_roll.py
 cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_kept_expiry.py
 cloud/launcher/tests/test_kept_failed_once.py
@@ -68,6 +71,7 @@ cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_long_run_setting.py
 cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_m_cap_stopped.py
+cloud/launcher/tests/test_m_request.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
@@ -81,6 +85,7 @@ cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_persistent_merge_fix.py
 cloud/launcher/tests/test_persistent_orchestrator.py
+cloud/launcher/tests/test_pod_boundaries.py
 cloud/launcher/tests/test_pod_requests.py
 cloud/launcher/tests/test_pod_state.py
 cloud/launcher/tests/test_pr_label_reaper.py
@@ -125,6 +130,7 @@ cloud/launcher/tests/test_token_service.py
 cloud/launcher/tests/test_untracked_report.py
 cloud/launcher/tests/test_vault_block.py
 cloud/launcher/tests/test_vault_check_pins.py
+cloud/launcher/tests/test_wip_rebasable.py
 cloud/launcher/tests/test_wip_root.py
 cloud/launcher/tests/test_wip_save.py
 cloud/launcher/tests/test_worker_copies.py
@@ -138,9 +144,11 @@ cloud/worker/tests/test_comment_by_id.py
 cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_cw_run.py
+cloud/worker/tests/test_cw_run_wake.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_browser.py
 cloud/worker/tests/test_dockerfile_go.py
+cloud/worker/tests/test_dockerfile_mise.py
 cloud/worker/tests/test_dockerfile_node.py
 cloud/worker/tests/test_dockerfile_pg_bundle.py
 cloud/worker/tests/test_dockerfile_postgres.py
@@ -149,17 +157,19 @@ cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_entrypoint_long_run.py
 cloud/worker/tests/test_entrypoint_question.py
-cloud/worker/tests/test_guard_env.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
+cloud/worker/tests/test_identity_required.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pod_inspect.py
+cloud/worker/tests/test_pod_notes_log.py
 cloud/worker/tests/test_pod_rules.py
 cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
 cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
+cloud/worker/tests/test_pre_push_hook.py
 cloud/worker/tests/test_question_denied.py
 cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_root_scanner.py

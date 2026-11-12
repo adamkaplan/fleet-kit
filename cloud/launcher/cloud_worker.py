@@ -47,8 +47,13 @@ DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack la
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 
-# Per-shape requests (#1978): ONE table, shape S only; a shape with no row has no requests key. The limits stay the SHAPES rows.
-SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}}
+# Per-shape requests (#1978): ONE table, shapes S and M; a shape with no row has no requests key. The limits stay the SHAPES rows.
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}}
+
+
+def capacity_shapes():
+    """The SHAPES rows as the capacity read counts room: a shape's REQUEST when SHAPE_REQUESTS has a row, else its limit (the scheduler's own rule)."""
+    return {name: dict(row, **SHAPE_REQUESTS.get(name, {})) for name, row in SHAPES.items()}
 
 
 def parse_quantity(q):
@@ -103,7 +108,7 @@ REAP_PARALLEL = 4                       # the stops of one pass run at most this
 REAP_STOP_SECONDS = 420                 # one stop's own limit: past it the wait is abandoned for this pass and the pod is left whole
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
-CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
+CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/wip_save.py",)   # #2304: the save step is part of the reaper's code identity
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/stall_watch.py",)   # #2399
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
@@ -2062,8 +2067,10 @@ def write_audit(path, line):
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as f:   # one short O_APPEND write: atomic enough for one line, the chosen guarantee
             f.write(json.dumps(line, sort_keys=True) + "\n")
+        return True
     except OSError as e:
         print("cloud-worker: WARNING: the action ran but its audit line could not be written: %s" % e, file=sys.stderr)
+        return False   # #2399: the stall watch needs to know (it retries an alert whose line was not written)
 
 
 def last_audit_line(path, action, runtime_id=None):
@@ -3186,7 +3193,7 @@ class Launcher:
             line["refresh"] = refresh
         if cause:   # a stop the launcher made of its own accord names why: idle, hard, pod_gone or pod_failed (a person's stop has none)
             line["cause"] = cause
-        write_audit(self.audit_path, dict(line, **(extra or {})))
+        return write_audit(self.audit_path, dict(line, **(extra or {})))
 
     def cost(self, pod):
         hours = (self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600
@@ -3804,7 +3811,7 @@ class Launcher:
                 view["note"] = NO_REPOSITORY_NOTE
                 info["hook_note"] = NO_REPOSITORY_NOTE
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
-            self._hook_record(info, dict(view, ran=True, refresh=info["refresh"]))
+            self._hook_record(info, dict(view, ran=True, refresh=info["refresh"], run_logs=self._run_logs(res)))
             if view["error"] and res.get("refresh") == "needed" and phase == "Running":
                 # An ended token after the one refresh and the one retry: the stop's own record and audit line are the one pair; the pod is marked and the reaper skips it.
                 self._mark(target, pod["metadata"].get("uid"), **{KEPT_RUNNING_MARK: "true"})
@@ -3911,6 +3918,24 @@ class Launcher:
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
             return {"pushed": False, "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
+
+    def _run_logs(self, res):
+        """The end hook's `runs` and `wake_lines` as the run record keeps them under `run_logs` (ask #2432), the same shape: names checked, exit an int or
+        None, woke a bool, text scrubbed and cut again here (the pod's answer is untrusted). Never raises; a bad part is left out, and a failure never touches the stop."""
+        try:
+            out = {"runs": [], "wake_lines": []}
+            for r in (res.get("runs") if isinstance(res.get("runs"), list) else [])[:20]:
+                if isinstance(r, dict) and isinstance(r.get("name"), str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", r["name"]):
+                    code = r.get("exit")
+                    tail = r.get("log_tail")
+                    out["runs"].append({"name": r["name"], "exit": code if type(code) is int else None, "woke": r.get("woke") is True,
+                                        "log_tail": "\n".join(self.kube.scrub(x, 3000) for x in tail.split("\n"))[:3000] if isinstance(tail, str) and tail else ""})
+            for x in (res.get("wake_lines") if isinstance(res.get("wake_lines"), list) else [])[:10]:
+                if isinstance(x, str):
+                    out["wake_lines"].append(self.kube.scrub(x, 200)[:200])
+            return out
+        except Exception:
+            return {"runs": [], "wake_lines": []}
 
     def _pod_state_of(self, pod, name):
         """The pod's own state from the pod object already read (phase, each container's state, the node) and, ONLY when the phase is
