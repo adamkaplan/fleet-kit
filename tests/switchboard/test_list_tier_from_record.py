@@ -123,3 +123,18 @@ class TestListTierFromRecord(Base):
         self.assertEqual({d["number"]: d["tier"] for d in body["decisions"]}, {7: "cos", 8: "cos"})
         self.assertIn("cannot be read", body["escalation_note"])
         self.assertEqual(path.read_bytes(), before)
+
+    def test_a_hostile_record_or_row_falls_back_and_never_raises(self):
+        self.daemon_file([row(7, HEAD)])
+        (self.state / "escalated-requests.json").write_text("[" * 200000)
+        self.assertIn("cannot be read", sb.decisions_listing(self.state, time.time())["escalation_note"])
+        (self.state / "escalated-requests.json").unlink()
+        import os
+        os.mkfifo(str(self.state / "escalated-requests.json"))
+        self.assertIn("cannot be read", sb.decisions_listing(self.state, time.time())["escalation_note"])
+        self.assertEqual(sb.decision_core.entry_escalation_key({"kind": "captain", "repo": "a/b", "number": float("inf"), "head": HEAD}), None)
+
+    def test_the_daemons_own_read_has_no_size_bound(self):
+        big = {"captain:acme/widget#7@" + HEAD: "t", "pad": "x" * (sb.ESCALATED_READ_MAX + 10)}
+        (self.state / "escalated-requests.json").write_text(json.dumps({"requests": big}))
+        self.assertIn("captain:acme/widget#7@" + HEAD, sb.read_escalated(self.state))

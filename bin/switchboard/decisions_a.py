@@ -19,18 +19,25 @@ def escalated_lock(state_dir):
 ESCALATED_READ_MAX = 1 << 20   # the list reads the record once, at most this many bytes
 
 
-def read_escalated_checked(state_dir):
-    """(found, note): `read_escalated`'s result and, when the record is unreadable, too large or malformed, one line (a missing record is an empty one: no note) saying so (else None). One bounded read; writes nothing."""
+def read_escalated_checked(state_dir, limit=None):
+    """(found, note): `read_escalated`'s result and, when the record is unreadable, too large (only with a `limit` in bytes: the list's one bounded read) or malformed, one line
+    (a missing record is an empty one: no note). The daemon passes no limit, so its read is what it was. A record that is not a regular file is unreadable (never opened blocking). Writes nothing."""
     path = Path(state_dir) / ESCALATED_FILE
     try:
-        with open(str(path), "rb") as handle:
-            data = handle.read(ESCALATED_READ_MAX + 1)
-        if len(data) > ESCALATED_READ_MAX:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return {}, "%s cannot be read" % ESCALATED_FILE
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                data = handle.read() if limit is None else handle.read(limit + 1)
+        finally:
+            os.close(fd)
+        if limit is not None and len(data) > limit:
             return {}, "%s is too large to read" % ESCALATED_FILE
         raw = json.loads(data.decode("utf-8"))
     except FileNotFoundError:
         return {}, None   # nothing was ever escalated (the normal state): the same as an empty record, and no note on every list
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}, "%s cannot be read" % ESCALATED_FILE
     found = raw.get("requests") if isinstance(raw, dict) else None
     if not isinstance(found, dict):
@@ -52,7 +59,7 @@ def escalation_applied(decisions, state_dir):
     waiting = [d for d in decisions if isinstance(d, dict) and d.get("tier") == "cos" and decision_core.entry_escalation_key(d)]
     if not waiting:
         return decisions, None
-    found, note = read_escalated_checked(state_dir)
+    found, note = read_escalated_checked(state_dir, ESCALATED_READ_MAX)
     if note:
         return decisions, "%s: the tiers shown are the daemon's as of its last pass" % note
     return decision_core.apply_escalations(decisions, found)[0], None

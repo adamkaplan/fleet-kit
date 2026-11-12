@@ -771,7 +771,7 @@ def entry_escalation_key(entry):
             return captain_escalation_key(entry["repo"], int(entry["number"]), entry.get("head"))
         if entry.get("session") and entry.get("request"):
             return request_escalation_key(entry["session"], entry["request"])
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         pass
     return None
 
