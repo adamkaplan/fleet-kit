@@ -40591,7 +40591,7 @@ class TestDecisionsCommand(DecisionsBase):
         self.world.v2.ask_permission(self.world.sessions["platform"], timed=True)
         self.pass_(1)
         code, out, err = self.cli("decisions", "--tier", "all")
-        _, first, second = out.splitlines()
+        _, first, second = out.splitlines()[:3]   # then the one note line: no escalation record yet, and a cos row could move
         self.assertEqual(first.index("waiting"), second.index("waiting"))
 
     def test_json_prints_the_files_list(self):

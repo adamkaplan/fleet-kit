@@ -21,7 +21,7 @@ ESCALATED_READ_MAX = 1 << 20   # the list reads the record once, at most this ma
 
 def read_escalated_checked(state_dir, limit=None):
     """(found, note): `read_escalated`'s result and, when the record is unreadable, too large (only with a `limit` in bytes: the list's one bounded read) or malformed, one line
-    (a missing record is an empty one: no note). The daemon passes no limit, so its read is what it was. A record that is not a regular file is unreadable (never opened blocking). Writes nothing."""
+    (a missing record is an empty one, with a note the list shows only when a cos row could move). The daemon passes no limit, so its read is what it was. A record that is not a regular file is unreadable (never opened blocking). Writes nothing."""
     path = Path(state_dir) / ESCALATED_FILE
     try:
         fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
@@ -36,7 +36,7 @@ def read_escalated_checked(state_dir, limit=None):
             return {}, "%s is too large to read" % ESCALATED_FILE
         raw = load_module("record_json").parse_bounded(data.decode("utf-8"))
     except FileNotFoundError:
-        return {}, None   # nothing was ever escalated (the normal state): the same as an empty record, and no note on every list
+        return {}, "%s is missing" % ESCALATED_FILE   # the same as an empty record for the daemon; the list notes it only when a `cos` row could move (see `escalation_applied`)
     except (OSError, ValueError, RecursionError):
         return {}, "%s cannot be read" % ESCALATED_FILE
     found = raw.get("requests") if isinstance(raw, dict) else None

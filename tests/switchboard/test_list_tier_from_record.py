@@ -75,10 +75,17 @@ class TestListTierFromRecord(Base):
         self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.state.iterdir()}, before)
         self.assertTrue(path.exists())
 
-    def test_s4_a_missing_record_is_an_empty_one_with_no_note(self):
+    def test_s4_a_missing_record_is_noted_in_one_line_when_a_cos_row_could_move(self):
         self.daemon_file([row(7, HEAD)])
         listed = sb.decisions_listing(self.state, time.time())
-        self.assertEqual((self.tiers(listed), "escalation_note" in listed), ({7: "cos"}, False))
+        self.assertEqual(self.tiers(listed), {7: "cos"})
+        self.assertIn("is missing", listed["escalation_note"])
+        self.assertNotIn("\n", listed["escalation_note"])
+
+    def test_s4_a_missing_record_is_not_noted_when_no_cos_row_could_move(self):
+        self.daemon_file([row(7, HEAD, tier="human"), row(8, None)])
+        listed = sb.decisions_listing(self.state, time.time())
+        self.assertEqual((self.tiers(listed), "escalation_note" in listed), ({7: "human", 8: "cos"}, False))
 
     def test_s4_a_malformed_record_says_so(self):
         self.daemon_file([row(7, HEAD)])
