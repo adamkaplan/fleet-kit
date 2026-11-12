@@ -259,6 +259,25 @@ waits for idle, then stops the worker (the end hook pushes the work; the pod and
 
 Tests: `bin/test-cloud-launcher` (driver, fake kubectl), `cloud/tests/test-cloud` (entrypoint, stub server).
 
+## Shape `L`, for a land (ask #2457)
+
+`L` is a pod shape for a land: limit and request both 6 CPU and 16 GiB, nested Docker allowed like `M`, chosen by name only (`--shape L`; a launch with no shape is unchanged). Its request equals its limit, so one `L` pod takes 6 of the 7 or so CPU a node has after system pods (the plan assumed about 7; not read on a live node here): two `L` pods never share a node. The autoscaler may add a node for it, and a node is a cost.
+
+Cost (list-price estimate, not a billed figure): 0.34 USD per hour (6 of 8 vCPU of a 0.452 USD node). One land of 45 minutes costs about 0.26 USD (0.34 x 0.75); one of 90 minutes about 0.51 USD (0.34 x 1.5).
+
+A lane may hold at most 2 live shape-`L` cloud workers at once (the launch check in `bin/cloud_worker.py`, beside `MAX_M_PER_LANE`; a lower limit than the 10 of `M`, because one `L` pod takes a node and the autoscaler would add one each); the refusal reads `lane LANE already holds 2 shape-L cloud workers (...)`, exits 2 before any token or cluster call, and counts only `L` records. Test: `cloud/launcher/tests/test_m_cap.py` (`test_l_...`, with a mutant that never stops).
+
+A dedicated pool of a larger SKU is an option, not part of this change: it needs the owner's word, and no Azure resource is created by it.
+
+Why: `tests:pg` on our pods was measured at 2520 to 2618 s, while a reference host ran the same step in 759 s (shape `M` has a 4 CPU limit and a 2 CPU request). The first real land on `L` is to be compared with both numbers; that run is not recorded here yet.
+
+| Input or outside call | Test | Mutant |
+|---|---|---|
+| the `L` row and its request | `cloud/launcher/tests/test_land_shape.py::Row` | request left at 2 CPU: `the L request is not 6 CPU` |
+| the capacity count (3 nodes, then 2; 0 nodes; `not read`) | `::Capacity` | request of 3 CPU counts 3 nodes after one pod |
+| the other rows and the default | `::Row.test_s4_...` | an edited `M` request fails the byte-equal check |
+| the diff has no Azure create, node pool or scale command | `::NoAzureCreate` | a planted command is found by the scan |
+
 ## The Sysbox node fix
 
 The stock Sysbox installer writes the `sysbox-runc` runtime under the legacy plugin key

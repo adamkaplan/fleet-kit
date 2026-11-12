@@ -23,7 +23,7 @@ FIXTURES = os.path.join(HERE, "fixtures")
 S_FIXTURES = {"default_pod.json": 2, "run_secret_pod.json": 1, "stack_pod.json": 2, "stack_pod_registry.json": 2}   # indent step of the file's text
 ABOVE = "a request is above its limit:"
 REFUSED = "a stack pod with requests was refused:"
-TABLE = '{"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}}'
+TABLE = '{"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}, "L": {"cpu": "6", "memory": "16Gi"}}'
 # the line of the allow-list as it is at the integration tip (quoted in the plan's PC-1)
 TIP_LINE = ('        or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)'
             '   # limits stay')
@@ -100,7 +100,7 @@ class S10Requests(unittest.TestCase):
 
     def test_the_other_shapes_carry_no_requests(self):
         for name, row in cw.SHAPES.items():
-            if name in ("S", "M"):
+            if name in ("S", "M", "L"):
                 continue
             for stack in ((False, True) if row.get("stack") else (False,)):
                 with self.subTest(shape=name, stack=stack):
