@@ -52535,6 +52535,7 @@ class TestDecisionBaselineViews(BaselineWorld):
         self.ask_permission("api-coder")
         self.gh.issue(API, 2, "an issue", labels=["me:awaiting-cos"])
         self.daemon_pass()
+        sb.write_escalated(self.world.state, {})  # a record exists (nothing escalated), so the list prints no missing-record note
         out = self.cmd("cos", "decisions")["out"]
         starts = {line.index("waiting") for line in out.splitlines()[1:]}
         self.assertEqual(len(starts), 1, out)
