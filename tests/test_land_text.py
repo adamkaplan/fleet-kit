@@ -138,6 +138,8 @@ class TestLandText(unittest.TestCase):
     def test_a_land_launch_carries_the_rebut_rule_once_and_another_launch_none(self):
         land = "\n".join(self.lines("acme-org/widget", ON))
         self.assertEqual(land.count("--rebut 'ROLE=Pn: why'"), 1)
+        self.assertIn("list every rebuttal (finding, principle, accepted or not) in your final report", land)
+        self.assertEqual(land.count("--rebut"), 1)
         self.assertIn("the same finding rejected twice: stop and report it to the orchestrator", land)
         self.assertNotIn("--rebut", pod.payload(BRIEF, repo="acme/other"))
         self.assertNotIn("--rebut", pod.payload(BRIEF, repo="acme-org/widget", config={"land_repos": []}))
