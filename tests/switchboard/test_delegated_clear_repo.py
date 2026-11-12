@@ -75,10 +75,21 @@ class TestDelegatedClearRepo(unittest.TestCase):
         module.validate(make_config(repo=CHARTER_REPO)["delegated_clear"], "config")
 
     def test_s3_the_configuration_loader_refuses_a_malformed_repo(self):
-        module = sb.load_module("delegated_clear")
-        with self.assertRaises(ValueError) as caught:
-            module.validate(make_config(repo="nope")["delegated_clear"], "config.json")
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"delegated_clear": make_config(repo="nope")["delegated_clear"]}, "config.json")
         self.assertIn("delegated_clear.repo", str(caught.exception))
+        sb.validate_config({"delegated_clear": make_config(repo=CHARTER_REPO)["delegated_clear"]}, "config.json")   # a well formed one loads
+        sb.validate_config({"delegated_clear": make_config()["delegated_clear"]}, "config.json")   # and so does none
+
+    def test_s5_control_the_old_reader_reads_intent_repo_and_the_s2_expectation_fails(self):
+        """The old behaviour planted (`charter_repo` always answers its default): the repository read is intent_repo, so S2's expectation does not hold."""
+        module = sb.load_module("delegated_clear")
+        with mock.patch.object(module, "charter_repo", lambda config, default: default):
+            (order, why), reads = self.check(make_config(repo=CHARTER_REPO))
+        self.assertEqual(reads.repos, [(INTENT, 34)])
+        self.assertIsNone(order)
+        self.assertEqual(why, "order 2 does not exist on charter %s#34" % INTENT)
+        self.assertNotEqual(reads.repos, [(CHARTER_REPO, 34)])
 
     def test_s4_the_refusal_names_the_repository_read(self):
         config = make_config(repo=CHARTER_REPO)
