@@ -370,7 +370,7 @@ class Recorder:
             return None
         mtime = None
         first = out.split("\n", 1)[0]
-        if first.startswith("MTIME ") and first[6:].strip().isdigit():
+        if re.fullmatch(r"MTIME [0-9]{1,12}", first.strip()):
             mtime, out = int(first[6:]), out.split("\n", 1)[1] if "\n" in out else ""
         lines = [x.strip() for x in out.splitlines() if x.strip()]
         try:
