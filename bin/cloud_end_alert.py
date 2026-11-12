@@ -547,7 +547,7 @@ def scan_stall(audit_file, state_file, send, parse):
 
 
 # ---- ask #2443: the idle notice. The reaper's pass reads each pod's own server and writes ONE `idle-notice` audit line per idle of a session (cloud/launcher/stall_watch.py
-# idle_notice); this pass adds the pod's last report of that turn (the `fleet-switchboard report done|failed|blocked "<line>"` call, last-reports.json) and tells the recorded boss
+# idle_notice); this pass adds the pod's last report of that turn (the `fleet-switchboard report done|failed|blocked "<line>"` call, the daemon's last-report record) and tells the recorded boss
 # (the Chief of Staff when none), once per line. The report is the finish signal; the server's outcome and finish, the results file and the commits ahead are EVIDENCE only.
 # The audit file is UNTRUSTED text: every field is checked. ----
 IDLE_ACTION = "idle-notice"
