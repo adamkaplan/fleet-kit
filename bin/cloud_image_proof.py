@@ -162,7 +162,7 @@ def prove(args, env, now=None, sleep=time.sleep):
     if not match or not REPO_RE.fullmatch(args.repo) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", args.branch):
         raise Refused("usage: DIGEST (name@sha256:<64 hex>) and --repo OWNER/NAME")
     digest = match.group(1)
-    switchboard = env.get("CW_SWITCHBOARD") or "fleet-switchboard"
+    switchboard = env.get("CW_SWITCHBOARD") or SWITCHBOARD
     kubectl = env.get("CW_KUBECTL") or "kubectl"
     revision = read_revision(env, args.digest)
     worker = "proof-%s-%s" % (digest[7:19], now().strftime("%d%H%M%S"))
