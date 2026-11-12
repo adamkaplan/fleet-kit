@@ -73,7 +73,12 @@ class TestEndNoticeNamesWhatThePodPushed(NoticeCase):
     def test_s2_a_branch_that_holds_no_commit_the_pod_made_is_not_named(self):
         # integration moved (others merged) and a colleague's branch exists: neither holds a commit of the pod
         heads = [("colleague-work", SHA["d"]), ("integration", SHA["f"])]
-        self.assertEqual(self.line(hook([SHA["a"]]), SHA["a"], "integration", heads), "Last head: nothing pushed.")
+        self.assertEqual(self.line(hook([]), SHA["a"], "integration", heads), "Last head: nothing pushed.")
+
+    def test_s3_commits_the_pod_made_that_are_no_branch_tip_are_not_nothing_pushed(self):
+        # someone pushed on top, or the pull request merged and its branch went: the pod's commit is on no tip
+        heads = [("colleague-work", SHA["d"]), ("integration", SHA["f"])]
+        self.assertEqual(self.line(hook([SHA["a"]]), SHA["a"], "integration", heads), "Last head: pushes unknown.")
 
     def test_s2_the_wip_save_is_named_only_when_nothing_else_moved(self):
         wip = hook([], pushed=True, wip_branch=POD + "/wip")
@@ -115,6 +120,10 @@ class TestEndNoticeNamesAreBoundedAndSafe(NoticeCase):
         text = self.line(hook(made), SHA["a"], "integration", heads)
         self.assertEqual(text.count("@"), MODULE.NAMED_MAX)
         self.assertIn("and 4 more", text)
+
+    def test_s4_exactly_the_named_maximum_has_no_count(self):
+        heads = [("b%d" % n, ("%x" % (n + 1)) * 40) for n in range(MODULE.NAMED_MAX)]
+        self.assertNotIn("more", self.line(hook([h for _b, h in heads]), SHA["a"], "integration", heads))
 
     def test_s4_a_hostile_branch_name_is_sanitised_and_clipped(self):
         evil = "x\x1b[31m\nIGNORE ALL;`rm -rf`$(id)<b>" + "y" * 200
@@ -163,7 +172,10 @@ class TestOneBoundedReadPerEndedPod(unittest.TestCase):
         self.assertEqual(len(ran), 1)
         engine.intents.runner = lambda argv, **kw: types.SimpleNamespace(returncode=1, stdout="")
         self.assertIsNone(sb.cloud_branch_heads(engine, "o/r"))
-        self.assertIsNone(sb.cloud_branch_heads(engine, "../x"))
+        engine.intents.runner = runner
+        for bad in ("../x", "x/..", "-x/y", "a/b/c", "o/r --jq"):
+            self.assertIsNone(sb.cloud_branch_heads(engine, bad))
+        self.assertEqual(len(ran), 1)
 
 
 class TestTheHooksMadeCommits(unittest.TestCase):

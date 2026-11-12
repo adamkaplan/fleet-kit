@@ -279,7 +279,7 @@ NAME_CLIP = 60     # a branch name longer than this is cut
 def shown_name(name):
     """A remote branch name as it may stand in a notice: printable ASCII of the safe set, cut to NAME_CLIP; a name with a secret shape or nothing left is `(unprintable name)`."""
     text = plain(name, NAME_CLIP)
-    return text if text and not SECRETISH.search(text) else "(unprintable name)"
+    return text if text and not SECRETISH.search(str(name)[:200]) and not SECRETISH.search(text) else "(unprintable name)"   # the secret shapes are looked for in the raw name too (plain drops `_`)
 
 
 def moved_branches(hook, heads, worker):
@@ -290,7 +290,8 @@ def moved_branches(hook, heads, worker):
     if not isinstance(heads, list) or not isinstance(made, list):
         return None
     mine = {m for m in made if isinstance(m, str) and FULL_SHA.fullmatch(m)}
-    return [(b, h) for b, h in heads if isinstance(b, str) and isinstance(h, str) and h in mine and b != "%s/wip" % worker]
+    found = [(b, h) for b, h in heads if isinstance(b, str) and isinstance(h, str) and h in mine and b != "%s/wip" % worker]
+    return found if found or not mine else None   # commits the pod made, yet no tip holds one (pushed over, merged, rebased): where they went is not shown, so never `nothing pushed`
 
 
 def many_heads(repo, moved, head_checks):

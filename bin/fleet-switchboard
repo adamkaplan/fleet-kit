@@ -8526,9 +8526,9 @@ HEADS_MAX = 5000   # the most branch lines one read keeps (ask #2470); more is a
 
 def cloud_branch_heads(engine, repo):
     """Ask #2470: ONE bounded read of the repository's own branch heads at the end of a pod: [(branch, full sha)], or None on any failure (an unreadable remote, a partial list).
-    One `gh api --paginate` call under the account of the repository, a timeout, output cut at HEADS_MAX lines; the answer is a pair of fixed-shape fields, nothing else is kept."""
+    One `gh api --paginate` call under the account of the repository, a 30 s timeout; an answer of more than HEADS_MAX lines is a partial read (None); the answer is a pair of fixed-shape fields, nothing else is kept."""
     try:
-        if not (isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}", repo)):
+        if not (isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,99}/[A-Za-z0-9_-][A-Za-z0-9._-]{0,99}", repo)):
             return None
         intents = engine.intents
         env = intents.env_for(repo)
