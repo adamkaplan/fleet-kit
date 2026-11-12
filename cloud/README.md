@@ -305,12 +305,14 @@ No pod may be selected or placed by that label (rule test in `launcher/tests/tes
 whether the system DaemonSets tolerate a NoSchedule taint, and what a pool taint update does to existing nodes. If the cloud refuses the taint, the ask
 closes with that evidence and nothing has changed.
 
+(`RESOURCE_GROUP_NAME` and `CLUSTER_NAME` are the placeholders of cloud/launcher/README.md: use the real ones.)
+
 **Administrator commands, in this order (HELD for the owner's word; nothing runs before it).** The taint is applied only AFTER the DaemonSet change
 is in place and has removed it from nodes that are already right (a node that never loses the taint takes no pod).
 
 ```sh
 # 1. BEFORE state: record it (the rollback uses it)
-az aks nodepool show -g aura-sp-cloud --cluster-name fk-cloud-workers -n workers --query nodeTaints -o tsv | tee /tmp/workers-taints-before.txt
+az aks nodepool show -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --query nodeTaints -o tsv | tee /tmp/workers-taints-before.txt
 
 # 2. the DaemonSet change first. The installer's current tolerations (add them to the patch file if any, it replaces the list):
 kubectl -n kube-system get ds sysbox-deploy-k8s -o jsonpath='{.spec.template.spec.tolerations}'
@@ -322,7 +324,7 @@ kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints[*].k
 kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20     # expect: "startup taint already absent" on each node
 
 # 3. THEN the pool update (applies the taint to new nodes)
-az aks nodepool update -g aura-sp-cloud --cluster-name fk-cloud-workers -n workers --node-taints 'startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule'
+az aks nodepool update -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --node-taints 'startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule'
 
 # 4. the one-pod proof: one pod that needs a new node (the worker pod spec as usual), print the time of each step
 date -u +%T; kubectl -n cw get pod <pod> -w          # the pod starts Pending
@@ -332,7 +334,7 @@ kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20   # "startup tain
 date -u +%T                                           # the pod is Running
 
 # 5. rollback: the pool back to the recorded taints, then the DaemonSet from git
-az aks nodepool update -g aura-sp-cloud --cluster-name fk-cloud-workers -n workers --node-taints "$(cat /tmp/workers-taints-before.txt)"   # empty: --node-taints ""
+az aks nodepool update -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --node-taints "$(cat /tmp/workers-taints-before.txt)"   # empty: --node-taints ""
 git checkout <the commit before this change> -- cloud/k8s/containerd-fix.yaml && kubectl apply -f cloud/k8s/containerd-fix.yaml
 # the installer: patch back the toleration list recorded in step 2 (or remove the one toleration)
 # a node that still carries the taint: kubectl taint node <node> startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule-
