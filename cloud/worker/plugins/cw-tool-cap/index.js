@@ -1,7 +1,7 @@
 // Pod plugin: no shell call of a pod runs longer than 300000 ms (5 minutes). The pod's tool calls end at 5 minutes,
 // so a longer call must go through cw-run. Only the spec's `timeout` changes; the command and env are untouched.
 export const CAP_MS = 300000;
-export const NOTE = "This call was limited to 300000 ms (5 minutes); run anything longer with cw-run start and poll it with cw-run wait.";
+export const NOTE = `This call was limited to ${CAP_MS} ms (5 minutes); run anything longer with cw-run start and poll it with cw-run wait.`;
 
 export function clampSpec(spec) {
   const t = spec.timeout;
@@ -15,12 +15,17 @@ export function noteOf(text) {
   return /time(d)? ?out/i.test(s) && !s.includes(NOTE) ? s + "\n" + NOTE : s;
 }
 
+const UNAVAILABLE = "cw-tool-cap: shell hooks unavailable, calls are NOT capped";
+
 export default {
   id: "cw.tool-cap",
   async setup(api) {
-    if (api && api.shell && typeof api.shell.hook === "function") {
+    if (!(api && api.shell && typeof api.shell.hook === "function")) { console.log(UNAVAILABLE); return; }
+    try {
       api.shell.hook("create.before", async (spec) => { clampSpec(spec); });
-      try { api.shell.hook("run.after", async (res) => { if (res && typeof res.output === "string") res.output = noteOf(res.output); }); } catch (_) { /* the hook name is offered by some builds only */ }
-    }
+    } catch (_) { console.log(UNAVAILABLE); return; }
+    try {
+      api.shell.hook("run.after", async (res) => { if (res && typeof res.output === "string") res.output = noteOf(res.output); });
+    } catch (_) { console.log("cw-tool-cap: run.after hook unavailable, the timeout note is not added"); }
   },
 };

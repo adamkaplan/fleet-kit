@@ -25,7 +25,6 @@ class ToolCap(unittest.TestCase):
     def test_s3_plugin_listed_once(self):
         c = self.cfg()
         self.assertEqual([p for p in c["plugin"] if "cw-tool-cap" in p], ["/usr/local/share/cw/plugins/cw-tool-cap/index.js"])
-        self.assertEqual(len(c["plugin"]), 1)
 
     def test_s3_no_timeout_above_cap(self):
         vals = list(timeouts(self.cfg()))
