@@ -12,6 +12,7 @@ from xml.etree import ElementTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the repository, for the remote_worker package
 
+from support.core import Base
 from remote_worker import Transport, TransportError, WorkerHandle, launch_remote_worker, wait_for_end
 from remote_worker import floor as floor_mod
 from remote_worker.floor import FloorTransport, load_sas_file
@@ -83,8 +84,9 @@ def sas_file(d, name, text, mode=0o600):
     return p
 
 
-class Base(unittest.TestCase):
+class CarrierCase(Base):
     def setUp(self):
+        super().setUp()
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.qf = sas_file(self.dir.name, "q", QSAS + "\n")
@@ -103,7 +105,7 @@ class Base(unittest.TestCase):
         return t, launch_remote_worker(t, **GOOD)
 
 
-class TestRemoteCarrier(Base):
+class TestRemoteCarrier(CarrierCase):
     def test_satisfies_the_interface(self):
         self.assertIsInstance(self.transport(), Transport)
 
@@ -212,7 +214,7 @@ class TestRemoteCarrier(Base):
         self.assertEqual(t.command_result(cid), "rejected:terminal")
 
 
-class TestRemotePayload(Base):
+class TestRemotePayload(CarrierCase):
     def test_a_large_brief_goes_to_a_blob_written_first(self):
         t = self.transport()
         big = "x" * (60 * 1024)
@@ -260,7 +262,7 @@ class TestRemotePayload(Base):
         self.assertEqual(len(self.store.requests), n)
 
 
-class TestRemoteState(Base):
+class TestRemoteState(CarrierCase):
     def test_status_reads_the_session_from_state_json(self):
         t, h = self.launched()
         self.store.publish({h.worker_id: {"state": "done", "busy": False, "last_update": "2026-11-12T09:30:12Z", "landed_sha": SHA}})
@@ -330,7 +332,7 @@ class TestRemoteState(Base):
         self.assertEqual(wait_for_end(t, h, 10, sleep=lambda s: None, clock=self.clock).landed_sha, SHA)
 
 
-class TestRemoteStopAndSession(Base):
+class TestRemoteStopAndSession(CarrierCase):
     def test_stop_adds_one_retire_and_a_repeat_adds_none(self):
         t, h = self.launched()
         t.stop(h, "r")
@@ -366,7 +368,7 @@ class TestRemoteStopAndSession(Base):
         self.assertEqual(self.store.requests, [])
 
 
-class TestRemoteSafety(Base):
+class TestRemoteSafety(CarrierCase):
     def test_errors_are_classified_and_never_carry_a_token(self):
         cases = [(429, True), (503, True), (500, True), (403, False), (401, False), (400, False)]
         for status, retry in cases:
@@ -435,7 +437,7 @@ class TestRemoteSafety(Base):
                 self.assertIn(".blob.", url)
 
 
-class TestRemoteConfiguration(Base):
+class TestRemoteConfiguration(CarrierCase):
     def test_unsafe_settings_are_refused(self):
         bad = [dict(account="X"), dict(account="ab"), dict(account="a.b.c"), dict(floor_id="F1"), dict(caller_id="a/b"), dict(caller_id=""),
                dict(git_base="http://git.example"), dict(git_base="https://u:p@git.example")]

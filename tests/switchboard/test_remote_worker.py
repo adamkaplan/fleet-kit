@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the repository,
 
 from remote_worker import (Config, ConfigError, SpecError, TransportError, WorkerHandle, launch_remote_worker, load_config,
                            register_transport, transport_from_config, validate_spec, wait_for_end, Transport)
+from support.core import Base
 from remote_worker import launch as launch_mod
 from remote_worker.fake import FakeTransport
 
@@ -15,7 +16,7 @@ GOOD = dict(name="widget-1", repo="acme/widget-api", branch="work/widget-1", tas
 SHA = "0" * 39 + "1"
 
 
-class TestRemoteSpec(unittest.TestCase):
+class TestRemoteSpec(Base):
     def test_valid_spec_brief_carries_task_and_land_command(self):
         spec = validate_spec(**GOOD)
         self.assertIn("Fix the parser.", spec.brief)
@@ -35,7 +36,7 @@ class TestRemoteSpec(unittest.TestCase):
                 self.assertEqual(t.calls, [])
 
 
-class TestRemoteLaunch(unittest.TestCase):
+class TestRemoteLaunch(Base):
     def test_launch_starts_and_returns_handle(self):
         t = FakeTransport()
         h = launch_remote_worker(t, **GOOD)
@@ -70,8 +71,9 @@ class TestRemoteLaunch(unittest.TestCase):
         self.assertIsInstance(FakeTransport(), Transport)
 
 
-class TestRemoteWait(unittest.TestCase):
+class TestRemoteWait(Base):
     def setUp(self):
+        super().setUp()
         self.t = FakeTransport()
         self.h = launch_remote_worker(self.t, **GOOD)
         self.now = 0.0
@@ -104,7 +106,7 @@ class TestRemoteWait(unittest.TestCase):
             self.wait(60)
 
 
-class TestRemoteFake(unittest.TestCase):
+class TestRemoteFake(Base):
     def test_send_dedups_by_message_id_and_refuses_after_end(self):
         t = FakeTransport()
         h = launch_remote_worker(t, **GOOD)
@@ -115,7 +117,7 @@ class TestRemoteFake(unittest.TestCase):
             t.send(h, "late")
 
 
-class TestRemoteConfig(unittest.TestCase):
+class TestRemoteConfig(Base):
     def test_both_settings_required(self):
         with self.assertRaises(ConfigError):
             load_config({})
