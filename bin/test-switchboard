@@ -80373,7 +80373,8 @@ NOT_ISOLATED_BY_BASE = {
     "TestPlanHashMarkerMutants", "TestPlanHashMarkerNoSizeTest", "TestPlanHashMarkerPure", "TestPlanHashMarkerStored", "TestPlanHashMarkerTally", "TestPlanKeyHash",
     "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
     "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
-    "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
+    "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",   # (#2483) the next two have no setUp and touch no file or state path: they call delegated_clear_checks and validate over in-memory dicts, with fetch_orders, _intent_reader, read_cos_orders patched to stubs
+    "TestDelegatedClearRepo", "TestDelegatedClearRepoOwnerFile",
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
     "TestAskIsItsOwn", "TestBranchTipRead",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254; (#2392) the second runs cloud_branch_tip over a stub _api: no file, no state
