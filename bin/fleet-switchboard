@@ -18124,6 +18124,7 @@ CU_HINT = "; the chief of staff can log a waiver at this head (`waive %s --gates
 
 
 CLAIM_LEDGER_SINCE = 1793310807   # #1690: the ledger's first claim line (2026-10-29T21:53:27Z); a merged sibling at or before it was merged before claims were recorded
+CLAIM_HAND_MERGE_UNTIL = 1794412648   # #2454: the merge of #2380 (2026-11-11T15:57:28Z), which ended the hand-merge hold of a `MERGE: captain` pull request; a merged sibling at or before it with no recorded claim may have been merged by hand, outside the merge gate (#2324)
 
 
 class ClaimUnknown(Exception):
@@ -18178,6 +18179,9 @@ def plan_peers(ctx, runner, now, closed=None):
         merged = _measure_time(other.get("merged_at"))
         found, text = plan_ledger.recorded_claim(ctx.entries, "%s#%s" % (repo, other.get("number")), at=merged if merged is not None else -1)
         if not found and merged is not None and merged <= CLAIM_LEDGER_SINCE:   # #1690: a legacy sibling has no claim line (it claims every per-pull-request scenario)
+            peers.append(("merged", ""))
+            continue
+        if not found and merged is not None and merged <= CLAIM_HAND_MERGE_UNTIL:   # #2454: merged by hand before the end of the captain hold: no claim line, as the legacy sibling above
             peers.append(("merged", ""))
             continue
         if not found:
