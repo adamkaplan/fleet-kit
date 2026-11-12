@@ -26,7 +26,7 @@ def read_escalated_checked(state_dir, limit=None):
     try:
         fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            if os.fstat(fd).st_mode & 0o170000 != 0o100000:   # not a regular file
                 return {}, "%s cannot be read" % ESCALATED_FILE
             with os.fdopen(fd, "rb", closefd=False) as handle:
                 data = handle.read() if limit is None else handle.read(limit + 1)
