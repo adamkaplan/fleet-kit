@@ -219,12 +219,13 @@ class Patch(unittest.TestCase):
             self.skipTest("the patch was applied and its file removed")
         with open(PATCH) as f:
             text = f.read()
-        self.assertIn("+  test-cloud-launcher:", text)                                   # (a) the split into a job of shards
+        self.assertIn("+  test-cloud-launcher:", text)                                   # the split into a job of shards
         self.assertIn("+        include: ${{ fromJSON(needs.plan.outputs.launcher) }}", text)
-        self.assertIn("-        timeout-minutes: 20", text)                               # (b) the limit 20 -> 45
-        self.assertIn("+        timeout-minutes: 45", text)
+        self.assertIn("-        timeout-minutes: 20", text)                               # the whole-suite step and its limit leave test-cloud
+        self.assertIn("+        timeout-minutes: 25", text)                               # each shard step has its own limit (no stop-gap value)
+        self.assertNotIn("timeout-minutes: 45", text)
         self.assertIn("-      - name: bin/test-cloud-launcher\n", text)                   # the whole-suite step is gone
-        self.assertIn("alarm.test.mjs plugins/fleet-decisions-tui/click.test.mjs", text)  # (c) the node step runs alarm.test.mjs
+        self.assertIn("alarm.test.mjs plugins/fleet-decisions-tui/click.test.mjs", text)  # the node step runs alarm.test.mjs
         self.assertIn("-exempt plugins/fleet-decisions-tui/alarm.test.mjs", text)         # the exempt row leaves in the same patch
         self.assertIn("+run plugins/fleet-decisions-tui/alarm.test.mjs | node --test", text)
 

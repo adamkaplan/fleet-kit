@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
-index 0110153c..24b5fdaa 100644
+index 0110153c..9b40818f 100644
 --- a/.github/workflows/test.yml
 +++ b/.github/workflows/test.yml
 @@ -40,6 +40,7 @@ jobs:
@@ -35,7 +35,7 @@ index 0110153c..24b5fdaa 100644
 +  # The cloud launcher suite (bin/test-cloud-launcher.chain) in 4 shards, beside `test-cloud` (needs only `plan`) (ask #2500). One step of the whole chain outgrew its
 +  # 20-minute limit on 12 November 2026 (about 90 of 187 entries done at the limit). `CLOUD_LAUNCHER_SHARD=K/N` (`--shard K/N`) takes every N-th entry of the chain file, so the chain stays the
 +  # one list of files; bin/check-launcher-shards fails when a file is in no job or in two. Check names: `<cloud name> launcher K/4`. The rows (every runner row x shards 1..4) are made by `plan`: an `include` beside a `shard` axis would overwrite itself row by row.
-+  # timeout-minutes 45 (was 20 on the whole-suite step): the stop-gap value, at least 1.5 times a shard's estimated duration on either system (see the pull request); tighten it once the split run is read.
++  # timeout-minutes 25: at least 1.5 times a shard's estimated duration on either system (about 14 minutes on macOS, see the pull request); no step runs the whole suite.
 +  test-cloud-launcher:
 +    needs: plan
 +    name: ${{ matrix.launcher }}
@@ -61,7 +61,7 @@ index 0110153c..24b5fdaa 100644
 +        run: bin/check-launcher-shards
 +
 +      - name: bin/test-cloud-launcher
-+        timeout-minutes: 45
++        timeout-minutes: 25
 +        env:
 +          CLOUD_LAUNCHER_SHARD: ${{ matrix.shard }}/4
 +        run: |
@@ -86,7 +86,7 @@ index 0110153c..24b5fdaa 100644
          if: ${{ !cancelled() }}
          timeout-minutes: 10
 diff --git a/bin/test-workflow-split b/bin/test-workflow-split
-index 0c8851c9..7dd23c59 100755
+index 0c8851c9..fe82a9e6 100755
 --- a/bin/test-workflow-split
 +++ b/bin/test-workflow-split
 @@ -124,8 +124,9 @@ ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/t
@@ -95,7 +95,7 @@ index 0c8851c9..7dd23c59 100755
  RELAY = [("bin/test-cloud-relay", "10"), ("bin/test-cloud-hub-relay", "10"), ("bin/test-cloud-relay-daemon", "10")]
 -LAUNCHER_TIMEOUT = "20"   # the cloud launcher step's timeout-minutes; the one pinned figure (ask #1390)
 -NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", LAUNCHER_TIMEOUT)] + [suite(n, "", t) for n, t in ADDED + RELAY]
-+LAUNCHER_TIMEOUT = "45"   # the timeout-minutes of the cloud launcher shard step in the `test-cloud-launcher` job (ask #1390; ask #2500 split it into 4 shards, limit 20 -> 45)
++LAUNCHER_TIMEOUT = "25"   # the timeout-minutes of the cloud launcher shard step in the `test-cloud-launcher` job (ask #1390; ask #2500 split the whole-suite step into 4 shards)
 +LAUNCHER_SHARDS = 4       # the shard count of that job (ask #2500)
 +NEW_JOB = [suite("bin/test-cloud-worker")] + [suite(n, "", t) for n, t in ADDED + RELAY]   # the launcher left this job for `test-cloud-launcher` (ask #2500)
  MOVED = [n for n, _, _ in NEW_JOB]
@@ -189,7 +189,7 @@ index 0c8851c9..7dd23c59 100755
 +
      def test_s1_launcher_limit_changed(self):
 -        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 25", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
-+        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 25", self.LSHARD)
++        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 45", self.LSHARD)
 +
 +    def test_launcher_shard_dropped_from_the_plan_rows(self):
 +        self.fails("for k in range(1, 5)]", "for k in range(1, 4)]", self.LSHARD)
