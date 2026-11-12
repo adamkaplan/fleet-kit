@@ -18124,7 +18124,6 @@ CU_HINT = "; the chief of staff can log a waiver at this head (`waive %s --gates
 
 
 CLAIM_LEDGER_SINCE = 1793310807   # #1690: the ledger's first claim line (2026-10-29T21:53:27Z); a merged sibling at or before it was merged before claims were recorded
-CLAIM_HAND_MERGE_UNTIL = 1794412648   # #2454: the merge of #2380 (2026-11-11T15:57:28Z), which ended the hand-merge hold of a `MERGE: captain` pull request; a merged sibling at or before it with no recorded claim may have been merged by hand, outside the merge gate (#2324)
 
 
 class ClaimUnknown(Exception):
@@ -18161,10 +18160,49 @@ def plan_listing(ctx, runner, now, same=None):
     return out
 
 
+CLAIM_BODY_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){body mergedAt lastEditedAt}}}"
+
+
+def _merged_body_claim(ctx, runner, now, number, merged):
+    """#2465: the claim of a MERGED sibling with no recorded claim (a merge made by hand, outside the merge gate, records none): the `CLAIMS:` line of the sibling's own body AS MERGED,
+    as a body `pr_claim` reads. ONE GraphQL read of the pull request itself (fixed query text, typed variables): its body, `mergedAt` and `lastEditedAt`. The body counts only when its last
+    edit is PROVEN to precede the merge: never edited (`lastEditedAt` null), or edited strictly before `mergedAt`; an edit at or after the merge, an edit time that cannot be read, a
+    `mergedAt` that is not the merge time of the listing, a body that cannot be read, no `CLAIMS:` line or a line the plan refuses (an identifier it lacks, one claimed at the epic, none)
+    raises ClaimUnknown: the gate fails closed, as before. A later edit never widens a claim. The ledger claim is preferred: this runs only when none was recorded. GETs only."""
+    def unknown(why):
+        return ClaimUnknown("merged pull request #%s has no recorded claim at or before its merge and its own body could not be read as merged (%s): its claim is unknown" % (number, why))
+    scenarios = (ctx.plan or {}).get("scenarios_parsed") if isinstance(getattr(ctx, "plan", None), dict) else None
+    if merged is None or not scenarios or not isinstance(number, int) or isinstance(number, bool):
+        raise unknown("no merge time or no plan to check it against")
+    repo = ctx.pr.rsplit("#", 1)[0]
+    try:
+        refuse_excluded(ctx.config, repo)
+        owner, _, name = repo.partition("/")
+        accounts = GhAccounts(ctx.config, runner, now)
+        env = accounts.env_for(repo)
+        extra = {"env": env} if env is not None else {}
+        argv = [ctx.config["gh"], "api", "graphql", "-f", "query=" + CLAIM_BODY_QUERY, "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=%d" % number]
+        done = runner(argv, capture_output=True, text=True, timeout=ctx.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            raise ValueError("the read failed")
+        pull = json.loads(done.stdout)["data"]["repository"]["pullRequest"]
+        body, merged_at, edited = pull["body"], _measure_time(pull["mergedAt"]), pull["lastEditedAt"]
+    except Exception:
+        raise unknown("the pull request could not be read") from None
+    if not isinstance(body, str) or merged_at != merged:
+        raise unknown("the body or the merge time was not readable")
+    if edited is not None and ((_measure_time(edited) if isinstance(edited, str) else None) is None or _measure_time(edited) >= merged):
+        raise unknown("the body was edited at or after the merge, or its edit time is unreadable")
+    ids, error = plan_ledger.pr_claim(body, scenarios)
+    if error or ids is None:
+        raise unknown("its CLAIMS line is missing or refused by the plan")
+    return plan_ledger.claim_body(plan_ledger.claim_text(body))
+
+
 def plan_peers(ctx, runner, now, closed=None):
     """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
     (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the NEWEST claim line recorded at or before its `merged_at`, the claim in force at the merge: never its current body, which an author can edit, and never a line recorded after the merge):
-    a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is `plan_listing`: bounded, and with more the read raises
+    a merged sibling with no recorded claim reads the claim line of its own body as merged (`_merged_body_claim`, #2465), else raises ClaimUnknown. An open one reads its current body. GETs only. The list is `plan_listing`: bounded, and with more the read raises
     `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
     repo = ctx.pr.rsplit("#", 1)[0]
     peers = []
@@ -18181,11 +18219,9 @@ def plan_peers(ctx, runner, now, closed=None):
         if not found and merged is not None and merged <= CLAIM_LEDGER_SINCE:   # #1690: a legacy sibling has no claim line (it claims every per-pull-request scenario)
             peers.append(("merged", ""))
             continue
-        if not found and merged is not None and merged <= CLAIM_HAND_MERGE_UNTIL:   # #2454: merged by hand before the end of the captain hold: no claim line, as the legacy sibling above
-            peers.append(("merged", ""))
+        if not found:   # #2465: a merge made by hand records no claim: read the claim line of the pull request's own body, as merged
+            peers.append(("merged", _merged_body_claim(ctx, runner, now, other.get("number"), merged)))
             continue
-        if not found:
-            raise ClaimUnknown("merged pull request #%s has no recorded claim at or before its merge: its claim is unknown" % other.get("number"))
         peers.append(("merged", plan_ledger.claim_body(text)))
     return peers
 
