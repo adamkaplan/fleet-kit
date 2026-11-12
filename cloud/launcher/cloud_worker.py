@@ -41,14 +41,16 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
           # the orchestrator row: it reads and relays, it builds nothing; no nested Docker. The estimate is the larger of the ratios 0.25 (cpu) and 0.375 (memory) against XS 0.05 = 0.01875, rounded up
           "O": {"cpu": "250m", "memory": "768Mi", "usd_per_hour": 0.02, "stack": False},
           "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
-          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
+          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True},
+          # the landing row (ask #2457): request equals limit, so one L takes a node's CPU; 0.34 is 6 of 8 vCPU of a 0.452 node
+          "L": {"cpu": "6", "memory": "16Gi", "usd_per_hour": 0.34, "stack": True}}  # list-price estimates, not billed figures
 
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 
 # Per-shape requests (#1978): ONE table, shapes S and M; a shape with no row has no requests key. The limits stay the SHAPES rows.
-SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}}
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}, "L": {"cpu": "6", "memory": "16Gi"}}
 
 
 def capacity_shapes():
@@ -121,7 +123,7 @@ IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the r
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
 # stores it as the `git-token` key of the per-run Secret; the managed reaper renews it by the SAME mint route before it ends. All of the
 # renewal's numbers and names are here.
-GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
+GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh script read at every call
 GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
 SAFE_TO_EVICT_KEY = "cluster-autoscaler.kubernetes.io/safe-to-evict"  # not a cw/ key: the autoscaler reads it, the launcher reads nothing from it
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)

@@ -11,7 +11,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.dirname(HERE)
 HOOKDIR = os.path.join(WORKER, "pod-hooks")
 HOOK = os.path.join(HOOKDIR, "pre-push")
-GUARD = os.path.join(WORKER, "guard.sh")
 README = os.path.join(WORKER, "..", "README.md")
 LINE = "refused: pushing the default branch without a land record: the repository's rules are the guard; this hook is only a convenience\n"
 ANCHOR = "the default branch was pushed without a land record"
@@ -245,12 +244,8 @@ class Hook(unittest.TestCase):
         for row in ('"git*push*--no-verif*": "deny"', '"*push*--no-verif*": "deny"', '"*core.hooksPath*": "deny"', '"*hooksPath=*": "deny"'):
             self.assertEqual(conf.count(row), 0, row)   # ask #2402: the permission file holds no shell rows
 
-    def test_the_wrapper_no_longer_parses_a_push(self):
-        text = read(GUARD)
-        for gone in ("net_remote", "land_record", "cfg_add", "#PUSH ", "pushing to the default branch of a network remote"):
-            self.assertNotIn(gone, text, gone)
-        r = subprocess.run(["sh", GUARD, "git", "push", "origin", "main"], env=self.env, capture_output=True, text=True, cwd=self.repo)
-        self.assertEqual((r.returncode, r.stderr), (0, ""))
+    def test_there_is_no_wrapper_to_parse_a_push(self):
+        self.assertFalse(os.path.exists(os.path.join(WORKER, "guard.sh")))   # the guard layer was removed (ask #2402); the hook is the only push rule left
         self.assertIn("pre-push", read(README))
 
 
