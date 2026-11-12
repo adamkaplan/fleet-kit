@@ -19,7 +19,7 @@ import test_persistent_orchestrator as po  # noqa: E402
 
 cw, mutant, ROOT = po.cw, po.mutant, po.ROOT
 BIN_SWITCHBOARD_TEST = os.path.join(ROOT, "bin", "test-switchboard")
-ROW_LINE = '''            ' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),\n'''
+ROW_LINE = '''' > getattr(args, "persistent", Fa|return EXIT_USAGE': (B + ["--persistent"], []),'''   # the row shares its line with a later row, so it is matched without the line break
 RESULT = "refused before any pod exists: it says nothing was created"
 ENTRY_LINES = ["        '--persistent is only for --age': '%s',\n" % RESULT, "        '--persistent does not combine ': '%s',\n" % RESULT]
 INTEGRATION_KEYS = ["'the stack model secret %s coul'", "'%s; nothing was created'"]   # what the scan names for the raise integration added (#1435): the text is cut at 30 characters, and its second form is the bare tail
