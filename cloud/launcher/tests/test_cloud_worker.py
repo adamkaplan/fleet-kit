@@ -432,6 +432,14 @@ class S5EndHook(Base):
 
     def test_stale_remote_ref_does_not_make_unpushed_work_look_safe(self):
         work, origin = make_repo(self.tmp.name, "r", dirty=False)
+        # a tree with no change and nothing of its own beyond the clone's start commit needs no remote call (clean_local, #2236), so the stale
+        # reference is met by a tree that has work to save: a second commit that origin/main holds, then a new file, then main gone upstream
+        g = lambda *a: subprocess.run(["git", "-C", work, *a], check=True, capture_output=True)
+        g("commit", "--allow-empty", "-m", "second")
+        g("push", "origin", "HEAD:main")
+        g("fetch", "origin")
+        with open(os.path.join(work, "late.txt"), "w") as f:
+            f.write("late\n")
         subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/heads/main"], check=True)  # gone upstream
         res = end_hook.run(work, "coder7")
         self.assertEqual((res["pushed"], res["wip_branch"]), (True, "coder7/wip"))
