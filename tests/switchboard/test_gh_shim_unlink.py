@@ -50,6 +50,7 @@ class TestGhShimUnlink(UnlinkBase):
                "non-numeric id": delete(PATH, "-F", "sub_issue_id=abc"), "id from file": delete(PATH, "-F", "sub_issue_id=@/etc/passwd"),
                "extra field": delete(PATH, *FIELD, "-f", "x=y"), "two ids": delete(PATH, *FIELD, *FIELD), "extra body": delete(PATH, *FIELD, "-f", "body=hello"),
                "--input": delete(PATH, "--input", "-"), "field and --input": delete(PATH, *FIELD, "--input", "-"),
+               "second positional": delete(PATH, "repos/o/r/issues/13/sub_issue", *FIELD), "--input= form": delete(PATH, "--input=-"),
                "override header": delete(PATH, *FIELD, "-H", "X-HTTP-Method-Override: PUT")}
         for label, args in bad.items():
             with self.subTest(label):
@@ -104,6 +105,16 @@ class TestGhShimUnlinkControls(UnlinkBase):
         r = self.rig(shim_source=mutant("gh", 'if found[0] == "sub-issue-unlink" and (has_input or "?" in raw or ', 'if found[0] == "sub-issue-unlink" and ('))
         done, calls = self.passes(r, delete(PATH + "?x=1", *FIELD))
         self.assertEqual(len(calls), 1, "control: the query check is what refuses it")
+
+    def test_without_the_has_input_check_an_input_with_no_field_check_would_pass(self):
+        old = 'if found[0] == "sub-issue-unlink" and (has_input or "?" in raw or len(raw_positionals) != 1 or len(fields) != 1 or not re.fullmatch(r"sub_issue_id=[0-9]+", fields[0])):'
+        new = 'if found[0] == "sub-issue-unlink" and ("?" in raw or len(raw_positionals) != 1):'
+        r = self.rig(shim_source=mutant("gh", old, new))
+        done, calls = self.passes(r, delete(PATH, "--input", "-"))
+        self.assertEqual(len(calls), 1, "control: with only the query and positional checks an --input passes")
+        r2 = self.rig(shim_source=mutant("gh", old, new.replace('"?" in raw or', 'has_input or "?" in raw or')))
+        done, calls = self.passes(r2, delete(PATH, "--input", "-"))
+        self.assertEqual(calls, [], "has_input alone refuses it")
 
     def test_the_mutated_sources_differ_from_the_real_one(self):
         self.assertIn(self.ROW, source("gh"))
