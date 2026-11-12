@@ -14,9 +14,9 @@ import unittest
 from unittest import mock
 from support.core import Base
 from support.loader import sb
-from support.orders_and_adapters import pr_view_json
+from support.orders_and_adapters import HEAD_A, HEAD_B, pr_view_json
 
-HEAD_A, HEAD_B = "a" * 40, "b" * 40
+
 REPO = "acme-org/widget-service"
 
 
