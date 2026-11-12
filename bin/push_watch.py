@@ -50,7 +50,7 @@ def _clean(text, limit):   # no @ (no mention can fire) and no double quote (the
 # Ask #2320: a repository that lands by `spire land` (config `land_repos`, read by the switchboard's `uses_spire_land`) has no pull request. A push to its default branch
 # whose commit carries a Land trailer is the worker's completion: ONE `done` report from the worker, through the engine's own report path (the path the worker's own
 # `report done` takes), with the sha. ASSUMPTION (the playbook acme-org/widget-service#8193 was not readable): a trailer is a line of the commit message that starts
-# `Landed-by:` or `Land-<key>:`. With more than one live worker in the repository a commit completes only the worker whose name its message holds.
+# `Landed-by:` or `Land-<key>:`. With more than one live worker in the repository a commit completes only the pod that owns it (ask #2393: its patch id equals one of its branch head's commits, or its sha starts with the sha the pod reported), never by the name in its message.
 LAND_TRAILER = re.compile(r"^(?:Landed-by|Land-[A-Za-z0-9-]+)[ \t]*:[ \t]*\S")
 LAND_READ = 20   # the newest commits of the default branch read per worker per pass
 

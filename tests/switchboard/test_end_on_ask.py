@@ -32,7 +32,7 @@ class TestEndOnAsk(unittest.TestCase):
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine, posts, events, cluster = mock.Mock(), [], [], mock.MagicMock()
         engine.send = lambda sender, to, text: w.sent.append((to, text))
-        record = dict({"worker": NAME, "reports_to": "boss-lane", "issue": 2393, "repo": "adamkaplan/fleet-kit"}, **(record_extra or {}))
+        record = dict({"worker": NAME, "reports_to": "boss-lane", "issue": 2393, "repo": "acme/widget-api"}, **(record_extra or {}))
         args = argparse.Namespace(name=NAME, undo=False, reason="finished")
 
         def comment(eng, issue, body, author=None, repo=None):
@@ -67,7 +67,7 @@ class TestEndOnAsk(unittest.TestCase):
         posts, _ = self.end(log=log)
         self.assertEqual(len(posts), 1)
         issue, body, repo = posts[0]
-        self.assertEqual((issue, repo), (2393, "adamkaplan/fleet-kit"))
+        self.assertEqual((issue, repo), (2393, "acme/widget-api"))
         self.assertIn("my final words", body)
         shown = [l for l in body.split("\n") if l.startswith("land line")]
         self.assertIn("land line %04d" % count, shown)
