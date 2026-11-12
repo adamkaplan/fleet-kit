@@ -1,7 +1,7 @@
 """Ask #2445: a comment by someone else on an issue the Chief of Staff authored reaches the Chief of Staff (S2 to S4, U1).
 
 Neutral names only. The Chief of Staff's account is read from `gh_users` for the repository (acct-a here, acct-b on another), never typed into the code.
-GithubRig and GH_REPO are set by bin/test-switchboard after the import."""
+GithubRig is set by bin/test-switchboard after the import."""
 import importlib
 from unittest import mock
 from support.core import Base
@@ -9,7 +9,7 @@ from support.loader import sb
 
 GithubRig = None   # set by bin/test-switchboard after the import
 _roles = importlib.import_module("support.scenario_roles")
-GH_REPO = _roles.GH_REPO
+SCRATCH = _roles.GH_REPO
 
 AGENTS = {"chief": {"role": "orchestrator", "charter": 1},
           "coder": {"role": "coder", "issue": 12, "reports_to": "chief"}}
@@ -20,7 +20,7 @@ class TestCosIssueComments(Base):
 
     def setUp(self):
         super().setUp()
-        self.start({"gh_users": {GH_REPO: self.ACCOUNT}})
+        self.start({"gh_users": {SCRATCH: self.ACCOUNT}})
 
     def start(self, config):
         self.rig = GithubRig(self, agents=AGENTS, config=config)
@@ -49,7 +49,7 @@ class TestCosIssueComments(Base):
         self.assertEqual(self.audit("github.comment.chief_unknown"), [])
 
     def test_s2_the_account_is_the_one_of_the_repository_not_a_fixed_login(self):
-        self.start({"gh_users": {GH_REPO: "acct-b"}})
+        self.start({"gh_users": {SCRATCH: "acct-b"}})
         self.gh.issues[30]["user"]["login"] = "acct-b"
         self.gh.comment(30, "hello", 5003, login="acct-a")
         self.assertEqual([t[:2] for t in self.told()], [("github.comment:5003", "chief")])
@@ -75,7 +75,7 @@ class TestCosIssueComments(Base):
 
     def test_s3_a_failed_read_of_the_issue_routes_nothing_and_audits_once(self):
         self.gh.comment(30, "hello", 5007, login="reviewer-1", forward=False)
-        item = sb._comment_item(GH_REPO, self.gh.comments[-1], None, self.world.clock.now())
+        item = sb._comment_item(SCRATCH, self.gh.comments[-1], None, self.world.clock.now())
         self.hub.queue[item.key] = item
         self.gh.api_down = True
         self.hub.facts()
