@@ -362,14 +362,19 @@ class RunCall(unittest.TestCase):
         empty = tempfile.mkdtemp()
         self.addCleanup(os.rmdir, empty)
         old, os.environ["PATH"] = os.environ.get("PATH", ""), empty   # the senders find no program: the pass still writes its state
+        import contextlib
+        import io
+        err = io.StringIO()
         try:
-            mod.run(launcher, NOW)
+            with contextlib.redirect_stderr(err):
+                mod.run(launcher, NOW)
         finally:
             os.environ["PATH"] = old
-        self.assertTrue(os.path.isfile(os.path.join(tmp.dir, ".land-report.json")), "RUN state path")
+        found = [n for n in os.listdir(tmp.dir) if n.endswith("land-report.json")]
+        self.assertTrue(found, "RUN env reached the pass: no state file written")
+        self.assertEqual(found, [".land-report.json"], "RUN state path")
         self.assertEqual(os.listdir(elsewhere.dir), [])
-        with open(os.path.join(tmp.dir, ".land-report.json")) as f:
-            self.assertEqual(json.load(f)["day"], "2026-11-12", "RUN env reached the pass")
+        self.assertIn("cloud-worker: land report: the message was not sent", err.getvalue(), "RUN log reaches stderr")
 
     def check_raise(self, mod):
         import contextlib
@@ -395,13 +400,21 @@ class RunCall(unittest.TestCase):
         m = mutant("daily_pass(launcher.env, now, root", "daily_pass({}, now, root")
         with self.assertRaises(AssertionError) as cm:
             self.check(m)
-        self.assertIn("RUN state path", str(cm.exception))
+        self.assertIn("RUN env reached the pass", str(cm.exception))
+
+    def test_mutant_log_dropped(self):
+        self.check(real)
+        m = mutant('log=lambda t: print("cloud-worker: " + t, file=sys.stderr))', "log=None)")
+        with self.assertRaises(AssertionError) as cm:
+            self.check(m)
+        self.assertIn("RUN log reaches stderr", str(cm.exception))
 
     def test_mutant_exception_escapes(self):
         self.check_raise(real)
         m = mutant("    except Exception as err:\n        print(\"cloud-worker: the land report failed", "    except ZeroDivisionError as err:\n        print(\"cloud-worker: the land report failed")
-        with self.assertRaises(OSError):
+        with self.assertRaises(OSError) as cm:
             self.check_raise(m)
+        self.assertEqual(str(cm.exception), "no root", "RUN exception escaped")
 
 
 def reaper_module_name(src):
