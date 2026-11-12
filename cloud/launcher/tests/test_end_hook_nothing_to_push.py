@@ -66,6 +66,7 @@ class Scratch(unittest.TestCase):
         git(self.work, "add", "-A")
         git(self.work, "commit", "-q", "-m", "first")
         git(self.work, "push", "-q", "origin", "base")   # the remote holds the first commit; origin/base tracks it
+        git(t, "-C", self.bare, "config", "core.hooksPath", os.path.join(self.bare, "hooks"))   # a global core.hooksPath (the pod's) must not hide the counting hook
         hook = os.path.join(self.bare, "hooks", "pre-receive")
         with open(hook, "w") as f:
             f.write("#!/bin/sh\necho attempt >> %s\nexit 1\n" % self.log)   # from now on the remote refuses every push, after counting it

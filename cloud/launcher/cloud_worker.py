@@ -4239,7 +4239,7 @@ class Launcher:
         """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
         (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
         `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
-        if not NAME_RE.match(a.worker or ""):
+        if not NAME_RE.fullmatch(a.worker or ""):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         name = pod_name(a.worker)
         if not self.kube.get_pod(name):
