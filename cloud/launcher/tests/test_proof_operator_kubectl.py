@@ -15,11 +15,16 @@ MARK = "TOKMARK-9f3a1c77"
 PROMPT = "To sign in, use a web browser to open the page https://example.invalid/devicelogin and enter the code ABCD1234"
 FAKE = """#!/bin/sh
 echo "$@" >> "$FAKE_DIR/kubectl.log"
+tr '\\0' ' ' < /proc/$$/cmdline >> "$FAKE_DIR/argv.log"; echo >> "$FAKE_DIR/argv.log"
+tr '\\0' '\\n' < /proc/$$/environ | grep -v '^PATH=' >> "$FAKE_DIR/env.log"
 case "$*" in
   *"create token cw-operator --duration=30m"*) [ -f "$FAKE_DIR/refuse" ] && exit 1; printf '%s\\n' TOKMARK-9f3a1c77; exit 0;;
+  *"config view"*) echo '{"clusters":[{"name":"c","cluster":{"server":"https://example.invalid:6443","certificate-authority-data":"QQ=="}}]}'; exit 0;;
 esac
 [ -f "$FAKE_DIR/hang" ] && { echo "To sign in, use a web browser to open the page https://example.invalid/devicelogin and enter the code ABCD1234"; sleep 20; exit 0; }
-case "$1 $2" in "--token TOKMARK-9f3a1c77") ;; *) echo "no token" >&2; exit 1;; esac
+case "$1" in --token) echo "old form" >> "$FAKE_DIR/oldform.log";; esac
+cfg=$(cat "$KUBECONFIG" 2>/dev/null)
+case "$cfg" in *TOKMARK-9f3a1c77*) ;; *) case "$1 $2" in "--token TOKMARK-9f3a1c77") ;; *) echo "no token" >&2; exit 1;; esac;; esac
 case "$*" in *proof-results*) cat "$FAKE_DIR/results"; exit 0;; esac
 cat > /dev/null 2>&1 || true
 exit 0
@@ -72,9 +77,48 @@ class ProofOperatorKubectl(G.Base):
         self.minter()
         done = self.child()
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertTrue(any(l.startswith("--token ") and "proof-results" in l for l in self.log("kubectl")), self.log("kubectl"))
+        self.assertTrue(any("proof-results" in l for l in self.log("kubectl")), self.log("kubectl"))
         self.assertNotIn(MARK, done.stdout + done.stderr + self.everything())
         self.assertEqual(len(os.listdir(self.rdir)), 1)
+
+    def argv_env_text(self):
+        out = ""
+        for n in ("argv.log", "env.log", "kubectl.log"):
+            p = Path(self.fake, n)
+            out += p.read_text(errors="replace") if p.exists() else ""
+        return out
+
+    def test_the_token_is_never_in_argv_environment_or_files_of_kubectl(self):
+        self.minter()
+        done = self.child()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        seen = Path(self.fake, "argv.log").read_text()
+        self.assertIn("proof-results", seen)   # the calls were recorded, so the absence below means something
+        self.assertNotIn(MARK, self.argv_env_text() + done.stdout + done.stderr + self.everything())
+        self.assertIn("KUBECONFIG=/dev/fd/", Path(self.fake, "env.log").read_text())
+
+    def test_control_the_old_token_on_argv_form_is_seen_by_the_same_check(self):
+        self.minter()
+        old = 'kubectl, cfg = ([env["CW_KUBECTL"]], None) if env.get("CW_KUBECTL") else (["kubectl"], mint_token(env))'
+        self.assertEqual(G.PROOF.count(old), 1)
+        argv_form = G.PROOF.replace(old, 'kubectl, cfg = ["kubectl", "--token", json.loads(mint_token(env))["users"][0]["user"]["token"]], None')
+        self.child(argv_form)
+        self.assertIn(MARK, self.argv_env_text())   # the mutant puts the token back on argv and the check sees it
+
+    def test_a_grandchild_of_kubectl_is_killed_on_the_normal_path(self):
+        self.minter()
+        Path(self.fake, "results").write_text("")
+        src = Path(self.fake, "kubectl").read_text().replace("exit 0\n\"\"\"", "exit 0")
+        Path(self.fake, "kubectl").write_text(src.replace("cat > /dev/null 2>&1 || true", "sleep 300 >/dev/null 2>&1 </dev/null & echo $! > \"$FAKE_DIR/gc.pid\"; cat > /dev/null 2>&1 || true"))
+        self.child()
+        pids = [int(x) for x in Path(self.fake, "gc.pid").read_text().split()] if Path(self.fake, "gc.pid").exists() else []
+        self.assertTrue(pids)
+        for pid in pids:
+            try:
+                st = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[0]
+            except OSError:
+                continue
+            self.assertEqual(st, "Z", "grandchild %d lives" % pid)
 
     def test_no_minter_kubeconfig_is_exit_2_with_one_line_and_the_pod_retired(self):
         done = self.child()
