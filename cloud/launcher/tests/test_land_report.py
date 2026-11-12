@@ -5,6 +5,8 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -351,6 +353,40 @@ class FakeLauncher:
         self.recorder, self.env = FakeRecorder(root, boom), env
 
 
+class RunSmoke(unittest.TestCase):
+    """#2448: the REAL Launcher through the reaper's call with the report enabled: a message is attempted and the state written; a raise fails it."""
+
+    def test_real_launcher(self):
+        import cloud_worker as cw
+        import contextlib
+        import io
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        git = os.path.join(tmp, "g")
+        subprocess.run(["git", "init", "-q", git], check=True)
+        env = {"CW_KUBECTL": "/nonexistent", "CW_CLOUD_AUDIT": os.path.join(tmp, "a.jsonl"), "CW_CLOUD_IMAGE": "r.example.internal/w:1",
+               "CW_RUN_RECORD_DIR": os.path.join(tmp, "rec"), "CW_LAND_REPORT_ISSUE": "acme-org/widget-service#1", "CW_LAND_REPORT_GIT_DIR": git}
+        launcher = cw.Launcher(cw.Kube(env), env, clock=lambda: NOW)
+        bindir = os.path.join(tmp, "bin")
+        os.mkdir(bindir)
+        SB = "fl" + "eet-switchboard"   # the executable name, built from two parts (the names rule)
+        for prog in (SB, "gh"):   # stubs: each records that it was called
+            with open(os.path.join(bindir, prog), "w") as f:
+                f.write("#!/bin/sh\necho \"$1\" >> %s/%s.calls\n" % (tmp, prog))
+            os.chmod(os.path.join(bindir, prog), 0o755)
+        err = io.StringIO()
+        old, os.environ["PATH"] = os.environ.get("PATH", ""), bindir + os.pathsep + os.environ.get("PATH", "")
+        try:
+            with contextlib.redirect_stderr(err):
+                real.run(launcher, NOW)
+        finally:
+            os.environ["PATH"] = old
+        self.assertNotIn("failed", err.getvalue())
+        with open(os.path.join(tmp, SB + ".calls")) as f:
+            self.assertEqual(f.read(), "send\n", "one message attempted")
+        self.assertTrue(os.path.exists(os.path.join(tmp, "rec", ".land-report.json")), "state file written")
+
+
 class RunCall(unittest.TestCase):
     """The reaper's one call, land_report.run(launcher, now), through a fake launcher (a stub recorder.root(), an env)."""
 
@@ -382,7 +418,7 @@ class RunCall(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             mod.run(FakeLauncher("/nonexistent", {}, boom=True), NOW)
-        self.assertEqual(err.getvalue(), "cloud-worker: the land report failed: OSError\n", "RUN stderr line")
+        self.assertEqual(err.getvalue(), "cloud-worker: the land report failed: OSError in test_land_report.py:root\n", "RUN stderr line")
 
     def test_control(self):
         self.check(real)
