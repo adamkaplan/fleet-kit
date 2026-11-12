@@ -1,4 +1,5 @@
 {
+  "plugin": ["/usr/local/share/cw/plugins/cw-tool-cap/index.js"],
   "permission": {
     "question": "deny",
     "bash": {

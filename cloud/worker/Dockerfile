@@ -109,6 +109,7 @@ COPY worker/start-dockerd.sh /usr/local/bin/start-dockerd
 COPY worker/cw-stack-pull /usr/local/bin/cw-stack-pull
 COPY worker/entrypoint.sh /usr/local/bin/worker-entrypoint
 COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md worker/agents/orchestrator.md /usr/local/share/cw/
+COPY worker/plugins/cw-tool-cap/index.js /usr/local/share/cw/plugins/cw-tool-cap/index.js
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
 COPY worker/cw-prestop /usr/local/bin/cw-prestop
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
@@ -130,6 +131,7 @@ RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/lo
       /usr/local/bin/cloud_client.py /usr/local/bin/cloud_hub.py /usr/local/bin/cloud_channel.py /usr/local/bin/cloud_channel_server.py /usr/local/bin/cloud_relay.py \
  && chmod 0644 /usr/local/bin/plan_check.py \
  && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
+RUN chmod 0644 /usr/local/share/cw/plugins/cw-tool-cap/index.js
 RUN chmod 0755 /usr/local/bin/cw-stack-up && chown root:root /usr/local/bin/cw-stack-up
 # The token service (cloud/k8s/token-mint.yaml runs `python3 /opt/cloud/launcher/token_service.py`): the launcher modules it imports,
 # directly or through cloud_worker (token_service -> app_token, cloud_worker; app_token -> token_mint; cloud_worker -> run_record, wip_save,
