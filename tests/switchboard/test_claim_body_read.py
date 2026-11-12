@@ -75,6 +75,10 @@ class TestClaimBodyRead(unittest.TestCase):
         for claims in ("S2 U1 S3 S9", "S9", ""):
             self.assertIn("no recorded claim", self.gate(claims) or "", claims)
 
+    def test_s3_a_claim_line_after_a_blank_line_is_refused_as_in_every_claim_reader(self):
+        misplaced = "PLAN: acme/app#7\n\nCLAIMS: S2 U1 S3"   # the line must stand directly under the PLAN line (#1617)
+        self.assertIn("no recorded claim", self.gate(raw={"body": misplaced}) or "")
+
     def test_s3_a_body_edited_after_the_merge_does_not_widen_the_claim(self):
         for edited in (AFTER, MERGED, "not a time", 7):   # after, at the same second, unreadable: the edit is not proven to precede the merge
             self.assertIn("no recorded claim", self.gate("S2 U1 S3", edited=edited) or "", edited)
