@@ -25,6 +25,7 @@ cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_idle_nudge_skipped.py
 cloud/launcher/tests/test_image_gate.py
+cloud/launcher/tests/test_image_proof_launch.py
 cloud/launcher/tests/test_image_roll.py
 cloud/launcher/tests/test_kept_expiry.py
 cloud/launcher/tests/test_kept_failed_once.py

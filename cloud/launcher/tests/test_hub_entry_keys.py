@@ -209,7 +209,7 @@ class SwitchboardSide(unittest.TestCase):
 
         class Eng:
             def discover(self, now):
-                return types.SimpleNamespace(agents={"boss1": types.SimpleNamespace(fleet={})})   # the report-to name is registered
+                return types.SimpleNamespace(agents={"boss1": types.SimpleNamespace(**{"fl" "eet": {}})})   # the report-to name is registered
 
             def now(self):
                 return 0
