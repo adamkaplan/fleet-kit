@@ -141,5 +141,38 @@ class Mutants(unittest.TestCase):
         self.assertEqual(count(room(["a", "b", "c"], {"a": {"cpu_m": 6000, "memory_b": 16 * GIB}})), 2)   # the control
 
 
+class MoreMutants(unittest.TestCase):
+    def test_s4_a_changed_m_request_is_caught_with_anchored_text(self):
+        original = base.source()
+        row = '"M": {"cpu": "2", "memory": "8Gi"}'
+        def check(mod):
+            if mod.SHAPE_REQUESTS["M"] != OLD_REQUESTS["M"]:
+                raise AssertionError("old row changed: M request " + repr(mod.SHAPE_REQUESTS["M"]))
+        check(base.load(original))   # control first
+        with self.assertRaises(AssertionError) as cm:
+            check(base.load(base.mutate(original, row, '"M": {"cpu": "3", "memory": "8Gi"}')))
+        self.assertTrue(str(cm.exception).startswith("old row changed"), str(cm.exception))
+
+    def test_s8_s9_no_room_and_unreadable_never_end_the_launch(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cw_bin_land_shape_m", os.path.join(ROOT, "bin", "cloud_worker.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod._lib = lambda: cw
+        full = {n: {"cpu_m": 6000, "memory_b": 16 * GIB} for n in "abc"}
+        body = {"nodes_read": True, "pods_read": True, "nodes": [dict(NODE, name=n) for n in "abc"], "requests": full}
+        for name, answer in (("no room", (0, body, "")), ("unreadable", (1, None, "x"))):
+            mod.run_launcher = lambda *a, **k: answer
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                mod._print_capacity(None, None)   # control: must not raise
+            self.assertIn("shape L:", err.getvalue(), name)
+        mod.run_launcher = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mod._print_capacity(None, None)   # an unexpected failure of the read is said, never raised: the launch goes on
+
+
+
 if __name__ == "__main__":
     unittest.main()
