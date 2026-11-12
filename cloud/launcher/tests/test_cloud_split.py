@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import tempfile
+import types
 import tokenize
 import unittest
 from pathlib import Path
@@ -147,6 +148,8 @@ class TestSplitCommands(tcw.VaultBase):
         sys.modules["cw_before_1647"] = module
         self.addCleanup(sys.modules.pop, "cw_before_1647", None)
         loader.exec_module(module)
+        if not hasattr(module, "cloud_launch_again"):   # the frozen file predates the part (#1619); the switchboard reads its RETURNED set (the empty stand-in is all the s4 comparison needs from it)
+            module.cloud_launch_again = types.SimpleNamespace(RETURNED=set())
         return module
 
     def normal(self, text):
@@ -218,9 +221,10 @@ class TestSplitCommands(tcw.VaultBase):
         text = text.replace('print(message_id or "sent")', 'print(message_id or "sent!")')
         self.applied = before == 1 and text.count('print(message_id or "sent!")') == 1
         (tree / "bin" / "cloud_worker.py").write_text(text)
-        for name in ("cloud_cluster.py", "cloud_inspect.py", "cloud_launch_again.py", "path_walk.py"):
+        for name in sorted(q.name for q in (ROOT / "bin").glob("cloud_*.py") if q.name != "cloud_worker.py") + ["path_walk.py"]:   # every part the file may load
             shutil.copy(str(ROOT / "bin" / name), str(tree / "bin" / name))
         os.symlink(str(ROOT / "cloud"), str(tree / "cloud"))
+        self.mutant_file = tree / "bin" / "cloud_worker.py"   # the copy loop above skips cloud_worker.py: copying it would overwrite the mutant with the pristine file
         loader = importlib.machinery.SourceFileLoader("cw_mutant_1647", str(tree / "bin" / "cloud_worker.py"))
         spec = importlib.util.spec_from_loader("cw_mutant_1647", loader)
         module = importlib.util.module_from_spec(spec)
@@ -228,6 +232,16 @@ class TestSplitCommands(tcw.VaultBase):
         self.addCleanup(sys.modules.pop, "cw_mutant_1647", None)
         loader.exec_module(module)
         return module
+
+    def test_s4_the_mutant_tree_keeps_the_mutated_file_and_the_parts(self):
+        """Control first: the pristine file has no 'sent!'; then the mutant tree's cloud_worker.py must still carry it (a part copy must not overwrite it)."""
+        self.assertNotIn('print(message_id or "sent!")', (ROOT / "bin" / "cloud_worker.py").read_text())
+        self.mutant_module()
+        self.assertTrue(self.applied)
+        self.assertIn('print(message_id or "sent!")', self.mutant_file.read_text())
+        for q in (ROOT / "bin").glob("cloud_*.py"):
+            if q.name != "cloud_worker.py":
+                self.assertTrue((self.mutant_file.parent / q.name).exists(), q.name)
 
     def test_s4_mutant_the_changed_fallback_text_is_seen(self):
         new = self.script()
