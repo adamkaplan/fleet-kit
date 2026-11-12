@@ -154,25 +154,43 @@ MINT = "cre" + "ate token cw-operator --duration=30m"   # the one mint command (
 SIGN_IN = re.compile(r"devicelogin|device login|to sign in|enter the code|authenticate", re.I)
 
 
-def kube_run(argv, env, stdin=None, fds=()):
+def kube_run(argv, env, stdin=None, fds=(), config=None):
     """One kubectl call: stdin closed (or the brief), its own process group, a hard timeout (CW_PROOF_KUBECTL_TIMEOUT seconds, default 120).
-    Raises KubeUnusable on a sign-in prompt or a timeout; returns the finished process otherwise (None when it cannot run)."""
+    config: kubeconfig text handed over a pipe descriptor (KUBECONFIG=/dev/fd/N): never on disk, argv or environment text.
+    The process group is killed on every path. Raises KubeUnusable on a sign-in prompt or a timeout; returns the finished process otherwise."""
     try:
         limit = float(env.get("CW_PROOF_KUBECTL_TIMEOUT") or 120)
     except ValueError:
         limit = 120.0
+    cfd = -1
+    if config is not None:
+        rfd, wfd = os.pipe()
+        try:
+            os.write(wfd, config.encode())
+        finally:
+            os.close(wfd)
+        cfd = rfd
+        env = dict(env, KUBECONFIG="/dev/fd/%d" % cfd)
+        fds = tuple(fds) + (cfd,)
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, env=env, start_new_session=True, pass_fds=fds)
     except OSError:
         raise KubeUnusable("kubectl could not be run") from None
-    try:
-        out, err = proc.communicate(stdin, timeout=limit)
-    except subprocess.TimeoutExpired:
+    finally:
+        if cfd >= 0:
+            os.close(cfd)
+
+    def group_kill():
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
-            proc.kill()
+            pass
+    try:
+        out, err = proc.communicate(stdin, timeout=limit)
+    except subprocess.TimeoutExpired:
+        group_kill()
+        proc.kill()
         try:
             out, err = proc.communicate(timeout=5)
         except subprocess.SubprocessError:
@@ -180,13 +198,14 @@ def kube_run(argv, env, stdin=None, fds=()):
         if SIGN_IN.search((out or "") + (err or "")):
             raise KubeUnusable("kubectl is waiting for a cluster sign-in; sign in again (or set CW_SECRET_DIR with the minter kubeconfig)") from None
         raise KubeUnusable("kubectl did not answer within %d seconds" % limit) from None
+    group_kill()   # the normal end too: nothing kubectl started outlives the call
     if SIGN_IN.search((out or "") + (err or "")) and proc.returncode != 0:
         raise KubeUnusable("kubectl asked for a cluster sign-in; sign in again (or set CW_SECRET_DIR with the minter kubeconfig)")
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def mint_token(env):
-    """A 30-minute cw-operator token from the minter kubeconfig of CW_SECRET_DIR (the launcher's reader and file name); never printed or stored."""
+    """The kubeconfig text for a 30-minute cw-operator token minted with the minter kubeconfig of CW_SECRET_DIR (the launcher's reader and file name); never printed or stored."""
     sys.path.insert(0, os.path.join(ROOT, "cloud", "launcher"))
     try:
         import secret_files as module
@@ -201,21 +220,30 @@ def mint_token(env):
         raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig cannot be read from CW_SECRET_DIR") from None
     if not config or len(config) > 60000:
         raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig is empty or too large")
-    rfd, wfd = os.pipe()
-    try:
-        os.write(wfd, config.encode())
-        os.close(wfd)
-        wfd = -1
-        done = kube_run(["kubectl", "--kubeconfig", "/dev/fd/%d" % rfd, "-n", env.get("CW_CLOUD_NAMESPACE") or "cw"] + MINT.split(),
-                        dict(env, KUBECONFIG=os.devnull), fds=(rfd,))
-    finally:
-        os.close(rfd)
-        if wfd >= 0:
-            os.close(wfd)
+    mint = kube_run(["kubectl", "-n", env.get("CW_CLOUD_NAMESPACE") or "cw"] + MINT.split(), dict(env, KUBECONFIG=os.devnull), config=config)
+    done = mint
+    view = kube_run(["kubectl", "config", "view", "--minify", "--raw", "-o", "json"], dict(env, KUBECONFIG=os.devnull), config=config)
     token = (done.stdout or "").strip() if done is not None and done.returncode == 0 else ""
     if not token or re.search(r"\s", token):
         raise KubeUnusable("no cluster login for kubectl: the token for cw-operator was refused")
-    return token
+    return operator_config(view, token, env.get("CW_CLOUD_NAMESPACE") or "cw")
+
+
+def operator_config(view, token, namespace):
+    """The in-memory kubeconfig (JSON, which is YAML) of cw-operator: the minter's server and CA, the token as the user credential, a context for
+    the namespace. Held only in memory and handed over a pipe descriptor."""
+    try:
+        cluster = json.loads(view.stdout)["clusters"][0]["cluster"]
+        server = cluster["server"]
+    except (AttributeError, ValueError, KeyError, IndexError, TypeError):
+        raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig names no cluster server") from None
+    keep = {"server": server}
+    for key in ("certificate-authority-data", "certificate-authority", "insecure-skip-tls-verify", "tls-server-name"):
+        if key in cluster:
+            keep[key] = cluster[key]
+    return json.dumps({"apiVersion": "v1", "kind": "Config", "current-context": "cw-operator",
+                       "clusters": [{"name": "cw", "cluster": keep}], "users": [{"name": "cw-operator", "user": {"token": token}}],
+                       "contexts": [{"name": "cw-operator", "context": {"cluster": "cw", "user": "cw-operator", "namespace": namespace}}]})
 
 
 def read_revision(env, source):
@@ -263,7 +291,7 @@ def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchbo
         raise Refused("the proof pod could not be launched (exit %s); no receipt was written" % ("?" if made is None else made.returncode))
     results = ""
     try:
-        kubectl = [env["CW_KUBECTL"]] if env.get("CW_KUBECTL") else ["kubectl", "--token", mint_token(env)]   # minted after the launch, so it lasts the whole wait; a refusal retires the pod below
+        kubectl, cfg = ([env["CW_KUBECTL"]], None) if env.get("CW_KUBECTL") else (["kubectl"], mint_token(env))   # minted after the launch, so it lasts the whole wait; a refusal retires the pod below
         try:
             last = [l for l in made.stdout.splitlines() if l.strip()][-1]
             pod = str(json.loads(last).get("runtime_id") or worker)
@@ -273,13 +301,13 @@ def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchbo
         if not isinstance(pod, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", pod):
             pod = worker
         ns = ["-n", env["CW_CLOUD_NAMESPACE"]] if env.get("CW_CLOUD_NAMESPACE") else []
-        kube_run(kubectl + ns + [KUBE_RUN, pod, "--", "rm", "-f", RESULTS_PATH], env)   # a results file the image brought with it is never read
+        kube_run(kubectl + ns + [KUBE_RUN, pod, "--", "rm", "-f", RESULTS_PATH], env, config=cfg)   # a results file the image brought with it is never read
         with open(os.path.join(ROOT, "cloud", "worker", "proof-set.md"), encoding="utf-8") as f:
             brief = f.read()
-        kube_run(kubectl + ns + [KUBE_RUN, "-i", pod, "--", "sh", "-c", "cat > /work/proof-set.md"], env, stdin=brief)
+        kube_run(kubectl + ns + [KUBE_RUN, "-i", pod, "--", "sh", "-c", "cat > /work/proof-set.md"], env, stdin=brief, config=cfg)
         deadline = time.monotonic() + args.wait
         while True:
-            got = kube_run(kubectl + ns + [KUBE_RUN, pod, "--", "cat", RESULTS_PATH], env)
+            got = kube_run(kubectl + ns + [KUBE_RUN, pod, "--", "cat", RESULTS_PATH], env, config=cfg)
             if got is not None and got.returncode == 0 and got.stdout.strip():
                 results = got.stdout
                 if all(any(l.split()[:1] == [item] for l in results.splitlines()) for item in ITEMS):
