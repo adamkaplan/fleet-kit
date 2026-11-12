@@ -472,7 +472,9 @@ class ReaperLoad(unittest.TestCase):
         spec = importlib.util.find_spec(name)
         self.assertIsNotNone(spec, "REAPER load %s" % name)
         self.assertEqual(os.path.realpath(spec.origin), os.path.realpath(SOURCE), "REAPER load target")
-        self.assertTrue(callable(getattr(importlib.import_module(name), "run", None)), "REAPER run")
+        module = importlib.util.module_from_spec(spec)   # loaded from the spec found above: no import by a name read at run time
+        spec.loader.exec_module(module)
+        self.assertTrue(callable(getattr(module, "run", None)), "REAPER run")
 
     def test_control(self):
         with open(WORKER) as f:

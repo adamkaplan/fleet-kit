@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
@@ -355,14 +356,10 @@ class Stall(unittest.TestCase):
     def test_an_alert_writes_exactly_one_audit_line_with_the_fixed_fields_and_runs_no_subprocess(self):
         w = World()
         w.add(msg="Permission denied: shell")
-        real = subprocess.run, subprocess.Popen
         def no(*a, **k):
             raise AssertionError("a subprocess was run")
-        subprocess.run = subprocess.Popen = no
-        try:
+        with mock.patch("subprocess.run", side_effect=no), mock.patch("subprocess.Popen", side_effect=no):   # named by string: restored on exit
             self.assertEqual(w.run(), [("w1-pod", "refusal")])
-        finally:
-            subprocess.run, subprocess.Popen = real
         self.assertEqual(w.audits, [{"worker": "w1", "runtime_id": "pod/w1-pod", "action": "stall-alert", "ok": True, "reason": "", "condition": "refusal",
                                      "recipients": ["coder-lead"], "ask": sw.STALL_ASK, "evidence": "Permission denied: shell"}])
         self.assertFalse(hasattr(sw, "_default_send"))
