@@ -42,6 +42,7 @@ cloud/launcher/tests/test_no_open_files.py
 cloud/launcher/tests/test_nudge_reused.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
+cloud/launcher/tests/test_pdb.py
 cloud/launcher/tests/test_persistent_merge_fix.py
 cloud/launcher/tests/test_persistent_orchestrator.py
 cloud/launcher/tests/test_pod_boundaries.py

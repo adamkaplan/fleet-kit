@@ -358,12 +358,14 @@ Table of every input and outside call of the change, each with its test and muta
 
 | Input or outside call | Failure handled | Test | Mutant |
 | --- | --- | --- | --- |
-| budget `create` before the pod | forbidden, odd answer: launch ends, 0 pods, 0 Secrets | `test_s8_*` | not run (a launch that creates the pod anyway fails `test_s8_*`) |
-| budget selector | matches exactly its own pod | `test_s2_*` | `test_mutant_selector_on_the_shared_label_fails_s2` |
-| budget `delete` on stop, by-name stop, reaper, failed launch | own budget removed, another's left | `test_s3_*` | `test_mutant_budget_not_deleted_by_stop_fails_s3` |
-| budget `get` for the run-identity check | missing: nothing to do; another run's: left whole | `test_s3_a_stop_with_another_run_id_leaves_the_budget` | none: not a mutant, the control run only shows the unmutated copy passes |
-| budget list in the reaper pass | unreadable: nothing deleted, one line | `test_s3_the_reaper_pass_removes_a_budget_*` | none yet (follow-up: a mutant that keeps old orphan budgets) |
-| the rendered object | name, labels, selector, `minAvailable` only | `test_s4_*` | none |
+| budget `create` before the pod | forbidden, odd answer: launch ends, 0 pods, 0 Secrets | `test_s8_*` | `test_mutant_a_refused_budget_create_is_ignored_fails_s8`, `test_mutant_pod_made_without_the_budget_first_fails_s2` |
+| budget selector | matches exactly its own pod | `test_s2_*`, `test_the_selector_keys_*` | `test_mutant_selector_on_the_shared_label_fails_s2` |
+| budget `delete` on stop, by-name stop, reaper, failed launch, gone pod | own budget removed, another's left | `test_s3_*` | `test_mutant_stop_keeps_the_budget_fails_s3`, `..._failed_launch_keeps_...`, `..._gone_pod_retire_keeps_...`, `..._reaper_keeps_orphan_budgets_...`, `..._delete_by_the_shared_label_...` |
+| budget `get` for the run-identity check | missing: nothing to do; another run's: left whole | `test_s3_a_stop_with_another_run_id_leaves_the_budget`, `test_a_young_budget_left_by_a_crashed_run_*` | none (the control run only shows the unmutated copy passes) |
+| budget list in the reaper pass | unreadable: nothing deleted, one line; a listed pod's budget is kept | `test_s3_the_reaper_pass_removes_a_budget_*`, `test_the_orphan_pass_keeps_*` | `test_mutant_reaper_keeps_orphan_budgets_fails_s3` |
+| the rendered object | name, labels, selector, `minAvailable` only | `test_s4_*` | `test_mutant_budget_copies_annotations_fails_s4` |
+
+Two delete paths do not compare the run id, on purpose: the by-name retire of a gone pod (no run id was sent, so `_mine` would also answer yes) and the reaper's orphan pass (it has no run id; it deletes only a budget whose own `cw/pod` label names an absent pod and that is over an hour old, by its exact name).
 
 Each mutant has a control run first (`test_control_*`) and an anchored failure text.
 

@@ -285,7 +285,12 @@ elif cmd == "delete" and args[1] == "pod" and st.get("pods", {}).get(args[2], {}
     sts_recreate(st["pods"].pop(args[2]))
     save()
 elif cmd == "delete" and args[1] == "poddisruptionbudget":
-    st.get("pdbs", {}).pop(args[2], None)
+    if args[2] == "-l":   # by label: every budget with it
+        k, v = args[3].split("=", 1)
+        for n in [n for n, o in st.get("pdbs", {}).items() if o["metadata"].get("labels", {}).get(k) == v]:
+            st["pdbs"].pop(n)
+    else:
+        st.get("pdbs", {}).pop(args[2], None)
     save()
 elif cmd == "delete":
     kind, name = args[1], args[2]
