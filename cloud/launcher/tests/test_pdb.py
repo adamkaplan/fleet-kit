@@ -123,6 +123,15 @@ class Pdb(base.Base):
         self.clock.advance(hours=2)
         self.assertEqual(L.remove_orphan_pdbs(pods, self.clock()), [cw.pod_name("coder1") + "-pdb"])
 
+    def test_an_unreadable_budget_list_deletes_nothing(self):
+        self.create("coder1")
+        L = cw.Launcher(cw.Kube(self.env), self.env, self.clock)
+        L.kube.list_pdbs = lambda: (_ for _ in ()).throw(cw.CloudError("garbled"))
+        self.assertEqual(L.remove_orphan_pdbs([], self.clock()), [])
+        self.assertEqual(len(self.pdbs()), 1)
+
+    # U1: every earlier launcher test passes; only the fake cluster and two forced lines changed (named in the PR body)
+
     # S8
     def refused(self, how):
         self.patch_state(fail_pdb=how)
