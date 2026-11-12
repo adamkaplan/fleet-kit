@@ -45,7 +45,7 @@ class TestClaimLegacy(unittest.TestCase):
 
     def test_the_shape_of_1675_a_sibling_merged_on_25_october_with_no_recorded_claim_passes_with_no_waiver(self):
         self.assertIsNone(self.judge("2026-10-25T17:57:00Z"))
-        self.assertIn("no recorded claim", self.judge("2026-10-30T00:00:00Z"))   # the same shape after the cutoff is still refused
+        self.assertIn("no recorded claim", self.judge("2026-11-12T00:00:00Z"))   # the same shape after both cutoffs is still refused (the second: CLAIM_HAND_MERGE_UNTIL, #2454)
 
     def test_s3_after_the_cutoff_or_unreadable_the_sibling_is_still_unknown(self):
         for when in (iso(CUTOFF + 86400 * 30), "not a time", "2026-10-29"):
@@ -56,7 +56,7 @@ class TestClaimLegacy(unittest.TestCase):
     def test_s4_the_boundary_is_at_or_before(self):
         self.assertIsNone(self.judge(iso(CUTOFF)))
         self.assertIsNone(self.judge(iso(CUTOFF - 1)))
-        self.assertIn("no recorded claim", self.judge(iso(CUTOFF + 1)))
+        self.assertIsNone(self.judge(iso(CUTOFF + 1)))   # #2454: now read by CLAIM_HAND_MERGE_UNTIL; its own boundary is pinned in test_claim_hand_merge.py
 
     def test_s5_the_cutoff_is_defined_once_read_by_one_rule_and_documented(self):
         src = (REPO / "bin" / "fleet-switchboard").read_text()
@@ -104,7 +104,7 @@ class TestClaimLegacy(unittest.TestCase):
                 copy_entry(directory)
                 text = (directory / "fleet-switchboard").read_text()
                 self.assertEqual(text.count(old), 1, "the mutant applies exactly once")
-                for label, source in (("control", text), (name, text.replace(old, new, 1))):
+                for label, source in (("control", text), (name, text.replace(old, new, 1).replace("CLAIM_HAND_MERGE_UNTIL = 1794412647 ", "CLAIM_HAND_MERGE_UNTIL = 0 "))):   # #2454: the second cutoff is neutralised, so each mutant tests the older rule alone
                     (directory / "fleet-switchboard").write_text(source)
                     loader = importlib.machinery.SourceFileLoader("sb_legacy_%s_%d" % (label.replace(" ", "_"), id(directory)), str(directory / "fleet-switchboard"))
                     copy = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
