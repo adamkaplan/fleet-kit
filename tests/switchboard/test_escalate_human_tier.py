@@ -95,7 +95,7 @@ class TestEscalateHeldPullRequestTier(HOST.BaselineWorld if HOST is not None els
         self.assertEqual(self.row()["tier"], "human")
         (shown,) = self.owners_rows()
         self.assertEqual((shown["url"], shown["head"]), ("https://github.com/%s/pull/7" % REPO, HEAD_A))
-        self.assertTrue(shown["review_evidence"], "the reviewer line is there")
+        self.assertEqual(shown["review_evidence"], "no notice recorded: held on its labels alone", "the reviewer line")
         self.assertEqual(len([d for d in self.derive() if d.get("number") == 7]), 1, "one row")
         self.engine.run_pass()   # a pass of the daemon keeps it
         self.assertEqual(self.row()["tier"], "human")
