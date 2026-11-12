@@ -1,5 +1,4 @@
-"""#1083: the ONE table cloud/worker/guard-table.tsv. Every row runs through the guard layer (guard.sh plus the allow and deny patterns of
-opencode-worker.json, last match wins) and through the client (cw-gh against a loopback stub): they must agree. Mutants: a config that opens
+"""#1083: the ONE table cloud/worker/guard-table.tsv. Every row runs through the guard layer (guard.sh alone: since ask #2402 opencode-worker.json carries no shell deny row) and through the client (cw-gh against a loopback stub): they must agree. Mutants: a config that opens
 the whole issues path, and a client that opens it, each make a row fail. Offline; the token is synthetic."""
 import http.server
 import json
@@ -21,11 +20,6 @@ TOKEN = "synthetic-" + "Zp4Rt9" * 6
 NEW_IDS = {"issue-comments-read", "pull-reviews-read", "pull-comments-read", "api-jq-filter", "issues-other-path"}
 
 
-def load_conf():
-    with open(CONF) as f:
-        return json.load(f)
-
-
 def rows():
     out = []
     for line in open(TABLE).read().splitlines():
@@ -36,23 +30,17 @@ def rows():
     return out
 
 
-def conf_decision(conf, line):
-    bash = conf["permission"]["bash"]
-    assert bash == conf["agent"]["worker"]["permission"]["bash"]
-    res = "allow"
-    for pat, v in bash.items():   # opencode: the last matching rule wins
-        if re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S):
-            res = v
-    return res
+# ask #2402: rows whose shell-layer refusal was only a deny row of opencode-worker.json (removed); the client still refuses them
+CONF_ONLY = {"issues-other-path", "issues-labels-path", "shell-record-var", "shell-record-dir"}
 
 
-def guard_denies(example, conf=None):
+def guard_denies(example):
     args = example.split()
     r = subprocess.run(["sh", GUARD, "gh"] + args, capture_output=True, text=True, timeout=30, env={"PATH": "/usr/bin:/bin"})
     if r.returncode == 3:
         return True
     assert r.returncode == 0, r.stderr
-    return conf_decision(conf or load_conf(), "gh " + example) == "deny"
+    return False
 
 
 class Rec(http.server.BaseHTTPRequestHandler):
@@ -101,7 +89,7 @@ class Table(unittest.TestCase):
                 continue   # ask 1200: these rows write; tests/test_pr_edit.py runs them through both
             with self.subTest(row=r["id"]):
                 denied = r["kind"] == "denied"
-                self.assertEqual(guard_denies(r["example"]), denied, "guard: " + r["id"])
+                self.assertEqual(guard_denies(r["example"]), denied and r["id"] not in CONF_ONLY, "guard: " + r["id"])
                 p = self.client(r["example"])
                 if denied:
                     self.assertEqual(p.returncode, 2, (r["id"], p.stderr))
@@ -116,7 +104,7 @@ class Table(unittest.TestCase):
         by = {r["id"]: r for r in rows()}
         for i in ("issue-comments-read", "pull-reviews-read", "pull-comments-read"):
             self.assertFalse(guard_denies(by[i]["example"]), i)
-        for i in ("issues-write-post", "issues-write-patch", "issues-write-delete", "issues-other-path", "issues-labels-path", "pull-merge", "pull-review-write"):
+        for i in ("issues-write-post", "issues-write-patch", "issues-write-delete", "pull-merge", "pull-review-write"):
             self.assertTrue(guard_denies(by[i]["example"]), i)
 
     def test_s9_the_jq_filter_applies_client_side_and_the_write_flags_stay_refused(self):
@@ -135,15 +123,6 @@ class Table(unittest.TestCase):
         self.assertIn(r.returncode, (0, 128))   # 128: no origin/HEAD in this checkout
         for row in rows():
             self.assertEqual(row["tool"], "gh")
-
-    def test_s10_a_mutant_that_opens_the_whole_issues_path_fails(self):
-        conf = load_conf()
-        conf["permission"]["bash"] = dict(conf["permission"]["bash"])
-        del conf["permission"]["bash"]["gh api*/issues*"]
-        conf["agent"]["worker"]["permission"]["bash"] = conf["permission"]["bash"]
-        bad = [r["id"] for r in rows() if r["kind"] == "denied" and r["method"] == "GET" and "issues" in r["path"]
-               and not guard_denies(r["example"], conf)]
-        self.assertIn("issues-other-path", bad)   # the changed row: the agreement test would fail on it
 
     def test_s10_a_client_that_opens_the_whole_issues_path_fails_the_agreement(self):
         src = open(CW_GH).read()
@@ -175,49 +154,13 @@ class Table(unittest.TestCase):
             self.assertEqual(p.returncode, 0, bad)   # the mutant sends the GET: the test above would fail on it
             self.assertEqual(len(Rec.seen), 1)
 
-    FLAG_PATTERNS = {"-f": "gh api* -f*", "-F": "gh api* -F*", "--input": "gh api*--input*", "graphql": "gh api*graphql*"}
-
-    def table_deny_patterns(self):
-        """The permission patterns that the table's denied rows need in opencode-worker.json (the method rows and the flag rows)."""
-        out = set()
-        for r in rows():
-            if r["kind"] != "denied":
-                continue
-            if r["method"] in ("POST", "PATCH", "PUT", "DELETE"):
-                out.add("gh api*%s*" % r["method"])
-            if r["path"] in self.FLAG_PATTERNS:
-                out.add(self.FLAG_PATTERNS[r["path"]])
-        return out
-
-    def missing_deny_rows(self, conf):
-        """Table deny rows absent from either bash block, and method deny rows of the file that the table does not list."""
-        want = self.table_deny_patterns()
-        blocks = (conf["permission"]["bash"], conf["agent"]["worker"]["permission"]["bash"])
-        missing = [(i, w) for i, b in enumerate(blocks) for w in sorted(want) if b.get(w) != "deny"]
-        extra = [k for k, v in blocks[0].items() if v == "deny" and re.fullmatch(r"gh api\*(POST|PATCH|PUT|DELETE)\*", k) and k not in want]
-        return missing, extra
-
-    def test_m2_every_deny_row_of_the_table_is_in_the_permission_file_and_back(self):
-        self.assertEqual(self.missing_deny_rows(load_conf()), ([], []))
-        self.assertEqual(len(self.table_deny_patterns()), 8)
-
-    def test_m2_a_mutant_that_drops_a_deny_row_is_seen(self):
-        for drop in ("gh api*POST*", "gh api*graphql*"):
-            conf = json.loads(json.dumps(load_conf()))
-            del conf["permission"]["bash"][drop]
-            del conf["agent"]["worker"]["permission"]["bash"][drop]
-            missing, _ = self.missing_deny_rows(conf)
-            self.assertEqual(sorted(w for _, w in missing), [drop, drop], drop)
-
-    def test_low_lower_and_capitalised_method_words_are_denied_in_the_shell_layer_and_by_the_client(self):
+    def test_low_lower_and_capitalised_method_words_are_denied_by_the_client(self):
         for m in ("post", "Post", "patch", "Patch", "put", "Put", "delete", "Delete"):
             for fl in ("-X", "--method"):
                 ex = "api %s %s repos/acme-org/widget-service/pulls/7/comments" % (fl, m)
                 with self.subTest(ex=ex):
-                    self.assertEqual(conf_decision(load_conf(), "gh " + ex), "deny")
                     self.assertEqual(self.client(ex).returncode, 2)
                     self.assertEqual(Rec.seen, [])
-        self.assertEqual(conf_decision(load_conf(), "gh api -X GET repos/acme-org/widget-service/pulls/7/comments"), "allow")
 
     def test_low_an_unsupported_jq_expression_is_refused_before_any_request(self):
         for expr in (".[]|.body", "map(.id)", ".a|length", "$ENV", ".[0].body?"):
