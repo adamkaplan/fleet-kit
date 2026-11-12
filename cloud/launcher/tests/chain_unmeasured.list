@@ -111,3 +111,5 @@ cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_scan_dpkg_skip.py
 cloud/worker/tests/test_shell_check.py
 cloud/worker/tests/test_token_table.py
+cloud/worker/tests/test_tool_cap.py
+cloud/worker/tests/test_tool_cap_env.py
