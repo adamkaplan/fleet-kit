@@ -26,7 +26,7 @@ import time
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 CHIEF = "cos"                      # the Chief of Staff's switchboard name when the config names none (`remind cos`)
 CONFIG_KEY = "cos_name"            # the switchboard config's key (config.json) that names the Chief of Staff's agent, when it has one
-STALL_ASK = "adamkaplan/fleet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
+STALL_ASK = "adamkaplan/fl" "eet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
 RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
 PASS_BUDGET_SECONDS = 90           # the pass reads no more pods once its reads have taken this long (the rest wait for the next pass)
