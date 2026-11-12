@@ -24,3 +24,4 @@ exempt plugins/opencode-todolist/tests/todolist.test.ts | a TypeScript test: the
 exempt plugins/opencode-todolist/tests/tui-data.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
 exempt plugins/opencode-todolist/tests/tui-settings.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
 exempt remote_worker/tests/test_remote_worker.py | an offline unit suite of the new remote_worker package; no workflow step runs it yet, and adding one is a workflow-file change a worker token cannot push
+exempt remote_worker/tests/test_floor_carrier.py | an offline unit suite of the new remote_worker package; no workflow step runs it yet, and adding one is a workflow-file change a worker token cannot push

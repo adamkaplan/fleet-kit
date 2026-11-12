@@ -8,7 +8,9 @@ from remote_worker import launch_remote_worker, load_config, transport_from_conf
 from remote_worker.floor import FloorTransport
 
 cfg = load_config(os.environ)   # FLEET_REMOTE_TRANSPORT and FLEET_REMOTE_LAND_COMMAND, both required
-register_transport("floor", lambda: FloorTransport(base_url=..., token_env="MY_TOKEN_VAR", git_base="https://git.example"))
+register_transport("floor", lambda: FloorTransport(account="examplestore", floor_id="f1", caller_id="fleet",
+                                                   queue_sas_file="/path/queue-sas", container_sas_file="/path/container-sas",
+                                                   git_base="https://git.example"))
 t = transport_from_config(cfg)
 h = launch_remote_worker(t, name="widget-1", repo="acme/widget-api", branch="work/widget-1", task="...", land_command=cfg.land_command)
 status = wait_for_end(t, h, timeout=3600)   # status.state "done" carries landed_sha
@@ -36,29 +38,42 @@ States: `queued`, `running`, `idle`, `done`, `failed`, `retired`; the last three
 | worker name, `OWNER/NAME` repo, branch, task, idle and hard seconds | `launch.validate_spec`, before any call | `SpecTests.test_each_bad_input_is_refused_before_any_call` |
 | land command (configuration `FLEET_REMOTE_LAND_COMMAND`, no default, one printable line) | `load_config`, `validate_spec` | `ConfigTests` |
 | transport name (`FLEET_REMOTE_TRANSPORT`) | `transport_from_config` | `ConfigTests.test_registry` |
-| base URL (https, or http to loopback), git base (https), token variable | `FloorTransport.__init__` | `FloorTests.test_construction_refuses_unsafe_settings` |
-| HTTP request to `<base>/v1/...` with a bearer token (the only network call) | `FloorTransport._call` | `FloorTests` (an in-memory HTTP function) |
-| service answers (state, session id, landed sha, size, JSON) | `FloorTransport` | `FloorTests.test_bad_answers_are_refused` |
-| message size, handle of another transport | `FloorTransport` | `FloorTests.test_oversize_message...`, `test_foreign_handle...` |
+| storage account, floor id, caller id, git base | `FloorTransport.__init__` | `ConfigurationTests.test_unsafe_settings_are_refused`, `test_names_are_configuration` |
+| the two SAS files (paths are configuration; regular, small, not group or other readable) | `floor.load_sas_file` | `ConfigurationTests.test_sas_file_rules` |
+| `POST` to the command queue (add only, `messagettl=86400` on every message) | `FloorTransport._add_message` | `CarrierTests.test_every_message_carries_the_24_hour_ttl` |
+| `PUT` of a payload blob (a command over 48 KiB) | `FloorTransport._put_blob` | `PayloadTests` |
+| `GET` of `state.json` (conditional) and `msg/<session>.json` | `FloorTransport._get_blob` | `StateTests` |
+| service answers (state, landed sha, JSON, acks) | `FloorTransport.status`, `_read_state` | `StateTests.test_bad_state_answers_are_refused` |
+| handle of another transport, message over 256 KiB | `FloorTransport` | `StopAndSessionTests.test_foreign_handle...`, `PayloadTests.test_over_256_kib...` |
 
-The land command is text the worker is told to run as its last step; this package never runs it. The token is read once from the named
-environment variable and appears in no log, error or return value.
+The land command is text the worker is told to run as its last step; this package never runs it. Neither SAS token appears in a log, error, repr or
+return value; each goes only to its own fixed host (the queue token to the queue, the container token to the blob container).
 
-## Floor transport and the service's interface v0
+## Floor transport (`floor.py`): the outbound-only carrier, interface v1
 
-`floor.py` follows the service's published transport interface v0. Where the two differ:
+Neither side accepts a connection. Commands are added to a storage queue; state is read back from a blob container.
 
-- The service takes the repository as a full git URL and a `ref`; this package takes `OWNER/NAME` and a branch, and the transport joins `git_base`.
-- The service keeps its own land command and does not take one in a launch request; here it is configuration and goes to the worker in the brief.
-  The service detects the end when the worker's message ends with `landed <sha>` (state `done`, `landed_sha` set), so the configured command must be
-  one whose result the worker reports in that form.
-- A repeated `client_key` (the worker name) returns the first session; `send` with a `message_id` is idempotent. Both are used.
-- A send to a finished session is refused by the service (409); it surfaces as a non-retryable `TransportError`. A 429 (busy) is retryable.
-- The service answers 404 for a session that is another caller's, so `stop` cannot tell it from one already gone and treats both as stopped.
-- The service's retire takes no reason; `stop` does not send it.
-- `idle` and `queued` are states of the service; the interface carries them as they are.
+| Operation | What the carrier does |
+|---|---|
+| start | add a `launch` command, `seq` 1. The session id and the command id come from the worker name, so a repeated start (even from a new process) is the same launch |
+| send | add a `send` command, `seq` + 1. A repeated `message_id` reuses its `cmd_id` and sends nothing more |
+| stop | add a `retire` command; nothing if the session is known to have ended |
+| status | conditional `GET` of `state.json`, take the session; read the `acks`; add again, unchanged, any command with no ack after 60 s |
+| last_message | `GET` of `msg/<session>.json` ("" when the blob does not exist) |
+
+Details a caller needs:
+
+- Numbering is kept in memory. A new process that wants to send to a session an earlier one started calls `adopt(handle, next_seq)`.
+- A command that could not be added is kept and added again (same `cmd_id`, same `seq`) before the next command of that session, so no number is skipped.
+- A command over 48 KiB has its `brief`, `text` and `env` moved to the blob `payload/<cmd_id>.json`, written first; the message carries its name.
+- `command_result(cmd_id)` gives `pending`, `applied`, `duplicate` or `rejected:<code>`, as of the last `status` call. A rejected launch makes `status` raise.
+- `floor_alive()` is false when `state.json` is older than 90 s: Floor is unreachable. Do not retire or relaunch on that alone.
+- The land command is Floor's own configuration (the project's land tool); it is not a request field. The brief names the configured command, and the
+  service detects the end when the worker's message ends with `landed <sha>`.
+- The caller never deletes from the container or reads the queue (its tokens do not allow it).
+- `messagettl=86400` is set by the sender on every message; the queue's default is 7 days.
 
 ## Tests
 
-`python3 -m unittest remote_worker.tests.test_remote_worker` (standard library only, no network, about a millisecond). This file is not yet a
-step of the CI workflow.
+`python3 -m unittest remote_worker.tests.test_remote_worker remote_worker.tests.test_floor_carrier` (standard library only, no network, a fake HTTP layer). These
+files are not yet a step of the CI workflow.
