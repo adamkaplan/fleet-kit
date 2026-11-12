@@ -26,7 +26,8 @@ sys.modules["cw_test_cloud_worker_mod"] = tcw
 _loader.exec_module(tcw)
 
 FUTURE, PAST = "2099-01-01T00:00:00Z", "2001-01-01T00:00:00Z"
-CAP = int(re.search(r"^MAX_M_PER_LANE = (\d+)", (ROOT / "bin" / "cloud_worker.py").read_text(), re.M).group(1))   # the cap itself, read from the code
+CAP = int(re.search(r"^MAX_PER_LANE = .*?\"M\": (\d+)", (ROOT / "bin" / "cloud_worker.py").read_text(), re.M).group(1))   # the cap itself, read from the code
+CAP_L = int(re.search(r'"L": (\d+)', (ROOT / "bin" / "cloud_worker.py").read_text()).group(1))   # the cap of shape L, from the table
 OLD_ONLY = "M_CAP_SCRATCH_OLD"   # set only in the scratch copy of the code before the change
 
 
@@ -86,6 +87,17 @@ class TestScenarios(Cap):
         self.assertIn("retire one", lines[0])
         self.assertIn("--shape S", lines[0])
         self.assertEqual(self.calls(), 0)
+
+    def test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l(self):
+        self.assertLess(CAP_L, CAP)
+        for n in range(1, CAP_L + 1):
+            self.put("big%d" % n, shape="L")
+        self.put("mid1")   # a shape-M record does not count against L
+        code, out, err = self.ask("extra1", shape="L")
+        self.assertEqual(code, 2, err)
+        self.assertIn("holds %d shape-L" % CAP_L, err)
+        self.assertEqual(self.calls(), 0)
+        self.assertEqual(self.ask("extra2", lane="lane-b", shape="L")[0], 0)   # another lane is not held
 
     def test_s4_other_shapes_names_and_lanes_proceed_as_before(self):
         for n in range(1, CAP + 1):
@@ -198,7 +210,7 @@ class TestScratch(unittest.TestCase):
         return applied, code, Path(d, "out.txt").read_text() + Path(d, "err.txt").read_text()
 
     def test_s2_the_old_code_accepts_the_sixth_launch(self):
-        edits = [('    if args.shape == "M":   # the per-lane cap', '    if False:   # the per-lane cap'),
+        edits = [('    if args.shape in MAX_PER_LANE:   # the per-lane cap', '    if False:   # the per-lane cap'),
                  ("            if isinstance(args.shape, str) and args.shape:\n                record[\"shape\"]", "            if False:\n                record[\"shape\"]")]
         applied, code, out = self.child(edits, "test_s2_the_code_before_the_change_accepts_a_sixth_launch", old=True)
         print(out.strip().splitlines()[0] if "S2:" in out else out[-300:])
@@ -209,6 +221,12 @@ class TestScratch(unittest.TestCase):
         applied, code, out = self.child([("            if len(held) >= MAX_M_PER_LANE:", "            if False:")], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")
         print("S8: mutant never-stops exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
+
+    def test_l_a_mutant_that_never_stops_shape_l_fails_the_l_cap_test(self):
+        edits = [("            if len(held) >= MAX_PER_LANE[args.shape]:", "            if False:")]
+        applied, code, out = self.child(edits, "test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l")
+        self.assertEqual((applied, code), (1, 1), out[-800:])
+        self.assertIn("holds %d shape-L" % CAP_L, out)   # the failing assertion names the missing refusal
 
     def test_s8_a_mutant_that_counts_every_shape_fails_the_other_shapes_scenario(self):
         applied, code, out = self.child([('record.get("shape") != "M" or ', "")], "test_s4_other_shapes_names_and_lanes_proceed_as_before")

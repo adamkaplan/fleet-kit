@@ -48,7 +48,8 @@ NO_COMMIT_OPTION = "--no-commit"   # the pod is launched NOT to commit (a measur
 CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "L", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M", "L")   # the rows with stack: true; --stack with another shape is refused here, before any call
-MAX_M_PER_LANE = 10  # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
+MAX_PER_LANE = {"M": 10, "L": 2}  # live cloud workers of a capped shape one lane may hold (L: one pod takes a node)
+MAX_M_PER_LANE = MAX_PER_LANE["M"]  # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -738,14 +739,14 @@ def _launch(args, runner, now, reserve):
     check_allowed(repo)   # before anything is read, minted or created
     if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
         raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
-    if args.shape == "M":   # the per-lane cap on shape M: a directory read, only for a new name, before the preflight mints a token
+    if args.shape in MAX_PER_LANE:   # the per-lane cap on shapes M and L: a directory read, only for a new name, before the preflight mints a token
         cap_state = H["ensure_state_dir"]()
         if load_record(cap_state, name) is None:
             lane = args.reports_to or "(no boss)"
-            held = lane_m_workers(cap_state, lane)
-            if len(held) >= MAX_M_PER_LANE:
-                raise Refusal("lane %s already holds %d shape-M cloud workers (%s): retire one (retire NAME) or launch a smaller shape (--shape S)"
-                              % (lane, MAX_M_PER_LANE, ", ".join(held[:10])))
+            held = lane_m_workers(cap_state, lane, args.shape)
+            if len(held) >= MAX_PER_LANE[args.shape]:
+                raise Refusal("lane %s already holds %d shape-%s cloud workers (%s): retire one (retire NAME) or launch a smaller shape (--shape S)"
+                              % (lane, MAX_PER_LANE[args.shape], args.shape, ", ".join(held[:10])))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
