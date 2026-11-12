@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import tempfile
+import types
 import tokenize
 import unittest
 from pathlib import Path
@@ -147,6 +148,8 @@ class TestSplitCommands(tcw.VaultBase):
         sys.modules["cw_before_1647"] = module
         self.addCleanup(sys.modules.pop, "cw_before_1647", None)
         loader.exec_module(module)
+        if not hasattr(module, "cloud_launch_again"):   # the frozen file predates the part (#1619); the switchboard reads its RETURNED set
+            module.cloud_launch_again = types.SimpleNamespace(RETURNED=set())
         return module
 
     def normal(self, text):
@@ -218,7 +221,7 @@ class TestSplitCommands(tcw.VaultBase):
         text = text.replace('print(message_id or "sent")', 'print(message_id or "sent!")')
         self.applied = before == 1 and text.count('print(message_id or "sent!")') == 1
         (tree / "bin" / "cloud_worker.py").write_text(text)
-        for name in ("cloud_cluster.py", "cloud_inspect.py", "cloud_launch_again.py", "path_walk.py"):
+        for name in sorted(q.name for q in (ROOT / "bin").glob("cloud_*.py")) + ["path_walk.py"]:   # every part the file may load
             shutil.copy(str(ROOT / "bin" / name), str(tree / "bin" / name))
         os.symlink(str(ROOT / "cloud"), str(tree / "cloud"))
         loader = importlib.machinery.SourceFileLoader("cw_mutant_1647", str(tree / "bin" / "cloud_worker.py"))
