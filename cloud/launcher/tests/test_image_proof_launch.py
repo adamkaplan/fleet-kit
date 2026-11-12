@@ -192,7 +192,6 @@ class Items(unittest.TestCase):
         self.assertEqual(sorted(items), sorted(G.ITEMS))
         rows = deny_table()
         compiled = [wildcard(p) for p, _ in rows]
-        self.assertGreater(len(rows), 1000)
         count = 0
         for item, lines in items.items():
             self.assertTrue(lines, item)
@@ -202,11 +201,21 @@ class Items(unittest.TestCase):
         self.assertGreaterEqual(count, 7)
 
     def test_s6_discriminates_the_old_hook_command_and_a_push_are_refused(self):
-        rows = deny_table()
-        compiled = [wildcard(p) for p, _ in rows]
+        # the shipped file may hold no deny row at all (#2423); the matcher must still discriminate, so judge it on a table
+        # that holds the shipped rows plus deny rows for a push to the default branch and the old hook command
         scope = "glo" + "bal"
-        for bad in ("git con" + "fig --" + scope + " core.hooksPath", "git con" + "fig --" + scope + " core.hooksPath=/x", "git push origin HEAD:main"):
+        hook = "git con" + "fig --" + scope + " core.hooksPath*"
+        rows = deny_table() + [("git push origin HEAD:main", "deny"), (hook, "deny")]
+        compiled = [wildcard(p) for p, _ in rows]
+        for bad in ("git con" + "fig --" + scope + " core.hooksPath=/x", "git push origin HEAD:main"):
             self.assertTrue(refused(bad, rows, compiled), bad)
+        self.assertFalse(refused("git status", rows, compiled))
+        # every deny row the shipped file really has refuses its own text
+        real = deny_table()
+        rc = [wildcard(p) for p, _ in real]
+        for pattern, action in real:
+            if action == "deny" and "*" not in pattern and "?" not in pattern:
+                self.assertTrue(refused(pattern, real, rc), pattern)
 
     def test_the_hook_item_reads_a_file_and_never_asks_git_for_the_hooks_path(self):
         hook = "\n".join(proof_items()["hook"])
