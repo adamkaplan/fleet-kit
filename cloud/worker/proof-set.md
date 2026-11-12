@@ -69,7 +69,7 @@ cw-run start --name proof-test-8 -- sh -c 'cd /work/repo/server && node --import
 cw-run wait proof-test-8 240
 ```
 
-Expected (operator's run in a pod of image 48ecb532, all exit 0): queue-install 5 pass, queue-install-postgres 2 pass and 4 skipped, index-facts-postgres 13, demo-checkpoint-repos 3, workroom-clone-real-git 2, workroom-writer-git-env 6, workroom-contract 5, pod-setup-script 11.
+Expected (operator's run in a pod of the previous image, all exit 0): queue-install 5 pass, queue-install-postgres 2 pass and 4 skipped, index-facts-postgres 13, demo-checkpoint-repos 3, workroom-clone-real-git 2, workroom-writer-git-env 6, workroom-contract 5, pod-setup-script 11.
 
 ### identity
 
@@ -77,7 +77,7 @@ Expected (operator's run in a pod of image 48ecb532, all exit 0): queue-install 
 [ "$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*//p' ~/.git[c]onfig | tail -n 1)" = "$(sed -n 1p /etc/cw-default-identity)" ] && [ "$(sed -n 's/^[[:space:]]*email[[:space:]]*=[[:space:]]*//p' ~/.git[c]onfig | tail -n 1)" = "$(sed -n 2p /etc/cw-default-identity)" ] && echo pass
 ```
 
-## The formerly red test files of the spire-venue repository
+## The formerly red test files of the launch repository
 
 One line each; the `tests` item is `pass` only when every one exits 0.
 

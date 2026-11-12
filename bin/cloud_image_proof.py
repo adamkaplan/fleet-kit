@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -168,6 +169,7 @@ def prove(args, env, now=None, sleep=time.sleep):
     remove_stale_scratch(env)
     scratch = None
     try:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # SIGTERM runs the same cleanup below
         scratch = make_scratch(env, args.digest)
         return _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard, kubectl)
     finally:
