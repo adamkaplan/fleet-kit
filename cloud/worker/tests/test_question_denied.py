@@ -74,11 +74,6 @@ def loud_skip(test, what):
     test.skipTest(msg)
 
 
-def base_other_keys():
-    ref, data = base_file(JSON_REL)
-    # the base may already hold the record entries (on the integration tip the merge base is HEAD itself): strip them from both sides
-    return None if ref is None else strip_record_entries(strip_question(json.loads(data)))
-
 
 EXPECTED_STRIPPED = {"permission": {"bash": {"*": "allow"}}, "agent": {"worker": {"permission": {"bash": {"*": "allow"}}}}}
 
@@ -104,11 +99,10 @@ class T(unittest.TestCase):
         # ask #2402: the file is compared with its whole expected content, not with the base commit's copy (the base held the rows this change removes)
         check_pin(load())
 
-    def test_s4_unrelated_change_still_fails_against_base_with_record_entries(self):
-        # the base already carries the record entries (CI on the tip): an unrelated change must still differ
-        base = strip_record_entries(strip_question(load()))
+    def test_s4_unrelated_change_still_fails_the_whole_content_pin(self):
+        # integration's test of the same name idea (an unrelated change must still differ) kept: ask #2402 compares with the whole expected content, so no base copy is needed
         cur = load()
-        self.assertEqual(without_ref_rules(strip_record_entries(strip_question(cur))), without_ref_rules(base))
+        check_pin(cur)
         for mut in ("bash", "edit"):
             m = copy.deepcopy(cur)
             if mut == "bash":
@@ -116,7 +110,8 @@ class T(unittest.TestCase):
             else:
                 m["permission"].setdefault("edit", {})["*unrelated*"] = "deny"
             self.assertNotEqual(m, cur, "mutation not applied")
-            self.assertNotEqual(without_ref_rules(strip_record_entries(strip_question(m))), without_ref_rules(base), mut + " change not refused")
+            with self.assertRaises(AssertionError, msg=mut + " change not refused"):
+                check_pin(m)
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()
