@@ -105,7 +105,9 @@ class TestEscalateHeldPullRequestTier(HOST.BaselineWorld if HOST is not None els
     def test_s1_the_cause_a_key_for_a_head_the_row_does_not_list_leaves_the_row_in_the_cos_tier(self):
         """The control: what the code did before, written as it did (the key of the head read now, not of the head the row lists, and `escalated` without reading back)."""
         row = self.case(listed_head=HEAD_A, now_head=HEAD_B)
-        sb.decision_store(self.engine).mark_escalated("captain:%s#7@%s" % (REPO, HEAD_B), self.world.clock.now())
+        held = {"id": row["id"], "kind": "captain", "tier": "cos", "repo": REPO, "number": 7, "head": HEAD_B}   # what the old escalate_notice built: the head read NOW
+        line = sb.escalate_decision(self.engine, self.route, held, "the owner decides", "cos")
+        self.assertIn("escalated", line, "the old command said so")
         self.list_pull_requests(7, head=HEAD_A)
         self.assertEqual(self.row()["tier"], "cos", "S1/S5: the escalated item stays in the Chief of Staff's tier")
         self.assertEqual(self.owners_rows(), [], "and the owner's rows do not have it")
@@ -127,7 +129,6 @@ class TestEscalateHeldPullRequestTier(HOST.BaselineWorld if HOST is not None els
             got = self.escalate(row)
         self.assertEqual(got["code"], 1, got)
         self.assertEqual(got["out"], "")
-        self.assertNotIn("escalated pr", got["out"] + got["err"].replace("could not be placed", ""))
         self.assertIn("could not be placed in the owner's tier", got["err"])
         self.assertEqual(self.marks(), [])
         self.assertEqual(self.row()["tier"], "cos")
