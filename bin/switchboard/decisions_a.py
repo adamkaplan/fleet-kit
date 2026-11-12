@@ -20,7 +20,7 @@ ESCALATED_READ_MAX = 1 << 20   # the list reads the record once, at most this ma
 
 
 def read_escalated_checked(state_dir):
-    """(found, note): `read_escalated`'s result and, when the record is missing, unreadable or malformed, one line saying so (else None). One bounded read; writes nothing."""
+    """(found, note): `read_escalated`'s result and, when the record is unreadable, too large or malformed, one line (a missing record is an empty one: no note) saying so (else None). One bounded read; writes nothing."""
     path = Path(state_dir) / ESCALATED_FILE
     try:
         with open(str(path), "rb") as handle:
@@ -29,7 +29,7 @@ def read_escalated_checked(state_dir):
             return {}, "%s is too large to read" % ESCALATED_FILE
         raw = json.loads(data.decode("utf-8"))
     except FileNotFoundError:
-        return {}, "%s does not exist" % ESCALATED_FILE
+        return {}, None   # nothing was ever escalated (the normal state): the same as an empty record, and no note on every list
     except (OSError, ValueError):
         return {}, "%s cannot be read" % ESCALATED_FILE
     found = raw.get("requests") if isinstance(raw, dict) else None

@@ -75,11 +75,15 @@ class TestListTierFromRecord(Base):
         self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.state.iterdir()}, before)
         self.assertTrue(path.exists())
 
-    def test_s4_a_missing_record_says_so_only_when_a_cos_row_could_have_moved(self):
+    def test_s4_a_missing_record_is_an_empty_one_with_no_note(self):
         self.daemon_file([row(7, HEAD)])
-        self.assertIn("does not exist", sb.decisions_listing(self.state, time.time())["escalation_note"])
-        self.daemon_file([row(7, HEAD, tier="human")])
-        self.assertNotIn("escalation_note", sb.decisions_listing(self.state, time.time()))
+        listed = sb.decisions_listing(self.state, time.time())
+        self.assertEqual((self.tiers(listed), "escalation_note" in listed), ({7: "cos"}, False))
+
+    def test_s4_a_malformed_record_says_so(self):
+        self.daemon_file([row(7, HEAD)])
+        (self.state / "escalated-requests.json").write_text("[]")
+        self.assertIn("malformed", sb.decisions_listing(self.state, time.time())["escalation_note"])
 
     def test_an_oversized_record_is_not_read_whole(self):
         self.daemon_file([row(7, HEAD)])
