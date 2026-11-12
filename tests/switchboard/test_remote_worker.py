@@ -3,19 +3,27 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the repository, for the remote_worker package
+# The mutation tests of test_brief_integration copy bin/, docs/ and tests/ only: in such a copy the package is absent and these classes skip.
+# In the repository the package is there, and a failing import is a failure, never a skip.
+ROOT = Path(__file__).resolve().parents[2]
+PRESENT = (ROOT / "remote_worker").is_dir()
+only_with_package = unittest.skipUnless(PRESENT, "remote_worker is not in this copy of the tree")
+sys.path.insert(0, str(ROOT))   # the repository, for the remote_worker package
 
-from remote_worker import (Config, ConfigError, SpecError, TransportError, WorkerHandle, launch_remote_worker, load_config,
-                           register_transport, transport_from_config, validate_spec, wait_for_end, Transport)
 from support.core import Base
-from remote_worker import launch as launch_mod
-from remote_worker.fake import FakeTransport
+
+if PRESENT:
+    from remote_worker import (Config, ConfigError, SpecError, TransportError, WorkerHandle, launch_remote_worker, load_config,
+                               register_transport, transport_from_config, validate_spec, wait_for_end, Transport)
+    from remote_worker import launch as launch_mod
+    from remote_worker.fake import FakeTransport
 
 LAND = "acme-land --now"
 GOOD = dict(name="widget-1", repo="acme/widget-api", branch="work/widget-1", task="Fix the parser.", land_command=LAND)
 SHA = "0" * 39 + "1"
 
 
+@only_with_package
 class TestRemoteSpec(Base):
     def test_valid_spec_brief_carries_task_and_land_command(self):
         spec = validate_spec(**GOOD)
@@ -36,6 +44,7 @@ class TestRemoteSpec(Base):
                 self.assertEqual(t.calls, [])
 
 
+@only_with_package
 class TestRemoteLaunch(Base):
     def test_launch_starts_and_returns_handle(self):
         t = FakeTransport()
@@ -71,6 +80,7 @@ class TestRemoteLaunch(Base):
         self.assertIsInstance(FakeTransport(), Transport)
 
 
+@only_with_package
 class TestRemoteWait(Base):
     def setUp(self):
         super().setUp()
@@ -106,6 +116,7 @@ class TestRemoteWait(Base):
             self.wait(60)
 
 
+@only_with_package
 class TestRemoteFake(Base):
     def test_send_dedups_by_message_id_and_refuses_after_end(self):
         t = FakeTransport()
@@ -117,6 +128,7 @@ class TestRemoteFake(Base):
             t.send(h, "late")
 
 
+@only_with_package
 class TestRemoteConfig(Base):
     def test_both_settings_required(self):
         with self.assertRaises(ConfigError):

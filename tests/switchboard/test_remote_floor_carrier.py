@@ -10,12 +10,19 @@ from pathlib import Path
 import urllib.parse
 from xml.etree import ElementTree
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the repository, for the remote_worker package
+# The mutation tests of test_brief_integration copy bin/, docs/ and tests/ only: in such a copy the package is absent and these classes skip.
+# In the repository the package is there, and a failing import is a failure, never a skip.
+ROOT = Path(__file__).resolve().parents[2]
+PRESENT = (ROOT / "remote_worker").is_dir()
+only_with_package = unittest.skipUnless(PRESENT, "remote_worker is not in this copy of the tree")
+sys.path.insert(0, str(ROOT))   # the repository, for the remote_worker package
 
 from support.core import Base
-from remote_worker import Transport, TransportError, WorkerHandle, launch_remote_worker, wait_for_end
-from remote_worker import floor as floor_mod
-from remote_worker.floor import FloorTransport, load_sas_file
+
+if PRESENT:
+    from remote_worker import Transport, TransportError, WorkerHandle, launch_remote_worker, wait_for_end
+    from remote_worker import floor as floor_mod
+    from remote_worker.floor import FloorTransport, load_sas_file
 
 QSAS = "sv=2021-08-06&sp=a&sig=QUEUESECRET0123456789"
 CSAS = "sv=2021-08-06&sp=rcw&sig=CONTAINERSECRET0123456789"
@@ -84,6 +91,7 @@ def sas_file(d, name, text, mode=0o600):
     return p
 
 
+@only_with_package
 class CarrierCase(Base):
     def setUp(self):
         super().setUp()
@@ -105,6 +113,7 @@ class CarrierCase(Base):
         return t, launch_remote_worker(t, **GOOD)
 
 
+@only_with_package
 class TestRemoteCarrier(CarrierCase):
     def test_satisfies_the_interface(self):
         self.assertIsInstance(self.transport(), Transport)
@@ -214,6 +223,7 @@ class TestRemoteCarrier(CarrierCase):
         self.assertEqual(t.command_result(cid), "rejected:terminal")
 
 
+@only_with_package
 class TestRemotePayload(CarrierCase):
     def test_a_large_brief_goes_to_a_blob_written_first(self):
         t = self.transport()
@@ -262,6 +272,7 @@ class TestRemotePayload(CarrierCase):
         self.assertEqual(len(self.store.requests), n)
 
 
+@only_with_package
 class TestRemoteState(CarrierCase):
     def test_status_reads_the_session_from_state_json(self):
         t, h = self.launched()
@@ -332,6 +343,7 @@ class TestRemoteState(CarrierCase):
         self.assertEqual(wait_for_end(t, h, 10, sleep=lambda s: None, clock=self.clock).landed_sha, SHA)
 
 
+@only_with_package
 class TestRemoteStopAndSession(CarrierCase):
     def test_stop_adds_one_retire_and_a_repeat_adds_none(self):
         t, h = self.launched()
@@ -368,6 +380,7 @@ class TestRemoteStopAndSession(CarrierCase):
         self.assertEqual(self.store.requests, [])
 
 
+@only_with_package
 class TestRemoteSafety(CarrierCase):
     def test_errors_are_classified_and_never_carry_a_token(self):
         cases = [(429, True), (503, True), (500, True), (403, False), (401, False), (400, False)]
@@ -437,6 +450,7 @@ class TestRemoteSafety(CarrierCase):
                 self.assertIn(".blob.", url)
 
 
+@only_with_package
 class TestRemoteConfiguration(CarrierCase):
     def test_unsafe_settings_are_refused(self):
         bad = [dict(account="X"), dict(account="ab"), dict(account="a.b.c"), dict(floor_id="F1"), dict(caller_id="a/b"), dict(caller_id=""),
