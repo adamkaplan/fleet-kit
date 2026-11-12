@@ -250,12 +250,6 @@ def session_state(data, now, threshold):
     return False, ""
 
 
-def _results_done(data):
-    """Ask #2472: the run record's one rule (last non-empty line, and newer than the pod's start when both times are known)."""
-    from run_record import results_verdict
-    return results_verdict(str(data.get("results") or ""), _num(data.get("results_mtime")), _num(data.get("started")), nocase=True) == "done"
-
-
 def decide(data):
     """{condition: evidence text} for the three conditions, from the probe's answer. Pure: times are the pod's own clock (`now` in the answer)."""
     now = _num(data.get("now"))
