@@ -411,7 +411,7 @@ class Structural(unittest.TestCase):
             code = [l for l in f.read().split("\n") if not l.lstrip().startswith("#")]
         body = "\n".join(code)
         self.assertEqual(len(re.findall(r'"status: done"|\("done"|== "done"|last_p', body)), 0)
-        files = [os.path.join(ROOT, "skills", "fleet-coordination", "operator-brief-header.txt")]
+        files = []   # the walk below reads every skill's .md and .txt file, the operator brief header included
         for base, _dirs, names in os.walk(os.path.join(ROOT, "skills")):
             files += [os.path.join(base, n) for n in names if n.endswith((".md", ".txt"))]
         files += [os.path.join(ROOT, "bin", "cloud_worker.py"), os.path.join(LAUNCHER, "cloud_worker.py")]
