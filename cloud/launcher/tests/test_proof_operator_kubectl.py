@@ -76,12 +76,12 @@ class ProofOperatorKubectl(G.Base):
         self.assertNotIn(MARK, done.stdout + done.stderr + self.everything())
         self.assertEqual(len(os.listdir(self.rdir)), 1)
 
-    def test_no_minter_kubeconfig_is_exit_2_with_one_line_and_no_pod(self):
+    def test_no_minter_kubeconfig_is_exit_2_with_one_line_and_the_pod_retired(self):
         done = self.child()
         self.assertEqual(done.returncode, 2, done.stderr)
         self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
         self.assertIn("minter kubeconfig", done.stderr)
-        self.assertEqual([l for l in self.log("launcher") if l.startswith("launch ")], [])
+        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("retire ")]), 1)   # the pod it launched is retired
         self.assertNotIn(MARK, done.stdout + done.stderr)
 
     def test_a_refused_token_is_exit_2_with_one_line(self):
@@ -91,6 +91,7 @@ class ProofOperatorKubectl(G.Base):
         self.assertEqual(done.returncode, 2, done.stderr)
         self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
         self.assertIn("refused", done.stderr)
+        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("retire ")]), 1)
 
     def test_a_proof_that_waits_on_the_prompt_is_caught(self):
         self.minter()

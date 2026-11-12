@@ -165,7 +165,7 @@ def kube_run(argv, env, stdin=None, fds=()):
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, env=env, start_new_session=True, pass_fds=fds)
     except OSError:
-        return None
+        raise KubeUnusable("kubectl could not be run") from None
     try:
         out, err = proc.communicate(stdin, timeout=limit)
     except subprocess.TimeoutExpired:
@@ -235,9 +235,6 @@ def prove(args, env, now=None, sleep=time.sleep):
         raise Refused("usage: DIGEST (name@sha256:<64 hex>) and --repo OWNER/NAME")
     digest = match.group(1)
     switchboard = env.get("CW_SWITCHBOARD") or SWITCHBOARD
-    kubectl = env.get("CW_KUBECTL")
-    token = None if kubectl else mint_token(env)   # before any pod is launched: a refusal leaves nothing behind
-    kubectl = [kubectl] if kubectl else ["kubectl", "--token", token]
     revision = read_revision(env, args.digest)
     worker = "proof-%s-%s" % (digest[7:19], now().strftime("%d%H%M%S"))
     remove_stale_scratch(env)
@@ -246,14 +243,14 @@ def prove(args, env, now=None, sleep=time.sleep):
     try:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # SIGTERM runs the same cleanup below
         scratch = make_scratch(env, args.digest)
-        return _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard, kubectl)
+        return _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard)
     finally:
         signal.signal(signal.SIGTERM, previous)
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)   # removed whatever the verdict
 
 
-def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard, kubectl):
+def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard):
     launch_env = dict(env, XDG_CONFIG_HOME=scratch)
     launch_env.pop("CW_CLOUD_IMAGE", None)   # the settings clash rule: the scratch file is the one source of the image line
     argv = [switchboard, "launch", worker, "--cloud", "--repo", args.repo, "--branch", args.branch, "--role", "tester", "--agent", "coder", "--shape", "M",
@@ -266,6 +263,7 @@ def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchbo
         raise Refused("the proof pod could not be launched (exit %s); no receipt was written" % ("?" if made is None else made.returncode))
     results = ""
     try:
+        kubectl = [env["CW_KUBECTL"]] if env.get("CW_KUBECTL") else ["kubectl", "--token", mint_token(env)]   # minted after the launch, so it lasts the whole wait; a refusal retires the pod below
         try:
             last = [l for l in made.stdout.splitlines() if l.strip()][-1]
             pod = str(json.loads(last).get("runtime_id") or worker)
