@@ -424,7 +424,7 @@ def pr_note(workdir, res, hub=None, comment=None):
 
 
 MADE_MAX = 100
-MADE_REFLOG = re.compile(r"(commit|cherry-pick|rebase)\b|merge .*: Merge made")   # a reflog subject of a commit this clone CREATED (a fast-forward or a fetch is not)
+MADE_REFLOG = re.compile(r"commit\b|cherry-pick\b(?!: fast-forward)|rebase \((pick|continue|squash|fixup|reword|edit)\)|merge .*: Merge made")   # a reflog subject of a commit this clone CREATED (a fast-forward or a fetch is not)
 
 
 def made_commits(workdir, ctx=None):

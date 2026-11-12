@@ -206,4 +206,13 @@ class TestTheHooksMadeCommits(unittest.TestCase):
         made = hook_mod.made_commits(two)
         self.assertIn(mine, made)
         self.assertNotIn(theirs, made)
+        git(two, "reset", "-q", "--hard", "HEAD~2")
+        git(two, "rebase", "-q", "origin/main")   # `rebase (start)` logs the fetched commit it moves onto: not made by the pod
+        self.assertNotIn(theirs, hook_mod.made_commits(two))
+        git(two, "checkout", "-q", "-b", "side", "HEAD~1")
+        git(two, "commit", "-q", "--allow-empty", "-m", "side")
+        git(two, "rebase", "-q", "origin/main")   # a rebased commit of the pod's own is a new commit it made
+        side = git(two, "rev-parse", "HEAD")
+        self.assertIn(side, hook_mod.made_commits(two))
+        self.assertNotIn(theirs, hook_mod.made_commits(two))
         self.assertIsNone(hook_mod.made_commits(os.path.join(tmp, "absent")))
