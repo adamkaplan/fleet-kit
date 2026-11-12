@@ -138,3 +138,27 @@ class TestListTierFromRecord(Base):
         big = {"captain:acme/widget#7@" + HEAD: "t", "pad": "x" * (sb.ESCALATED_READ_MAX + 10)}
         (self.state / "escalated-requests.json").write_text(json.dumps({"requests": big}))
         self.assertIn("captain:acme/widget#7@" + HEAD, sb.read_escalated(self.state))
+
+    def snapshot(self):
+        return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.state.iterdir()}
+
+    def test_the_success_path_and_the_command_write_nothing_anywhere_in_the_state_directory(self):
+        self.daemon_file([row(7, HEAD)])
+        self.record("captain:acme/widget#7@" + HEAD)
+        before = self.snapshot()
+        self.assertEqual(self.tiers(sb.decisions_listing(self.state, time.time())), {7: "human"})
+        with captured():
+            sb.main(["decisions", "--tier", "all", "--json"], runner=lambda argv, **k: subprocess.CompletedProcess(argv, 1, "", "no"), now=time.time)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_hostile_rows_next_to_a_valid_row_leave_the_valid_one_moved(self):
+        self.daemon_file(["junk", {"kind": "captain", "repo": "a/b", "number": 1e999, "head": HEAD, "tier": "cos"},
+                          {"kind": "captain", "repo": "a/b", "number": 2, "head": 5, "tier": "cos"}, row(7, HEAD)])
+        self.record("captain:acme/widget#7@" + HEAD)
+        listed = sb.decisions_listing(self.state, time.time())
+        self.assertEqual([d["tier"] for d in listed["decisions"] if isinstance(d, dict) and d.get("number") == 7], ["human"])
+
+    def test_no_note_when_no_cos_row_could_move(self):
+        self.daemon_file([row(7, HEAD, tier="human"), {"id": "n", "kind": "notice", "tier": "cos", "title": "x"}])
+        (self.state / "escalated-requests.json").write_text("{bad")
+        self.assertNotIn("escalation_note", sb.decisions_listing(self.state, time.time()))
