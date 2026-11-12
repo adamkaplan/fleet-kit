@@ -11,14 +11,14 @@ the send, as the minute-40 note does; when the send reached nobody the mark is m
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
-A pod that has finished (ask #2443: its server reports the session idle, the last turn succeeded with finish stop, no cw-run job active, and /work/results.txt exists; see `classify`) is not stalled for progress-stale and
-failed-run-idle (refusal still fires). The text lines `done` and `STATUS: done` decide nothing.
+A pod whose server reports the session idle (ask #2443; see `classify`) is not stalled for progress-stale and failed-run-idle: its boss got the idle notice (refusal still fires). The text lines `done` and `STATUS: done` decide nothing.
 A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass line names it (pod and reason, no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
 """
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
@@ -28,6 +28,7 @@ AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 CHIEF = "cos"                      # the Chief of Staff's switchboard name when the config names none (`remind cos`)
 CONFIG_KEY = "cos_name"            # the switchboard config's key (config.json) that names the Chief of Staff's agent, when it has one
 STALL_ASK = "adamkaplan/fleet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
+IDLE_NOTICE_MIN_SECONDS = 120      # ask #2443: a pod's idle notices are at least this far apart (the key comes from the pod's own server: a looping pod cannot flood its boss)
 RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
 PASS_BUDGET_SECONDS = 90           # the pass reads no more pods once its reads have taken this long (the rest wait for the next pass)
@@ -189,7 +190,8 @@ def _ann(pod, key, default=None):
 
 
 def _num(v):
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    """A finite number or None (a pod's answer is untrusted: NaN and infinity read as no number)."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
 
 
 TURN_VALUES = {"turn": ("running", "idle", "unknown"), "outcome": ("succeeded", "failed", "interrupted", None), "finish": ("stop", "length", "tool-calls", "content-filter", "error", "unknown", None)}
@@ -322,13 +324,19 @@ def boss_of(launcher, worker):
 def _idle_notice_send(launcher, pod, worker, name, data, now):
     """Ask #2443: ONE `idle-notice` audit line per idle of a pod (the key is the idle message's id, kept in the pod annotation cw/idle-notice BEFORE the send; a line that could not be
     written puts the old mark back so the next pass tries again). The daemon adds the pod's last report and sends the message to the boss. Returns True when a line was written."""
-    note = idle_notice(data)
+    try:
+        note = idle_notice(data)
+    except Exception:   # the pod's answer is untrusted: whatever it holds, the stall conditions after this call still run
+        return False
     if note is None or _ann(pod, "idle-notice") == note["key"]:
         return False
+    last = launcher_parse(_ann(pod, "idle-notice-at"))
+    if last is not None and 0 <= (now - last).total_seconds() < IDLE_NOTICE_MIN_SECONDS:
+        return False   # too soon after this pod's last notice: the next pass tells the newest idle
     kube, uid = launcher.kube, (pod.get("metadata") or {}).get("uid")
     scrub = (lambda t: kube.scrub(t, 3000)) if callable(getattr(kube, "scrub", None)) else (lambda t: t)
     boss = boss_of(launcher, worker)
-    kube.annotate(name, uid, idle_notice=note["key"])   # BEFORE the send
+    kube.annotate(name, uid, idle_notice=note["key"], idle_notice_at=launcher_iso(now))   # BEFORE the send
     try:
         wrote = launcher.audit(worker, "pod/" + name, IDLE_ACTION, 0.0, True, "",
                                extra={"idle": note["key"], "state": note["state"], "outcome": note["outcome"], "finish": note["finish"], "turn_start": note["turn_start"],
@@ -339,7 +347,7 @@ def _idle_notice_send(launcher, pod, worker, name, data, now):
         print("cloud-worker: idle notice for %s not recorded: %s" % (name, type(e).__name__), file=sys.stderr)
         ok = False
     if not ok:
-        kube.annotate(name, uid, idle_notice=_ann(pod, "idle-notice") or "none")
+        kube.annotate(name, uid, idle_notice=_ann(pod, "idle-notice") or "none", idle_notice_at=_ann(pod, "idle-notice-at") or "none")
     return ok
 
 

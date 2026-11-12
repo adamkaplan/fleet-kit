@@ -558,6 +558,11 @@ IDLE_KEY = re.compile(r"msg_[A-Za-z0-9_]{1,80}|u[0-9]{1,20}")
 REPORT_SKEW = 10   # seconds: the pod's clock and the daemon's differ by a little
 
 
+def quiet(text):
+    """Pod text put inside a quoted part of the message: the quote and the separator become harmless, so it cannot close the part and fake the next one."""
+    return text.replace('"', "'").replace(";", ",")
+
+
 def idle_report_text(worker, line, last_reports):
     """`report <state>: "<line>"` when the worker made a report after its turn began, else `idle with no report: assess`. The line is the stored, already redacted report text."""
     entry = last_reports.get(worker) if isinstance(last_reports, dict) else None
@@ -565,7 +570,7 @@ def idle_report_text(worker, line, last_reports):
     at = entry.get("at") if isinstance(entry, dict) else None
     if (isinstance(entry, dict) and isinstance(entry.get("state"), str) and re.fullmatch(r"[a-z]{1,12}", entry["state"]) and isinstance(at, (int, float)) and not isinstance(at, bool)
             and isinstance(start, (int, float)) and not isinstance(start, bool) and at >= start - REPORT_SKEW):
-        said = stall_evidence(entry.get("text")) if isinstance(entry.get("text"), str) else ""
+        said = quiet(stall_evidence(entry.get("text"))) if isinstance(entry.get("text"), str) else ""
         return 'report %s%s' % (entry["state"], ': "%s"' % said[:IDLE_REPORT_MAX] if said else "")
     return "idle with no report: assess"
 
@@ -573,7 +578,7 @@ def idle_report_text(worker, line, last_reports):
 def idle_text(worker, line, report, when, ask):
     unknown = line.get("state") == "unknown"
     head = "[idle] %s idle state unknown: assess" % worker if unknown else "[idle] %s went idle (outcome %s, finish %s): %s" % (worker, line.get("outcome") or "none", line.get("finish") or "none", report)
-    ev = stall_evidence(line.get("evidence"))
+    ev = quiet(stall_evidence(line.get("evidence")))
     jobs = line.get("jobs") if isinstance(line.get("jobs"), list) else []
     jobs = [j for j in jobs if isinstance(j, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,40}", j)][:5]
     ahead = line.get("ahead")
