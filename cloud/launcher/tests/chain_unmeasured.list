@@ -99,7 +99,6 @@ cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_entrypoint_long_run.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pod_notes_log.py
-cloud/worker/tests/test_pr_branch_source.py
 cloud/worker/tests/test_pr_label.py
 cloud/worker/tests/test_pr_record.py
 cloud/worker/tests/test_pre_push_hook.py
