@@ -1817,7 +1817,7 @@ API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|
 REST_SIGNED_METHODS = {label: ("POST", "PATCH", "DELETE") for label, _p in SIGNED_API + SIGNED_API_MORE}   # every signed shape: the old tests use POST, PATCH and DELETE on all of them
 REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned REST write shapes lanes use (N, NAME: one path segment)
     ("issue-create", r"issues", ("POST",)), ("issue-update", r"issues/[^/]+", ("PATCH", "POST")), ("issue-labels", r"issues/[^/]+/labels", ("POST", "PUT", "DELETE")),
-    ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)),
+    ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)), ("sub-issue-unlink", r"issues/[0-9]+/sub_issue", ("DELETE",)),   # ask #2475: unlink ONE sub-issue (closed ones still count toward GitHub's 100 limit); the one field sub_issue_id=N is checked in api_decide
     ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)), ("label-delete", r"labels/[^/]+", ("DELETE",)),
     ("deployment-gate", r"actions/runs/[0-9]+/pending_deployments", ("POST",)),   # approving a deployment gate: its 'comment' field is not a comment body
     ("webhook-delete", r"hooks/[0-9]+", ("DELETE",)))   # a `cli` hook with the forwarder url (any forwarder's, not only the caller's): shims/gh_body.py reads the hook first and passes only a `cli` hook with the forwarder url
@@ -2116,6 +2116,8 @@ def api_decide(args, namer, previous):
             api_refuse_unknown(effective or "(no method)", "the endpoint (%s)" % raw[:60])
         if effective not in found[1]:
             api_refuse_unknown(effective or "(no method)", "the endpoint %s (%s allows %s)" % (raw[:60], found[0], "/".join(found[1])))
+        if found[0] == "sub-issue-unlink" and (has_input or "?" in raw or len(raw_positionals) != 1 or len(fields) != 1 or not re.fullmatch(r"sub_issue_id=[0-9]+", fields[0])):
+            raise Refused("a DELETE of issues/N/sub_issue passes only as `gh api -X DELETE repos/O/R/issues/N/sub_issue -F sub_issue_id=NUMBER` (that one field, no --input, no query string)")
         if found[2] and effective in ("POST", "PATCH"):
             query = raw.partition("#")[0].partition("?")[2]
             query_keys = [urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query) if part]
