@@ -237,13 +237,15 @@ Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of 
 
 Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_mint_roles.py` (177 s), `test_m_cap.py` (157 s).
 
-Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_mint_roles.py` (80 s), `test_cloud_stack_wait.py` (58 s).
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_mint_roles.py` (80 s), `test_brief_header.py` (62 s, a pod run, not CI; test_cloud_stack_wait.py follows at 58 s).
 
 Not yet measured: the names are in cloud/launcher/tests/chain_unmeasured.list, one per line (a member adds a new chain test there).
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 
 Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, not yet measured on CI): lane 0 785 s, lane 1 822 s, lane 2 773 s (from 696, 665, 596), after `test_cloud_split.py`, `test_m_cap.py`, `test_mint_roles.py` and `test_git_token_retry.py` moved from serial to the end of the parallel list (positions 22, 23, 24, 25 = lanes 0, 1, 2, 0); the Ubuntu seconds of those four are one run on an idle pod, not CI.
+
+Rebalance (ask #2387): eight serial entries moved to the end of the parallel list (positions 25 to 32, lanes 0,1,2,0,1,2,0,1): `test_failed_pod_record.py`, `test_fixture_root.py`, `test_brief_header.py`, `test_cloud_status_summary.py`, `test_cloud_model_served.py`, `test_cloud_settings.py`, `test_cloud_tests_write_tmp.py`, `test_app_token_route.py`. Each uses its own temporary directory and binds no fixed port. `test_no_open_files.py` (335 s in a pod) stays serial: it re-runs 27 chain files, among them ones that list the shared temp directory, so it is not shown safe beside other entries.
 
 ### macOS (per entry)
 
@@ -266,9 +268,9 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_cloud_preflight_wired.py` | 42 | serial |
 | `cloud/launcher/tests/test_cloud_quick_guards.py` | 7 | serial |
 | `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
-| `cloud/launcher/tests/test_cloud_settings.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 15 | parallel |
 | `cloud/launcher/tests/test_cloud_shapes.py` | 27 | serial |
-| `cloud/launcher/tests/test_cloud_status_summary.py` | 22 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 22 | parallel |
 | `cloud/launcher/tests/test_cluster_token_refresh.py` | 37 | serial |
 | `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
 | `cloud/launcher/tests/test_cw_names.py` | 5 | serial |
@@ -322,6 +324,12 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_m_cap.py` | 157 | parallel |
 | `cloud/launcher/tests/test_mint_roles.py` | 177 | parallel |
 | `cloud/launcher/tests/test_git_token_retry.py` | 40 | parallel |
+| `cloud/launcher/tests/test_failed_pod_record.py` | 35 | parallel |
+| `cloud/launcher/tests/test_fixture_root.py` | 30 | parallel |
+| `cloud/launcher/tests/test_brief_header.py` | 62 | parallel |
+| `cloud/launcher/tests/test_cloud_model_served.py` | 20 | parallel |
+| `cloud/launcher/tests/test_cloud_tests_write_tmp.py` | 16 | parallel |
+| `cloud/launcher/tests/test_app_token_route.py` | 15 | parallel |
 
 ### Ubuntu (per entry)
 
@@ -344,9 +352,9 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_cloud_preflight_wired.py` | 5 | serial |
 | `cloud/launcher/tests/test_cloud_quick_guards.py` | 2 | serial |
 | `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
-| `cloud/launcher/tests/test_cloud_settings.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 10 | parallel |
 | `cloud/launcher/tests/test_cloud_shapes.py` | 11 | serial |
-| `cloud/launcher/tests/test_cloud_status_summary.py` | 16 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 16 | parallel |
 | `cloud/launcher/tests/test_cluster_token_refresh.py` | 7 | serial |
 | `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
 | `cloud/launcher/tests/test_cw_names.py` | 2 | serial |
@@ -400,6 +408,12 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_m_cap.py` | 11 | parallel |
 | `cloud/launcher/tests/test_mint_roles.py` | 80 | parallel |
 | `cloud/launcher/tests/test_git_token_retry.py` | 2 | parallel |
+| `cloud/launcher/tests/test_failed_pod_record.py` | 35 | parallel |
+| `cloud/launcher/tests/test_fixture_root.py` | 30 | parallel |
+| `cloud/launcher/tests/test_brief_header.py` | 62 | parallel |
+| `cloud/launcher/tests/test_cloud_model_served.py` | 20 | parallel |
+| `cloud/launcher/tests/test_cloud_tests_write_tmp.py` | 16 | parallel |
+| `cloud/launcher/tests/test_app_token_route.py` | 15 | parallel |
 
 ## The vault block (ask #1427)
 

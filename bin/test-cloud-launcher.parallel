@@ -22,3 +22,11 @@ cloud/launcher/tests/test_cloud_split.py
 cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_git_token_retry.py
+cloud/launcher/tests/test_failed_pod_record.py
+cloud/launcher/tests/test_fixture_root.py
+cloud/launcher/tests/test_brief_header.py
+cloud/launcher/tests/test_cloud_status_summary.py
+cloud/launcher/tests/test_cloud_model_served.py
+cloud/launcher/tests/test_cloud_settings.py
+cloud/launcher/tests/test_cloud_tests_write_tmp.py
+cloud/launcher/tests/test_app_token_route.py
