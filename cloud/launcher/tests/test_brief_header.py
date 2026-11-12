@@ -98,6 +98,14 @@ class Header(unittest.TestCase):
         for word in ("/dev/null", "mode 700", "exact name", "stop and report"):
             self.assertIn(word, text)
 
+    def test_the_header_carries_the_finish_line_once_derived_from_the_source(self):
+        line = "When finished, the LAST line of /work/progress.txt is exactly: done"
+        rules = [t for _, t in rules_of(SOURCE) if line in t]
+        self.assertEqual(len(rules), 1)
+        code, out, err = run_header()
+        self.assertEqual(out.count(line), 1)
+        self.assertEqual(out.count("[finish-line]"), 1)
+
 
 NAME_ALIAS = "chief-of-staff"
 

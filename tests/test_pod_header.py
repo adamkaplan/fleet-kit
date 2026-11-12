@@ -89,6 +89,16 @@ class TestPodHeader(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "the header was sent twice"):
             check(payload(b, source=mutant), b)
 
+    def test_launch_text_carries_the_done_line_once(self):
+        line = "When finished, the LAST line of /work/progress.txt is exactly: done"
+        text = payload("do it\n")
+        self.assertEqual(text.count(line), 1)
+        self.assertEqual(text.split("\n")[2], line)
+
+    def test_control_text_without_the_line_fails(self):
+        pre = cloud_worker.SETUP_PREAMBLE.replace(cloud_worker.DONE_LINE + "\n", "")
+        self.assertEqual(payload("do it\n", pre).count("LAST line of /work/progress.txt"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
