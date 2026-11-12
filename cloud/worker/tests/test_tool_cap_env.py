@@ -31,7 +31,7 @@ class T(unittest.TestCase):
     def test_control_then_mutant(self):
         t = self.read()
         self.assertEqual(problems(t, cap()), [])
-        m = re.sub(r"(?m)^(ENV %s=)\d+" % NAME, r"\g<1>600000", t)
+        m = re.sub(r"(?m)^(ENV %s=)\d+" % NAME, r"\g<1>%d" % (cap() + 1), t)
         self.assertNotEqual(m, t)
         self.assertEqual(problems(m, cap()), ["the default shell timeout variable is outside 1..CAP_MS"])
         self.assertEqual(problems(t.replace("ENV " + NAME, "#"), cap()), ["the default shell timeout variable must be set exactly once"])
