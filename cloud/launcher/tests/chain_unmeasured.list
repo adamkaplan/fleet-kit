@@ -67,6 +67,8 @@ cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_reaper_unauthorized.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py
+cloud/launcher/tests/test_results_own_run.py
+cloud/launcher/tests/test_results_own_run_wiring.py
 cloud/launcher/tests/test_retire_gone_exact.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
