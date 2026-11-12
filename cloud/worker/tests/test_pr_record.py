@@ -1,6 +1,6 @@
 """#1200 scenario S14: the pod's entrypoint exports CW_PR_RECORD (a file inside the worker-private temporary directory), the client writes the
 number of a pull request it creates there (mode 0600, never through a symlink), and an own edit through the guard then passes while another
-number refuses. A shell command that names the record is refused by a row of the permission file and of the ONE table. The record is NOT a
+number refuses. The client refuses a command that names the record (the ONE table); the permission file has no row for it (ask #2402). The record is NOT a
 security boundary against a determined agent (same user): the head-branch check and the token's scope are. Offline; the token is synthetic."""
 import os
 import shutil
@@ -184,80 +184,6 @@ class T(unittest.TestCase):
         self.assertEqual(len(P.patches()), 1)
         self.assertEqual(self.client_with_record(8, "8\n").returncode, 3)   # the true build refuses it
 
-    # S16 (a): the file-editing tool is denied for a path holding pr-record, in both agent blocks
-    @staticmethod
-    def resolve(rules, path):
-        """The documented rule: the last matching rule wins, `*` matches any characters, no match = no decision."""
-        import re
-        out = None
-        for pat, act in rules.items():
-            if re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), path, re.S):
-                out = act
-        return out
-
-    def s16_check(self, conf):
-        blocks = (conf["permission"], conf["agent"]["worker"]["permission"])
-        denied = ordinary = 0
-        for b in blocks:
-            self.assertEqual(b["edit"], {"*pr-record*": "deny"})
-            for p in ("pr-record", "x/pr-record.json", "pr-record-x"):
-                self.assertEqual(self.resolve(b["edit"], p), "deny", p)
-                denied += 1
-            self.assertIsNone(self.resolve(b["edit"], "src/a.py"))
-            ordinary += 1
-            self.assertIn("bash", b)
-            self.assertEqual(b["question"], "deny")
-        return len(blocks), denied, ordinary
-
-    def test_s16_the_edit_tool_is_denied_for_the_record_in_both_blocks(self):
-        import json
-        with open(os.path.join(WORKER, "opencode-worker.json")) as f:
-            text = f.read()
-        r = self.s16_check(json.loads(text))
-        print("S16: %d of 2 deny entries, 0 allow keys, %d of 6 paths denied, %d of 2 ordinary unmatched" % (r[0], r[1], r[2]))
-        # the mutant: the deny key replaced by another; `applied` is computed from the two texts
-        old, new = '"*pr-record*": "deny"\n    }', '"*pr-record-none*": "deny"\n    }'
-        self.assertEqual(text.count(old), 1)
-        changed = text.replace(old, new)
-        applied = self.applied(text, changed, old)
-        print("S16 mutant: applied=%s" % applied)
-        self.assertTrue(applied, "the mutation was not applied")
-        with self.assertRaises(AssertionError) as cm:
-            self.s16_check(json.loads(changed))
-        self.assertIn("{'*pr-record-none*': 'deny'}", str(cm.exception))
-        # the no-op control: the removed text equal to the added text must fail the computation
-        self.assertFalse(self.applied(text, text.replace(old, old), old))
-
-    @staticmethod
-    def applied(original, changed, removed):
-        return changed != original and removed in original and removed not in changed
-
-    # S19: the top-level block (read by every agent) holds the deny
-    def s19_check(self, conf):
-        top = conf["permission"]
-        self.assertIn("edit", top, "the default agent is not covered")
-        self.assertEqual(top["edit"], {"*pr-record*": "deny"}, "the default agent is not covered")
-        got = [self.resolve(top["edit"], p) for p in ("src/a.py", "pr-record", "x/pr-record.json", "pr-record-x")]
-        self.assertEqual(got, [None, "deny", "deny", "deny"])
-        return got
-
-    def test_s19_the_deny_sits_in_the_top_level_block(self):
-        import json
-        with open(os.path.join(WORKER, "opencode-worker.json")) as f:
-            text = f.read()
-        got = self.s19_check(json.loads(text))   # the control first
-        old = '    "edit": {\n      "*pr-record*": "deny"\n    },\n'
-        self.assertEqual(text.count(old), 1)
-        changed = text.replace(old, "")
-        applied = self.applied(text, changed, old)
-        self.assertTrue(applied, "the mutation was not applied")
-        with self.assertRaises(AssertionError) as cm:
-            self.s19_check(json.loads(changed))
-        self.assertIn("the default agent is not covered", str(cm.exception))
-        self.assertFalse(self.applied(text, text.replace(old, old), old))
-        print("S19: top-level paths %s, copy without the entry fails with %r, applied=%s, no-op applied=%s" % (
-            got, "the default agent is not covered", applied, self.applied(text, text.replace(old, old), old)))
-
     # S16 (b): a pr-record that is already a symlink refuses the start, and the target's mode is not changed
     def test_s16_a_symlink_at_the_record_directory_refuses_the_start(self):
         target = os.path.join(self.d, "elsewhere")
@@ -279,28 +205,9 @@ class T(unittest.TestCase):
                        "false positives", "already a symlink"):
             self.assertEqual(doc.count(phrase), 1, phrase)
 
-    # the guard row: a command naming the record is refused
-    FORMS = ("echo 99 >> $CW_PR_RECORD", "echo 99 > /run/cw-tmp/pr-record/numbers", 'cat "$CW_PR_RECORD"')
-
-    def test_a_command_naming_the_record_is_refused_in_both_blocks(self):
-        conf = G.load_conf()
-        for form in self.FORMS:
-            self.assertEqual(G.conf_decision(conf, form), "deny", form)
-        self.assertEqual(G.conf_decision(conf, "ls -l"), "allow")
-        self.assertEqual(G.conf_decision(conf, "gh pr edit 7 --body-file /tmp/f"), "allow")
-        self.assertEqual(G.conf_decision(conf, "gh pr edit 7 --body-file /tmp/f ; echo $CW_PR_RECORD"), "deny")
-        for pat in ("*CW_PR_RECORD*", "*pr-record*"):
-            self.assertEqual(conf["permission"]["bash"][pat], "deny")
-            self.assertEqual(conf["agent"]["worker"]["permission"]["bash"][pat], "deny")
-
-    def test_a_mutant_permission_file_without_the_row_allows_the_forms(self):
-        import json
-        conf = json.loads(json.dumps(G.load_conf()))
-        for blk in (conf["permission"]["bash"], conf["agent"]["worker"]["permission"]["bash"]):
-            del blk["*CW_PR_RECORD*"]
-            del blk["*pr-record*"]
-        for form in self.FORMS:
-            self.assertEqual(G.conf_decision(conf, form), "allow", form)
+    # ask #2402: the permission file's edit deny for the record and its bash rows (CW_PR_RECORD, pr-record) are gone; the tests that pinned them
+    # (s16 the edit tool, s19 the top-level deny, the two permission-file form tests) are replaced by test_pod_rules.py, which asserts the file holds
+    # no deny row, no edit rule and 'question: deny'. The record stays a convenience of the client's head-branch check, not a boundary.
 
     # the client and the guard agree on the two table rows
     def test_the_table_rows_agree_in_the_guard_and_the_client(self):
@@ -308,7 +215,8 @@ class T(unittest.TestCase):
         self.assertEqual(sorted(r["id"] for r in rows), ["shell-record-dir", "shell-record-var"])
         for r in rows:
             self.assertEqual(r["kind"], "denied")
-            self.assertTrue(G.guard_denies(r["example"]), r["id"])
+            self.assertIn(r["id"], G.CONF_ONLY)   # the shell layer has no row for it any more; the client still refuses
+            self.assertFalse(G.guard_denies(r["example"]), r["id"])
             P.H.seen = []
             c = subprocess.run([sys.executable, self.cw] + r["example"].split(), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
                                env={"PATH": "/usr/bin:/bin", "CW_GH_API_BASE": self.base, "GH_TOKEN": P.TOKEN, "HOME": "/nonexistent"})

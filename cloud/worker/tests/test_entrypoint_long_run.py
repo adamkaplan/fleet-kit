@@ -63,7 +63,8 @@ class Rows(Base):
             rows, old = list(node["bash"].items()), list(tnode["bash"].items())
             self.assertEqual(rows[:len(old)], old, "an existing row changed")
             self.assertEqual(rows[len(old):], [("*longcmd*", "deny"), ("*other.sh*", "deny"), ("cw-run start*", "allow")])
-            self.assertEqual(node["edit"], tnode["edit"])
+            self.assertEqual(node["question"], tnode["question"])
+            self.assertNotIn("edit", node)
 
     def test_decisions(self):
         self.assertEqual(self.start(PATTERNS).returncode, 0)
