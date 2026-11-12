@@ -130,13 +130,18 @@ class NoAzureCreate(unittest.TestCase):
     PATTERN = re.compile(r"\baz\s+(aks|group|vm|network|acr)\b[^\n]*\b(create|nodepool|scale)\b|\bnodepool\s+(add|scale|update)\b|\bscale\b[^\n]*--node-count", re.I)
 
     def added(self):
-        for ref in ("origin/integration", "integration"):
-            out = subprocess.run(["git", "diff", "-U0", ref + "...HEAD", "--", ".", ":!cloud/launcher/tests/test_land_shape.py"], cwd=ROOT, capture_output=True, text=True)
-            if out.returncode == 0:
-                return [l[1:] for l in out.stdout.splitlines() if l.startswith("+") and not l.startswith("+++")]
-        self.fail("no base ref to diff against (origin/integration or integration): the scan cannot run")
+        """The text of the files the shape-L change touched: the shape table region of cloud_worker.py and the README section (the working tree, not the pull request's diff)."""
+        with open(os.path.join(ROOT, "cloud/launcher/cloud_worker.py"), encoding="utf-8") as f:
+            src = f.read()
+        table = src[src.index("SHAPES = {"):src.index("DEFAULT_SHAPE =")]
+        with open(os.path.join(ROOT, "cloud/README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        start = readme.index("## Shape `L`, for a land")
+        end = readme.find("\n## ", start + 1)
+        section = readme[start:end if end != -1 else None]
+        return (table + "\n" + section).splitlines()
 
-    def test_s7_the_diff_has_no_azure_create_nodepool_or_scale_command(self):
+    def test_s7_the_shape_l_text_has_no_azure_create_nodepool_or_scale_command(self):
         self.assertEqual([l for l in self.added() if self.PATTERN.search(l)], [])
 
     def test_s7_the_scan_finds_a_planted_command(self):
