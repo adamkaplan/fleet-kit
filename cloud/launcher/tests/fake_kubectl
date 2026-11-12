@@ -325,6 +325,8 @@ elif cmd == "exec":
             print("head: cannot open '%s' for reading: No such file or directory" % path, file=sys.stderr); sys.exit(1)
         if fs["type"] != "file" and "-L" in script:
             print("not a regular file", file=sys.stderr); sys.exit(3)
+        if fs["type"] == "file" and "stat -c" in script and fs.get("mtime") is not None:   # ask #2472: the script prints the file's mtime first
+            sys.stdout.write("MTIME %d\n" % fs["mtime"])
         sys.stdout.write(fs["content"] if fs["type"] == "file" else fs.get("target", ""))
     elif tool == "git":
         if st.get("head_sha"): print(st["head_sha"])

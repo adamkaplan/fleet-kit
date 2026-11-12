@@ -1,3 +1,4 @@
+cloud/launcher/tests/test_all_reds.py
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
 cloud/launcher/tests/test_azure_config_dir.py
@@ -31,6 +32,8 @@ cloud/launcher/tests/test_kept_expiry.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
+cloud/launcher/tests/test_l_hard_default.py
+cloud/launcher/tests/test_land_report.py
 cloud/launcher/tests/test_land_shape.py
 cloud/launcher/tests/test_launch_idempotent.py
 cloud/launcher/tests/test_load_part.py
@@ -65,6 +68,8 @@ cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_reaper_unauthorized.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py
+cloud/launcher/tests/test_results_own_run.py
+cloud/launcher/tests/test_results_own_run_wiring.py
 cloud/launcher/tests/test_retire_gone_exact.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py

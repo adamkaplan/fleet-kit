@@ -244,7 +244,7 @@ Tests: `bin/test-cloud-launcher` (driver, fake kubectl), `cloud/tests/test-cloud
 
 ## Shape `L`, for a land (ask #2457)
 
-`L` is a pod shape for a land: limit and request both 6 CPU and 16 GiB, nested Docker allowed like `M`, chosen by name only (`--shape L`; a launch with no shape is unchanged). Its request equals its limit, so one `L` pod takes 6 of the 7 or so CPU a node has after system pods (the plan assumed about 7; not read on a live node here): two `L` pods never share a node. The autoscaler may add a node for it, and a node is a cost.
+`L` is a pod shape for a land: limit and request both 6 CPU and 16 GiB, nested Docker allowed like `M`, chosen by name only (`--shape L`; a launch with no shape is unchanged). Its request equals its limit, so one `L` pod takes 6 of the 7 or so CPU a node has after system pods (the plan assumed about 7; not read on a live node here): two `L` pods never share a node. The autoscaler may add a node for it, and a node is a cost. A `--shape L` launch with no `--hard` gets the maximum hard limit (`DEFAULT_MAX_HARD`, 8 hours) instead of 2 hours, because a land takes 1 to 3.5 hours; an explicit `--hard` is kept and one above the maximum still refuses, and the launch note says `hard limit 8h (default for shape L)`.
 
 Cost (list-price estimate, not a billed figure): 0.34 USD per hour (6 of 8 vCPU of a 0.452 USD node). One land of 45 minutes costs about 0.26 USD (0.34 x 0.75); one of 90 minutes about 0.51 USD (0.34 x 1.5).
 
@@ -389,6 +389,8 @@ Cost: an upgrade adds one surge node per pool step, about 0.45 dollars per hour 
 - **The session's activity** (same exec, same local route: the session's last update, the time of its last message or tool call and whether a turn is running, from `/api/session`, its messages and `/api/session/active`): `progress-stale` and `failed-run-idle` stay silent while that last time is younger than their 15 and 10 minutes, or while a turn is running and that time is younger than 30 minutes; a running turn with no new message or tool call for 30 minutes still alerts (a turn hung in one tool call). When the server does not answer or the fields are missing, the condition decides from the files and its evidence line says so.
 
 A pod that has finished is not stalled: when the progress file's last non-empty line is `done` or `STATUS: done` (any case), or `/work/results.txt`'s last non-empty line is `STATUS: done` (read in the same one exec, at most 200 characters), `progress-stale` and `failed-run-idle` are skipped; `refusal` still fires (a line that merely contains the word, such as `not done yet`, does not count).
+
+The end notice says `reporting done (its results file says STATUS: done)` only for a results file that belongs to the run: `STATUS: done` must be the LAST non-empty line of `/work/results.txt` and the file must be newer than the run's recorded start (the stall watch shares the one rule). A file older than the start is reported as `results.txt is from an earlier run` (relaunches reuse the pod's name and directory); a newer file without the marker last is `results.txt present but not finished`; none is `no results file`.
 
 Each condition is alerted at most once per pod per 60 minutes (the pod annotation `cw/stall-alert-<condition>` is set before the send). One message goes to the pod's boss (`reports_to` in the switchboard's worker record, `CW_CLOUD_RECORD_DIR`) and one to the Chief of Staff, through the switchboard's `send`: the pod name, the condition, one evidence line (secret-looking text and the launcher's known secrets replaced by `[redacted]`, at most 300 characters; untrusted data, never a command) and the time. Nothing is stopped, restarted, nudged or changed in the pod. A pod younger than 10 minutes or a pod whose exec fails is skipped, and the pass line names it with the reason and no pod content. The pass line gains ` stall read=N alerted=M [skipped=pod:reason,...]` before its steps. Rollback: revert the change and restart the reaper.
 
@@ -752,3 +754,29 @@ The owner's steps (nothing here is applied by the repository):
 Rollback: unset the setting, delete the Deployment (`kubectl -n cw delete deployment,service,networkpolicy -l app.kubernetes.io/part-of=copilot-bridge`), revoke the sign-in at GitHub.
 
 Tests: `test_copilot_front.py`, `test_copilot_manifest.py`, `test_council_url_render.py` in `cloud/launcher/tests/` (fakes only).
+
+## The daily land report (ask #2448)
+
+`cloud/launcher/land_report.py` is READ-ONLY. The reaper's pass (`_land_report` in `cloud_worker.py`, one inserted call) runs `daily_pass`: at the first pass at or after 13:00 UTC of a day whose report is not complete, it reads the last 24 hours of run records and of landed commits, sends ONE message (the switchboard command `send cos --issue <the setting>`) and adds ONE comment line (`gh issue comment`) to the pinned issue. It edits no issue body. The last-sent day and each part's state (`message`, `comment`) are in `<run record dir>/.land-report.json` (0600, written atomically after each part); a part that failed is tried at the next pass, a part that went is not sent again. Rollback: remove the call.
+
+**What the records hold (read on 12 November 2026).** `run_logs` is `{runs: [{name, exit, woke, log_tail}], wake_lines}`: it has NO time field, so a per-step time of `tests:server` or `tests:pg` is not recorded. The report reads one only from a line `step=<tests:server|tests:pg> seconds=<n>` in a land run's log tail; without it the run is counted as `no step data` (never as 0). Follow-up: the land tool prints that line. Land wall time is the record's `end` minus `start` (the pod's). A landing's size and rounds come from the commit's trailer `Land-Checks: files=<n> lines=<n> rounds=<n>` (`rounds` may be in `Land-Council`); a commit without a key counts as unread. A land run is a run named `land` or `land-*`; its exit 0 is landed, 18 council, 13 tests, 3 environment, 124 or 137 time limit, any other other. A pod counts as landed when its record's `head_sha` is a landed commit of the window (a squashed landing with another sha shows as unlanded: known limit). A lane is the worker name without its trailing `-<digits>`. Windows are by the record's `end`. Median of an even count is the mean of the middle two; p90 is the nearest rank; a lane with fewer than 3 landings prints `n/a`.
+
+Settings (the settings file; all optional): `CW_LAND_REPORT_ISSUE` (`owner/repo#N`; unset: nothing is sent, one stderr line), `CW_LAND_REPORT_SMALL_LINES` (the small bound, default 50, named in the report), `CW_LAND_REPORT_GIT_DIR` (a checkout) and `CW_LAND_REPORT_BRANCH` (default `origin/main`); without a checkout the report says `landed commits: not read`.
+
+| Input or outside call | Failure handled | Test | Mutant (control first, anchored text) |
+|---|---|---|---|
+| run records directory, 24 h window | records of other days are not counted | `S1.test_control` | `S1.test_mutant_counts_every_record` (`S1 lane a`) |
+| a record that is corrupt, a link, or 5 MB | skipped and counted `N records not read`; the rest counted | `S7.test_control` | `S7.test_mutant_stops_at_corrupt` (`S7`) |
+| a secret-shaped value in a log tail or an outside error | one `scrub` on every output; log lines carry the class name only | `S7.test_scrub`, `S8.test_raising_sender_and_missing_issue` | none: the scrub is pinned by value |
+| the land wall times (median, p90, trend) | fewer than 3: `n/a` | `S2.test_control` | `S2.test_mutant_mean` (`S2 numbers`) |
+| step times in the log tail | a missing time is `no step data`, not 0 | `S3.test_control` | `S3.test_mutant_missing_is_zero` (`S3 server`) |
+| `git log` of the default branch (one call, 60 s, no shell) | non-zero, a bad branch or no directory: `None`, the report says so | `S8.test_git_reads` | none: the failure is the test |
+| trailers `Land-Checks`, `Land-Council` (untrusted text) | only `files`, `lines`, `rounds` as digits are read | `S5.test_trailer_parse` | none |
+| the small bound setting | not a whole number 1 to 999999: 50 | `S4.test_small_bound_setting`, `S4.test_control` | `S4.test_mutant_at_least` (`S4 bound`) |
+| council rounds per landing | median and max, not a sum | `S5.test_control` | `S5.test_mutant_sum` (`S5 rounds`) |
+| pods ended unlanded | only pods with no landed head | `S6.test_control` | `S6.test_mutant_every_pod` (`S6 count`) |
+| the schedule and the state file | one per day, none repeated in the hour; a bad state file means due | `S8.test_control` | `S8.test_mutant_no_last_day` (`S8 repeat`) |
+| the switchboard `send cos` (60 s, argv list) | non-zero or an exception: the part stays unsent and is retried alone | `S8.test_failed_part_is_retried_alone`, `S8.test_sender_calls_are_argv_lists` | none |
+| `gh issue comment` (60 s, argv list; issue checked against `owner/repo#N`) | as above; a bad issue is refused | `S8.test_comment_alone_retried`, `S8.test_sender_calls_are_argv_lists` | none |
+
+A crash between a send and the state write can send that part twice (the state is written right after each part). Tests: `cloud/launcher/tests/test_land_report.py`. S9 (the hand check against the real records) is a tester's.

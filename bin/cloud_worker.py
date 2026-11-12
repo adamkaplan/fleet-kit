@@ -983,7 +983,7 @@ def _limits_note(args, record):
         return "%dh" % (seconds // 3600) if seconds % 3600 == 0 else "%dm" % (seconds // 60) if seconds % 60 == 0 else "%ds" % seconds
     def limit(label, value, key):
         text = str(value)[:20] if value else applied(record.get(key))
-        return "%s limit %s%s" % (label, text, "" if value else " (default)" if text != "not reported" else "")
+        return "%s limit %s%s" % (label, text, "" if value else (" (default for shape L)" if getattr(args, "shape", None) == "L" and label == "hard" else " (default)") if text != "not reported" else "")
     stops = []
     for key in ("idle_deadline", "hard_deadline"):
         try:

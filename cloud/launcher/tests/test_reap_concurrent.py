@@ -428,17 +428,22 @@ class ScrubSnapshot(unittest.TestCase):
         errors, removed, done = [], 0, threading.Event()
 
         def adder():
-            for i in range(5000):
+            i = 0
+            while not done.is_set() and i < 20000:   # keeps growing the set for the whole run: the scrub keeps a built copy of an unchanged set
                 known.add("late-added-%07d-yy" % i)
-                time.sleep(0)   # let the scrubbing thread run between two adds
-            done.set()
+                i += 1
+                time.sleep(0)
         t = threading.Thread(target=adder, daemon=True)
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)   # the adder gets the interpreter inside a scrub, not only between two
+        self.addCleanup(sys.setswitchinterval, old_interval)
         t.start()
         for _ in range(SCRUB_RUNS):
             try:
                 removed += planted not in mod.scrub(text, known)
             except RuntimeError as e:
                 errors.append(str(e))
+        done.set()
         t.join()
         print("S9: scrubs %d of %d, RuntimeError %d, planted value removed %d of %d"
               % (SCRUB_RUNS, SCRUB_RUNS, len(errors), removed, SCRUB_RUNS))
