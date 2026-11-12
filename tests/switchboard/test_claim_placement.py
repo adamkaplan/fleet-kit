@@ -174,7 +174,8 @@ class TestClaimReaders(unittest.TestCase):
             self.skipTest("the readers are fixtures of bin/test-switchboard")
     READERS = {("plan_ledger.py", "pr_scenarios"), ("plan_ledger.py", "covered_ids"), ("plan_ledger.py", "claim_union"), ("plan_ledger.py", "closed_unclaimed"),
                ("plan_ledger.py", "evaluate_gates"), ("fleet-switchboard", "_scenario_of"), ("fleet-switchboard", "cmd_verdict"), ("fleet-switchboard", "claim_union_refusal"),
-               ("fleet-switchboard", "unclaimed_verdict"), ("fleet-switchboard", "claim_union_note"), ("fleet-switchboard", "ci_record_core")}
+               ("fleet-switchboard", "unclaimed_verdict"), ("fleet-switchboard", "claim_union_note"), ("fleet-switchboard", "ci_record_core"),
+               ("fleet-switchboard", "_merged_body_claim")}   # the last: a merged sibling's own body as merged (#2465), tested in test_claim_body_read.py
 
     def test_the_readers_found_by_search_are_the_readers_tested(self):
         self.assertEqual(callers(), self.READERS)
