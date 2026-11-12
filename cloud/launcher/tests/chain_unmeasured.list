@@ -31,6 +31,7 @@ cloud/launcher/tests/test_kept_expiry.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
+cloud/launcher/tests/test_land_shape.py
 cloud/launcher/tests/test_launch_idempotent.py
 cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_long_run_setting.py

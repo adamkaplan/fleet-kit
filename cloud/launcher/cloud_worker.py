@@ -41,14 +41,16 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
           # the orchestrator row: it reads and relays, it builds nothing; no nested Docker. The estimate is the larger of the ratios 0.25 (cpu) and 0.375 (memory) against XS 0.05 = 0.01875, rounded up
           "O": {"cpu": "250m", "memory": "768Mi", "usd_per_hour": 0.02, "stack": False},
           "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
-          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
+          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True},
+          # the landing row (ask #2457): request equals limit, so one L takes a node's CPU; 0.34 is 6 of 8 vCPU of a 0.452 node
+          "L": {"cpu": "6", "memory": "16Gi", "usd_per_hour": 0.34, "stack": True}}  # list-price estimates, not billed figures
 
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 
 # Per-shape requests (#1978): ONE table, shapes S and M; a shape with no row has no requests key. The limits stay the SHAPES rows.
-SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}}
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}, "L": {"cpu": "6", "memory": "16Gi"}}
 
 
 def capacity_shapes():
