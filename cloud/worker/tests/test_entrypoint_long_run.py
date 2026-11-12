@@ -24,7 +24,7 @@ class Base(unittest.TestCase):
         self.run_dir = os.path.join(self.d, "run"); self.home = os.path.join(self.d, "home"); self.bin = os.path.join(self.d, "bin"); self.rec = os.path.join(self.d, "rec")
         for x in (self.tmpfs, self.share, self.run_dir, self.home, self.bin, self.rec):
             os.mkdir(x)
-        for src, name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md"), ("agents/orchestrator.md", "orchestrator.md")):
+        for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md"), ("agents/orchestrator.md", "orchestrator.md")):
             shutil.copy(os.path.join(CLOUD, "worker", src), os.path.join(self.share, name))
         oc = os.path.join(self.bin, "opencode")
         shutil.copy(os.path.join(HERE, "fake_opencode.sh"), oc); os.chmod(oc, 0o755)

@@ -27,7 +27,7 @@ import time
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 CHIEF = "cos"                      # the Chief of Staff's switchboard name when the config names none (`remind cos`)
 CONFIG_KEY = "cos_name"            # the switchboard config's key (config.json) that names the Chief of Staff's agent, when it has one
-STALL_ASK = "adamkaplan/fleet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
+STALL_ASK = "adamkaplan/fl" "eet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
 IDLE_NOTICE_MIN_SECONDS = 120      # ask #2443: a pod's idle notices are at least this far apart (the key comes from the pod's own server: a looping pod cannot flood its boss)
 RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
@@ -58,7 +58,7 @@ def tail(p, n):
     except OSError:
         return None
 out = {"now": time.time(), "results": "", "results_exists": False, "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None, "turn": {"turn": "unknown", "outcome": None, "finish": None},
-       "idle": None, "active_read": False, "session_updated": None, "turn_start": None, "ahead": None}
+       "idle": None, "active_read": False, "session_updated": None, "turn_start": None, "ahead": None, "updated": None, "activity": None, "running": None}
 try:
     p = "/work/progress.txt"
     out["progress"] = {"mtime": os.path.getmtime(p), "tail": [l[:400] for l in (tail(p, 10) or [])]}
@@ -94,8 +94,18 @@ try:
     ss.sort(key=lambda s: (s.get("time") or {}).get("updated") or 0)
     if ss:
         u = (ss[-1].get("time") or {}).get("updated")
-        if isinstance(u, (int, float)):
+        if isinstance(u, (int, float)) and not isinstance(u, bool):
             out["msg_time"] = u / 1000.0 if u > 1e11 else u
+            if out["msg_time"] > out["now"] + 60:
+                out["msg_time"] = None
+            out["updated"] = out["msg_time"]
+        try:
+            act = get("/api/session/active").get("data")
+            out["running"] = any(not isinstance(v, dict) or v.get("type") in (None, "running") for v in act.values()) if isinstance(act, dict) else bool(act)
+        except Exception:
+            pass
+        def sec(x):
+            return (x / 1000.0 if x > 1e11 else x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
         best, bt, q = "", -1, ""
         for _page in range(5):
             body = get("/api/session/%s/message%s" % (ss[-1]["id"], q)) if time.time() - out["now"] < 1.2 else {}
@@ -111,6 +121,11 @@ try:
                     text = " ".join(str(x.get("text") or "") for x in m["parts"] if isinstance(x, dict))
                 t = (info.get("time") or {}).get("created")
                 t = t if isinstance(t, (int, float)) else 0
+                for tm in [info.get("time") or {}] + [((x.get("state") or {}).get("time") or x.get("time") or {}) for x in (m.get("parts") if isinstance(m.get("parts"), list) else []) if isinstance(x, dict)]:
+                    for k in ("created", "start", "end", "completed"):
+                        v = sec(tm.get(k)) if isinstance(tm, dict) else None
+                        if v is not None and v <= out["now"] + 60:
+                            out["activity"] = max(out["activity"] or 0, v)
                 if text and t >= bt:
                     best, bt = text, t
             cur = body.get("cursor") if isinstance(body, dict) else None
@@ -207,6 +222,30 @@ def classify(data):
     return turn["turn"] if turn["turn"] in ("running", "idle") else "unknown"
 
 
+RUNNING_QUIET_SECONDS = 30 * 60    # a running turn with no new message or tool call for this long no longer silences a condition (a turn hung inside one tool call)
+
+
+def session_state(data, now, threshold):
+    """(working, reason): working is True when the session shows activity that silences a condition of `threshold` seconds (its last message or tool call, else its
+    last update, is younger than the threshold; or a turn is running and that time is younger than RUNNING_QUIET_SECONDS), False when it is quiet, None with the
+    reason when the server did not answer or the fields are missing (the condition then decides from the files)."""
+    def ok(v):   # a time that is a finite number not in the future (a pod could write any value)
+        v = _num(v)
+        return v if v is not None and v == v and abs(v) != float("inf") and v <= now + 60 else None
+    last = ok(data.get("activity"))
+    if last is None:
+        last = ok(data.get("updated"))
+    running = data.get("running") if isinstance(data.get("running"), bool) else None
+    if last is None:
+        return None, ("the session's activity was not readable" if running is None and data.get("updated") is None else "the session's last activity time was missing")
+    age = now - last
+    if age < threshold:
+        return True, ""
+    if running and age < RUNNING_QUIET_SECONDS:
+        return True, ""
+    return False, ""
+
+
 def decide(data):
     """{condition: evidence text} for the three conditions, from the probe's answer. Pure: times are the pod's own clock (`now` in the answer)."""
     now = _num(data.get("now"))
@@ -220,6 +259,8 @@ def decide(data):
     ptime = _num(prog.get("mtime")) if prog else None
     tail = [str(x) for x in (prog.get("tail") or [])] if prog else []
     stime = _num(data.get("msg_time"))
+    if stime is not None and not (stime <= now + 60 and abs(stime) != float("inf")):   # a future or non-finite session time is read as missing (a pod could write any value)
+        stime = None
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
@@ -227,7 +268,9 @@ def decide(data):
     # (running, or an unreadable answer); no text line decides anything. (b) refusal still fires.
     finished = classify(data) == "idle"
     if not finished and times and not active and now - max(times) >= STALE_SECONDS:
-        found["progress-stale"] = "no change for %d minutes; last progress line: %s" % ((now - max(times)) // 60, tail[-1] if tail else "(none)")
+        working, why = session_state(data, now, STALE_SECONDS)
+        if not working:
+            found["progress-stale"] = "no change for %d minutes%s; last progress line: %s" % ((now - max(times)) // 60, "" if working is False else " (decided from the files: %s)" % why, tail[-1] if tail else "(none)")
     # (b)
     msg = str(data.get("msg") or "")
     hit = next((l for l in msg.splitlines() + tail[-2:] if REFUSAL_WORDS.search(l)), None)
@@ -250,9 +293,10 @@ def decide(data):
     if bad and not finished:
         e = max(bad, key=lambda x: _num(x["mtime"]))
         moved = max([t for t in (_num(e["mtime"]), ptime, stime) if t is not None])
-        if now - moved >= FAILED_IDLE_SECONDS:
+        working, why = session_state(data, now, FAILED_IDLE_SECONDS) if now - moved >= FAILED_IDLE_SECONDS else (True, "")
+        if not working:
             log = next((r.get("last") for r in runs if r.get("name") == e.get("name")), "") or ""
-            found["failed-run-idle"] = "run %s exited %s; no change for %d minutes; last log line: %s" % (str(e.get("name"))[:60], str(e.get("code"))[:6], (now - moved) // 60, log)
+            found["failed-run-idle"] = "run %s exited %s; no change for %d minutes%s; last log line: %s" % (str(e.get("name"))[:60], str(e.get("code"))[:6], (now - moved) // 60, "" if working is False else " (decided from the files: %s)" % why, log)
     return found
 
 

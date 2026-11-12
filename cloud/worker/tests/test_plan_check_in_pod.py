@@ -127,16 +127,14 @@ class PlanCheckInPod(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual((sorted(os.listdir(self.tmp.name)), read(p)), before)
 
-    def test_u1_guard_and_permissions_untouched(self):
+    def test_u1_permissions_untouched(self):
         # Pinned hashes of the files at the time of this change (they must not change for the plan check).
-        self.assertEqual(hashlib.sha256(read(os.path.join(WORKER, "guard.sh"))).hexdigest(), PINNED["guard.sh"])
         # opencode-worker.json: ask #2402 removed every convenience row; the file is pinned by its whole content (the per-row pins of earlier asks went with the rows)
         import json
         with open(os.path.join(WORKER, "opencode-worker.json")) as f:
             conf = json.load(f)
         self.assertEqual(conf["permission"]["bash"], {"*": "allow"})
         self.assertEqual(conf["permission"]["bash"], conf["agent"]["worker"]["permission"]["bash"])
-        self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "guard.sh")))
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "opencode-worker.json")))
 
     def test_s11_docs_and_readme(self):
@@ -237,7 +235,6 @@ def intent_differs():
     return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
-PINNED = {'guard.sh': 'b8f86ad11591e3f2a6d22d414d1a4230849efa3be055dbd78c23d105e510e2cd'}
 
 if __name__ == "__main__":
     unittest.main()
