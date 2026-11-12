@@ -317,7 +317,7 @@ def build():
             self.assertEqual(code, 0, err)
             block = self.block(err)
             rows = self.rows(block)
-            for shape in ("XS", "S", "M"):   # the room per shape from the launcher's table and the fixture; a new shape adds a row
+            for shape in ("XS", "S", "M", "L"):   # the room per shape from the launcher's table and the fixture; a new shape adds a row
                 self.assertEqual(rows.get(shape), str(self.expected_room(shape)), block)
             limits = {n: dict(r) for n, r in LIB.SHAPES.items()}
             self.assertNotEqual(self.expected_room("M", shapes=limits), self.expected_room("M"), "the fixture cannot tell the request from the limit")

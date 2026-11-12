@@ -219,17 +219,22 @@ class TestScratch(unittest.TestCase):
         self.assertIn("S2: launches accepted for a lane holding 5 records 1, written records with a shape key 0", out)
 
     def test_s8_a_mutant_that_never_stops_a_launch_fails_the_cap_scenario(self):
+        self.assertEqual(self.child([], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")[1], 0)   # the control, first
         applied, code, out = self.child([(HELD_CHECK, "            if False:")], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")
+        self.assertIn("AssertionError: 0 != 2", out)
         print("S8: mutant never-stops exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
 
     def test_l_a_mutant_that_never_stops_shape_l_fails_the_l_cap_test(self):
         edits = [(HELD_CHECK, "            if False:")]
+        _, ccode, cout = self.child([], "test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l")   # the control, first
+        self.assertEqual(ccode, 0, cout[-800:])
         applied, code, out = self.child(edits, "test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l")
         self.assertEqual((applied, code), (1, 1), out[-800:])
-        self.assertIn("AssertionError: 0 != 2", out)   # the launch that should be refused exits 0
+        self.assertIn("AssertionError: 0 != 2 : ", out)   # the launch that should be refused exits 0
 
     def test_s8_a_mutant_that_counts_every_shape_fails_the_other_shapes_scenario(self):
+        self.assertEqual(self.child([], "test_s4_other_shapes_names_and_lanes_proceed_as_before")[1], 0)   # the control, first
         applied, code, out = self.child([('record.get("shape") != shape or ', "")], "test_s4_other_shapes_names_and_lanes_proceed_as_before")
         print("S8: mutant counts-every-shape exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
