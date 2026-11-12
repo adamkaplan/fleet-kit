@@ -219,7 +219,7 @@ class Harness(base.Base):
 
     def audit(self):
         try:
-            return self.audit_lines()
+            return [x for x in self.audit_lines() if not (isinstance(x, dict) and x.get("action") == "wip-save")]   # the reaper's wip save (#2304) audits its own lines, pinned in test_wip_save; the renewal's audit is the rest
         except OSError:
             return []
 

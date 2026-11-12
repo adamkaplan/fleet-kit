@@ -45,7 +45,7 @@ class TestClaimLegacy(unittest.TestCase):
 
     def test_the_shape_of_1675_a_sibling_merged_on_25_october_with_no_recorded_claim_passes_with_no_waiver(self):
         self.assertIsNone(self.judge("2026-10-25T17:57:00Z"))
-        self.assertIn("no recorded claim", self.judge("2026-10-30T00:00:00Z"))   # the same shape after the cutoff is still refused
+        self.assertIn("no recorded claim", self.judge("2026-11-12T00:00:00Z"))   # the same shape after both cutoffs is still refused (the body of a hand merge is read only when it is proven as merged, #2465: here the body read is unavailable)
 
     def test_s3_after_the_cutoff_or_unreadable_the_sibling_is_still_unknown(self):
         for when in (iso(CUTOFF + 86400 * 30), "not a time", "2026-10-29"):
@@ -56,7 +56,7 @@ class TestClaimLegacy(unittest.TestCase):
     def test_s4_the_boundary_is_at_or_before(self):
         self.assertIsNone(self.judge(iso(CUTOFF)))
         self.assertIsNone(self.judge(iso(CUTOFF - 1)))
-        self.assertIn("no recorded claim", self.judge(iso(CUTOFF + 1)))
+        self.assertIn("no recorded claim", self.judge(iso(CUTOFF + 1)) or "")   # #2465: as before #2455 (it had been assertIsNone for #2455): one second after the cutoff with no recorded claim and no readable body is unknown; a readable CLAIMS line is read, test_claim_body_read.py
 
     def test_s5_the_cutoff_is_defined_once_read_by_one_rule_and_documented(self):
         src = (REPO / "bin" / "fleet-switchboard").read_text()

@@ -17,7 +17,6 @@ run plugins/fleet-hooks/index.test.mjs | node --test
 exempt cloud/launcher/tests/test_cloud_pod_deadline.py | named in bin/test-cloud-launcher EXCEPTIONS as slow (26 s), not yet chained
 exempt cloud/launcher/tests/test_cloud_stop_nonce.py | named in bin/test-cloud-launcher EXCEPTIONS as slow (57 s), not yet chained
 exempt cloud/launcher/tests/test_reaper_record_family.py | named in bin/test-cloud-launcher EXCEPTIONS: did not finish in 120 s, not yet chained
-exempt cloud/worker/tests/test_guard.py | measured over 100 s on one core, too slow for a chain leg; run it by hand (python3 cloud/worker/tests/test_guard.py)
 exempt plugins/opencode-todolist/tests/plugin.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
 exempt plugins/opencode-todolist/tests/timing.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
 exempt plugins/opencode-todolist/tests/todolist.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it

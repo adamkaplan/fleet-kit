@@ -67121,6 +67121,7 @@ TestSummaryCluster = importlib.import_module("test_pod_silence").TestSummaryClus
 TestDaemonSummary = importlib.import_module("test_pod_silence").TestDaemonSummary   # the daemon summary of #2173
 TestUnreadableSummary = importlib.import_module("test_pod_silence").TestUnreadableSummary   # the unreadable summary of #2173
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
+_cos_issue_comments = importlib.import_module("test_cos_issue_comments"); _cos_issue_comments.GithubRig = GithubRig; TestCosIssueComments = _cos_issue_comments.TestCosIssueComments   # ask #2445
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
@@ -78983,7 +78984,7 @@ class TestClosedUnmergedAskClose(unittest.TestCase):
         if kind == "too many pull requests":
             self.too_many = True
         elif kind == "unknown sibling":   # merged, and no claim line was ever recorded for it
-            self.found = [dict(number=31, state="closed", merged_at="2026-11-01T00:00:00Z", body="PLAN: %s\nCLAIMS: S1" % self.ASK, pull_request={"merged_at": "2026-11-01T00:00:00Z"})]
+            self.found = [dict(number=31, state="closed", merged_at="2026-11-12T00:00:00Z", body="PLAN: %s\nCLAIMS: S1" % self.ASK, pull_request={"merged_at": "2026-11-12T00:00:00Z"})]   # no recorded claim and no readable body as merged (#2465): unknown
         else:
             self.broken = kind
 
@@ -80383,6 +80384,7 @@ NOT_ISOLATED_BY_BASE = {
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
     "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile", "TestTheProductionWiring",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392
     "TestLandAttribution", "TestEndOnAsk", "TestLaunchRecordsTheAsk",   # (#2393) TestLandAttribution derives from the push-watch Case (a TemporaryDirectory removed by addCleanup, fake engine and GitHub, no state path); TestEndOnAsk builds its StopWorld (mkdtemp removed by addCleanup); TestLaunchRecordsTheAsk runs the stubbed launch inside its own TemporaryDirectory
+    "TestClaimBodyRead", "TestClaimHandMerge",   # (#2465 for TestClaimBodyRead, the same reason) (#2454) its own isolating setUp: it builds a TestClaimUnionAtLastMerge (a LedgerBase, so a Base) fixture and runs that fixture's setUp, which isolates the state; it reads no real state
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255

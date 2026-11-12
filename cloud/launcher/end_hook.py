@@ -32,9 +32,7 @@ SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
 HOST_URL = "https://github.com/"
 HELPER_DIR = "/run/cw-tmp/bin"   # the directory entrypoint.sh fills ($TMP/bin, TMP=/run/cw-tmp); the helper is git-credential-cw in it
 HELPER_NAME = "git-credential-cw"
-# git is run by ABSOLUTE path, never found on PATH: in a pod the guard wrapper ($TMP/bin/git, first on the entrypoint's PATH) refuses the
-# hook's own calls (a global-configuration override variable in the environment) and would make every pre-stop push fail. The wrapper itself execs the real
-# binary the image installs (cloud/worker/entrypoint.sh: CW_REAL_GIT, found before the wrapper exists); the image's git package puts
+# git is run by ABSOLUTE path, never found on PATH, so nothing first on the pod's PATH can stand in for it; the image's git package puts
 # it at /usr/bin/git. Test seam: the tests patch GIT_BIN like the two constants above.
 GIT_CANDIDATES = ("/usr/bin/git", "/usr/local/bin/git")
 
