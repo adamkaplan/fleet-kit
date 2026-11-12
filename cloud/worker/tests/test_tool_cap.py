@@ -26,8 +26,11 @@ class ToolCap(unittest.TestCase):
             return json.load(f)
 
     def test_s3_plugin_listed_once(self):
-        c = self.cfg()
-        self.assertEqual([p for p in c["plugin"] if "cw-tool-cap" in p], ["/usr/local/share/cw/plugins/cw-tool-cap/index.js"])
+        # the permission file stays the catch-all allow alone (content pin); the entrypoint registers the plugin in the running config
+        self.assertNotIn("plugin", self.cfg())
+        with open(os.path.join(W, "entrypoint.sh")) as f:
+            ep = f.read()
+        self.assertEqual(ep.count('"plugin": ["%s/plugins/cw-tool-cap/index.js"]'), 1)
 
     def test_s3_no_timeout_above_cap(self):
         vals = list(timeouts(self.cfg()))
