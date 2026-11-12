@@ -83,6 +83,18 @@ class Pdb(base.Base):
         self.assertEqual(code, 0, err)
         self.assert_only_other_left("stop by name")
 
+    def test_s3_a_stop_of_a_gone_pod_removes_its_budget_and_not_the_others(self):
+        for nonce in (A, None):
+            self.create("coder1", *(["--run-id", nonce] if nonce else []))
+            self.other()
+            st = self.st()
+            del st["pods"][cw.pod_name("coder1")]   # the pod is gone: the retire path
+            self.write_state(st)
+            code, _, err = self.run_cli("stop", "coder1", "--no-record", *(["--run-id", nonce] if nonce else []))
+            self.assertEqual(code, 0, err)
+            self.assert_only_other_left("gone pod")
+            self.run_cli("stop", "other", "--no-record", "--run-id", B)
+
     def test_s3_a_stop_with_another_run_id_leaves_the_budget(self):
         self.create("coder1", "--run-id", A)
         code, _, _ = self.run_cli("stop", "coder1", "--no-record", "--run-id", B)
