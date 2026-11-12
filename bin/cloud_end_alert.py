@@ -481,7 +481,7 @@ def stall_evidence(value):
 
 
 def stall_text(worker, condition, evidence, when, ask):
-    return "[stall] %s %s: %s; at %s; read it with: fleet-switchboard read %s; ask %s" % (worker, condition, evidence, when, worker, ask)
+    return "[stall] %s %s: %s; at %s; read it with: fleet-switchboard read %s; ask %s" % (worker, condition, quiet(evidence), when, worker, ask)
 
 
 def scan_stall(audit_file, state_file, send, parse):
