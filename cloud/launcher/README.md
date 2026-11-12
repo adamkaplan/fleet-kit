@@ -311,12 +311,10 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_cloud_quick_bounds.py` | 46 | parallel |
 | `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
-| `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
 | `cloud/worker/tests/test_pod_rules.py` | 3 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
 | `cloud/worker/tests/test_pod_inspect.py` | 3 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
-| `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
 | `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
@@ -391,12 +389,10 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_cloud_quick_bounds.py` | 45 | parallel |
 | `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
-| `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
 | `cloud/worker/tests/test_pod_rules.py` | 3 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
 | `cloud/worker/tests/test_pod_inspect.py` | 2 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
-| `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
 | `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
@@ -443,7 +439,7 @@ the create's own clock, so the floor can trail the stored cap by scheduling time
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
 is read from `CW_CLOUD_SPEND_CAP_USD`; unset or empty means the prototype's USD 25, and zero, negative, non-numeric,
 `nan`, `inf` or a cost that cannot be read refuses `create` (exit 5). The check adds this launch's estimate (hard limit times the shape's rate) to what the running pods already cost. A worker name with `_` maps to `-` plus a 4-hex
-hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `O`, the orchestrator row: `O` (250m CPU, 768 MiB, 0.02 USD/hour), requests equal limits, no nested Docker; cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day, a list-price estimate, not a billed figure, the node's own price not included; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory); `create` refuses a spec with a stored credential.
+hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20, `L` 0.34 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `O`, the orchestrator row: `O` (250m CPU, 768 MiB, 0.02 USD/hour), requests equal limits, no nested Docker; cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day, a list-price estimate, not a billed figure, the node's own price not included; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory); `create` refuses a spec with a stored credential.
 
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
@@ -559,8 +555,7 @@ that fails revokes the token and exits non-zero. Success is silent. It refuses (
   and the answer is checked again): no extra key, no higher level, none missing.
 
 The worker can now read issues and their comments of its own repository (its ask and plan), through `issues: read`.
-It cannot write issues, labels, merges or settings; `issues: read` opens no write path, and the worker's `gh` wrapper
-still refuses every such write (a second line behind GitHub's own permission). The one owner step, in this order: merge the
+It cannot write issues, labels, merges or settings; `issues: read` opens no write path, and the worker's client (`cw-gh`) has no code for such a write (the token's own scope and the repository's rules are the guard). The one owner step, in this order: merge the
 change, then add `issues: read` to the App's permissions and accept it on each installation. Until then a launch is refused
 before any pod exists, with one line that names `issues` and the owner step (the mint fails closed rather than also
 accepting the old set). The exact refusal GitHub gives for a permission granted but not yet accepted is not verified live.

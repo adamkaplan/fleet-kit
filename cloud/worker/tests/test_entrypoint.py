@@ -43,7 +43,7 @@ class Entrypoint(unittest.TestCase):
             os.mkdir(x)
         self.share = os.path.join(self.d, "share")   # what the image's COPY lays down under /usr/local/share/cw
         os.mkdir(self.share)
-        for src, name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
+        for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
             shutil.copy(os.path.join(CLOUD, "worker", src), os.path.join(self.share, name))
         rec = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))   # what the stand-in opencode records (its calls and the stdin it was given): outside the tree the tests scan
         self.addCleanup(rec.cleanup)
@@ -134,7 +134,7 @@ class Entrypoint(unittest.TestCase):
         self.assertEqual(json.loads(read(conf))["model"], "github-copilot/claude-sonnet-5.5")
         self.assertEqual(stat.S_IMODE(os.stat(conf).st_mode), 0o600)
         self.assertEqual(self.start(CW_MODEL="acme/other-model").returncode, 0)
-        self.assertEqual(json.loads(read(conf))["model"], "acme/other-model")   # (the file also carries the worker agent: see test_guard.py)
+        self.assertEqual(json.loads(read(conf))["model"], "acme/other-model")   #
 
     def test_s4_no_secret_is_in_the_environment_of_the_command_or_in_any_file_but_its_own(self):
         r = self.start("env")
