@@ -513,7 +513,7 @@ polled on a timer.
   `from=` marker of the issue body names a registered agent and the issue's author is a fleet identity (`gh_users` or `github_bot_logins`): that agent gets it; a
   marker in any other issue, or naming an unknown agent, routes nothing. Otherwise (unreadable issue or author, another author's issue, more than one Chief-of-Staff
   lane) the Chief of Staff (the first by name when more than one) receives it, with the reason in the summary and one `github.comment.chief_unknown` line per
-  comment. Only when no Chief-of-Staff lane runs is it dropped, with that one audit line. A fleet identity's own comments are never routed.
+  comment. Only when no Chief-of-Staff lane runs is it dropped, with that one audit line. The Chief of Staff's own comments (its account; where the repository has none, any fleet login's) are never routed.
 
   **Which events reach the agent.** Everything routed by `closing` is delivered as before (a passing check
   included). For an agent found by `notice` or `reference` only these are delivered: a check or workflow run

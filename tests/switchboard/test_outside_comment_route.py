@@ -75,12 +75,12 @@ class TestOutsideCommentRoute(Base):
     def test_s4_an_ambiguous_chief_case_is_delivered_to_a_chief_and_audited_once(self):
         self.rig(agents=TWO_CHIEFS)
         self.issue(34, "lane-zz", FLEET)
-        for n in range(2):
-            self.gh.comment(34, "hello %d" % n, 6005 + n, login="outsider-1")
+        for key in (6005, 6006, 6006, 6006):   # the same comment delivered again is routed once
+            self.gh.comment(34, "hello %d" % key, key, login="outsider-1")
         got = self.told()
-        self.assertEqual({t[1] for t in got}, {"chief"})
-        self.assertEqual(len(got), 2)
+        self.assertEqual([t[1] for t in got], ["chief", "chief"])
         self.assertIn("not one lane", got[0][2])
+        self.assertIn("chief, chief2", got[0][2])
         self.assertEqual(len(self.audit("github.comment.chief_unknown")), 2)   # once per comment
         self.assertEqual(self.audit("github.unrouted"), [])
 
@@ -97,17 +97,58 @@ class TestOutsideCommentRoute(Base):
         self.rig()
         self.issue(36, "lane-a", FLEET)
         self.gh.comment(36, "my own note", 6011, login=FLEET)
-        self.gh.comment(36, "a bot's note", 6012, login="widget-bot[bot]")
+        self.assertEqual(self.told(), [])
+        self.gh.comment(36, "an outsider", 6012, login="outsider-1")   # the same issue does route another person's comment
+        self.assertEqual([t[0] for t in self.told()], ["github.comment:6012"])
+
+    def test_s5_without_an_account_a_fleet_logins_comment_is_not_routed(self):
+        self.rig(config={"gh_users": {}, "github_bot_logins": ["widget-bot[bot]"]})
+        self.issue(38, "lane-a", "widget-bot[bot]")
+        self.gh.comment(38, "a bot's note", 6016, login="widget-bot[bot]")
         self.assertEqual(self.told(), [])
 
+    def test_s3_an_unknown_agent_from_a_non_chief_fleet_author_falls_back_to_the_chief(self):
+        self.rig(config={"gh_users": {SCRATCH: FLEET}, "github_bot_logins": ["widget-bot[bot]"]})
+        self.issue(39, "lane-zz", "widget-bot[bot]")
+        self.gh.comment(39, "hello", 6017, login="outsider-1")
+        got = self.told()
+        self.assertEqual([t[:2] for t in got], [("github.comment:6017", "chief")])
+        self.assertIn("no lane could be decided", got[0][2])
+        self.assertEqual(len(self.audit("github.comment.chief_unknown")), 1)
+
+    @staticmethod
+    def old_chief_route(hub, item, agents, now):
+        """The _chief_route of integration before ask #2484, as it decided: no marker route, no fallback; an ambiguous or absent Chief lane audits and drops."""
+        facts = item.issue_facts
+        if facts is None or facts["pr"]:
+            return None, None, False
+        account = str(hub.accounts.account_for(item.repo) or "").lower()
+        if not account or facts["author"].lower() != account or str(item.sender or "").lower() == account:
+            return None, None, False
+        mine = [n for n in sorted(agents) if sb._is_orchestrator(agents[n])]
+        if len(mine) != 1:
+            hub._chief_audit_once(item, "the Chief of Staff lane is not one lane")
+            return None, None, True
+        return mine[0], "chief", False
+
     def test_s6_control_the_current_routing_sends_the_first_case_to_nobody(self):
-        self.rig()
+        self.rig(agents=TWO_CHIEFS)   # the real case: more than one Chief-of-Staff lane
         self.issue(37, "lane-a", FLEET)
-        with mock.patch.object(sb.GitHubHub, "_chief_route", lambda hub, item, agents, now: (None, None, False)):
+        with mock.patch.object(sb.GitHubHub, "_chief_route", self.old_chief_route):
             self.gh.comment(37, "hello", 6013, login="outsider-1")
             self.assertEqual(self.told(), [])
+            self.assertEqual(len(self.audit("github.comment.chief_unknown")), 1)
         self.gh.comment(37, "hello again", 6014, login="outsider-1")
         self.assertEqual([t[1] for t in self.told()], ["lane-a"])
+
+    def test_s6_control_the_ambiguous_case_reaches_nobody_in_the_old_routing(self):
+        self.rig(agents=TWO_CHIEFS)
+        self.issue(40, "lane-zz", FLEET)
+        with mock.patch.object(sb.GitHubHub, "_chief_route", self.old_chief_route):
+            self.gh.comment(40, "hello", 6018, login="outsider-1")
+            self.assertEqual(self.told(), [])
+        self.gh.comment(40, "hello again", 6019, login="outsider-1")
+        self.assertEqual([t[1] for t in self.told()], ["chief"])
 
     def test_u1_a_comment_on_a_lanes_registered_issue_still_goes_to_the_lane_not_the_marker(self):
         self.rig()

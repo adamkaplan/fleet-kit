@@ -10921,8 +10921,8 @@ class GitHubHub:
         account = self.accounts.account_for(item.repo)
         account = str(account).lower() if account else None
         sender = str(item.sender or "").lower()
-        if (account and sender == account) or self._fleet_login(item.sender):
-            return None, None, False   # the Chief of Staff's own comment, or a fleet identity's: never routed
+        if (account and sender == account) or (not account and self._fleet_login(item.sender)):
+            return None, None, False   # the Chief of Staff's own comment (its account here, else any fleet login): never routed
         why = None
         if facts is None:
             why = "the issue could not be read"
@@ -10948,7 +10948,9 @@ class GitHubHub:
         if not mine:
             self._chief_audit_once(item, why + " (and no Chief of Staff lane is running)")
             return None, None, True
-        lane = mine[0]   # more than one lane: the first by name; the reason names it
+        lane = mine[0]   # more than one lane: the first by name; the reason names the lanes
+        if len(mine) > 1:
+            why += " (Chief-of-Staff lanes %s; delivered to %s)" % (", ".join(mine[:5]), lane)
         self._chief_audit_once(item, why, delivered=True)
         return self._deliver_summary(item, lane, "chief", "no lane could be decided (%s)" % why)
 
