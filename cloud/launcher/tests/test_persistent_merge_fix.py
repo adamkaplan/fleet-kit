@@ -54,7 +54,7 @@ class CopyRun(unittest.TestCase):
             f.write(text)
         os.chmod(target, 0o755)
         p = stub_support.start(self, [sys.executable, target, "-k", k], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        out, _ = p.communicate(timeout=90)
+        out, _ = p.communicate(timeout=300)   # the copy runs a whole switchboard test (about 90 s of CPU under the heavy-run wrapper); 90 s was a timeout, not a leak
         return p.returncode, out
 
     def source(self):
