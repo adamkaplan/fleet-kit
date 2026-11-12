@@ -66,6 +66,10 @@ except OSError:
     pass
 out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]   # text for humans: decides nothing
 out["results_exists"] = os.path.isfile("/work/results.txt") and not os.path.islink("/work/results.txt")   # the deliverable as structure
+try:
+    out["results_mtime"] = os.path.getmtime("/work/results.txt")
+except OSError:
+    pass
 rd = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 try:
     names = sorted(os.listdir(rd))[:200]
@@ -244,6 +248,12 @@ def session_state(data, now, threshold):
     if running and age < RUNNING_QUIET_SECONDS:
         return True, ""
     return False, ""
+
+
+def _results_done(data):
+    """Ask #2472: the run record's one rule (last non-empty line, and newer than the pod's start when both times are known)."""
+    from run_record import results_verdict
+    return results_verdict(str(data.get("results") or ""), _num(data.get("results_mtime")), _num(data.get("started")), nocase=True) == "done"
 
 
 def decide(data):
@@ -431,6 +441,7 @@ def watch_pass(launcher, pods, now, name_ok):
                 counts["notices"] = counts.get("notices", 0) + 1
             if young:
                 continue
+            data["started"] = started.timestamp()   # ask #2472: results.txt older than this is an earlier run's
             for condition, text in decide(data).items():
                 mark = _ann(pod, "stall-alert-" + condition)
                 last = launcher_parse(mark)

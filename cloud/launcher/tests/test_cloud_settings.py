@@ -31,6 +31,10 @@ OPTIONAL_SAMPLES["CW_SECRET_DIR"] = os.path.join(os.path.expanduser("~"), "cw-se
 OPTIONAL_SAMPLES["CW_AZURE_CONFIG_DIR"] = "/tmp"   # an existing directory; the setting is refused when it is missing
 OPTIONAL_SAMPLES["CW_COUNCIL_URL"] = "http://copilot-bridge.cw.svc:8080"   # ask #2341
 OPTIONAL_SAMPLES["CW_LONG_RUN_DENY"] = "*longcmd*,*other.sh*"   # ask #2369
+OPTIONAL_SAMPLES["CW_LAND_REPORT_ISSUE"] = "owner/repo#7"   # ask #2448
+OPTIONAL_SAMPLES["CW_LAND_REPORT_SMALL_LINES"] = "50"
+OPTIONAL_SAMPLES["CW_LAND_REPORT_GIT_DIR"] = "/srv/checkout"
+OPTIONAL_SAMPLES["CW_LAND_REPORT_BRANCH"] = "origin/main"
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -95,6 +99,10 @@ HOSTILE["CW_SECRET_DIR"] = ["secrets", "/tmp/cw-secrets", "/etc", "-x", os.path.
 HOSTILE["CW_AZURE_CONFIG_DIR"] = ["azure", "/a/../b", "-x", "/no/such/dir-azure-test"]   # relative, a .. segment, an option, a missing directory
 HOSTILE["CW_COUNCIL_URL"] = ["ftp://bridge.example", "bridge.example:8080", "http://", "http://user@bridge.example", "http://bridge.example?x=1", "http://bridge.example#f", "https://bridge.example/a/b", "file:///etc/passwd", "http://bridge example", "http://bridge.example/opaque-segment", "http://bridge.example/.."]   # ask #2341
 HOSTILE["CW_LONG_RUN_DENY"] = [",".join("*p%d*" % i for i in range(9)), "*a b*", "*a;b*", "*" + "a" * 80, "*a*,", ",*a*", "*a*,,*b*", "$(x)"]   # ask #2369: 9 patterns, a space, a semicolon, 81 characters, an empty entry, a substitution
+HOSTILE["CW_LAND_REPORT_ISSUE"] = ["7", "#7", "o/r#0", "o/r#", "o/r#1x", "o r/x#1", "../r#1"]   # ask #2448
+HOSTILE["CW_LAND_REPORT_SMALL_LINES"] = ["0", "-5", "1.5", "abc", "1000000", "05", "\u0662"]
+HOSTILE["CW_LAND_REPORT_GIT_DIR"] = ["relative", "/a/../b", "-x"]
+HOSTILE["CW_LAND_REPORT_BRANCH"] = ["-x", "a b", "a;b", "$(x)", "a" * 101]
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 
