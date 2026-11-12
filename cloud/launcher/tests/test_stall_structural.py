@@ -21,12 +21,14 @@ ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, LAUNCHER)
 sys.path.insert(0, HERE)
 import stall_watch as sw  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "bin"))
 from test_stall_watch import World, conditions  # noqa: E402
 
 ACTIVITY = os.path.join(ROOT, "cloud", "worker", "activity.py")
 with open(os.path.join(HERE, "fixtures", "server_shapes", "turn.json")) as _f:
     FIX = json.load(_f)
 FIX["assistant_bogus_finish"] = dict(FIX["assistant_stop"], finish="finished-ok")   # off the server's enum
+FIX["user"] = {"id": "msg_example0090", "metadata": {}, "time": {"created": FIX["assistant_stop"]["time"]["created"] - 60000}, "text": "neutral example brief", "type": "user"}   # the real shape of a user message (id, metadata, time.created, text, type); neutral text
 FINISHED = {"turn": "idle", "outcome": "succeeded", "finish": "stop"}
 
 
@@ -49,7 +51,7 @@ class Server:
                 elif url.path == "/api/session":
                     body = {"data": [FIX["session"]], "cursor": {"previous": None, "next": None}}
                 elif url.path.endswith("/message"):
-                    pick = {"idle": idle_body if idle_body is not None else (FIX[idle] if idle else None), "assistant": FIX[assistant] if assistant else None}
+                    pick = {"idle": idle_body if idle_body is not None else (FIX[idle] if idle else None), "assistant": FIX[assistant] if assistant else None, "user": FIX["user"]}
                     items = [pick[kind]] if kind in pick and pick[kind] else [m for m in pick.values() if m]
                     body = {"data": [] if kind in pick and not pick[kind] else items, "cursor": {"previous": None, "next": None}}
                 else:
@@ -124,37 +126,165 @@ def s2_wrong(script=ACTIVITY):
     return wrong
 
 
-def pod(world, turn, results_exists, **kw):
-    world.add(**kw)
-    inner = world.pods["w1-pod"]["probe"]
-    world.pods["w1-pod"]["probe"] = lambda now: dict(inner(now), turn=turn, results_exists=results_exists)
-    return world
+def real_probe(server):
+    """The whole answer of the stall watch's own probe against the loopback server (real shapes: active, session, messages by type)."""
+    d = tempfile.mkdtemp(prefix="turn-probe-")
+    pw = os.path.join(d, "pw")
+    with open(pw, "w") as f:
+        f.write("synthetic-password\n")
+    env = dict(os.environ, CW_RUNS_DIR=d, CW_ACTIVITY_PORT=str(server.port), CW_ACTIVITY_PASSWORD_FILE=pw, CW_WORKDIR=d)
+    out = subprocess.run([sys.executable, "-I", "-c", sw.PROBE_CODE], env=env, capture_output=True, text=True, timeout=30)
+    return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-def class_cases(module):
-    """S3/S4: a list of (case, wanted, got) for the finished, failed, stranded, running, unknown and sentinel-on-a-running-pod cases (16 minutes without change)."""
-    rows = []
-    for case, turn, exists, tail, want in [
-            ("finished", FINISHED, True, ("working",), []),
-            ("failed", {"turn": "idle", "outcome": "failed", "finish": "error"}, True, ("done",), ["progress-stale"]),
-            ("stranded", FINISHED, False, ("done",), ["progress-stale"]),
-            ("running with the word done", {"turn": "running", "outcome": None, "finish": None}, True, ("done",), ["progress-stale"]),
-            ("unknown", {"turn": "unknown", "outcome": None, "finish": None}, True, ("done",), ["progress-stale"])]:
-        w = pod(World(), turn, exists, progress_age=16, tail=tail)
-        rows.append((case, want, conditions(w.run(module))))
-    return rows
+STATE_KEYS = ("turn", "idle", "active_read", "session_updated", "turn_start")
 
 
-def old_watch():
-    """The watch as it was before this change: the line `finished = classify(...)` put back as the text-sentinel line it replaced."""
+def pod(server_kw=None, text="neutral last text", exists=True, ahead=2, runs=(), exits=(), **add):
+    """A world with one pod whose probe answer carries the REAL structural fields read from a loopback server holding the fixtures' shapes."""
+    s = Server(**(server_kw or {}))
+    try:
+        data = real_probe(s)
+    finally:
+        s.close()
+    w = World()
+    w.add(runs=runs, exits=exits, **add)
+    inner = w.pods["w1-pod"]["probe"]
+    extra = {k: data[k] for k in STATE_KEYS}
+    extra.update(msg=text, results_exists=exists, ahead=ahead)
+    w.pods["w1-pod"]["probe"] = lambda now: dict(inner(now), **extra)
+    w.real = data
+    return w
+
+
+class Boss:
+    """The daemon side: the audit file the launcher wrote and `scan_idle` over it, with the last reports the switchboard holds; the messages it sent."""
+    def __init__(self, reports=None):
+        d = tempfile.mkdtemp(prefix="idle-boss-")
+        self.audit, self.state = os.path.join(d, "audit.jsonl"), os.path.join(d, "state.json")
+        open(self.audit, "w").close()
+        self.sent, self.reports, self.written = [], reports or {}, {}
+        self.scan()   # the first pass only sets the cursor
+
+    def scan(self):
+        import cloud_end_alert as cea
+        return cea.scan_idle(self.audit, self.state, self.reports, lambda to, text: self.sent.append((to, text)), json.loads)
+
+    def feed(self, world):
+        lines = [a for a in world.audits if a["action"] == "idle-notice"]
+        with open(self.audit, "a") as f:
+            for a in lines[self.written.get(id(world), 0):]:
+                f.write(json.dumps(dict(a, ts="2026-11-12T03:00:00Z")) + "\n")
+        self.written[id(world)] = len(lines)
+        return self.scan()
+
+
+def idle_messages(w, boss=None):
+    """Run one pass and deliver: the messages the boss got."""
+    boss = boss or Boss()
+    w.run()
+    boss.feed(w)
+    return boss.sent
+
+
+# ---- scenarios, each raising AssertionError (so a control on the old code can be shown to fail it) ----
+def scn_s2_text_done_is_not_done(mod=sw):
+    w = pod(tail=("done",))
+    w.set_results("w1-pod", "STATUS: done")
+    sent = idle_messages_mod(w, mod)
+    if len(sent) != 1 or "idle with no report: assess" not in sent[0][1] or "report done" in sent[0][1]:
+        raise AssertionError("a text line without a report call: %r" % (sent,))
+
+
+def idle_messages_mod(w, mod, boss=None):
+    boss = boss or Boss()
+    w.run(mod)
+    boss.feed(w)
+    return boss.sent
+
+
+def scn_s3_idle_after_done_failed_and_none(mod=sw):
+    cases = [({"w1": {"state": "done", "at": 1794451800, "text": "all checks pass"}}, 'report done: "all checks pass"'),
+             ({"w1": {"state": "failed", "at": 1794451800, "text": "tests fail"}}, 'report failed: "tests fail"'),
+             ({}, "idle with no report: assess")]
+    for reports, want in cases:
+        w = pod(text="the last words of the agent", runs=[("build", 1, "still going")])
+        sent = idle_messages_mod(w, mod, Boss(reports))
+        if len(sent) != 1:
+            raise AssertionError("idles without exactly one message: %d for %r" % (len(sent), want))
+        to, text = sent[0]
+        for part in (want, 'last text: "the last words of the agent"', "cw-run jobs: build", "results file exists", "2 commit(s) ahead"):
+            if part not in text:
+                raise AssertionError("missing %r in %r" % (part, text))
+        if to != "coder-lead":
+            raise AssertionError("not sent to the boss: %s" % to)
+
+
+def scn_s4_running_sends_nothing(mod=sw):
+    w = pod(dict(running=True), tail=("done",))
+    for _ in range(3):
+        w.run(mod)
+        w.at(1)
+    if [a for a in w.audits if a["action"] == "idle-notice"]:
+        raise AssertionError("an idle message for a running session")
+
+
+def scn_s5_backstop_and_unknown(mod=sw):
+    w = pod(dict(running=True), progress_age=16, tail=("done",))
+    w.set_results("w1-pod", "STATUS: done")
+    if conditions(w.run(mod)) != ["progress-stale"]:
+        raise AssertionError("a running session that never goes idle did not reach the backstop alert")
+    for kw in (dict(idle=None), dict(idle_body={"id": "msg_x", "time": {"created": 1}, "type": "idle", "outcome": "bogus"})):
+        w = pod(kw)
+        sent = idle_messages_mod(w, mod)
+        if len(sent) != 1 or "idle state unknown" not in sent[0][1] or "went idle" in sent[0][1] or "report done" in sent[0][1]:
+            raise AssertionError("an unreadable answer was not the unknown message: %r" % (sent,))
+
+
+def scn_one_message_per_idle(mod=sw):
+    w = pod()
+    boss = Boss()
+    for _ in range(3):
+        w.run(mod)
+        boss.feed(w)
+        w.at(1)
+    if len(boss.sent) != 1:
+        raise AssertionError("not one message for one idle: %d" % len(boss.sent))
+    w2 = pod(dict(idle_body=dict(FIX["idle_succeeded"], id="msg_example0777")))   # a second idle (a new turn ended): its own id
+    w2.pods["w1-pod"]["doc"]["metadata"]["annotations"] = w.pods["w1-pod"]["doc"]["metadata"]["annotations"]
+    w2.run(mod)
+    boss.feed(w2)
+    if len(boss.sent) != 2:
+        raise AssertionError("a second idle was not told: %d" % len(boss.sent))
+
+
+SCENARIOS = (scn_s2_text_done_is_not_done, scn_s3_idle_after_done_failed_and_none, scn_s4_running_sends_nothing, scn_s5_backstop_and_unknown, scn_one_message_per_idle)
+
+
+def mutant(old, new):
+    """The watch with one source line replaced (the control: the code as it was, or a build that breaks the rule)."""
     with open(os.path.join(LAUNCHER, "stall_watch.py")) as f:
         text = f.read()
-    new = '    finished = classify(data, active) == "finished"\n'
-    old = '    last_p = tail[-1].strip().lower() if tail else ""\n    finished = last_p in ("done", "status: done") or str(data.get("results") or "").strip().lower() == "status: done"\n'
-    assert text.count(new) == 1
-    mod = types.ModuleType("stall_watch_old")
-    exec(compile(text.replace(new, old), "old", "exec"), mod.__dict__)
+    assert text.count(old) == 1, old
+    mod = types.ModuleType("stall_watch_mutant")
+    exec(compile(text.replace(old, new), "mutant", "exec"), mod.__dict__)
     return mod
+
+
+def current_code():
+    """The watch as it was before this change: it sends nothing at idle, and reads the text line `done` as the finish."""
+    mod = mutant('    note = idle_notice(data)\n    if note is None or', '    note = None\n    if note is None or')
+    return mod
+
+
+def always_sends_code():
+    """A build that tells the boss on every pass, whatever the server says."""
+    return mutant('    if cls == "idle" and isinstance(idle, dict) and isinstance(idle.get("id"), str) and re.fullmatch(r"msg_[A-Za-z0-9_]{1,80}", idle["id"]):\n        state, key = "idle", idle["id"]\n',
+                  '    if True:\n        state, key = "idle", "msg_always"\n')
+
+
+def sentinel_code():
+    return mutant('    finished = classify(data) == "idle"\n', '    last_p = tail[-1].strip().lower() if tail else ""\n    finished = last_p in ("done", "status: done") or str(data.get("results") or "").strip().lower() == "status: done"\n')
 
 
 class Structural(unittest.TestCase):
@@ -190,33 +320,46 @@ class Structural(unittest.TestCase):
             f.write(text.replace(old, '}))').replace('"last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),', '"last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")'))
         self.assertGreater(s2_wrong(path), 0)
 
-    def test_s3_each_pod_gets_its_class_and_the_stranded_one_is_stalled(self):
-        wrong = [r for r in class_cases(sw) if r[1] != r[2]]
-        self.assertEqual(wrong, [])
+    def test_s2_a_text_line_done_without_a_report_call_is_idle_with_no_report(self):
+        scn_s2_text_done_is_not_done()
 
-    def test_s3_the_classes_themselves(self):
-        self.assertEqual(sw.classify({"turn": FINISHED, "results_exists": True}), "finished")
-        self.assertEqual(sw.classify({"turn": FINISHED, "results_exists": False}), "stranded")
-        self.assertEqual(sw.classify({"turn": FINISHED, "results_exists": True}, job_active=True), "unknown")
-        for outcome, finish in (("failed", "stop"), ("succeeded", "error"), ("succeeded", "content-filter"), ("succeeded", "length")):
-            self.assertEqual(sw.classify({"turn": {"turn": "idle", "outcome": outcome, "finish": finish}, "results_exists": True}), "failed")
-        self.assertEqual(sw.classify({"turn": {"turn": "idle", "outcome": "succeeded", "finish": "tool-calls"}, "results_exists": True}), "unknown")
-        self.assertEqual(sw.classify({"turn": {"turn": "running", "outcome": None, "finish": None}, "results_exists": True}), "running")
+    def test_s3_one_message_after_report_done_report_failed_and_no_report(self):
+        scn_s3_idle_after_done_failed_and_none()
 
-    def test_s3_a_pod_with_an_active_run_is_not_finished_and_the_text_decides_nothing(self):
-        w = pod(World(), FINISHED, True, progress_age=16, runs=[("build", 2, "still going")])
-        self.assertEqual(w.run(), [])   # an active run keeps progress-stale silent as before
-        for line in ("done", "STATUS: done"):
-            w = pod(World(), {"turn": "unknown", "outcome": None, "finish": None}, True, progress_age=16, tail=(line,))
-            w.set_results("w1-pod", "STATUS: done")
-            self.assertEqual(conditions(w.run()), ["progress-stale"], line)
+    def test_s4_a_running_session_sends_no_idle_message(self):
+        scn_s4_running_sends_nothing()
 
-    def test_s4_a_running_pod_whose_last_progress_line_is_done_is_not_finished(self):
-        w = pod(World(), {"turn": "running", "outcome": None, "finish": None}, True, progress_age=16, tail=("done",))
-        w.set_results("w1-pod", "STATUS: done")
-        self.assertEqual(sum(1 for _, c in w.run() if c == "progress-stale"), 1)
+    def test_s5_the_backstop_alert_and_the_unknown_message(self):
+        scn_s5_backstop_and_unknown()
 
-    def test_s5_no_text_tells_an_agent_to_end_its_progress_file_with_the_word_done(self):
+    def test_one_message_per_idle(self):
+        scn_one_message_per_idle()
+
+    def test_the_probe_reads_the_idle_id_and_the_turn_start_from_the_real_shapes(self):
+        s = Server()
+        try:
+            data = real_probe(s)
+        finally:
+            s.close()
+        self.assertEqual((data["turn"], data["active_read"], data["idle"]["id"], data["turn_start"]), (FINISHED, True, FIX["idle_succeeded"]["id"], FIX["user"]["time"]["created"]))
+
+    def test_the_last_assistant_text_is_read_from_the_content_blocks(self):
+        s = Server()
+        try:
+            self.assertEqual(real_probe(s)["msg"], "neutral example text")
+        finally:
+            s.close()
+
+    def test_a_pod_younger_than_ten_minutes_is_told_at_idle_but_raises_no_stall_condition(self):
+        w = pod(age_minutes=3, progress_age=16, msg="Permission denied: shell")
+        self.assertEqual(len(idle_messages(w)), 1)
+        self.assertEqual([a for a in w.audits if a["action"] == "stall-alert"], [])
+
+    def test_s6_no_text_sentinel_decides_anything(self):
+        with open(os.path.join(LAUNCHER, "stall_watch.py")) as f:
+            code = [l for l in f.read().split("\n") if not l.lstrip().startswith("#")]
+        body = "\n".join(code)
+        self.assertEqual(len(re.findall(r'"status: done"|\("done"|== "done"|last_p', body)), 0)
         files = [os.path.join(ROOT, "skills", "fleet-coordination", "operator-brief-header.txt")]
         for base, _dirs, names in os.walk(os.path.join(ROOT, "skills")):
             files += [os.path.join(base, n) for n in names if n.endswith((".md", ".txt"))]
@@ -224,23 +367,18 @@ class Structural(unittest.TestCase):
         self.assertEqual(finish_line_count(files), 0)
         self.assertEqual(finish_line_count([], "Write progress to /work/progress.txt and end it with a last line exactly `done`."), 1, "the pattern sees the rule")
 
-    def test_s6_controls_the_old_watch_fails_each_check(self):
-        old = old_watch()
-        rows = class_cases(old)
-        failing = {r[0] for r in rows if r[1] != r[2]}
-        self.assertEqual(failing, {"finished", "failed", "stranded", "running with the word done", "unknown"}, rows)
-
-    def test_s6_control_the_old_watch_calls_the_text_sentinel_pod_finished(self):
-        old = old_watch()
-        for tail, results in ((("done",), ""), (("STATUS: done",), ""), (("x",), "STATUS: done")):
-            w = World()
-            w.add(progress_age=16, tail=tail)
-            w.set_results("w1-pod", results)
-            self.assertEqual(w.run(old), [], tail)   # silent = finished: a pod that is running or stranded is not told
-            w = World()
-            w.add(progress_age=16, tail=tail)
-            w.set_results("w1-pod", results)
-            self.assertEqual(conditions(w.run(sw)), ["progress-stale"], tail)   # the structural watch sees no finish in this fixture (no turn): unknown, alerted
+    def test_s7_controls_the_current_code_fails_each_scenario(self):
+        for scenario in SCENARIOS:
+            scenario()   # the control of the control: the new code passes
+        wrong = []
+        for scenario, old in ((scn_s2_text_done_is_not_done, current_code()), (scn_s3_idle_after_done_failed_and_none, current_code()), (scn_s5_backstop_and_unknown, current_code()),
+                              (scn_one_message_per_idle, current_code()), (scn_s4_running_sends_nothing, always_sends_code()), (scn_s5_backstop_and_unknown, sentinel_code())):
+            try:
+                scenario(old)
+            except AssertionError:
+                continue
+            wrong.append(scenario.__name__)
+        self.assertEqual(wrong, [], "controls that pass on the old code")
 
 
 class RecordAndNotice(unittest.TestCase):

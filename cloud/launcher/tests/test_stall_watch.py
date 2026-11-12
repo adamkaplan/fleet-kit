@@ -214,7 +214,7 @@ class Stall(unittest.TestCase):
         self.assertEqual(w.err, "", "a skip adds no line of its own to the log: the pass line carries it")
         self.assertNotIn("secret-pod-text", line)
         self.assertNotIn("secret-pod-text", w.err)
-        self.assertEqual([n for n, _ in w.kube.execs], ["broken-pod"], "a young pod is not read")
+        self.assertEqual([n for n, _ in w.kube.execs], ["young-pod", "broken-pod"], "a young pod is read for the idle notice only (ask #2443): no stall condition fires for it")
 
     def test_s8_twelve_pods_are_read_with_one_exec_each_and_the_pass_line_counts_them(self):
         w = World()
@@ -404,7 +404,7 @@ class Stall(unittest.TestCase):
         self._finished_cases(sw)   # the control: the unmutated module passes
         self.assertEqual(conditions(self._finished(sw, tail=("done", "more work"))), ["progress-stale"])
         self.assertEqual(conditions(self._finished(sw, tail=("x",), results="STATUS: running")), ["progress-stale"])
-        self.assertEqual(conditions(self._finished(sw, tail=("x",), turn={"turn": "idle", "outcome": "succeeded", "finish": "stop"}, exists=False)), ["progress-stale"], "no deliverable: stranded")
+        self.assertEqual(self._finished(sw, tail=("x",), turn={"turn": "idle", "outcome": "succeeded", "finish": "stop"}, exists=False), [], "idle: the boss got the idle notice; the deliverable is evidence, not a gate")
 
     def test_s4_a_finished_pod_still_fires_refusal_and_is_silent_for_failed_run_idle(self):
         fin = {"turn": "idle", "outcome": "succeeded", "finish": "stop"}
@@ -435,7 +435,7 @@ class Stall(unittest.TestCase):
         self._finished_cases(sw)   # the control passes first
         with open(SOURCE) as f:
             text = f.read()
-        old = '    finished = classify(data, active) == "finished"'
+        old = '    finished = classify(data) == "idle"'
         self.assertEqual(text.count(old), 1, "the mutation did not apply")
         mod = types.ModuleType("stall_watch_mutant2")
         exec(compile(text.replace(old, "    finished = True"), "mutant", "exec"), mod.__dict__)

@@ -544,3 +544,101 @@ def scan_stall(audit_file, state_file, send, parse):
         except Exception:
             pass
     return out
+
+
+# ---- ask #2443: the idle notice. The reaper's pass reads each pod's own server and writes ONE `idle-notice` audit line per idle of a session (cloud/launcher/stall_watch.py
+# idle_notice); this pass adds the pod's last report of that turn (the `fleet-switchboard report done|failed|blocked "<line>"` call, last-reports.json) and tells the recorded boss
+# (the Chief of Staff when none), once per line. The report is the finish signal; the server's outcome and finish, the results file and the commits ahead are EVIDENCE only.
+# The audit file is UNTRUSTED text: every field is checked. ----
+IDLE_ACTION = "idle-notice"
+IDLE_OUTCOMES = ("succeeded", "failed", "interrupted")
+IDLE_FINISHES = ("stop", "length", "tool-calls", "content-filter", "error", "unknown")
+IDLE_REPORT_MAX = 300
+IDLE_KEY = re.compile(r"msg_[A-Za-z0-9_]{1,80}|u[0-9]{1,20}")
+REPORT_SKEW = 10   # seconds: the pod's clock and the daemon's differ by a little
+
+
+def idle_report_text(worker, line, last_reports):
+    """`report <state>: "<line>"` when the worker made a report after its turn began, else `idle with no report: assess`. The line is the stored, already redacted report text."""
+    entry = last_reports.get(worker) if isinstance(last_reports, dict) else None
+    start = line.get("turn_start")
+    at = entry.get("at") if isinstance(entry, dict) else None
+    if (isinstance(entry, dict) and isinstance(entry.get("state"), str) and re.fullmatch(r"[a-z]{1,12}", entry["state"]) and isinstance(at, (int, float)) and not isinstance(at, bool)
+            and isinstance(start, (int, float)) and not isinstance(start, bool) and at >= start - REPORT_SKEW):
+        said = stall_evidence(entry.get("text")) if isinstance(entry.get("text"), str) else ""
+        return 'report %s%s' % (entry["state"], ': "%s"' % said[:IDLE_REPORT_MAX] if said else "")
+    return "idle with no report: assess"
+
+
+def idle_text(worker, line, report, when, ask):
+    unknown = line.get("state") == "unknown"
+    head = "[idle] %s idle state unknown: assess" % worker if unknown else "[idle] %s went idle (outcome %s, finish %s): %s" % (worker, line.get("outcome") or "none", line.get("finish") or "none", report)
+    ev = stall_evidence(line.get("evidence"))
+    jobs = line.get("jobs") if isinstance(line.get("jobs"), list) else []
+    jobs = [j for j in jobs if isinstance(j, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,40}", j)][:5]
+    ahead = line.get("ahead")
+    res = line.get("results_exists")
+    deliverable = "results file %s, %s" % ("exists" if res is True else "absent" if res is False else "not read",
+                                           "%d commit(s) ahead of the default branch" % ahead if isinstance(ahead, int) and not isinstance(ahead, bool) and 0 <= ahead < 10**6 else "branch not read")
+    return "%s; last text: %s; cw-run jobs: %s; evidence only: %s; at %s; read it with: fleet-switchboard read %s; ask %s" % (
+        head, '"%s"' % ev if ev else "(none)", ", ".join(jobs) or "none", deliverable, when, worker, ask)
+
+
+def scan_idle(audit_file, state_file, last_reports, send, parse):
+    """One pass over the NEW `idle-notice` audit lines (own cursor and sent keys in state_file): per valid line ONE message to the recorded boss (a valid agent name), else to the
+    Chief of Staff, through `send(recipient, text)`. The state is saved BEFORE the message goes. A line with a bad worker, time, runtime id, key or state sends nothing.
+    Returns [(recipient, text)] handed to send."""
+    try:
+        size = os.stat(str(audit_file)).st_size
+    except OSError:
+        return []
+    offset, keys, fresh = load_state(state_file, size, parse)
+    if fresh:
+        save_state(state_file, size, keys)
+        return []
+    if offset >= size:
+        if offset != size:
+            save_state(state_file, offset, keys)
+        return []
+    try:
+        with open(str(audit_file), "rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read(READ_BYTES)
+    except OSError:
+        return []
+    cut = chunk.rfind(b"\n") + 1
+    if cut == 0:
+        cut = len(chunk) if len(chunk) >= READ_BYTES else 0
+    out = []
+    for raw in chunk[:cut].split(b"\n"):
+        if b"idle-notice" not in raw:
+            continue
+        try:
+            line = parse(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(line, dict) or line.get("action") != IDLE_ACTION or line.get("ok") is not True:
+            continue
+        worker, ts, rid, idle = line.get("worker"), line.get("ts"), line.get("runtime_id"), line.get("idle")
+        if not isinstance(worker, str) or not WORKER_NAME.fullmatch(worker) or when_text(ts) == "unknown" or line.get("state") not in ("idle", "unknown"):
+            continue
+        if not isinstance(rid, str) or not re.fullmatch(r"pod/[A-Za-z0-9._-]{1,80}", rid) or not isinstance(idle, str) or not IDLE_KEY.fullmatch(idle):
+            continue
+        if line["state"] == "idle" and (line.get("outcome") not in IDLE_OUTCOMES or line.get("finish") not in IDLE_FINISHES + (None,)):
+            continue
+        key = ("%s@%s" % (rid, idle), "idle")
+        if any(key == k for k in keys):
+            continue
+        keys.append(key)
+        ask = line.get("ask")
+        ask = ask if isinstance(ask, str) and ASK_SHAPE.fullmatch(ask) else STALL_ASK
+        names = line.get("recipients") if isinstance(line.get("recipients"), list) else []
+        boss = next((n for n in names if isinstance(n, str) and AGENT_NAME.fullmatch(n)), None)
+        out.append((boss or CHIEF, idle_text(worker, line, idle_report_text(worker, line, last_reports), ts, ask)))
+    save_state(state_file, offset + cut, keys)
+    for to, text in list(out):
+        try:
+            send(to, text)
+        except Exception:
+            pass
+    return out
