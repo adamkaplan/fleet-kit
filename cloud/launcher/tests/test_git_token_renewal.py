@@ -22,6 +22,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -193,6 +194,10 @@ class Harness(base.Base):
                 json.dump({"repo": record_repo, "branch": "main", "hard_deadline": cw.iso(hard)}, f)
 
     def launcher(self):
+        # the wip save (#2304) runs in every reap and its failed exec on this fake kubectl is audited: these tests read the renewal's audit lines only
+        patcher = mock.patch.object(self.cwm.wip_save, "save_pass", lambda *a, **k: [])
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return self.cwm.Launcher(self.cwm.Kube(self.env), self.env, self.clock)
 
     def at(self, **kw):
