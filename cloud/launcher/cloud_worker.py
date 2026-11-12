@@ -411,6 +411,8 @@ def forbidden_pod_fields(pod):
 DEFAULT_IDLE = "60m"               # a create with no --idle (ask #2305: a coder pod outlives a long model wait)
 DEFAULT_ORCHESTRATOR_IDLE = "30m"  # an orchestrator keeps the older default
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
+DEFAULT_HARD = "2h"
+SHAPE_DEFAULT_HARD = {"L": DEFAULT_MAX_HARD}   # the one table of a per-shape default hard limit (a land runs 1 to 3.5 h); a shape with no row takes DEFAULT_HARD
 # The cluster-side floor: every pod carries spec.activeDeadlineSeconds = the --max-hard cap + this grace, so the kubelet
 # ends a pod even when no reaper runs. The cap, not the current hard deadline: Kubernetes lets that field be lowered on
 # a running pod but never raised, so a value at the initial hard limit would make `extend` (within the cap) a lie. The
@@ -3287,6 +3289,7 @@ class Launcher:
             if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
             check_shape(a, self.env)   # resolves an unnamed shape; before any cluster, vault or token call
+            a.hard = a.hard or SHAPE_DEFAULT_HARD.get(a.shape, DEFAULT_HARD)   # an explicit --hard is kept as given
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
@@ -5759,7 +5762,7 @@ def build_parser():
     c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
     c.add_argument("--idle", default=None, help="the idle limit; unset: %s (%s with --agent orchestrator)" % (DEFAULT_IDLE, DEFAULT_ORCHESTRATOR_IDLE))
-    c.add_argument("--hard", default="2h")
+    c.add_argument("--hard", default=None)
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))
     c.add_argument("--image")

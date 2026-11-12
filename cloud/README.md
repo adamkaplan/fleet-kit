@@ -261,7 +261,7 @@ Tests: `bin/test-cloud-launcher` (driver, fake kubectl), `cloud/tests/test-cloud
 
 ## Shape `L`, for a land (ask #2457)
 
-`L` is a pod shape for a land: limit and request both 6 CPU and 16 GiB, nested Docker allowed like `M`, chosen by name only (`--shape L`; a launch with no shape is unchanged). Its request equals its limit, so one `L` pod takes 6 of the 7 or so CPU a node has after system pods (the plan assumed about 7; not read on a live node here): two `L` pods never share a node. The autoscaler may add a node for it, and a node is a cost.
+`L` is a pod shape for a land: limit and request both 6 CPU and 16 GiB, nested Docker allowed like `M`, chosen by name only (`--shape L`; a launch with no shape is unchanged). Its request equals its limit, so one `L` pod takes 6 of the 7 or so CPU a node has after system pods (the plan assumed about 7; not read on a live node here): two `L` pods never share a node. The autoscaler may add a node for it, and a node is a cost. A `--shape L` launch with no `--hard` gets the maximum hard limit (`DEFAULT_MAX_HARD`, 8 hours) instead of 2 hours, because a land takes 1 to 3.5 hours; an explicit `--hard` is kept and one above the maximum still refuses, and the launch note says `hard limit 8h (default for shape L)`.
 
 Cost (list-price estimate, not a billed figure): 0.34 USD per hour (6 of 8 vCPU of a 0.452 USD node). One land of 45 minutes costs about 0.26 USD (0.34 x 0.75); one of 90 minutes about 0.51 USD (0.34 x 1.5).
 
