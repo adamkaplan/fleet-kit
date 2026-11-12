@@ -176,7 +176,7 @@ class TestTheHooksMadeCommits(unittest.TestCase):
         spec.loader.exec_module(hook_mod)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@invalid", GIT_CONFIG_GLOBAL="/dev/null")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@invalid", HOME=tmp, XDG_CONFIG_HOME=tmp)
         def git(cwd, *args):
             return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
         origin, one, two = (os.path.join(tmp, n) for n in ("origin.git", "one", "two"))
