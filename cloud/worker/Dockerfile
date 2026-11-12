@@ -81,6 +81,7 @@ RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.t
  && rm /tmp/go.tgz
 # The pinned toolchain is the only one: no other toolchain is downloaded at run time.
 ENV GOTOOLCHAIN=local
+ENV OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=300000
 # ---- end Go ----
 
 # ask #2407: mise, the version manager the land tool calls (`mise install python@3.11`): one pinned release, its sha256 pinned here, checked before it is unpacked.

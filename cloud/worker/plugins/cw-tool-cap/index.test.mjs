@@ -39,3 +39,12 @@ test("S4: note", () => {
   assert.equal(noteOf(out), out);
   assert.ok(!/process\.env|TOKEN|SECRET/.test(NOTE));
 });
+test("a hook that throws at call time does not crash the call", async () => {
+  const hooks = {};
+  await plugin.setup({ shell: { hook: (n, f) => { hooks[n] = f; } } });
+  const spec = Object.freeze({ command: "x", timeout: 9e9 }); // assignment throws in strict mode
+  const lines = []; const orig = console.log; console.log = (m) => lines.push(m);
+  try { await hooks["create.before"](spec); } finally { console.log = orig; }
+  assert.deepEqual(spec, { command: "x", timeout: 9e9 });
+  assert.equal(lines.length, 1); assert.ok(lines[0].startsWith("cw-tool-cap:"));
+});

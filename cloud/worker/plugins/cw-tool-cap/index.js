@@ -22,7 +22,9 @@ export default {
   async setup(api) {
     if (!(api && api.shell && typeof api.shell.hook === "function")) { console.log(UNAVAILABLE); return; }
     try {
-      api.shell.hook("create.before", async (spec) => { clampSpec(spec); });
+      api.shell.hook("create.before", async (spec) => {
+        try { clampSpec(spec); } catch (_) { console.log("cw-tool-cap: clamp failed for one call, it is NOT capped"); } // never crash the shell call
+      });
     } catch (_) { console.log(UNAVAILABLE); return; }
     try {
       api.shell.hook("run.after", async (res) => { if (res && typeof res.output === "string") res.output = noteOf(res.output); });
