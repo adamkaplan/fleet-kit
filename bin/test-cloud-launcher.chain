@@ -72,6 +72,7 @@ cloud/launcher/tests/test_l_hard_default.py
 cloud/launcher/tests/test_land_report.py
 cloud/launcher/tests/test_land_shape.py
 cloud/launcher/tests/test_launch_idempotent.py
+cloud/launcher/tests/test_launcher_shards.py
 cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_long_run_setting.py
 cloud/launcher/tests/test_m_cap.py
