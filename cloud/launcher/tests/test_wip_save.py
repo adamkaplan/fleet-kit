@@ -163,7 +163,7 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertEqual((r.returncode, json.loads(r.stdout)["saved"], p.count(), p.fingerprint()), (0, False, 1, before))
         p.write("b.txt", "newer\n")
         self.assertTrue(json.loads(p.snapshot().stdout)["saved"])
-        self.assertEqual(p.count(), 2)
+        self.assertEqual(p.count(), 1)   # #2437: one commit on top of the pod's HEAD, the earlier save is not in the history
 
     def test_s2_the_pods_commits_are_reachable_and_a_clean_pod_saves_nothing(self):
         p = self.pod
@@ -197,7 +197,7 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertIn(":(top)m.txt", names)
         self.assertEqual(git(p.remote, "show", "refs/heads/coder7/wip:.env"), "TOKEN=1\n")
 
-    def test_a_diverged_remote_wip_is_never_forced_over(self):
+    def test_a_diverged_remote_wip_is_replaced_only_under_a_lease_and_named(self):
         p = self.pod
         p.write("b.txt", "1\n")
         p.snapshot()
@@ -208,9 +208,9 @@ class EndHookSnapshot(unittest.TestCase):
         git(other, "push", "-q", "origin", "HEAD:refs/heads/coder7/wip")
         theirs = p.wip()
         p.write("b.txt", "2\n")
-        r = p.snapshot()   # the old wip head is fetched as the parent: a fast-forward over theirs, or a refusal; theirs stays reachable
-        self.assertIn(theirs, git(p.remote, "rev-list", "refs/heads/coder7/wip").split())
+        r = p.snapshot()   # #2437: theirs is not an ancestor of the new save: one lease push naming the tip just read (theirs), which the message names
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Previous-Save: " + theirs, git(p.remote, "log", "-n", "1", "--format=%B", "refs/heads/coder7/wip"))
 
     def test_deletions_links_and_the_executable_bit_are_saved_without_git_add(self):
         p = self.pod
@@ -347,7 +347,7 @@ class EndHookSnapshot(unittest.TestCase):
         self.assertTrue(json.loads(r.stdout)["saved"])
         self.assertEqual(git(u.remote, "show", "refs/heads/coder7/wip:x.txt"), "x\n")
 
-    def test_s3_the_new_commit_has_the_old_wip_head_as_its_parent(self):
+    def test_s3_the_new_commit_has_the_pods_head_as_its_one_parent(self):
         p = self.pod
         p.write("b.txt", "1\n")
         p.snapshot()
@@ -356,8 +356,8 @@ class EndHookSnapshot(unittest.TestCase):
         r = p.snapshot()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         parents = git(p.remote, "rev-list", "--parents", "-n", "1", "refs/heads/coder7/wip").split()[1:]
-        self.assertEqual(parents[0], old, "a fast-forward: the old wip head is the first parent")
-        self.assertEqual(git(p.remote, "merge-base", "--is-ancestor", old, "refs/heads/coder7/wip", check=False), "")
+        self.assertEqual(parents, [git(p.work, "rev-parse", "HEAD").strip()], "the pod's HEAD is the one parent")
+        self.assertIn("Previous-Save: " + old, git(p.remote, "log", "-n", "1", "--format=%B", "refs/heads/coder7/wip"))
 
     def test_s3_a_refused_push_is_an_error_and_is_not_marked_saved(self):
         p = self.pod
@@ -438,8 +438,8 @@ class FakeKube:
 
     def exec(self, name, *args, **kw):
         self.execs.append((name,) + args)
-        self.stdins.append(kw.get("stdin"))
         if args[:4] == ("python3", "-I", "-", "--snapshot"):
+            self.stdins.append(kw.get("stdin"))   # only the save's own exec: the stall watch's read-only probe (#2444) is not a save
             if self.answer is not None:
                 return self.answer
             r = self.pod_by_name[name].snapshot()
@@ -555,7 +555,7 @@ class ReaperSave(unittest.TestCase):
         self.assertEqual((len(s.snapshots()), p.count()), (2, 1), "asked again, and nothing changed: 0 new commits")
         p.write("b.txt", "more work\n")
         s.reap(22)
-        self.assertEqual(p.count(), 2)
+        self.assertEqual(p.count(), 1)
         self.assertEqual(p.fingerprint()[:1], before[:1])
 
     def test_an_orchestrator_and_a_pod_launched_not_to_commit_are_not_saved(self):

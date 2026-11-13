@@ -1,7 +1,6 @@
 """Ask #1165: the image installs make (one new apt package) and carries ONE system-level git file written at build with a
 default identity (one named pair in the Dockerfile); the entrypoint exports no identity variable and writes nothing; a
-repository's own identity and a local `git config user.name` still win; the shell guard is unchanged. Offline; temp dirs only."""
-import hashlib
+repository's own identity and a local `git config user.name` still win. Offline; temp dirs only."""
 import os
 import re
 import shutil
@@ -15,37 +14,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "..")
 CLOUD = os.path.join(WORKER, "..")
 ENTRYPOINT = os.path.join(WORKER, "entrypoint.sh")
-GUARD = os.path.join(WORKER, "guard.sh")
 DOCKERFILE = os.path.join(WORKER, "Dockerfile")
 README = os.path.join(CLOUD, "README.md")
 PREVIOUS = {"ca-certificates", "curl", "gnupg", "git", "openssh-client", "python3", "python3-pip", "python3-venv", "sudo",
             "iptables", "jq", "procps", "docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "docker-buildx-plugin", "xz-utils"}
-NAME, EMAIL = "cloud-worker", "cloud-worker@users.noreply.github.com"
+NAME, EMAIL = "Example Bot", "1+example-bot@users.noreply.example.invalid"   # dummy values: the build arguments are passed at build time
 IDFILE = "/etc/cw-default-identity"
-
-
-def guard_diff(base_ref, run, three_dot=True):
-    """The change's own edits of worker/guard.sh: merge-base compare (three dots) or a plain two-dot compare."""
-    spec = base_ref + "...HEAD" if three_dot else base_ref
-    return run(["diff", "--numstat", spec, "--", "worker/guard.sh"])
-
-
-def on_default_branch(run, main_ref, base_ref):
-    """HEAD is the default branch itself: the same commit, or main is behind HEAD and HEAD is not ahead of the base (nothing to compare)."""
-    rev = lambda r: run(["rev-parse", "--verify", "-q", r])
-    if rev(main_ref).returncode != 0:
-        return False
-    if rev("HEAD").stdout == rev(main_ref).stdout:
-        return True
-    anc = lambda a, b: run(["merge-base", "--is-ancestor", a, b]).returncode == 0
-    return rev(base_ref).returncode == 0 and anc(main_ref, "HEAD") and anc("HEAD", base_ref)
-
-
-def guard_verdict(run, base_ref, three_dot, main_ref="origin/main", skip=on_default_branch):
-    """'skip', 'fail' or 'pass' for the guard-unchanged check."""
-    if skip(run, main_ref, base_ref):
-        return "skip"
-    return "pass" if guard_diff(base_ref, run, three_dot).stdout.strip() == "" else "fail"
+EXPECTED_ADDED = {"make", "tini"} | set(BROWSER_PACKAGES)   # tini: the init (ask #2353), added after this test
 
 
 def read(p):
@@ -62,7 +37,7 @@ def apt_packages(text):
 
 
 _SHARE = tempfile.TemporaryDirectory()   # what the image's COPY lays down under /usr/local/share/cw
-for _src, _name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
+for _src, _name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
     shutil.copy(os.path.join(WORKER, _src), os.path.join(_SHARE.name, _name))
 S = "sys" + "tem"
 G = "glo" + "bal"   # spelled in pieces: the repository scan for config writes reads the added lines
@@ -86,27 +61,27 @@ def wrote_gitconfig(path):
 
 class Identity(unittest.TestCase):
     def test_s2_only_make_is_added_to_the_apt_list(self):
-        self.assertEqual(apt_packages(read(DOCKERFILE)) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
+        self.assertEqual(apt_packages(read(DOCKERFILE)) - PREVIOUS, EXPECTED_ADDED)
         self.assertLessEqual(PREVIOUS, apt_packages(read(DOCKERFILE)))
 
     def test_s2_the_pin_fails_for_a_package_outside_make_and_the_tuple(self):
         text = read(DOCKERFILE)
         pkgs = apt_packages(text)
-        self.assertEqual(pkgs - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))  # control first
+        self.assertEqual(pkgs - PREVIOUS, EXPECTED_ADDED)  # control first
         mutant = text.replace("libnss3 ", "libnss3 zz-extra ", 1)
         extra = apt_packages(mutant) - apt_packages(text)
         self.assertEqual(extra, {"zz-extra"}, "the mutation was not applied")
-        self.assertNotEqual(apt_packages(mutant) - PREVIOUS, {"make"} | set(BROWSER_PACKAGES))
+        self.assertNotEqual(apt_packages(mutant) - PREVIOUS, EXPECTED_ADDED)
         noop = text.replace("zz-absent-zz", "", 1)
         self.assertEqual(apt_packages(noop) - apt_packages(text), set())  # a no-op fails the computation above
 
     def test_u3_the_scan_stage_still_exists(self):
         self.assertEqual(len(re.findall(r"^FROM worker AS scan", read(DOCKERFILE), re.M)), 1)
 
-    def render_system_file(self, dockerfile_text=None):
-        """Run the Dockerfile's identity RUN line (path swapped for a temp file) with the ARG defaults; return the file text."""
+    def render_system_file(self, dockerfile_text=None, args=None):
+        """Run the Dockerfile's identity RUN line (path swapped for a temp file) with the build arguments (the dummy pair unless given); return the file text."""
         text = (dockerfile_text if dockerfile_text is not None else read(DOCKERFILE)).replace("\\\n", " ")
-        args = dict(re.findall(r"^ARG (CW_DEFAULT_IDENT_\w+)=(\S+)$", text, re.M))
+        args = dict(args or {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         runs = [l for l in text.splitlines() if l.startswith("RUN ") and IDFILE in l]
         self.assertEqual(len(runs), 1)
         with tempfile.TemporaryDirectory() as d:
@@ -130,9 +105,8 @@ class Identity(unittest.TestCase):
 
     def test_s2_the_dockerfile_writes_the_identity_file_with_the_one_constant(self):
         args = self.check_identity_file(read(DOCKERFILE))
-        self.assertEqual(args.get("CW_DEFAULT_IDENT_NAME"), NAME)   # the required ARGs carry the one constant; others may be added
-        self.assertEqual(args.get("CW_DEFAULT_IDENT_EMAIL"), EMAIL)
-        self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME=", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
+        self.assertEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})   # the pair is passed at build time
+        self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME$", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
 
     def test_s5_mutant_dockerfile_writing_the_system_file_again_fails_with_the_anchored_text(self):
         src = read(DOCKERFILE)
@@ -211,9 +185,7 @@ class Identity(unittest.TestCase):
 
     def test_s6_mutant_a_system_file_with_another_pair_is_caught(self):
         src = read(DOCKERFILE)
-        mutated = src.replace("ARG CW_DEFAULT_IDENT_NAME=" + NAME, "ARG CW_DEFAULT_IDENT_NAME=someone-else", 1)
-        self.assertNotEqual(mutated, src)
-        text, args = self.render_system_file(mutated)
+        text, args = self.render_system_file(src, {"CW_DEFAULT_IDENT_NAME": "someone-else", "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         self.assertNotEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         self.assertNotIn("name = " + NAME + "\n", text)
 
@@ -237,96 +209,6 @@ class Identity(unittest.TestCase):
             self.assertNotEqual(self.identity_variable_lines(mutated), [], add)
         mutated = src.rstrip("\n") + "\nRUN export GIT_AUTHOR_NAME=x\n"
         self.assertNotEqual(self.identity_variable_lines(mutated), [])
-
-    def guard(self, *args):
-        return subprocess.run(["sh", GUARD] + list(args), env={"PATH": "/usr/bin:/bin", "CW_REAL_GIT": "/bin/true"}, capture_output=True, text=True).returncode
-
-    def test_s7_u2_guard_lets_every_config_key_through_after_ask_2367(self):
-        self.assertEqual(self.guard("git", "config", "user.name", "x"), 0)
-        self.assertEqual(self.guard("git", "config", "user.email", "x@example.invalid"), 0)
-        self.assertEqual(self.guard("git", "config", "--" + G, "alias.x", "y"), 0)
-        self.assertEqual(self.guard("git", "config", "push.default", "y"), 0)
-
-    def test_s7_guard_is_unchanged_by_this_change(self):
-        digest = hashlib.sha256(open(GUARD, "rb").read()).hexdigest()   # the wrapper's content, not a diff against a branch (ask #1677)
-        self.assertEqual(digest, read(os.path.join(HERE, "guard.sha256")).strip())
-
-    def make_repo(self, feature_edits_guard, base_moves_on):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-
-        def g(*a):
-            r = subprocess.run(["git", "-C", d] + list(a), capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            return r
-        g("init", "-q")
-        g("config", "user.name", "t")
-        g("config", "user.email", "t@example.invalid")
-        os.makedirs(os.path.join(d, "worker"))
-        gp = os.path.join(d, "worker", "guard.sh")
-        with open(gp, "w") as f:
-            f.write("one\n")
-        g("add", "worker/guard.sh")
-        g("commit", "-q", "-m", "init")
-        g("branch", "base")
-        g("checkout", "-q", "-b", "feat")
-        with open(os.path.join(d, "other.txt"), "w") as f:
-            f.write("x\n")
-        g("add", "other.txt")
-        if feature_edits_guard:
-            with open(gp, "w") as f:
-                f.write("feature\n")
-            g("add", "worker/guard.sh")
-        g("commit", "-q", "-m", "feat")
-        if base_moves_on:
-            g("checkout", "-q", "base")
-            with open(gp, "w") as f:
-                f.write("moved\n")
-            g("add", "worker/guard.sh")
-            g("commit", "-q", "-m", "base moved")
-            self.assertEqual(g("diff", "--numstat", "feat", "base", "--", "worker/guard.sh").stdout.count("guard.sh"), 1)  # setup applied
-            g("checkout", "-q", "feat")
-        return d
-
-    def test_s7_mutant_feature_edit_of_guard_is_detected(self):
-        d = self.make_repo(True, False)
-        run = lambda args: subprocess.run(["git", "-C", d] + args, capture_output=True, text=True)
-        r = guard_diff("base", run, True)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("worker/guard.sh", r.stdout)
-
-    def test_s7_mutant_base_moving_on_is_not_a_difference(self):
-        d = self.make_repo(False, True)
-        run = lambda args: subprocess.run(["git", "-C", d] + args, capture_output=True, text=True)
-        self.assertIn("worker/guard.sh", guard_diff("base", run, False).stdout)   # the old two-dot compare gets this wrong
-        r = guard_diff("base", run, True)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.strip(), "")
-
-    def scratch_run(self, d):
-        return lambda args: subprocess.run(["git", "-C", d] + args, capture_output=True, text=True)
-
-    def test_s7_default_branch_head_skips_the_guard_check(self):
-        d = self.make_repo(True, False)
-        run = self.scratch_run(d)
-        self.assertEqual(guard_verdict(run, "base", True, "trunk"), "fail")   # setup applied: a feature edit, main not yet there
-        self.assertEqual(run(["branch", "trunk"]).returncode, 0)   # HEAD now equals main
-        self.assertEqual(guard_verdict(run, "base", True, "trunk"), "skip")
-
-    def test_s7_feature_branch_editing_the_guard_still_fails(self):
-        run = self.scratch_run(self.make_repo(True, False))
-        self.assertEqual(guard_verdict(run, "base", True, "trunk"), "fail")
-
-    def test_s7_mutant_always_skipping_fails_the_feature_check(self):
-        run = self.scratch_run(self.make_repo(True, False))
-        always = lambda *a: True
-        self.assertEqual(guard_verdict(run, "base", True, "trunk", always), "skip")   # the mutation applied
-        self.assertNotEqual(guard_verdict(run, "base", True, "trunk", always), "fail")
-        self.assertEqual(guard_verdict(run, "base", True, "trunk"), "fail")   # the real decision catches what the mutant hides
-
-    def test_s7_feature_branch_with_the_guard_unchanged_passes(self):
-        run = self.scratch_run(self.make_repo(False, True))
-        self.assertEqual(guard_verdict(run, "base", True, "trunk"), "pass")
 
     def test_s8_documentation(self):
         doc = read(README)

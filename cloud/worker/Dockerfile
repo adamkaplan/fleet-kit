@@ -38,8 +38,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends libasound2t64 l
 # The pair below is the ONE constant (line one: name, line two: email). The entrypoint sets user.name and user.email in the worker
 # user's global git configuration from this file, each only when unset. A repository's own configured identity, and a local
 # `git config user.name/user.email`, still win over it (git's own order: system, then global, then local). No identity variable is exported.
-ARG CW_DEFAULT_IDENT_NAME=cloud-worker
-ARG CW_DEFAULT_IDENT_EMAIL=cloud-worker@users.noreply.github.com
+ARG CW_DEFAULT_IDENT_NAME
+ARG CW_DEFAULT_IDENT_EMAIL
+RUN test -n "$CW_DEFAULT_IDENT_NAME" || { echo "the default identity build argument CW_DEFAULT_IDENT_NAME is missing" >&2; exit 1; }; test -n "$CW_DEFAULT_IDENT_EMAIL" || { echo "the default identity build argument CW_DEFAULT_IDENT_EMAIL is missing" >&2; exit 1; }
 RUN printf '%s\n%s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/cw-default-identity \
  && chown root:root /etc/cw-default-identity && chmod 0444 /etc/cw-default-identity
 # ---- end #1165 identity ----
@@ -82,6 +83,19 @@ RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.t
 ENV GOTOOLCHAIN=local
 # ---- end Go ----
 
+# ask #2407: mise, the version manager the land tool calls (`mise install python@3.11`): one pinned release, its sha256 pinned here, checked before it is unpacked.
+# MISE_VERSION and MISE_SHA256 (of mise-${MISE_VERSION}-linux-x64.tar.gz) are the only constants; a bump updates both (cloud/README.md).
+# Only the binary is installed, root-owned at /usr/local/bin/mise, not writable by others. Toolchains install at run time into the run user's own home (mise's default).
+# python3 stays the system Python.
+ARG MISE_VERSION=v2026.11.6
+ARG MISE_SHA256=d6ebb6f5601bdf5a8d1d56028b24fe575f45075b989941ccc920f95161c5fa28
+RUN curl -fsSL https://github.com/jdx/mise/releases/download/${MISE_VERSION}/mise-${MISE_VERSION}-linux-x64.tar.gz -o /tmp/mise.tgz \
+ && echo "${MISE_SHA256}  /tmp/mise.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/mise.tgz -C /tmp \
+ && install -o root -g root -m 0755 /tmp/mise/bin/mise /usr/local/bin/mise \
+ && rm -rf /tmp/mise.tgz /tmp/mise
+# ---- end mise ----
+
 # Non-root worker. It may start dockerd (and nothing else) as root: the daemon only
 # runs inside the Sysbox pod's own user namespace.
 RUN userdel -r ubuntu 2>/dev/null || true \
@@ -94,12 +108,11 @@ RUN userdel -r ubuntu 2>/dev/null || true \
 COPY worker/start-dockerd.sh /usr/local/bin/start-dockerd
 COPY worker/cw-stack-pull /usr/local/bin/cw-stack-pull
 COPY worker/entrypoint.sh /usr/local/bin/worker-entrypoint
-COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md worker/agents/orchestrator.md /usr/local/share/cw/
+COPY worker/opencode-worker.json worker/agents/worker.md worker/agents/orchestrator.md /usr/local/share/cw/
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
 COPY worker/cw-prestop /usr/local/bin/cw-prestop
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
-COPY worker/guard-table.tsv /usr/local/share/cw/guard-table.tsv
 COPY worker/cw-gh /usr/local/bin/cw-gh
 COPY worker/probe-reach.sh /usr/local/bin/cw-probe-reach
 COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
@@ -115,7 +128,7 @@ RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/lo
       /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach /usr/local/bin/cw-plan-check /usr/local/bin/cw-cloud \
       /usr/local/bin/cloud_client.py /usr/local/bin/cloud_hub.py /usr/local/bin/cloud_channel.py /usr/local/bin/cloud_channel_server.py /usr/local/bin/cloud_relay.py \
  && chmod 0644 /usr/local/bin/plan_check.py \
- && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
+ && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
 RUN chmod 0755 /usr/local/bin/cw-stack-up && chown root:root /usr/local/bin/cw-stack-up
 # The token service (cloud/k8s/token-mint.yaml runs `python3 /opt/cloud/launcher/token_service.py`): the launcher modules it imports,
 # directly or through cloud_worker (token_service -> app_token, cloud_worker; app_token -> token_mint; cloud_worker -> run_record, wip_save,
@@ -190,6 +203,9 @@ USER root
 # so the image sets no PG* variable. The directory name is a REQUIRED build argument (no default): the operator passes --build-arg CW_BUNDLE_CACHE_NAME=<name>.
 ARG CW_BUNDLE_CACHE_NAME
 RUN test -n "$CW_BUNDLE_CACHE_NAME"
+# ask #2418: the git commit the image tree was taken from (the operator passes --build-arg CW_IMAGE_REVISION=<commit>); cw-image-roll reads this label and refuses an empty one.
+ARG CW_IMAGE_REVISION
+LABEL org.opencontainers.image.revision="${CW_IMAGE_REVISION}"
 RUN set -eu; b="/home/worker/.cache/${CW_BUNDLE_CACHE_NAME}"; l="$b/usr/lib/postgresql/16"; e="$b/usr/share/postgresql/16/extension"; s=/opt/pg/share/postgresql \
  && mkdir -p "$l" "$e" \
  && cp -a /opt/pg/bin /opt/pg/lib "$l/" \

@@ -3,6 +3,8 @@
 import os, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import stub_support  # noqa: E402
 TOOL = os.path.join(HERE, "..", "cw-run")
 
 
@@ -13,6 +15,7 @@ class Run(unittest.TestCase):
         self.d = os.path.realpath(t.name)
         self.runs = os.path.join(self.d, "runs"); self.prog = os.path.join(self.d, "progress.txt")
         self.env = {"PATH": "/usr/bin:/bin", "CW_RUNS_DIR": self.runs, "CW_PROGRESS_FILE": self.prog, "CW_RUN_TICK": "300"}
+        self.env["CW_RUN_SERVER_PASSWORD_FILE"] = os.path.join(self.runs, "no-server-password")   # no local server here: the wake step (ask #2410) stays out of these tests
 
     def cw(self, *a, timeout=60, **kw):
         env = dict(self.env, **kw.pop("env", {}))
@@ -46,8 +49,7 @@ class Run(unittest.TestCase):
         self.assertEqual(r.stdout.splitlines()[0], "exited 3"); self.assertIn("err", r.stdout)
         # stdin is closed: a read sees end of input at once
         # the caller's own stdin stays OPEN (a pipe) while the child reads: a helper that lets the child inherit it would hang here
-        keep = subprocess.Popen([sys.executable, TOOL, "start", "--name", "rd", "--", "sh", "-c", "read x; echo got=[$x]"], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.d)
-        self.addCleanup(lambda: keep.stdin.close())
+        keep = stub_support.start(self, [sys.executable, TOOL, "start", "--name", "rd", "--", "sh", "-c", "read x; echo got=[$x]"], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.d)
         keep.wait(timeout=10)
         r, took = self.cw("wait", "rd", "20")
         self.assertIn("exited 0", r.stdout); self.assertIn("got=[]", r.stdout); self.assertLess(took, 10)
@@ -67,15 +69,23 @@ class Run(unittest.TestCase):
         r, _ = self.cw("tail", "three", "1")
         self.assertEqual(len(r.stdout.strip().splitlines()), 1)
 
-    def test_a_hard_rule_is_not_bypassed_by_start(self):
-        rules = os.path.join(HERE, "..", "opencode-worker.json")
+    def test_a_row_of_the_rules_list_is_not_bypassed_by_start(self):
+        # ask #2402: the pod's own file has no deny row any more, so the check is exercised on a rules list the test owns (the same shape as the file)
+        import json, tempfile
+        rows = {"*": "allow", "echo hello*": "deny"}
+        doc = {"agent": {"worker": {"permission": {"bash": rows}}}}
+        rules = os.path.join(tempfile.mkdtemp(), "rules.json")
+        with open(rules, "w") as f:
+            json.dump(doc, f)
         env = {"CW_BASE_RULES": rules}
-        r, _ = self.cw("start", "--name", "m", "--", "gh", "pr", "merge", "5", env=env)
+        r, _ = self.cw("start", "--name", "m", "--", "echo", "hello", env=env)
         self.assertNotEqual(r.returncode, 0); self.assertIn("refuse", r.stderr); self.assertEqual(len(r.stderr.strip().splitlines()), 1)
-        r, _ = self.cw("start", "--name", "p", "--", "git", "push", "--force", "origin", "x", env=env)
-        self.assertNotEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(self.runs, "m.pid")))
         r, _ = self.cw("start", "--name", "ok", "--", "sh", "-c", "sleep 1; echo done", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # the pod's real file refuses nothing: the same command starts
+        real = {"CW_BASE_RULES": os.path.join(HERE, "..", "opencode-worker.json")}
+        r, _ = self.cw("start", "--name", "real", "--", "echo", "hello", env=real)
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_s4_progress_lines(self):

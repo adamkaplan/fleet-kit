@@ -291,6 +291,23 @@ def build():
                 out.append(line)
             return "\n".join(out)
 
+        def expected_room(self, shape, nodes=None, pods=None, shapes=None):
+            """The room the block must say for a shape, from the launcher's own table (capacity_shapes: the REQUEST when SHAPE_REQUESTS has a row, else the limit)
+            and the fake nodes' allocatable minus the requests of their pods, never a pinned number."""
+            row = (shapes or LIB.capacity_shapes())[shape]
+            need_cpu, need_mem = LIB._quantity(row["cpu"], 1000), LIB._quantity(row["memory"], 1)
+            used = {}
+            for p in (PODS if pods is None else pods):
+                on = p["spec"].get("nodeName")
+                if on and p["status"]["phase"] not in ("Succeeded", "Failed"):
+                    u = used.setdefault(on, [0, 0])
+                    for c in p["spec"]["containers"]:
+                        u[0] += LIB._quantity(c["resources"]["requests"]["cpu"], 1000)
+                        u[1] += LIB._quantity(c["resources"]["requests"]["memory"], 1)
+            return sum(1 for n in (NODES if nodes is None else nodes)
+                       if LIB._quantity(n["status"]["allocatable"]["cpu"], 1000) - used.get(n["metadata"]["name"], [0, 0])[0] >= need_cpu
+                       and LIB._quantity(n["status"]["allocatable"]["memory"], 1) - used.get(n["metadata"]["name"], [0, 0])[1] >= need_mem)
+
         def rows(self, block):
             return dict(re.findall(r"shape (\w+): (\d+) nodes with room", block))
 
@@ -300,8 +317,11 @@ def build():
             self.assertEqual(code, 0, err)
             block = self.block(err)
             rows = self.rows(block)
-            for shape, room in {"XS": "4", "S": "3", "M": "1"}.items():   # the room per shape the fixture gives; a new shape adds a row
-                self.assertEqual(rows.get(shape), room, block)
+            for shape in ("XS", "S", "M", "L"):   # the room per shape from the launcher's table and the fixture; a new shape adds a row
+                self.assertEqual(rows.get(shape), str(self.expected_room(shape)), block)
+            limits = {n: dict(r) for n, r in LIB.SHAPES.items()}
+            self.assertNotEqual(self.expected_room("M", shapes=limits), self.expected_room("M"), "the fixture cannot tell the request from the limit")
+            self.assertNotEqual(rows.get("M"), str(self.expected_room("M", shapes=limits)), "the block counted M from its limit, not the table: " + block)
             self.assertIn("Pending pods: 2", block)
             event = [line for line in block.splitlines() if "last FailedScheduling:" in line]
             self.assertEqual(len(event), 1, block)
@@ -316,7 +336,9 @@ def build():
 
         # -- S3
         def test_s3_no_room_for_M_the_launch_proceeds_and_the_block_says_0(self):
-            small = [node("n%d" % i, "3") for i in range(1, 5)]
+            m_cpu = LIB._quantity(LIB.capacity_shapes()["M"]["cpu"], 1000)
+            small = [node("n%d" % i, "%dm" % (m_cpu - 1)) for i in range(1, 5)]   # every node's free cpu is just below M's request in the table
+            self.assertEqual(self.expected_room("M", nodes=small, pods=[]), 0)
             self.set_cluster(FakeKube(nodes=small, pods=[]))
             code, out, err = self.launch_with("--cloud", "--shape", "M", "--stack")
             self.assertEqual(code, 0, err)
@@ -413,7 +435,7 @@ def build():
             with mock.patch.dict(LIB.SHAPES, shapes):
                 code, out, err = self.launch_with("--cloud")
             rows = self.rows(self.block(err))
-            self.assertEqual(sorted(rows), ["M", "Q", "S", "XS"], err)
+            self.assertEqual(sorted(rows), sorted(n for n in shapes if n != "O"), err)
             self.assertEqual(rows["Q"], "1")
             self.assertNotIn("shape O", err)
 

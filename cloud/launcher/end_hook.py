@@ -32,9 +32,7 @@ SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
 HOST_URL = "https://github.com/"
 HELPER_DIR = "/run/cw-tmp/bin"   # the directory entrypoint.sh fills ($TMP/bin, TMP=/run/cw-tmp); the helper is git-credential-cw in it
 HELPER_NAME = "git-credential-cw"
-# git is run by ABSOLUTE path, never found on PATH: in a pod the guard wrapper ($TMP/bin/git, first on the entrypoint's PATH) refuses the
-# hook's own calls (a global-configuration override variable in the environment) and would make every pre-stop push fail. The wrapper itself execs the real
-# binary the image installs (cloud/worker/entrypoint.sh: CW_REAL_GIT, found before the wrapper exists); the image's git package puts
+# git is run by ABSOLUTE path, never found on PATH, so nothing first on the pod's PATH can stand in for it; the image's git package puts
 # it at /usr/bin/git. Test seam: the tests patch GIT_BIN like the two constants above.
 GIT_CANDIDATES = ("/usr/bin/git", "/usr/local/bin/git")
 
@@ -348,6 +346,7 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     branch = "%s/wip" % worker
     if prestop and ff_over_snapshots(workdir, worker, url, ctx):   # #2304: a running save made wip not an ancestor of HEAD: push a fast-forward instead
         return {"pushed": True, "wip_branch": branch, "skipped": skipped, **extra}
+    # (#2437: ff_over_snapshots above is the one lease push of the pre-stop path, to this one reference)
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
         git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
@@ -656,8 +655,8 @@ def write_marker(path, text):
 
 def snapshot(workdir, worker, repo, ctx):
     """Save the pod's commits and files to <worker>/wip as ONE new commit, without touching the pod's branch, index or files: a copy of the
-    index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the old wip head as parent (and the pod's HEAD as a
-    second parent, so its commits are reachable), then a plain push (a fast-forward, never forced). Secret-looking untracked files are left out.
+    index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the pod's HEAD as the ONE parent (the old save is named in a `Previous-Save:` line of the message), then a plain push when
+    the remote tip is an ancestor of the new commit, else one --force-with-lease push naming that tip, to this one reference. Secret-looking untracked files are left out.
     Returns {saved, tree, wip_branch}; saved is False when the tree equals the last saved one. A failure raises RuntimeError."""
     url = globals()["HOST_" + "URL"] + "%s.git" % repo   # by name: test_cloud_prestop counts the lines that hold the seam's identifier (its definition and its one use)
     branch = "%s/wip" % worker
@@ -691,13 +690,26 @@ def snapshot(workdir, worker, repo, ctx):
             git(net, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch + ":refs/cw/wip", ctx=ctx)
         if not head and not wip:   # no commit yet and no earlier save: the commit would have no parent (a root); save nothing until the pod has a commit
             return {"saved": False, "tree": tree, "wip_branch": branch, "note": "no commit yet: nothing saved"}
-        parents = [x for x in dict.fromkeys([wip, head]) if x]
+        parents = [x for x in (head or wip,) if x]   # #2437: the pod's own HEAD only, so a rebase of the branch replays each commit once; the previous save is named in the message (HEAD unreadable but an earlier save exists: that save, never a root)
         same = bool(wip) and git(net, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree
         commit = wip
         if not same:
             args = [a for x in parents for a in ("-p", x)]
-            commit = git(net, *SNAP_IDENT, "commit-tree", tree, *args, "-m", "WIP: work in progress saved by %s while it runs" % worker, ctx=ctx).stdout.strip()
-            git(net, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+            message = "WIP: work in progress saved by %s while it runs" % worker
+            if wip:
+                message += "\n\nPrevious-Save: %s" % wip
+            commit = git(net, *SNAP_IDENT, "commit-tree", tree, *args, "-m", message, ctx=ctx).stdout.strip()
+            spec = "%s:refs/heads/%s" % (commit, branch)
+            if not wip or git(net, "merge-base", "--is-ancestor", wip, commit, check=False, ctx=ctx).returncode == 0:
+                git(net, "push", "--no-verify", url, spec, ctx=ctx)
+            else:   # the remote tip is not an ancestor (the pod rebased): a lease on the tip fetched in this call, this one reference only, one try
+                try:
+                    git(net, "push", "--no-verify", "--force-with-lease=refs/heads/%s:%s" % (branch, wip), url, spec, ctx=ctx)
+                except TokenEnded:
+                    raise
+                except RuntimeError:
+                    print("the save of %s was not pushed: the branch moved since it was read" % branch, file=sys.stderr)
+                    return {"saved": False, "tree": tree, "wip_branch": branch, "note": "the branch moved: nothing saved"}
         write_marker(saved_path, "%s %s\n" % (tree, commit))
         return {"saved": not same, "tree": tree, "wip_branch": branch}
     finally:
@@ -706,7 +718,8 @@ def snapshot(workdir, worker, repo, ctx):
 
 def ff_over_snapshots(workdir, worker, url, ctx):
     """True when the remote <worker>/wip is the commit of this pod's own last running save, is not an ancestor of HEAD and a fast-forward commit of HEAD's tree
-    (parents: that wip head, HEAD) was pushed. False means: no such case, the plain push of HEAD follows."""
+    (parent: HEAD only, the wip head named in a `Previous-Save:` line; #2437) was pushed. False means: no such case, the plain push of HEAD follows.
+    The case still arises with a save whose one parent is HEAD's older state: wip is then never an ancestor of a newer HEAD."""
     branch = "%s/wip" % worker
     if not os.path.isfile(os.path.join(workdir, ".git", SNAP_SAVED_FILE)):
         return False   # never saved by a running save: the earlier path, no extra call
@@ -722,9 +735,10 @@ def ff_over_snapshots(workdir, worker, url, ctx):
         if git(net, "merge-base", "--is-ancestor", wip, head, check=False, ctx=ctx).returncode == 0:
             return False
         tree = git(workdir, "rev-parse", "HEAD^{tree}", ctx=ctx).stdout.strip()
-        commit = git(net, *SNAP_IDENT, "commit-tree", tree, "-p", wip, "-p", head, "-m", "WIP: work in progress saved by %s at the end of the worker" % worker,
-                     ctx=ctx).stdout.strip()
-        git(net, "push", "--no-verify", url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+        commit = git(net, *SNAP_IDENT, "commit-tree", tree, "-p", head, "-m",
+                     "WIP: work in progress saved by %s at the end of the worker\n\nPrevious-Save: %s" % (worker, wip), ctx=ctx).stdout.strip()
+        # one reference, the lease names the tip read above; a failure is the plain push's answer (no retry)
+        git(net, "push", "--no-verify", "--force-with-lease=refs/heads/%s:%s" % (branch, wip), url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
         return True
     finally:
         shutil.rmtree(tmp, True)
@@ -761,6 +775,154 @@ def snapshot_main():
         ctx.close()
 
 
+# ---- the run files (ask #2432): the pod's /work/runs and progress file live outside the checkout and end with the pod; the answer carries their tails ----
+# Cause: the wip save commits only the checkout, and the run record kept only this answer, so a run's exit number, its log and whether the end-of-run
+# wake was delivered (cw-run's files NAME.log, NAME.exit, NAME.pid, NAME.woke and its progress lines `run NAME exited CODE after Ns; ...` and
+# `wake not delivered`) were lost with the pod. The files are an agent's text: read as bytes, never executed, names checked, links skipped, every
+# read bounded, nothing raised. The answer's `runs` and `wake_lines` go to the run record only, never to the wip branch.
+# TEST SEAM: the tests patch RUNS_DIR and PROGRESS_FILE (nothing is read from the environment: the agent cannot move the directory).
+RUNS_DIR = "/work/runs"
+PROGRESS_FILE = "/work/progress.txt"
+RUN_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+RUN_EXTS = (".log", ".exit", ".pid", ".woke")
+MAX_RUNS = 20
+MAX_TAIL = 3000
+MAX_WAKE_LINES = 10
+MAX_WAKE_LINE = 200
+MAX_RUN_ADDITION = 20000
+MAX_RUN_FILE = 50 * 1024 * 1024   # a bigger file is named with an empty tail
+READ_TAIL_BYTES = 32768
+# The same pattern as cw-run's redact (cloud/worker/cw-run), which makes the wake's tail: one redaction path for both.
+RUN_SECRET = re.compile(r"(?i)(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|xox[a-z]-[A-Za-z0-9-]{8,}"
+                        r"|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]*)?"
+                        r"|(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|://[^/\s:@]+:[^@\s]+@|--(password|token|secret)[= ]\S+"
+                        r"|[A-Za-z0-9_]*(token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*[\"']?\s*[=:]\s*(\"[^\"]*\"|'[^']*'|\S+)"
+                        r"|[A-Za-z0-9+/_-]{40,}={0,2})")
+LEAD_TOKEN = re.compile(r"^[A-Za-z0-9+/_=.-]*")
+
+
+def _redact_line(line):
+    """One line, cut to its last MAX_TAIL characters (a cut also drops the token-shaped piece it may have split), control characters out, secrets replaced."""
+    if len(line) > MAX_TAIL:
+        line = line[-MAX_TAIL:]
+        line = line[LEAD_TOKEN.match(line).end():]
+    line = "".join(c if c in "\t" or c.isprintable() else " " for c in line)
+    return RUN_SECRET.sub("[redacted]", line)
+
+
+def _read_tail(path):
+    """(ok, bytes of the end of a regular file, not a link, at most READ_TAIL_BYTES); ok False when absent, a link, special, oversized or unreadable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return False, b""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_RUN_FILE:
+            return False, b""
+        if st.st_size > READ_TAIL_BYTES:
+            os.lseek(fd, st.st_size - READ_TAIL_BYTES, os.SEEK_SET)
+            data = os.read(fd, READ_TAIL_BYTES)
+            cut = data.find(b"\n")   # the window began mid-line: that partial line (a secret may be split in it) is dropped
+            return True, data[cut + 1:] if cut >= 0 else data   # no newline at all: one long line, which _redact_line cuts and strips
+        return True, os.read(fd, READ_TAIL_BYTES)
+    except OSError:
+        return False, b""
+    finally:
+        os.close(fd)
+
+
+def _is_link_or_odd(path):
+    """True when the path exists and is not a regular file (a link, a directory, a special file); False when absent."""
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def run_tail(path):
+    """The last 20 lines of a log, redacted, at most MAX_TAIL characters; "" for an unreadable one."""
+    ok, data = _read_tail(path)
+    if not ok:
+        return ""
+    lines = data.decode("utf-8", "replace").splitlines()[-20:]
+    return "\n".join(_redact_line(x) for x in lines)[-MAX_TAIL:]
+
+
+def run_exit(path):
+    ok, data = _read_tail(path)
+    text = data.decode("utf-8", "replace").strip() if ok else ""
+    return int(text) if re.fullmatch(r"-?[0-9]{1,6}", text) else None
+
+
+def wake_lines(progress=None):
+    """The last MAX_WAKE_LINES lines of the progress file that start with `run ` and contain ` exited `, or equal `wake not delivered`."""
+    ok, data = _read_tail(PROGRESS_FILE if progress is None else progress)
+    if not ok:
+        return []
+    keep = [x for x in data.decode("utf-8", "replace").splitlines()
+            if (x.startswith("run ") and " exited " in x) or x == "wake not delivered"]
+    return [_redact_line(x)[:MAX_WAKE_LINE] for x in keep[-MAX_WAKE_LINES:]]
+
+
+def run_entries(directory=None):
+    """The `runs` list: at most MAX_RUNS entries, newest first, {name, exit, woke, log_tail}. A name outside RUN_NAME_RE, or one of whose files is a link
+    or not a regular file, is skipped; a missing directory gives []. Never raises."""
+    directory = RUNS_DIR if directory is None else directory
+    try:
+        stems = {}
+        for f in os.listdir(directory):
+            for ext in RUN_EXTS:
+                if f.endswith(ext) and RUN_NAME_RE.fullmatch(f[:-len(ext)]):
+                    stems.setdefault(f[:-len(ext)], []).append(os.path.join(directory, f))
+        found = []
+        for name, paths in stems.items():
+            if any(_is_link_or_odd(os.path.join(directory, name + e)) for e in RUN_EXTS):
+                continue
+            try:
+                newest = max(os.lstat(x).st_mtime for x in paths)
+            except OSError:
+                continue
+            found.append((newest, name))
+        found.sort(reverse=True)
+        out = []
+        for _, name in found[:MAX_RUNS]:
+            base = os.path.join(directory, name)
+            out.append({"name": name, "exit": run_exit(base + ".exit"), "woke": os.path.lexists(base + ".woke"), "log_tail": run_tail(base + ".log")})
+        return out
+    except Exception:
+        return []
+
+
+def run_files(directory=None, progress=None):
+    """({runs, wake_lines}) with the whole addition at most MAX_RUN_ADDITION characters: the tails give way, newest kept longest. Never raises."""
+    try:
+        lines = wake_lines(progress)
+        runs = run_entries(directory)
+        room = MAX_RUN_ADDITION - len(json.dumps(lines)) - 200 - sum(len(json.dumps(dict(r, log_tail=""))) + 2 for r in runs)
+        for r in runs:
+            r["log_tail"] = r["log_tail"][-min(MAX_TAIL, max(0, room)):] if room > 0 else ""
+            room -= len(json.dumps(r["log_tail"])) - 2
+        for r in reversed(runs):   # escapes make a character longer than counted: the oldest tails are emptied until the whole fits
+            if len(json.dumps({"runs": runs, "wake_lines": lines})) <= MAX_RUN_ADDITION:
+                break
+            r["log_tail"] = ""
+        return {"runs": runs, "wake_lines": lines}
+    except Exception:
+        return {"runs": [], "wake_lines": []}
+
+
+def with_runs(res):
+    """The hook's answer with the run files added (see run_files). Never raises."""
+    try:
+        res.update(run_files())
+    except Exception:
+        pass
+    return res
+
+
 def main():
     if "--snapshot" in sys.argv[1:]:
         return snapshot_main()
@@ -771,7 +933,7 @@ def main():
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
     try:
-        print(json.dumps(with_pr(workdir, run(workdir, worker))))
+        print(json.dumps(with_runs(with_pr(workdir, run(workdir, worker)))))
         return 0
     except TokenEnded as e:
         # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.

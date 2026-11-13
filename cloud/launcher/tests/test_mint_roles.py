@@ -99,7 +99,7 @@ class Fx(unittest.TestCase):
 
     def run_kind(self, *extra, repo=REPO):
         e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
-        return subprocess.run([sys.executable, tam.MINT, repo, *extra], env=e, capture_output=True, text=True, timeout=60)
+        return tam.via_route([sys.executable, tam.MINT, repo, *extra], e)   # the token comes through the route (--fd), never stdout (#1453)
 
     def answer_with(self, perms):
         tam.Stub.answer["permissions"] = dict(perms)
@@ -291,7 +291,9 @@ class Mutants(unittest.TestCase):
         self.assertIn("body worker", table_failures(m))
 
 
-FAKE_MINT = "#!%s\nimport json, sys\nopen(sys.argv[0] + '.argv', 'a').write(json.dumps(sys.argv[1:]) + '\\n')\nprint('tok-' + sys.argv[1].split('/')[-1])\n" % sys.executable
+FAKE_MINT = ("#!%s\nimport json, os, sys\nargv = sys.argv[1:]\nfd = None\nif len(argv) >= 2 and argv[-2] == '--fd':\n    fd = int(argv[-1])\n    argv = argv[:-2]\n"
+             "open(sys.argv[0] + '.argv', 'a').write(json.dumps(argv) + '\\n')\nopen(sys.argv[0] + '.full', 'a').write(json.dumps(sys.argv[1:]) + '\\n')\nopen(sys.argv[0] + '.path', 'w').write(os.path.realpath(sys.argv[0]) + '\\n' + os.path.realpath(sys.executable))\n"
+             "tok = 'tok-' + argv[0].split('/')[-1]\nif fd is None:\n    print(tok)\nelse:\n    os.write(fd, tok.encode())\n" % sys.executable)   # the default mint gives the token through --fd (#1453)
 
 
 class LaunchSideMint(unittest.TestCase):
@@ -320,8 +322,12 @@ class LaunchSideMint(unittest.TestCase):
         mod = types.ModuleType("launch_side_copy")
         mod.__file__ = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.mint))), "bin", "cloud_worker.py")
         os.makedirs(os.path.dirname(mod.__file__), exist_ok=True)
-        for sibling in ("cloud_cluster.py", "cloud_inspect.py", "path_walk.py"):   # the copy loads its cluster module from beside its own (faked) path: the real ones
+        for sibling in sorted(n for n in os.listdir(os.path.join(ROOT, "bin")) if n.startswith("cloud_") and n != "cloud_worker.py") + ["path_walk.py"]:   # the copy loads its cluster module from beside its own (faked) path: the real ones
             shutil.copy(os.path.join(ROOT, "bin", sibling), os.path.dirname(mod.__file__))
+        launcher = os.path.dirname(self.mint)
+        for n in os.listdir(LAUNCHER):   # the copy's launcher library (git_token_cmd, run_git_token_cmd) sits beside the fake mint, as in the repository
+            if n.endswith(".py") and n != "app_token.py":
+                shutil.copy(os.path.join(LAUNCHER, n), launcher)
         exec(compile(src, mod.__file__, "exec"), mod.__dict__)
         mod._capture = lambda argv, env=None: (lambda p: (p.returncode, p.stdout, p.stderr))(
             subprocess.run(argv, env=env, capture_output=True, text=True))   # the module's own capture needs the switchboard's names: a plain run here
@@ -349,12 +355,9 @@ class LaunchSideMint(unittest.TestCase):
                     os.remove(self.log)
                 _, calls = self.run_mint(self.load(), *extra)
                 self.assertEqual(calls, [[REPO]])
-        mod = self.load()
-        seen = []
-        mod._capture = lambda argv, env=None: seen.append(argv) or (0, "x\n", "")
-        self.run_mint(mod)
-        self.assertEqual([[os.path.realpath(a) for a in argv] for argv in seen],
-                         [[os.path.realpath(a) for a in (sys.executable, self.mint, REPO)]])
+        self.assertEqual(pathlib.Path(self.mint + ".path").read_text().split("\n"), [os.path.realpath(self.mint), os.path.realpath(sys.executable)])   # the interpreter and the mint beside the copy
+        full = json.loads(pathlib.Path(self.mint + ".full").read_text().splitlines()[-1])
+        self.assertEqual((full[0], full[-2], full[-1].isdigit()), (REPO, "--fd", True))   # the default mint gets its route as the last two arguments   # it ran the mint beside the copy
 
     def test_a_launch_through_a_symlinked_temporary_directory_compares_resolved_paths(self):
         import tempfile
@@ -369,14 +372,11 @@ class LaunchSideMint(unittest.TestCase):
         with open(self.mint, "w") as f:
             f.write(FAKE_MINT)
         self.log = self.mint + ".argv"
-        mod = self.load()
-        seen = []
-        mod._capture = lambda argv, env=None: seen.append(argv) or (0, "x\n", "")
-        self.run_mint(mod)
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(os.path.realpath(seen[0][1]), os.path.realpath(self.mint))
-        self.assertEqual([os.path.realpath(a) for a in seen[0]],
-                         [os.path.realpath(a) for a in (sys.executable, self.mint, REPO)])
+        tok, calls = self.run_mint(self.load())
+        self.assertEqual((tok, calls), ("tok-widget-service", [[REPO]]))   # the default mint was recognised through the link and run once
+        self.assertEqual(pathlib.Path(self.mint + ".path").read_text().split("\n"), [os.path.realpath(self.mint), os.path.realpath(sys.executable)])   # the interpreter and the mint beside the copy
+        full = json.loads(pathlib.Path(self.mint + ".full").read_text().splitlines()[-1])
+        self.assertEqual((full[0], full[-2], full[-1].isdigit()), (REPO, "--fd", True))   # the default mint gets its route as the last two arguments
 
     def test_a_custom_command_runs_unchanged(self):
         own = os.path.join(os.path.dirname(self.mint), "own.py")
@@ -396,7 +396,7 @@ class LaunchSideMint(unittest.TestCase):
         self.assertEqual(src.count("token = git_token(repo, cluster, args.agent if args.agent in _lib().AGENTS else \"worker\")"), 1)
 
     def test_mutant_without_the_kind_in_the_orchestrator_call_is_caught(self):
-        mod = self.load('    if not raw and role != "worker":\n        argv += ["--role", role]\n', "")
+        mod = self.load("lib.git_token_cmd(repo, env, role)", "lib.git_token_cmd(repo, env)")
         _, calls = self.run_mint(mod, "orchestrator")
         self.assertNotEqual(calls, [[REPO, "--role", "orchestrator"]])
 

@@ -5631,7 +5631,6 @@ BOSS_READ_SITES = {
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
     "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
-    "bin/fleet-switchboard:cloud_turn_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to scan_turns, which sends to that lane or, with no valid name, to the Chief of Staff alone (#1484)",
     "bin/fleet-switchboard:pod_silence_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to pod_silence.scan, which sends the one summary to that lane alone (#2115)",
     "bin/fleet-switchboard:route_of": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record (#1740), only the address of a stage event (#1575); it is told to that lane and nobody else",
     "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
@@ -8482,6 +8481,8 @@ def cloud_watch_tick(engine, discovery):
     return result
 
 
+CLOUD_STALL_ALERT_FILE = "cloud-stall-alert.json"   # #2399: the private cursor and sent keys of the pass that reads the launcher's `stall-alert` audit lines
+CLOUD_IDLE_NOTICE_FILE = "cloud-idle-notice.json"   # #2443: the private cursor and sent keys of the pass that reads the launcher's `idle-notice` audit lines
 CLOUD_END_ALERT_FILE = "cloud-end-alert.json"   # #1480: the private cursor and the sent keys of the pass that reads the launcher's audit file
 
 
@@ -8536,6 +8537,15 @@ def cloud_end_tick(engine, discovery):
                                                      last_push=load_module("cloud_end_alert").push_reader(getattr(getattr(engine, "audit", None), "path", None), load_module("record_json").parse_bounded))
 
 
+def cloud_stall_tick(engine, discovery):
+    """#2399: a stall the reaper's watch found (one `stall-alert` audit line) tells the boss and the Chief of Staff, once per line, through the daemon's own `send`."""
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is None:
+        return []
+    return load_module("cloud_end_alert").scan_stall(cloud_audit_path(), Path(state_dir) / CLOUD_STALL_ALERT_FILE,
+                                                     lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded)
+
+
 def cloud_turn_activity(worker):
     """#1484: (busy, last update in epoch seconds) of a cloud worker, from the launcher's own `status` (which reads the worker's activity script in the pod); None when unreadable."""
     import datetime as _dt
@@ -8551,17 +8561,14 @@ def cloud_turn_activity(worker):
 
 
 def cloud_turn_tick(engine, discovery, activity=None):
-    """#1484: a cloud worker whose turn ended and who waits tells its recorded boss, once per turn end (the sender, state file and keys of #1480)."""
+    """#2443 (was #1484's polling of the worker's activity): a pod whose session the server reports idle (one `idle-notice` audit line from the reaper's watch) tells its recorded
+    boss ONE message at once: the last report of that turn (`report done|failed|blocked "<line>"`), or `idle with no report: assess`, with the last text, the cw-run jobs and the
+    deliverable as evidence, or `idle state unknown`. One message per idle, through the daemon's own `send`. `activity` is kept for the old callers and unused."""
     state_dir = getattr(engine, "state_dir", None)
-    watch = getattr(engine, "cloud_watch", None)
-    if state_dir is None or not watch:
+    if state_dir is None:
         return []
-    workers = [(r.get("worker"), r.get("reports_to")) for r in watch.get("records", []) if isinstance(r, dict)]
-    if not hasattr(engine, "_cloud_turn_memory"):
-        engine._cloud_turn_memory = {}
-    return load_module("cloud_end_alert").scan_turns(workers, activity or cloud_turn_activity, Path(state_dir) / CLOUD_END_ALERT_FILE, cloud_audit_path(),
-                                                     lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded,
-                                                     time.time(), engine._cloud_turn_memory)
+    return load_module("cloud_end_alert").scan_idle(cloud_audit_path(), Path(state_dir) / CLOUD_IDLE_NOTICE_FILE, _read_small(state_dir, LAST_REPORT_FILE),
+                                                    lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded)
 
 
 def pod_silence_summary(worker):
@@ -8636,6 +8643,7 @@ def push_watch_tick(engine, discovery):
     if state_dir is not None:   # #2186: only a record the one liveness test accepts is read (as pod_silence_tick reads it)
         retired, reports = registry_retired(state_dir), _read_small(state_dir, LAST_REPORT_FILE)
         ns.record_live = lambda rec, name, at: cloud_record_live(rec, name, retired, reports, at)
+        ns.reported_text = lambda name: (reports.get(name) or {}).get("text")   # ask #2393: the sha a pod reported as `landed <sha>`
     hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
     if hub is None:
         if not getattr(engine, "_push_watch_skip_told", False):   # once per engine, not every idle pass: a line per pass grows the audit and every reader of it rewrites its offsets (TestWriteOnlyOnChange)
@@ -8676,6 +8684,10 @@ def finish_pass(engine, discovery, report):
         load_module("cloud_worker").bind(globals())._first_push().first_push_tick(engine, discovery)   # #2057: a cloud pod with no first push by its checkpoint is named once to its orchestrator
     except Exception as err:
         engine._failed("first-push", "first-push", err, report)
+    try:
+        cloud_stall_tick(engine, discovery)   # #2399
+    except Exception as err:
+        engine._failed("cloud-stall-alert", "cloud-stall-alert", err, report)
     try:
         cloud_turn_tick(engine, discovery)
     except Exception as err:
@@ -9613,6 +9625,8 @@ GITHUB_AUDIT_KEYS = 20         # keys named in one audit line; the rest are only
 SECONDARY_READS = ("reviews", "check suites", "workflow runs", "items")
 GITHUB_REJECT_AUDITS = 20      # bad-signature audit lines per minute; the rest are only counted
 CONFLICT_TEXT = "Hook already exists"
+GITHUB_FORWARDER_HOOK_URL = "https://webhook-forwarder.github.com/hook"   # the url `gh webhook forward` gives the hook it creates (name "cli"): the only hooks the daemon ever lists for removal
+GITHUB_HOOK_REMOVALS = 30      # a safety net only: at most this many hooks are removed in one start (a repository holds 20, and the list reads one page of 100)
 WATCH_FILE = "github-watch.json"
 WATCH_STATES = ("starting", "running", "backoff", "conflict")
 
@@ -9705,6 +9719,8 @@ class GitHubItem:
         # is delivered only to an owner the old links found; `routed_by` says which link found the owner.
         self.numbers, self.actionable, self.routed_by = list(numbers), actionable, None
         self.review_signer = None   # the from= marker name of a review comment (`_review_comment_item`)
+        self.excerpt = ""   # ask #2445: the first 2000 characters of a comment's text (untrusted), for the Chief of Staff's line
+        self.issue_facts = None   # ask #2445: a comment's issue as the payload gave it ({"author", "signer", "pr"}), or None when the payload held no issue (a catch-up read)
 
     @property
     def issue(self):
@@ -9934,8 +9950,18 @@ def _comment_item(repo, comment, issue, now):
         return None
     known, lookups = _issue_refs(issue, number)
     summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(scrub_signed_links(comment.get("body") or ""), 400))
-    return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,
+    item = GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,
                       [number], not _is_bot(comment))
+    item.issue_facts = _issue_facts(issue)
+    item.excerpt = body[:2000] if isinstance(body, str) else ""
+    return item
+
+
+def _issue_facts(issue):
+    """Ask #2445: what the routing of a comment on an unowned issue needs of the issue, from the payload alone: its author, the agent that signed its body, whether it is a pull request. None when no issue was given."""
+    if not isinstance(issue, dict) or "user" not in issue:
+        return None
+    return {"author": _login(issue), "signer": signed_by_fleet(issue.get("body")), "pr": _is_pr(issue)}
 
 
 def _issue_item(repo, issue, now, what=None):
@@ -10162,7 +10188,11 @@ def red_ci_lane(hub, repo, pr, now):
 
 
 class GitHubUnavailable(Exception):
-    """A `gh api` read that did not answer; the caller tries again later."""
+    """A `gh api` read that did not answer; the caller tries again later. `status` is the HTTP status gh reported (an int), else None."""
+
+    def __init__(self, *args, status=None):
+        super().__init__(*args)
+        self.status = status
 
 
 FORWARDER_HISTORY_SECONDS = 3600
@@ -10213,6 +10243,9 @@ class Watch:
         # PR 15: a repo whose forwarder cannot work (no such repo yet, no right to make a webhook) is read on
         # a poll instead: the existing catch-up read, every github_poll_seconds.
         self.polling, self.poll_reason, self.next_poll, self.last_poll = False, None, 0.0, None
+        # the cli webhook this forwarder made: ids of the forwarder hooks that existed when it started (None: unknown), the id it made (None: not known, so none is removed), the note `status` shows
+        self.hooks_before, self.hook_id, self.hook_claim_tried, self.hook_note = None, None, False, None
+        self.conflicted = False   # someone else's forwarder held the hook at the last conflict, until a child of ours has run past the connect delay
 
     @property
     def mode(self):
@@ -10236,7 +10269,7 @@ class Watch:
                 "next_start": iso(self.next_start) if self.proc is None else None,
                 "last_catch_up": iso(self.last_catch_up), "last_error": self.last_error,
                 "drops": [[t, r] for t, r in self.drops], "down_since": self.down_since,
-                "catch_up_error": self.catch_up_error}
+                "catch_up_error": self.catch_up_error, "hook_note": self.hook_note}
 
 
 def spawn_forwarder(argv, log_path, env=None):
@@ -10248,6 +10281,13 @@ def spawn_forwarder(argv, log_path, env=None):
                                 start_new_session=True, close_fds=True)
     finally:
         os.close(fd)
+
+
+def _alive(proc):
+    try:
+        return proc is not None and proc.poll() is None
+    except Exception:
+        return False
 
 
 def _terminate(proc):
@@ -10318,6 +10358,8 @@ class GitHubHub:
         self._route_until, self._unrouted_batch, self._read_backoff = None, [], {}
         self._notices, self._filtered, self._filtered_batch = {}, set(), []   # PR 52
         self._routed_batch, self._conflicts = [], set()
+        self._chief_audited = set()   # ask #2445: comment keys whose chief-of-staff routing was audited (once per comment)
+        self._hook_audited = set()   # repos whose hook-cleanup failure is already in the audit
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
         self._cursors, self.last_incomplete, self.last_failed_primary = {}, False, False   # #494: per repo, the steps of an unfinished catch-up window
         self.engine = None
@@ -10429,13 +10471,17 @@ class GitHubHub:
         if server is not None:
             server.shutdown()
             server.server_close()
+        stopped = []
         with self.lock:
             for watch in self.watches.values():
                 if watch.proc is not None:
+                    stopped.append((watch, _alive(watch.proc)))
                     _terminate(watch.proc)
                     watch.proc, watch.secret, watch.state = None, None, "backoff"
             self._save_markers()
             self._write_snapshot(self.now(), stopped=True)
+        for watch, alive in stopped:
+            self._release_hook(watch, alive)   # #2397: its own hook, outside the lock (a bounded call each)
 
     # -- receiving
 
@@ -10746,9 +10792,11 @@ class GitHubHub:
         for repo in joined:
             self._audit("github.watch", repo, {"state": "joined"})
         for repo, watch in gone:
+            alive = _alive(watch.proc)
             if watch.proc is not None:
                 _terminate(watch.proc)
             watch.proc = watch.secret = None
+            self._release_hook(watch, alive)
             self._audit("github.watch", repo, {"state": "left"})
 
     def prune_cursors(self):
@@ -10797,6 +10845,8 @@ class GitHubHub:
         try:
             owner, routed_by = self.route_of(item, discovery.agents, now)
         except GitHubUnavailable:
+            if item.key.startswith("github.comment:"):
+                self._chief_audit_once(item, "the issue could not be read", keep=True)   # ask #2445: said once; the comment stays queued and is asked again next pass
             return
         if item.key.startswith("github.reviewcomment:"):
             if owner and item.review_signer and self._fleet_login(item.sender) and _review_lane_member(discovery.agents, item.review_signer, owner):
@@ -10810,6 +10860,10 @@ class GitHubHub:
                 if not seen_once:
                     self._audit("github.reviewcomment.unowned", item.repo, {"key": item.key, "prs": item.numbers[:GITHUB_AUDIT_KEYS],
                                                                             "note": "no lane owns the pull request; audited once per comment id, no message is sent"})
+                return
+        if not owner and item.key.startswith("github.comment:"):
+            owner, routed_by, dropped = self._chief_route(item, discovery.agents, now)   # ask #2445: an issue the Chief of Staff authored has no lane owner
+            if dropped:
                 return
         with self.lock:
             if owner and not item.actionable and routed_by != "closing":
@@ -10831,6 +10885,85 @@ class GitHubHub:
                         self._unrouted.clear()
                     self._unrouted.add(item.key)
                     self._unrouted_batch.append(item)
+
+    def _chief_audit_once(self, item, why, keep=False, delivered=False):
+        """Ask #2445: one audit line per comment key, whatever the reason. Ask #2484: `delivered` says the comment was handed to the Chief of Staff with the reason (it was not dropped)."""
+        with self.lock:
+            if not keep and not delivered:
+                self.queue.pop(item.key, None)
+            seen = item.key in self._chief_audited
+            if not seen:
+                if len(self._chief_audited) > 20000:
+                    self._chief_audited.clear()
+                self._chief_audited.add(item.key)
+        if not seen:
+            note = ("no lane could be decided; the comment is delivered to the Chief of Staff with this reason, audited once per comment" if delivered
+                    else "the author of the issue could not be told; nothing is routed by this line, audited once per comment")
+            self._audit("github.comment.chief_unknown", item.repo, {"key": item.key, "issues": item.numbers[:GITHUB_AUDIT_KEYS], "why": why, "note": note})
+
+    def _chief_route(self, item, agents, now):
+        """Ask #2445 and #2484: (owner, routed_by, dropped) for a comment no lane owns by the ordinary links. The Chief of Staff's own comments, and a pull request's, are never routed.
+        1. (`marker`) the from= marker of the issue body names a registered agent and the issue's author is a fleet identity: that agent. A marker anywhere else routes nothing.
+        2. (`chief`) an issue the Chief of Staff authored (the `gh_users` account of THIS repository, else a fleet login's from= marker): the Chief of Staff.
+        3. Nothing else decides: the Chief of Staff still receives it, with the reason (`chief`), and one `github.comment.chief_unknown` line is audited per comment.
+        Only when no Chief-of-Staff lane runs is the comment dropped (`dropped` True) with that one audit line."""
+        facts = item.issue_facts
+        if facts is None:
+            try:
+                data = self._read_one(item.repo, "issues/%d" % item.numbers[0], now) if item.numbers else None
+            except GitHubUnavailable:
+                data = None
+            facts = _issue_facts(data) if isinstance(data, dict) else None
+        if facts is not None and facts["pr"]:
+            return None, None, False
+        account = self.accounts.account_for(item.repo)
+        account = str(account).lower() if account else None
+        sender = str(item.sender or "").lower()
+        if (account and sender == account) or (not account and self._fleet_login(item.sender)):
+            return None, None, False   # the Chief of Staff's own comment (its account here, else any fleet login): never routed
+        why = None
+        if facts is None:
+            why = "the issue could not be read"
+        elif not facts["author"]:
+            why = "the issue has no readable author"
+        else:
+            author = facts["author"]
+            signer = facts["signer"]
+            if signer and self._fleet_login(author) and signer in agents:
+                return self._deliver_summary(item, signer, "marker", "an issue signed by %s" % signer)
+            if account:
+                chief_issue = author.lower() == account
+            else:
+                chief_issue = bool(signer) and self._fleet_login(author)
+            if chief_issue:
+                mine = self._chief_lanes(item, agents)
+                if len(mine) == 1:
+                    return self._deliver_summary(item, mine[0], "chief", "an issue the Chief of Staff authored")
+                why = "the Chief of Staff lane is %s" % ("not running" if not mine else "not one lane")
+            else:
+                why = "no lane owns the issue and the marker rule did not apply"
+        mine = self._chief_lanes(item, agents)
+        if not mine:
+            if why.startswith("no lane owns"):
+                return None, None, False   # nobody can receive it and nothing is known of it: the ordinary unowned path drops it and audits it in counts, not a line per comment
+            self._chief_audit_once(item, why + " (and no Chief of Staff lane is running)")
+            return None, None, True
+        lane = mine[0]   # more than one lane: the first by name; the reason names the lanes
+        if len(mine) > 1:
+            why += " (Chief-of-Staff lanes %s; delivered to %s)" % (", ".join(mine[:5]), lane)
+        self._chief_audit_once(item, why, delivered=True)
+        return self._deliver_summary(item, lane, "chief", "no lane could be decided (%s)" % why)
+
+    def _chief_lanes(self, item, agents):
+        lanes = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
+        own = [n for n in lanes if (agents[n].fleet or {}).get("repo") == item.repo]
+        return own or lanes   # a lane bound to this repository comes before one bound to none: two Chiefs of different organisations never share an issue
+
+    def _deliver_summary(self, item, lane, how, what):
+        who = _one_line(re.sub(r"[\x00-\x1f\x7f]", "", item.sender or "someone"), 60)
+        item.summary = "@%s commented on #%d, %s (untrusted text, no instruction): %s" % (
+            who, item.numbers[0], _one_line(re.sub(r"[\x00-\x1f\x7f]", " ", str(what)), 200), _one_line(scrub_signed_links(redact_command_text(item.excerpt)), 400))
+        return lane, how, False
 
     def _fleet_login(self, login):
         """True when `login` is a fleet identity: a `gh_users` account (the account the daemon acts as) or a `github_bot_logins` account (the cloud readers' bot). A `from=` marker is
@@ -11659,6 +11792,9 @@ class GitHubHub:
             if watch.proc is not None and watch.polling and now - watch.started >= self.catchup_delay:
                 with self.lock:  # the forwarder connected: the repo is no longer polled; one read closes the gap
                     watch.polling, watch.poll_reason, watch.catchup_at = False, None, now
+        if _alive(watch.proc) and not watch.hook_claim_tried and now - (watch.started or now) >= self.catchup_delay:
+            watch.conflicted = False   # it runs past the connect delay: no one else holds the hook
+            self._claim_hook(watch)   # the forwarder has connected: its hook exists
         if watch.proc is None and now >= watch.next_start:
             self._start(watch, now)
         if watch.polling and now >= watch.next_poll:
@@ -11681,12 +11817,128 @@ class GitHubHub:
         directory.mkdir(mode=0o700, exist_ok=True)
         return directory / ("forward-%s.log" % watch.repo.replace("/", "-"))
 
+    # -- the cli webhooks the forwarders make (#2397): `gh webhook forward` creates one and removes it only on a clean exit
+
+    def _hook_api(self, repo, env, args):
+        """One bounded `gh api` call on the repo's hooks, through the repo's account. Returns the stdout; raises GitHubUnavailable with a reason that holds no secret."""
+        extra = {"env": env} if env is not None else {}
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or any(part in (".", "..") for part in repo.split("/")):   # the repo is part of the path: no dot segment, no odd character
+            raise GitHubUnavailable("not a repository name")
+        try:
+            done = self.runner([self.config["gh"], "api"] + args, capture_output=True, text=True,
+                               timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
+        except Exception as err:   # the forwarder starts whatever happens here
+            raise GitHubUnavailable(self.accounts.scrub(_one_line("%s: %s" % (type(err).__name__, err), 200))) from None
+        if done.returncode != 0:
+            raw = done.stderr or done.stdout or "exit %s" % done.returncode
+            said = self.accounts.scrub(_one_line(raw, 200))
+            found = re.search(r"\(HTTP ([0-9]{3})\)|\bHTTP ([0-9]{3})\b", raw)
+            status = int(found.group(1) or found.group(2)) if found else None   # the status, as a number: callers compare it exactly
+            if "admin:repo_hook" in said or status == 403:
+                said = "the token lacks the admin:repo_hook scope (or the right to see hooks): %s" % said
+            raise GitHubUnavailable(said, status=status)
+        return done.stdout or ""
+
+    def _forwarder_hooks(self, repo, env):
+        """{id: active} of the repo's hooks that are name 'cli' AND whose url is the forwarder url, and nothing else: no other hook is ever a candidate."""
+        try:
+            hooks = json.loads(self._hook_api(repo, env, ["repos/%s/hooks?per_page=100" % repo]) or "[]")
+        except GitHubUnavailable as err:
+            if err.status == 404 and "admin:repo_hook" not in str(err):   # GitHub answers 404 to a token that may not see hooks
+                raise GitHubUnavailable("the token lacks the admin:repo_hook scope (or the right to see hooks): %s" % err) from None
+            raise
+        except ValueError:
+            raise GitHubUnavailable("the hook list is not JSON") from None
+        if not isinstance(hooks, list):
+            raise GitHubUnavailable("the hook list is not a list")
+        found = {}
+        for hook in hooks:
+            if not isinstance(hook, dict) or hook.get("name") != "cli" or type(hook.get("id")) is not int:
+                continue
+            config = hook.get("config")
+            if isinstance(config, dict) and config.get("url") == GITHUB_FORWARDER_HOOK_URL:
+                found[hook["id"]] = bool(hook.get("active"))
+        return found
+
+    def _remove_hook(self, repo, env, hook_id):
+        try:
+            endpoint = "repos/%s/hooks/%d" % (repo, hook_id)
+            with github_write(self.audit, self.actor, "DELETE", endpoint, repo):   # the ONE audit of a GitHub write (#2260): the intent line first; no audit log, no delete
+                self._hook_api(repo, env, ["--method", "DELETE", endpoint])
+        except GitHubUnavailable as err:
+            if err.status != 404:
+                raise
+            # 404: most likely gone already (the forwarder removed it itself); a token that may not manage hooks is told by the list call before, which would have failed first
+
+    def _hook_failed(self, watch, reason):
+        """A failed list or removal: a note for `status` and ONE audit line per repo (for as long as the daemon runs). Never an error for the caller."""
+        with self.lock:
+            watch.hook_note = "hook cleanup failed, stale webhooks stay (20 per repo cap; the account needs the admin:repo_hook scope to clear them): %s" % reason
+            first = watch.repo not in self._hook_audited
+            self._hook_audited.add(watch.repo)
+        if first:
+            self._audit("github.hooks", watch.repo, {"error": reason})   # once per repo for as long as the daemon runs (never cleared)
+
+    def _clear_stale_hooks(self, watch, env):
+        """Before a forwarder starts: remove every cli forwarder hook of the repo. At a start no forwarder child of THIS daemon runs for the repo, so none is ours and all
+        of them are stale (a forwarder of another daemon on the same repo cannot be told apart: its hook looks the same; one daemon per repo is the supported setup, and
+        the other forwarder, when it drops, finds that out through its own start). Never raises; a failure is the note and one audit line."""
+        watch.hooks_before, watch.hook_id, watch.hook_claim_tried = None, None, False
+        # after a conflict someone else may forward, by intent: its live hook is active and looks like a stale one, so only INACTIVE hooks (never a live forwarder's) are removed then
+        only_inactive = watch.state == "conflict" or watch.conflicted
+        found = {}
+        try:
+            found = self._forwarder_hooks(watch.repo, env)
+            for hook_id in [h for h in sorted(found) if not (only_inactive and found[h])][:GITHUB_HOOK_REMOVALS]:
+                self._remove_hook(watch.repo, env, hook_id)
+                found.pop(hook_id)
+        except Exception as err:
+            self._hook_failed(watch, _one_line(str(err), 200))
+            if found:   # a removal failed: the hooks still there are known, so the forwarder's own can still be told
+                with self.lock:
+                    watch.hooks_before = set(found)
+            return
+        with self.lock:
+            watch.hooks_before, watch.hook_note = set(found), None
+
+    def _claim_hook(self, watch, found=None):
+        """Learn which hook this forwarder made: the one forwarder hook that is not among those that existed when it started (gh prints no id). Two or none: not claimed,
+        so nothing is removed for it. Never raises."""
+        if watch.hook_id is not None or watch.hooks_before is None or watch.hook_claim_tried:
+            return   # one try per start: a hook that appears later is never claimed
+        watch.hook_claim_tried = True
+        try:
+            new = set(found if found is not None else self._forwarder_hooks(watch.repo, self.child_env(watch.repo))) - watch.hooks_before
+        except Exception as err:
+            self._hook_failed(watch, _one_line(str(err), 200))
+            return
+        if len(new) == 1:
+            watch.hook_id = next(iter(new))
+
+    def _release_hook(self, watch, alive=False):
+        """A forwarder is stopped: remove the hook it made, and no other. `alive`: its child was running up to the stop (only then may a hook be claimed
+        now: a forwarder that already died made no hook that a later one could be taken for). Never raises."""
+        try:
+            connected = alive and self.now() - (watch.started or 0) >= self.catchup_delay   # before the forwarder has connected its hook may not exist yet: a hook seen now could be anyone's
+            if watch.hook_id is None and not (connected and watch.hooks_before is not None and not watch.hook_claim_tried):
+                return   # nothing can be claimed or removed: no call
+            env = self.child_env(watch.repo)
+            found = self._forwarder_hooks(watch.repo, env)   # one fresh list: the claim and the removal both rest on what exists NOW
+            if connected:
+                self._claim_hook(watch, found)
+            if watch.hook_id is not None and watch.hook_id in found:   # an id that is no longer a cli forwarder hook is never deleted
+                self._remove_hook(watch.repo, env, watch.hook_id)
+            watch.hook_id = None
+        except Exception as err:
+            self._hook_failed(watch, _one_line(str(err), 200))
+
     def _start(self, watch, now):
         try:
             env = self.child_env(watch.repo)
         except GitHubUnavailable as err:
             self._failed(watch, now, str(err))
             return
+        self._clear_stale_hooks(watch, env)   # #2397: before the forwarder asks for a new hook (a failure never stops the start)
         secret = secrets.token_hex(32)  # a new one for every start; memory and argv only
         with self.lock:
             watch.secret = secret
@@ -11716,11 +11968,13 @@ class GitHubHub:
         tail = _scrub(self._log_tail(watch), watch.secret)
         with self.lock:
             watch.proc, watch.secret = None, None
+            watch.hooks_before, watch.hook_id = None, None   # a dead forwarder owns nothing: its hook, if any, is cleared by the next start
             ran = max(0.0, now - (watch.started or now))
             watch.drops = [d for d in watch.drops if now - d[0] < FORWARDER_HISTORY_SECONDS] + [(now, ran)]
             watch.down_since = now
         if CONFLICT_TEXT in tail:
             with self.lock:
+                watch.conflicted = True
                 watch.state, watch.next_start = "conflict", now + self.conflict_retry
                 watch.last_error = "someone else is already forwarding %s (%s); catch-up reads continue" % (
                     watch.repo, CONFLICT_TEXT)
@@ -11835,13 +12089,13 @@ def github_status(config, state_dir, fleets=None, now=None):
         why = None
         if watch:
             why = "; ".join(x for x in (watch.get("poll_reason"), watch.get("last_error"),
-                                        watch.get("catch_up_error")) if x) or None
+                                        watch.get("catch_up_error"), watch.get("hook_note")) if x) or None
         marker = parse_iso(watch.get("read_marker")) if watch and watch.get("read_marker") else None
         age = max(0, (time.time() if now is None else now) - marker) if marker is not None else None
         current = time.time() if now is None else now
         health = forwarder_health(watch, current) if watch else None
         if health and health["live"]:
-            why = watch.get("poll_reason") or None  # a recovered drop is history, not an error
+            why = "; ".join(x for x in (watch.get("poll_reason"), watch.get("hook_note")) if x) or None  # a recovered drop is history, not an error
         report["detail"].append({"repo": repo, "how": how, "account": accounts.describe(repo),
                                  "agents": members.get(repo, []), "why": why, "read_age": age, "health": health})
     return report
@@ -18002,10 +18256,49 @@ def plan_listing(ctx, runner, now, same=None):
     return out
 
 
+CLAIM_BODY_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){body mergedAt lastEditedAt}}}"
+
+
+def _merged_body_claim(ctx, runner, now, number, merged):
+    """#2465: the claim of a MERGED sibling with no recorded claim (a merge made by hand, outside the merge gate, records none): the `CLAIMS:` line of the sibling's own body AS MERGED,
+    as a body `pr_claim` reads. ONE GraphQL read of the pull request itself (fixed query text, typed variables): its body, `mergedAt` and `lastEditedAt`. The body counts only when its last
+    edit is PROVEN to precede the merge: never edited (`lastEditedAt` null), or edited strictly before `mergedAt`; an edit at or after the merge, an edit time that cannot be read, a
+    `mergedAt` that is not the merge time of the listing, a body that cannot be read, no `CLAIMS:` line or a line the plan refuses (an identifier it lacks, one claimed at the epic, none)
+    raises ClaimUnknown: the gate fails closed, as before. A later edit never widens a claim. The ledger claim is preferred: this runs only when none was recorded. GETs only."""
+    def unknown(why):
+        return ClaimUnknown("merged pull request #%s has no recorded claim at or before its merge and its own body could not be read as merged (%s): its claim is unknown" % (number, why))
+    scenarios = (ctx.plan or {}).get("scenarios_parsed") if isinstance(getattr(ctx, "plan", None), dict) else None
+    if merged is None or not scenarios or not isinstance(number, int) or isinstance(number, bool):
+        raise unknown("no merge time or no plan to check it against")
+    repo = ctx.pr.rsplit("#", 1)[0]
+    try:
+        refuse_excluded(ctx.config, repo)
+        owner, _, name = repo.partition("/")
+        accounts = GhAccounts(ctx.config, runner, now)
+        env = accounts.env_for(repo)
+        extra = {"env": env} if env is not None else {}
+        argv = [ctx.config["gh"], "api", "graphql", "-f", "query=" + CLAIM_BODY_QUERY, "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=%d" % number]
+        done = runner(argv, capture_output=True, text=True, timeout=ctx.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            raise ValueError("the read failed")
+        pull = load_module("record_json").parse_bounded(done.stdout)["data"]["repository"]["pullRequest"]
+        body, merged_at, edited = pull["body"], _measure_time(pull["mergedAt"]), pull["lastEditedAt"]
+    except Exception:
+        raise unknown("the pull request could not be read") from None
+    if not isinstance(body, str) or merged_at != merged:
+        raise unknown("the body or the merge time was not readable")
+    if edited is not None and ((_measure_time(edited) if isinstance(edited, str) else None) is None or _measure_time(edited) >= merged):
+        raise unknown("the body was edited at or after the merge, or its edit time is unreadable")
+    ids, error = plan_ledger.pr_claim(body, scenarios)
+    if error or ids is None:
+        raise unknown("its CLAIMS line is missing or refused by the plan")
+    return plan_ledger.claim_body(plan_ledger.claim_text(body))
+
+
 def plan_peers(ctx, runner, now, closed=None):
     """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
     (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the NEWEST claim line recorded at or before its `merged_at`, the claim in force at the merge: never its current body, which an author can edit, and never a line recorded after the merge):
-    a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is `plan_listing`: bounded, and with more the read raises
+    a merged sibling with no recorded claim reads the claim line of its own body as merged (`_merged_body_claim`, #2465), else raises ClaimUnknown. An open one reads its current body. GETs only. The list is `plan_listing`: bounded, and with more the read raises
     `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
     repo = ctx.pr.rsplit("#", 1)[0]
     peers = []
@@ -18022,8 +18315,9 @@ def plan_peers(ctx, runner, now, closed=None):
         if not found and merged is not None and merged <= CLAIM_LEDGER_SINCE:   # #1690: a legacy sibling has no claim line (it claims every per-pull-request scenario)
             peers.append(("merged", ""))
             continue
-        if not found:
-            raise ClaimUnknown("merged pull request #%s has no recorded claim at or before its merge: its claim is unknown" % other.get("number"))
+        if not found:   # #2465: a merge made by hand records no claim: read the claim line of the pull request's own body, as merged
+            peers.append(("merged", _merged_body_claim(ctx, runner, now, other.get("number"), merged)))
+            continue
         peers.append(("merged", plan_ledger.claim_body(text)))
     return peers
 
@@ -22065,8 +22359,8 @@ def add_core_parsers(sub):
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--base", help="With --cloud: the branch the worker's branch is created from (a branch name of the repository, checked like --branch); the setup text names it in place of the default branch. Without it the text is unchanged")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 60m; 30m for an orchestrator)")
-    launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
-    launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
+    launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h; 8h for --shape L)")
+    launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB), L (6 CPU, 16 GiB; for a land) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     launch.add_argument("--no-wait", dest="no_wait", action="store_true", help="With --cloud: request the pod and return at once (state starting); run the same launch command again to finish it (the session and the brief, once) when the pod is ready. Not with --stack")
     launch.add_argument("--no-commit", action="store_true", help="With --cloud: this pod is launched NOT to commit (a measure or a read): the launcher never tells it to push its work. Implied by --role tester and --role reviewer.")

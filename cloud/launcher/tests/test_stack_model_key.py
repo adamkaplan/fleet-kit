@@ -257,7 +257,7 @@ class NonStackReadsNothing(unittest.TestCase):
         import types
         lib = types.SimpleNamespace(check_repo_preflight=lambda repo, env: "ok")
         saved = {k: getattr(b, k) for k in ("stack_model_secret", "launcher_argv", "use_settings", "check_allowed", "_lib", "load_record", "H")}
-        h = dict(b.H, LaunchError=type('LaunchError', (Exception,), {}), NAME_RE=re.compile('[a-z0-9]+'), RESERVED_AGENT_NAMES=(), LANE_NAME_PREFIX='lane-', PROG='sb', launch_repo=lambda a: a.repo, build_engine=lambda r, n, c: (Eng(), object(), None), read_brief=lambda f, i: "brief")
+        h = dict(b.H, LaunchError=type('LaunchError', (Exception,), {}), NAME_RE=re.compile('[a-z0-9]+'), RESERVED_AGENT_NAMES=(), LANE_NAME_PREFIX='lane-', PROG='sb', launch_repo=lambda a: a.repo, launch_model_cloud=lambda a, p, au=None: {}, build_engine=lambda r, n, c: (Eng(), object(), None), read_brief=lambda f, i: "brief")
         try:
             b.stack_model_secret, b.launcher_argv, b.use_settings, b.check_allowed = fake_read, stop, (lambda: "test"), (lambda repo: None)
             b._lib, b.load_record, b.H = (lambda: lib), (lambda st, n: None), h

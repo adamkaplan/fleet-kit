@@ -46,8 +46,8 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
 NO_COMMIT_OPTION = "--no-commit"   # the pod is launched NOT to commit (a measure or a read): the launcher sends it no wip note
 CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}
-LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
-LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
+LAUNCHER_SHAPES = ("XS", "S", "M", "L", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
+LAUNCHER_STACK_SHAPES = ("S", "M", "L")   # the rows with stack: true; --stack with another shape is refused here, before any call
 MAX_M_PER_LANE = 10  # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
@@ -738,14 +738,14 @@ def _launch(args, runner, now, reserve):
     check_allowed(repo)   # before anything is read, minted or created
     if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
         raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
-    if args.shape == "M":   # the per-lane cap on shape M: a directory read, only for a new name, before the preflight mints a token
+    if args.shape in ("M", "L"):   # the per-lane cap on shapes M and L: a directory read, only for a new name, before the preflight mints a token
         cap_state = H["ensure_state_dir"]()
         if load_record(cap_state, name) is None:
             lane = args.reports_to or "(no boss)"
-            held = lane_m_workers(cap_state, lane)
-            if len(held) >= MAX_M_PER_LANE:
-                raise Refusal("lane %s already holds %d shape-M cloud workers (%s): retire one (retire NAME) or launch a smaller shape (--shape S)"
-                              % (lane, MAX_M_PER_LANE, ", ".join(held[:10])))
+            held = lane_m_workers(cap_state, lane, args.shape)
+            if len(held) >= {"M": MAX_M_PER_LANE, "L": 2}[args.shape]:
+                raise Refusal("lane %s already holds %d shape-%s cloud workers (%s): retire one (retire NAME) or launch a smaller shape (--shape S)"
+                              % (lane, {"M": MAX_M_PER_LANE, "L": 2}[args.shape], args.shape, ", ".join(held[:10])))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -837,7 +837,7 @@ def _launch(args, runner, now, reserve):
             record = _record_from_create(name, body)
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
-            record["repo"], record["branch"] = repo, branch
+            record["repo"], record["branch"], record["issue"] = repo, branch, None if args.issue is None else int(args.issue)   # ask #2393: the issue names the ask the pod's end is posted on
             if stack_model:
                 record["stack_model_secret"], record["stack_model_key"] = stack_model[0], "delivered"   # the name and that it was delivered; nothing else
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
@@ -943,7 +943,7 @@ def _print_capacity(runner, cluster):
             body = body if code == 0 else None
         except CloudError:
             body = None
-        lines = capacity_block(body, lib.SHAPES, lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
+        lines = capacity_block(body, getattr(lib, "capacity_shapes", lambda: lib.SHAPES)(), lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
         print("\n".join(lines), file=sys.stderr)
     except Exception:
         print("cloud capacity before the create: not read", file=sys.stderr)
@@ -983,7 +983,7 @@ def _limits_note(args, record):
         return "%dh" % (seconds // 3600) if seconds % 3600 == 0 else "%dm" % (seconds // 60) if seconds % 60 == 0 else "%ds" % seconds
     def limit(label, value, key):
         text = str(value)[:20] if value else applied(record.get(key))
-        return "%s limit %s%s" % (label, text, "" if value else " (default)" if text != "not reported" else "")
+        return "%s limit %s%s" % (label, text, "" if value else (" (default for shape L)" if getattr(args, "shape", None) == "L" and label == "hard" else " (default)") if text != "not reported" else "")
     stops = []
     for key in ("idle_deadline", "hard_deadline"):
         try:
@@ -1430,16 +1430,15 @@ _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
 def _final_message(engine, state, record, name, reason, body=None):
-    """Ask #1788: after a successful retire, ONE message to the recorded boss: the pod, the reason, and its last text (cut, scrubbed, framed as
-    untrusted: cloud_retired.last_message). Never raises: a failed send is said in the audit and the retire goes on."""
+    """Ask #1788: after a successful retire, ONE message to the boss with the pod's last text (cloud_retired.last_message); never raises."""
     boss = record.get("reports_to")
-    if not isinstance(boss, str) or not _BOSS_NAME_RE.fullmatch(boss):
-        return
+    boss = boss if isinstance(boss, str) and _BOSS_NAME_RE.fullmatch(boss) else None   # ask #2393: a pod without a boss still has its end posted on its ask
     try:
         where = body.get("record") if isinstance(body, dict) else None   # THIS stop's record, as the launcher's answer names it (PC-7); never a lookup by name
         block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        _retired().post_end(engine, state, record, name, reason, body, H["post_ask_comment"], lambda why_: _audit(engine, "cloud.end_post_failed", name, {"why": why_}), lambda why_: _audit(engine, "cloud.end_names_unchecked", name, {"why": why_}))   # ask #2393: once, on the pod's ask
         text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
-        engine.send("switchboard", boss, text)
+        boss and engine.send("switchboard", boss, text)
     except Exception as err:
         _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
 

@@ -23,7 +23,7 @@ FIXTURES = os.path.join(HERE, "fixtures")
 S_FIXTURES = {"default_pod.json": 2, "run_secret_pod.json": 1, "stack_pod.json": 2, "stack_pod_registry.json": 2}   # indent step of the file's text
 ABOVE = "a request is above its limit:"
 REFUSED = "a stack pod with requests was refused:"
-TABLE = '{"S": {"cpu": "500m", "memory": "2Gi"}}'
+TABLE = '{"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}, "L": {"cpu": "6", "memory": "16Gi"}}'
 # the line of the allow-list as it is at the integration tip (quoted in the plan's PC-1)
 TIP_LINE = ('        or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)'
             '   # limits stay')
@@ -100,7 +100,7 @@ class S10Requests(unittest.TestCase):
 
     def test_the_other_shapes_carry_no_requests(self):
         for name, row in cw.SHAPES.items():
-            if name == "S":
+            if name in ("S", "M", "L"):
                 continue
             for stack in ((False, True) if row.get("stack") else (False,)):
                 with self.subTest(shape=name, stack=stack):
@@ -135,18 +135,20 @@ class S10Requests(unittest.TestCase):
                         for v in o:
                             strip(v)
                 strip(old)
-                self.assertEqual(found, [{"cpu": "500m", "memory": "2Gi"}])   # the one S container; the M containers carry none
+                self.assertEqual(found, [{"cpu": "500m", "memory": "2Gi"}] + [{"cpu": "2", "memory": "8Gi"}] * (len(found) - 1))   # the S container, then the M containers (the new M row)
                 old_lines = (json.dumps(old, indent=indent, sort_keys=True) + "\n").split("\n")
                 new_lines = new_text.split("\n")
                 at = [i for i, l in enumerate(new_lines) if l.strip() == '"requests": {']
-                self.assertEqual(len(at), 1)
-                b = at[0]
-                self.assertEqual(new_lines[b - 1].strip(), "},")   # limits closes with a comma now
-                rest = new_lines[:b] + new_lines[b + 4:]   # without the inserted block of 4 lines
+                self.assertEqual(len(at), len(found))   # one block per container that carries requests (S, and now M)
+                rest = list(new_lines)
+                for b in reversed(at):
+                    self.assertEqual(new_lines[b - 1].strip(), "},")   # limits closes with a comma now
+                    del rest[b:b + 4]   # without the inserted block of 4 lines
                 self.assertEqual(len(rest), len(old_lines))
                 changed = [i for i in range(len(rest)) if rest[i] != old_lines[i]]
-                self.assertEqual(changed, [b - 1])   # exactly one changed line
-                self.assertEqual(rest[b - 1], old_lines[b - 1] + ",")
+                self.assertEqual(len(changed), len(at))   # exactly one changed line per block
+                for i in changed:
+                    self.assertEqual(rest[i], old_lines[i] + ",")
 
     def test_a_request_above_its_limit_is_caught(self):
         original = source()

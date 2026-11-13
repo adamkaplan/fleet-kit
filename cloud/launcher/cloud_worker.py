@@ -41,14 +41,21 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
           # the orchestrator row: it reads and relays, it builds nothing; no nested Docker. The estimate is the larger of the ratios 0.25 (cpu) and 0.375 (memory) against XS 0.05 = 0.01875, rounded up
           "O": {"cpu": "250m", "memory": "768Mi", "usd_per_hour": 0.02, "stack": False},
           "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
-          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
+          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True},
+          # the landing row (ask #2457): request equals limit, so one L takes a node's CPU; 0.34 is 6 of 8 vCPU of a 0.452 node
+          "L": {"cpu": "6", "memory": "16Gi", "usd_per_hour": 0.34, "stack": True}}  # list-price estimates, not billed figures
 
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 
-# Per-shape requests (#1978): ONE table, shape S only; a shape with no row has no requests key. The limits stay the SHAPES rows.
-SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}}
+# Per-shape requests (#1978): ONE table, shapes S and M; a shape with no row has no requests key. The limits stay the SHAPES rows.
+SHAPE_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory": "8Gi"}, "L": {"cpu": "6", "memory": "16Gi"}}
+
+
+def capacity_shapes():
+    """The SHAPES rows as the capacity read counts room: a shape's REQUEST when SHAPE_REQUESTS has a row, else its limit (the scheduler's own rule)."""
+    return {name: dict(row, **SHAPE_REQUESTS.get(name, {})) for name, row in SHAPES.items()}
 
 
 def parse_quantity(q):
@@ -103,9 +110,10 @@ REAP_PARALLEL = 4                       # the stops of one pass run at most this
 REAP_STOP_SECONDS = 420                 # one stop's own limit: past it the wait is abandoned for this pass and the pod is left whole
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
-CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
+CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/wip_save.py",)   # #2304: the save step is part of the reaper's code identity
 CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/stall_watch.py",)   # #2399
+CODE_IDENTITY_FILES = CODE_IDENTITY_FILES + ("cloud/launcher/land_report.py",)   # #2448
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -116,7 +124,7 @@ IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the r
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
 # stores it as the `git-token` key of the per-run Secret; the managed reaper renews it by the SAME mint route before it ends. All of the
 # renewal's numbers and names are here.
-GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
+GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh script read at every call
 GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
 SAFE_TO_EVICT_KEY = "cluster-autoscaler.kubernetes.io/safe-to-evict"  # not a cw/ key: the autoscaler reads it, the launcher reads nothing from it
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
@@ -404,6 +412,8 @@ def forbidden_pod_fields(pod):
 DEFAULT_IDLE = "60m"               # a create with no --idle (ask #2305: a coder pod outlives a long model wait)
 DEFAULT_ORCHESTRATOR_IDLE = "30m"  # an orchestrator keeps the older default
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
+DEFAULT_HARD = "2h"
+SHAPE_DEFAULT_HARD = {"L": DEFAULT_MAX_HARD}   # the one table of a per-shape default hard limit (a land runs 1 to 3.5 h); a shape with no row takes DEFAULT_HARD
 # The cluster-side floor: every pod carries spec.activeDeadlineSeconds = the --max-hard cap + this grace, so the kubelet
 # ends a pod even when no reaper runs. The cap, not the current hard deadline: Kubernetes lets that field be lowered on
 # a running pod but never raised, so a value at the initial hard limit would make `extend` (within the cap) a lie. The
@@ -2062,8 +2072,10 @@ def write_audit(path, line):
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as f:   # one short O_APPEND write: atomic enough for one line, the chosen guarantee
             f.write(json.dumps(line, sort_keys=True) + "\n")
+        return True
     except OSError as e:
         print("cloud-worker: WARNING: the action ran but its audit line could not be written: %s" % e, file=sys.stderr)
+        return False   # #2399: the stall watch needs to know (it retries an alert whose line was not written)
 
 
 def last_audit_line(path, action, runtime_id=None):
@@ -3186,7 +3198,7 @@ class Launcher:
             line["refresh"] = refresh
         if cause:   # a stop the launcher made of its own accord names why: idle, hard, pod_gone or pod_failed (a person's stop has none)
             line["cause"] = cause
-        write_audit(self.audit_path, dict(line, **(extra or {})))
+        return write_audit(self.audit_path, dict(line, **(extra or {})))
 
     def cost(self, pod):
         hours = (self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600
@@ -3278,6 +3290,10 @@ class Launcher:
             if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
             check_shape(a, self.env)   # resolves an unnamed shape; before any cluster, vault or token call
+            if not a.hard:   # only a default is lowered to a smaller --max-hard; an explicit --hard is kept as given
+                a.hard = SHAPE_DEFAULT_HARD.get(a.shape, DEFAULT_HARD)
+                if parse_duration(a.hard) > parse_duration(a.max_hard) and a.shape in SHAPE_DEFAULT_HARD:
+                    a.hard = a.max_hard
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
@@ -3804,7 +3820,7 @@ class Launcher:
                 view["note"] = NO_REPOSITORY_NOTE
                 info["hook_note"] = NO_REPOSITORY_NOTE
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
-            self._hook_record(info, dict(view, ran=True, refresh=info["refresh"]))
+            self._hook_record(info, dict(view, ran=True, refresh=info["refresh"], run_logs=self._run_logs(res)))
             if view["error"] and res.get("refresh") == "needed" and phase == "Running":
                 # An ended token after the one refresh and the one retry: the stop's own record and audit line are the one pair; the pod is marked and the reaper skips it.
                 self._mark(target, pod["metadata"].get("uid"), **{KEPT_RUNNING_MARK: "true"})
@@ -3911,6 +3927,24 @@ class Launcher:
                     "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
             return {"pushed": False, "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
+
+    def _run_logs(self, res):
+        """The end hook's `runs` and `wake_lines` as the run record keeps them under `run_logs` (ask #2432), the same shape: names checked, exit an int or
+        None, woke a bool, text scrubbed and cut again here (the pod's answer is untrusted). Never raises; a bad part is left out, and a failure never touches the stop."""
+        try:
+            out = {"runs": [], "wake_lines": []}
+            for r in (res.get("runs") if isinstance(res.get("runs"), list) else [])[:20]:
+                if isinstance(r, dict) and isinstance(r.get("name"), str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", r["name"]):
+                    code = r.get("exit")
+                    tail = r.get("log_tail")
+                    out["runs"].append({"name": r["name"], "exit": code if type(code) is int else None, "woke": r.get("woke") is True,
+                                        "log_tail": "\n".join(self.kube.scrub(x, 3000) for x in tail.split("\n"))[:3000] if isinstance(tail, str) and tail else ""})
+            for x in (res.get("wake_lines") if isinstance(res.get("wake_lines"), list) else [])[:10]:
+                if isinstance(x, str):
+                    out["wake_lines"].append(self.kube.scrub(x, 200)[:200])
+            return out
+        except Exception:
+            return {"runs": [], "wake_lines": []}
 
     def _pod_state_of(self, pod, name):
         """The pod's own state from the pod object already read (phase, each container's state, the node) and, ONLY when the phase is
@@ -4205,7 +4239,7 @@ class Launcher:
         """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
         (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
         `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
-        if not NAME_RE.match(a.worker or ""):
+        if not NAME_RE.fullmatch(a.worker or ""):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         name = pod_name(a.worker)
         if not self.kube.get_pod(name):
@@ -4646,6 +4680,7 @@ class Launcher:
             self.send_idle_nudges(live, now, acts)
         finally:
             steps["notes"] += mono() - t0   # the nudges are counted with the notes: both are the pass's sends
+        with __import__("contextlib").suppress(Exception): __import__("land_report").run(self, now)   # #2448: the daily land report, loaded by name (not shipped to the token service), never raises
         _stall("watch_pass", self, live, now, NAME_RE.fullmatch)   # #2399: one read of each pod older than 10 minutes; an alert only, never a stop
         try:
             out.extend(self.label_pod_prs(live, now))   # #2269: the pull requests a pod recorded get the labels its launch named
@@ -4855,7 +4890,7 @@ class Launcher:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 raw = ann(pod, "pr-labels")
-                if not raw or (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if not raw or (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 labels = [x for x in raw.split(",") if PR_LABEL_RE.fullmatch(x)]
                 if not labels:
@@ -4911,7 +4946,7 @@ class Launcher:
         for pod in pods:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
-                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 raw_end = ann(pod, "hard-deadline")
                 if not raw_end or ann(pod, "final-note"):
@@ -4972,7 +5007,7 @@ class Launcher:
         for pod in pods:
             worker = ann(pod, "worker")
             try:
-                if ann(pod, "persistent") is not None and (pod.get("status") or {}).get("phase") == "Running" and NAME_RE.match(worker or "") \
+                if ann(pod, "persistent") is not None and (pod.get("status") or {}).get("phase") == "Running" and NAME_RE.fullmatch(worker or "") \
                         and not self.kube.get_run_secret(pod_name(worker)):   # a persistent pod's Secret is the worker's: its absence is ONE report line
                     raise _NotRenewed("the per-run Secret of the persistent orchestrator was not found")
                 try:
@@ -5041,7 +5076,7 @@ class Launcher:
             return False
         # a persistent pod is NAME-0 but its per-run Secrets are named after the worker: found by the worker's name. Any annotation the renewal needs
         # (such as the token role) is read from the pod's own annotations, which are the pod template's.
-        persistent = ann(pod, "persistent") is not None and bool(NAME_RE.match(worker or ""))
+        persistent = ann(pod, "persistent") is not None and bool(NAME_RE.fullmatch(worker or ""))
         if persistent:
             name = pod_name(worker)
         secret = self.kube.get_run_secret(name)
@@ -5226,6 +5261,7 @@ SETTINGS = (
     ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
     ("CW_LONG_RUN_DENY", False, "name"),           # 1 to 8 comma-separated shell patterns (letters, digits . - / _ * ?, each at most 80 characters): a worker pod refuses a foreground shell command matching one and lets it run through cw-run; operator settings only
 )
+SETTINGS = SETTINGS + tuple((n, False, k) for n, k in (("CW_LAND_REPORT_ISSUE", "name"), ("CW_LAND_REPORT_SMALL_LINES", "number"), ("CW_LAND_REPORT_GIT_DIR", "path"), ("CW_LAND_REPORT_BRANCH", "name")))   # ask #2448: see cloud/README.md
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
 # The secret shapes a value is refused for: (shape name, pattern, kinds it applies to; None = every kind). One row per shape.
@@ -5401,6 +5437,7 @@ VALIDATORS = {
     "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
     "CW_LONG_RUN_DENY": ("1 to 8 comma-separated patterns of letters, digits, dot, dash, slash, underscore, * and ?, each at most 80 characters", lambda v: 1 <= len(v.split(",")) <= 8 and all(re.fullmatch(r"[A-Za-z0-9./_*?][A-Za-z0-9./_*?-]{0,79}", x) for x in v.split(","))),
 }
+VALIDATORS.update({"CW_LAND_REPORT_ISSUE": ("an issue as owner/repo#N", lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}#[1-9][0-9]{0,8}", v))), "CW_LAND_REPORT_SMALL_LINES": ("a whole number from 1 to 999999", lambda v: bool(re.fullmatch(r"[1-9][0-9]{0,5}", v))), "CW_LAND_REPORT_GIT_DIR": ("an absolute path with no .. segment", _path_ok), "CW_LAND_REPORT_BRANCH": ("a branch name of letters, digits, dot, dash, slash and underscore, not starting with a dash", lambda v: bool(re.fullmatch(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,99}", v)))})   # ask #2448
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
 
@@ -5732,7 +5769,7 @@ def build_parser():
     c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
     c.add_argument("--idle", default=None, help="the idle limit; unset: %s (%s with --agent orchestrator)" % (DEFAULT_IDLE, DEFAULT_ORCHESTRATOR_IDLE))
-    c.add_argument("--hard", default="2h")
+    c.add_argument("--hard", default=None)
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))
     c.add_argument("--image")

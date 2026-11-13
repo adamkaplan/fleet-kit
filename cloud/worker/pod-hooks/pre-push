@@ -61,6 +61,45 @@ EOF2
   return 0
 }
 
+# Ask #2426: LOG ONLY. One line per recorded push in /work/.pod-notes.log (the pod's boss reads the last lines at the pod's end), never a refusal:
+#   "<UTC time> <kind> <remote name> <ref> <short sha>", kind default-branch-push (the ref is a default branch: the same is_default as the rule below) or
+#   non-fast-forward (the remote's object is not an ancestor of the pushed one; a remote object this clone does not hold counts as one). A push that is both writes both lines.
+# The remote is shown only when it is a plain name ([A-Za-z0-9._-]); a URL (it may carry a credential) is written as "-". The ref is cut to [A-Za-z0-9._/-] and 100 characters.
+# The file is capped: past NOTES_MAX_BYTES it is cut to its last NOTES_KEEP_LINES lines. A failing write is silent and changes nothing (the subshell's status is dropped).
+NOTES_LOG=${CW_NOTES_LOG:-/work/.pod-notes.log}
+NOTES_MAX_BYTES=65536
+NOTES_KEEP_LINES=200
+
+note() {   # $1 kind, $2 ref, $3 sha
+  (
+    # the pod owns /work: a link or a FIFO at the path is left alone (a write to a FIFO would block the push), nothing is recorded then
+    [ ! -L "$NOTES_LOG" ] || exit 0
+    if [ -e "$NOTES_LOG" ] && [ ! -f "$NOTES_LOG" ]; then exit 0; fi
+    r=$(printf '%s' "${REMOTE_NAME:-}" | cut -c1-40)
+    case "$r" in ""|*[!A-Za-z0-9._-]*) r="-" ;; esac
+    ref=$(printf '%s' "$2" | tr -c 'A-Za-z0-9._/-' '?' | cut -c1-100)
+    sha=$(printf '%s' "$3" | tr -c '0-9a-f' '?' | cut -c1-10)
+    printf '%s %s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$r" "$ref" "${sha:--}" >> "$NOTES_LOG"
+    size=$(wc -c < "$NOTES_LOG")
+    if [ "${size:-0}" -gt "$NOTES_MAX_BYTES" ]; then
+      tmp="$NOTES_LOG.cut.$$"
+      tail -n "$NOTES_KEEP_LINES" "$NOTES_LOG" > "$tmp" && cat "$tmp" > "$NOTES_LOG"
+      rm -f "$tmp"
+    fi
+  ) >/dev/null 2>&1 || :
+}
+
+REMOTE_NAME=${1:-}
+while IFS=' ' read -r lref lsha rref rsha; do
+  [ -n "$rref" ] || continue
+  case "$rref" in refs/heads/*) if is_default "${rref#refs/heads/}"; then note default-branch-push "$rref" "$lsha"; fi ;; esac
+  if [ "$lsha" != "$zeros" ] && [ "$rsha" != "$zeros" ] && [ -n "$real_git" ]; then
+    "$real_git" merge-base --is-ancestor "$rsha" "$lsha" >/dev/null 2>&1 || note non-fast-forward "$rref" "$lsha"
+  fi
+done <<EOF4
+$input
+EOF4
+
 if network; then
   while IFS=' ' read -r lref lsha rref rsha; do
     [ -n "$rref" ] || continue

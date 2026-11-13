@@ -680,33 +680,19 @@ class TestGitShim(Base):
          "the image's default identity (#2361): sets user.name in the global file only when it is unset; a value already there is kept"),
         ("cloud/worker/entrypoint.sh", '    if [ -n "$id_email" ] && [ -z "$(git con' + 'fig --' + _G + ' --get user.email 2>/dev/null)" ]; then git con' + 'fig --' + _G + ' user.email "$id_email"; fi',
          "the image's default identity (#2361): sets user.email in the global file only when it is unset; a value already there is kept"),
-        # #2331 (git environment configuration in the guard): each row is the exact added line of the PR; the guard ALLOWS only /dev/null for these variables.
-        ('cloud/README.md', "- **Git's environment configuration is allowed only for an exact list (the table `#ENVCFG` in `cloud/worker/guard.sh`; this list names exactly its rows):** `GIT_CONFIG_NOSYSTEM`, `" + "GIT_CONFIG_" + _S.upper() + '`, `' + "GIT_CONFIG_" + _G.upper() + '`, `GIT_CONFIG_COUNT`, `user.name`, `user.email`, `core.excludesFile`, `maintenance.auto`, `gc.auto`, `credential.helper`, `url.<base>.insteadOf`, `http.<url>.extraHeader`; the rest is refused. Allowed: `GIT_CONFIG_NOSYSTEM=1`, `' + "GIT_CONFIG_" + _S.upper() + '=/dev/null`, `' + "GIT_CONFIG_" + _G.upper() + "=/dev/null` (no other value), and through `GIT_CONFIG_COUNT` (a whole number from 1 to 16) with `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` for n below the count: `user.name` and `user.email` (a printable value on one line), `core.excludesFile` (`/etc/gitignore`), `maintenance.auto` (`false`), `gc.auto` (`0`), `credential.helper` (empty), `url.<base>.insteadOf` (only a local absolute path or `file://` URL as base, no `..` segment, and only the value `https://github.com/`) and `http.<url>.extraHeader` (only scoped to `http://` or `https://` plus `127.0.0.1` or `localhost`, no user information). Refused with the one line and no value printed: `GIT_CONFIG_PARAMETERS`, any other value of the three fixed variables, a count outside 1 to 16, a missing or empty `GIT_CONFIG_KEY_n`, a `GIT_CONFIG_KEY_n` beyond the count, and every other key (`core.hooksPath`, `core.sshCommand`, `core.fsmonitor`, `core.pager`, `credential.helper` with a value, any other `credential.*`, `include.*`, `alias.*`, `push.default`, any other `http.*` and the unscoped `http.extraHeader`). This is a convenience, not the guard: the keys are compared in lower case, a URL part keeps its case. The pod's own credential helper is written to `~/" + ".git" + "config" + "` (a file) and the entrypoint exports none of these variables, so the worker's own git is not affected. `GH_CONFIG_DIR` is not refused: a `gh` alias only expands for a first word `gh` does not know, and the wrapper refuses every such word. `gh config set` is refused.",
-         'documents the #ENVCFG table of the guard: names the git environment variables the guard ALLOWS or refuses; writes no git configuration (#2331)'),
-        ('cloud/worker/guard.sh', '#ENVCFG allowed | ' + "GIT_CONFIG_" + _S.upper() + ' | /dev/null | only this value, never a path a program wrote',
-         "the guard's #ENVCFG table row or check of the git environment variables: it allows only /dev/null and refuses the rest; writes no git configuration (#2331)"),
-        ('cloud/worker/guard.sh', '#ENVCFG allowed | ' + "GIT_CONFIG_" + _G.upper() + ' | /dev/null | only this value, never a path a program wrote',
-         "the guard's #ENVCFG table row or check of the git environment variables: it allows only /dev/null and refuses the rest; writes no git configuration (#2331)"),
-        ('cloud/worker/guard.sh', '#ENVCFG refused | ' + "GIT_CONFIG_" + _G.upper() + ' or ' + "GIT_CONFIG_" + _S.upper() + ' of any other value | /tmp/x | a config file a program wrote',
-         "the guard's #ENVCFG table row or check of the git environment variables: it allows only /dev/null and refuses the rest; writes no git configuration (#2331)"),
-        ('cloud/worker/guard.sh', '  case "${' + "GIT_CONFIG_" + _G.upper() + ':-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac',
-         "the guard's #ENVCFG table row or check of the git environment variables: it allows only /dev/null and refuses the rest; writes no git configuration (#2331)"),
-        ('cloud/worker/guard.sh', '  case "${' + "GIT_CONFIG_" + _S.upper() + ':-}" in ""|/dev/null) ;; *) env_cfg_refuse ;; esac',
-         "the guard's #ENVCFG table row or check of the git environment variables: it allows only /dev/null and refuses the rest; writes no git configuration (#2331)"),
-        ('cloud/worker/tests/test_guard_env.py', '    ("system", {"' + "GIT_CONFIG_" + _S.upper() + '": "/dev/null"}),',
-         'a case of the guard test: the guard is given that variable and must allow or refuse it; writes no git configuration (#2331)'),
-        ('cloud/worker/tests/test_guard_env.py', '    ("global", {"' + "GIT_CONFIG_" + _G.upper() + '": "/dev/null"}),',
-         'a case of the guard test: the guard is given that variable and must allow or refuse it; writes no git configuration (#2331)'),
-        ('cloud/worker/tests/test_guard_env.py', '    ("all together", dict(pairs(("user.name", "x")), GIT_CONFIG_NOSYSTEM="1", ' + "GIT_CONFIG_" + _G.upper() + '="/dev/null", ' + "GIT_CONFIG_" + _S.upper() + '="/dev/null")),',
-         'a case of the guard test: the guard is given that variable and must allow or refuse it; writes no git configuration (#2331)'),
-        ('cloud/worker/tests/test_guard_env.py', '    ("global other", {"' + "GIT_CONFIG_" + _G.upper() + '": "/tmp/x"}),',
-         'a case of the guard test: the guard is given that variable and must allow or refuse it; writes no git configuration (#2331)'),
-        ('cloud/worker/tests/test_guard_env.py', '    ("system other", {"' + "GIT_CONFIG_" + _S.upper() + '": "/tmp/x"}),',
-         'a case of the guard test: the guard is given that variable and must allow or refuse it; writes no git configuration (#2331)'),
-        ('cloud/worker/tests/test_guard_env.py', '                      {"' + "GIT_CONFIG_" + _G.upper() + '": PLANTED}, pairs(("url./srv/x/.insteadOf", PLANTED)), pairs(("http.http://127.0.0.1/.extraHeader", PLANTED + "\\n"))):',
-         'a case of the guard test: the guard is given that variable and must allow or refuse it; writes no git configuration (#2331)'),
-        ('cloud/worker/tests/test_guard_env.py', '        for name in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_KEY_0", "' + "GIT_CONFIG_" + _G.upper() + '", "' + "GIT_CONFIG_" + _S.upper() + '", "GIT_CONFIG_NOSYSTEM"):',
-         'a case of the guard test: the guard is given that variable and must allow or refuse it; writes no git configuration (#2331)'),
+        # #2371/#2372 (the pre-push hook of the image): the entrypoint points the global core.hooksPath at the image's hook directory: exactly this one added line
+        # of that one file, one key and one value; any other key or value stays refused. The hook's own test (cloud/worker/tests/test_pre_push_hook.py) adds
+        # exactly these four lines: two that remove a rewrite rule from its scratch repository's LOCAL file (no scope flag), and two that read the entrypoint's text.
+        ("cloud/worker/entrypoint.sh", "  git con" + "fig --" + _G + " core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)",
+         "the image's pre-push hook directory (#2371): one key, one fixed value; any other key or value stays refused"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.git("con' + 'fig", "--unset-all", "url.%s.insteadOf" % self.bare, cwd=self.scratch)',
+         "removes a rewrite rule from the scratch repository's own file (no global scope): writes no global git configuration (#2371)"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.git("con' + 'fig", "--unset-all", "url.%s.insteadOf" % self.sshurl, cwd=self.scratch)',
+         "removes a rewrite rule from the scratch repository's own file (no global scope): writes no global git configuration (#2371)"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'i = [n for n, l in enumerate(e) if "git con' + "fig --" + _G + ' credential.helper" in l]',
+         "reads the entrypoint's text for the helper line (#2371): writes no git configuration"),
+        ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.assertTrue(e[i[0] + 1].startswith("  git con' + "fig --" + _G + ' core.hooksPath /usr/local/lib/cw-hooks"))',
+         "reads the entrypoint's text for the hooksPath line (#2371): writes no git configuration"),
     )
 
     @classmethod
@@ -734,6 +720,19 @@ class TestGitShim(Base):
         self.assertEqual(self.unallowed_config_write_hits(self.diff_adding(f, text)), [])
         self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding("tests/switchboard/test_other.py", text))), 1)
         self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding(f, text + " "))), 1)
+
+    def test_s7_u1_the_hooks_path_row_allows_only_its_one_line_of_the_entrypoint(self):
+        f, text = "cloud/worker/entrypoint.sh", "  git con" + "fig --" + self._G + " core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)"
+        self.assertEqual(self.unallowed_config_write_hits(self.diff_adding(f, text)), [])
+        for name, path, line in (
+            ("another value", f, text.replace("/usr/local/lib/cw-hooks", "/tmp/x")),
+            ("another key", f, text.replace("core.hooksPath", "core.sshCommand")),
+            ("another key with the same value", f, text.replace("core.hooksPath /usr/local/lib/cw-hooks", "credential.helper /tmp/x")),
+            ("another file", "cloud/worker/other.sh", text),
+            ("the system scope", f, text.replace("--" + self._G, "--" + self._S)),
+        ):
+            with self.subTest(name):
+                self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding(path, line))), 1)
 
     def test_s7_u1_allow_table_widening_mutants_are_caught(self):
         f, text, _ = self.CONFIG_WRITE_ALLOWED[0]

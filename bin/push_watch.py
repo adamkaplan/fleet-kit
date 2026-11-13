@@ -4,12 +4,13 @@ The switchboard receives no push event (no handler, no read), so this detector R
 `matching-refs/heads/<worker>` request per live worker per pass. A new tip sha is ONE item to the record's `reports_to` and to nobody else. A worker
 that pushed and then neither sent a message nor pushed again for `quiet_minutes` gets ONE quiet item per sha. Own state: `push-watch.json`.
 Item text: worker, branch, 8-hex sha, the commit SUBJECT, file and line counts, the first three paths: no body, no patch, no author.
-Pure text handling: subjects and paths are untrusted and are put in a quoted data line.
+Text handling: subjects and paths are untrusted and are put in a quoted data line. The one outside call is `git patch-id --stable` on a diff read from the API (ask #2393).
 """
 
 import json
 import os
 import re
+import subprocess
 import urllib.parse
 
 STATE_FILE = "push-watch.json"
@@ -17,6 +18,7 @@ READ_BYTES = 1 << 20
 FIRST_BYTES = 4 << 20
 TOLD_MAX = 50
 COMMITS_MAX = 5
+PATCH_BYTES = 1 << 20   # the most diff text one patch id is made from
 SUBJECT_MAX = 100
 PATH_MAX = 120
 PASS_WORKERS_MAX = 20   # workers read per pass; the rest wait (rotating)
@@ -47,8 +49,8 @@ def _clean(text, limit):   # no @ (no mention can fire) and no double quote (the
 
 # Ask #2320: a repository that lands by `spire land` (config `land_repos`, read by the switchboard's `uses_spire_land`) has no pull request. A push to its default branch
 # whose commit carries a Land trailer is the worker's completion: ONE `done` report from the worker, through the engine's own report path (the path the worker's own
-# `report done` takes), with the sha. ASSUMPTION (the playbook janus-infra/spire-venue#8193 was not readable): a trailer is a line of the commit message that starts
-# `Landed-by:` or `Land-<key>:`. With more than one live worker in the repository a commit completes only the worker whose name its message holds.
+# `report done` takes), with the sha. ASSUMPTION (the playbook acme-org/widget-service#8193 was not readable): a trailer is a line of the commit message that starts
+# `Landed-by:` or `Land-<key>:`. With more than one live worker in the repository a commit completes only the pod that owns it (ask #2393: its patch id equals one of its branch head's commits, or its sha starts with the sha the pod reported), never by the name in its message.
 LAND_TRAILER = re.compile(r"^(?:Landed-by|Land-[A-Za-z0-9-]+)[ \t]*:[ \t]*\S")
 LAND_READ = 20   # the newest commits of the default branch read per worker per pass
 
@@ -61,8 +63,72 @@ def land_trailer(message):
     return bool(paragraphs) and any(LAND_TRAILER.match(line) for line in paragraphs[-1].split("\n"))
 
 
-def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_config):
-    """The completion of a worker of a `spire land` repository: the newest Land-trailer commit on the default branch, made after the launch, not told before.
+def _patch_id(commit):
+    """The `git patch-id --stable` of a commit read (its files' patches put back into a diff), or None when it cannot be made: no files, a file without a patch (binary or too big), no git."""
+    files = commit.get("files") if isinstance(commit, dict) and isinstance(commit.get("files"), list) else []
+    if not files or not all(isinstance(f, dict) and isinstance(f.get("patch"), str) and isinstance(f.get("filename"), str) for f in files):
+        return None
+    parts = []
+    for f in files:
+        name, old = f["filename"], f["previous_filename"] if isinstance(f.get("previous_filename"), str) else f["filename"]
+        parts.append("diff --git a/%s b/%s\n--- %s\n+++ %s\n%s\n" % (
+            old, name, "/dev/null" if f.get("status") == "added" else "a/" + old, "/dev/null" if f.get("status") == "removed" else "b/" + name, f["patch"]))
+    diff = "".join(parts)
+    if len(diff) > PATCH_BYTES:
+        return None
+    try:   # no repository and no configuration is read: the diff is the whole input
+        done = subprocess.run(["git", "patch-id", "--stable"], input=diff, capture_output=True, text=True, timeout=20, cwd="/",
+                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1"})
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    found = re.match(r"[0-9a-f]{40}", done.stdout or "")
+    return found.group(0) if done.returncode == 0 and found else None
+
+
+def _own_patch_ids(gh, repo, default, name, record, mem):
+    """The patch ids of the commits of the pod's own branch head(s) (the record's branch, or its name's branches), remembered in `mem`. Raises when a read fails and nothing is remembered."""
+    wanted = [b for b in (record.get("branch"),) if isinstance(b, str) and b and b not in DENIED_BRANCHES and b != default]
+    found = {}
+    for ref in _dicts(gh("repos/%s/git/matching-refs/heads/%s" % (repo, urllib.parse.quote(wanted[0] if wanted else name, safe="")))):
+        branch, tip = str(ref.get("ref", "")).replace("refs/heads/", "", 1), (ref.get("object") or {}).get("sha")
+        if isinstance(tip, str) and re.fullmatch(r"[0-9a-f]{40}", tip) and (branch == wanted[0] if wanted else branch.split("/", 1)[0] == name):
+            found[branch] = tip
+    for tip in sorted(found.values()):
+        shas = [tip]
+        try:
+            data = (_dicts(gh("repos/%s/compare/%s...%s" % (repo, urllib.parse.quote(default, safe=""), tip))) or [{}])[0]
+            shas = [c["sha"] for c in data.get("commits", []) if isinstance(c, dict) and isinstance(c.get("sha"), str) and re.fullmatch(r"[0-9a-f]{40}", c["sha"])][-LAND_READ:]
+            shas = shas if tip in shas else shas + [tip]
+        except Exception:
+            pass   # the tip alone
+        for sha in shas:
+            pid = _patch_id((_dicts(gh("repos/%s/commits/%s" % (repo, sha))) or [{}])[0])
+            if pid:
+                mem["own_pids"] = ([p for p in mem.get("own_pids", []) if p != pid] + [pid])[-TOLD_MAX * 2:]
+    return set(mem.get("own_pids", []))
+
+
+def _reported_shas(sb, name):
+    """The shas the pod reported as `landed <sha>` in its last report text (the switchboard's own record of it)."""
+    reader = getattr(sb, "reported_text", None)
+    try:
+        text = reader(name) if reader else None
+    except Exception:
+        text = None
+    return [t.lower() for t in re.findall(r"\blanded\s+([0-9a-fA-F]{7,40})\b", text)] if isinstance(text, str) else []
+
+
+def _login(commit):
+    """The author's login of a commit read, one safe token (it is untrusted text that goes into a notice); `unknown` when the read has none."""
+    author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+    login = author.get("login")
+    return (re.sub(r"[^A-Za-z0-9._-]", "", login)[:40] or "unknown") if isinstance(login, str) else "unknown"
+
+
+def _landed(sb, engine, now, gh, name, record, mem, state, full_config, foreign=None):
+    """The completion of a worker of a land repository: the newest Land-trailer commit on the default branch, made after the launch, not told before,
+    and the pod's OWN (ask #2393): its patch id equals that of a commit of the pod's own branch head, or its sha is the one the pod reported. Another Land commit is
+    put in `foreign` (sha -> (worker, author login)) for the pass to say once that someone else landed; no pod is credited for it.
     Returns the sha told, or None. A read that fails is audited once and retried at the next pass; a send that fails is not marked."""
     repo = record.get("repo")
     uses = getattr(sb, "is_land_repo", None)
@@ -81,6 +147,24 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
             engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160), "reading": "default branch of a land repository"})
         return None
     mem.pop("landfailed", None)
+    own = {}
+    reported = _reported_shas(sb, name)
+
+    def is_own(sha_):
+        """(the commit is the pod's own, the answer is definite). Own: the sha the pod reported, or a patch id equal to one of its own branch head's commits. A read that fails: (False, False)."""
+        if any(sha_.startswith(r) for r in reported):
+            return True, True
+        if own.get("failed"):
+            return False, False   # a read failed in this pass: no further reads for it
+        try:
+            if "pids" not in own:
+                own["pids"] = _own_patch_ids(gh, repo, default, name, record, mem)
+            pid = _patch_id((_dicts(gh("repos/%s/commits/%s" % (repo, sha_))) or [{}])[0])
+        except Exception:
+            own["failed"] = True
+            return False, False
+        return (pid in own["pids"], True) if pid else (False, False)
+
     for c in commits:   # newest first
         sha = c["sha"]
         inner = c.get("commit") if isinstance(c.get("commit"), dict) else {}
@@ -95,10 +179,16 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
                 break
         if when is None or when <= since:
             continue   # made before the launch (or undated): a baseline, not this worker's landing
-        if repos_live > 1 and not re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(name), message, re.I):
-            if sha not in mem.setdefault("land_ambiguous", []):
-                mem["land_ambiguous"] = (mem["land_ambiguous"] + [sha])[-TOLD_MAX:]
-                engine.audit.append(engine.actor, "push_watch.land_ambiguous", name, {"sha": sha[:8], "why": "more than one live worker in the repository and the message names none"})
+        if sha in mem.get("land_foreign", []) and not any(sha.startswith(r) for r in reported):
+            if foreign is not None:
+                foreign.setdefault(sha, (name, _login(c)))   # told once (`land_said`); a line that did not go is tried again
+            continue   # judged not this pod's own (its patch id and its branch were both read)
+        mine, definite = is_own(sha)
+        if not mine:
+            if definite:
+                mem["land_foreign"] = (mem.get("land_foreign", []) + [sha])[-TOLD_MAX:]   # a definite answer; a failed read is asked again at the next pass
+            if foreign is not None:
+                foreign.setdefault(sha, (name, _login(c)))
             continue
         text = "landed %s on %s of %s (Land trailer seen by the push watch)" % (sha[:12], _clean(default, 60), _clean(repo, 80))
         try:
@@ -110,7 +200,8 @@ def _landed(sb, engine, now, gh, name, record, mem, state, repos_live, full_conf
             return None
         if not (isinstance(outcome, dict) and outcome.get("sent")):
             return None   # not delivered: not marked, retried at the next pass
-        older = [c2["sha"] for c2 in commits if c2["sha"] != sha and land_trailer(((c2.get("commit") or {}).get("message")) if isinstance(c2.get("commit"), dict) else None)]
+        older = [c2["sha"] for c2 in commits if c2["sha"] != sha and land_trailer(((c2.get("commit") or {}).get("message")) if isinstance(c2.get("commit"), dict) else None) and is_own(c2["sha"])[0]]   # ONE completion: an older Land commit of the same read that is also the pod's own is not a second one (another's is not marked)
+        state["land_said"] = (state.get("land_said", []) + older + [sha])[-TOLD_MAX * 4:]   # a credited commit is never told later as someone else's
         mem["landed"] = (mem.get("landed", []) + older + [sha])[-TOLD_MAX:]   # ONE completion: an older Land commit of the same read is not a second one
         state["reported"][name] = max(now, state["reported"].get(name, 0))   # the worker is completed: no quiet item follows
         engine.audit.append(engine.actor, "push_watch.landed", name, {"sha": sha, "repo": _clean(repo, 80), "branch": _clean(default, 60)})
@@ -284,6 +375,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
     current = None
     state["cursor"] = (start + PASS_WORKERS_MAX) % len(live) if live else 0
     # (a rate-limit stop below moves the cursor to the first unreached worker)
+    foreign, owned = {}, set()   # repo -> {sha: (worker, author login)} of Land commits that were no watched pod's own (ask #2393), and the shas some pod was credited with
     claimed = {}
     for n in live:
         b_ = records[n].get("branch")
@@ -313,7 +405,9 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 mem["noboss"] = True
                 engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": "no reports_to: tells no lane"})
             continue
-        if _landed(sb, engine, now, gh, name, record, mem, state, sum(1 for n in live if records[n].get("repo") == repo), getattr(engine, "config", None)):
+        credited = _landed(sb, engine, now, gh, name, record, mem, state, getattr(engine, "config", None), foreign.setdefault(repo, {}))
+        if credited:
+            owned.add(credited)
             continue   # completed by its landing (#2320): nothing more to tell of its branches
         task_ = record.get("branch")
         if isinstance(task_, str) and task_ and (task_ in DENIED_BRANCHES or task_ == record.get("default_branch") or any(o != name and (task_ == o or task_.startswith(o + "/")) for o in records) or len(claimed.get(task_, ())) > 1):
@@ -413,6 +507,17 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     continue
                 b["quiet"] = True   # marked only after a successful send: once per sha
                 engine.audit.append(engine.actor, "push_watch.quiet", name, {"to": lane, "sha": b["sha"][:8]})
+    said = state.setdefault("land_said", [])
+    for repo_, shas in sorted(foreign.items()):   # ONE line per sha, to the boss of the pod that saw it; a commit some pod was credited with is no one else's
+        for sha, (worker, login) in sorted(shas.items()):
+            lane = (records.get(worker) or {}).get("reports_to")
+            if sha in owned or sha in said or limited or not isinstance(lane, str) or not lane:
+                continue
+            n_before = len(sent)
+            tell(lane, "a landing by someone else was seen: %s by %s" % (sha[:12], login), worker)
+            if len(sent) > n_before:
+                state["land_said"] = said = (said + [sha])[-TOLD_MAX * 4:]   # marked only after a successful send
+                engine.audit.append(engine.actor, "push_watch.land_foreign", worker, {"sha": sha[:12], "repo": _clean(repo_, 80)})
     if limited and current in live:
         state["cursor"] = live.index(current)   # the worker the stop hit and those after it are read first at the next pass
     for name in list(state["workers"]):

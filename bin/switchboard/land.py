@@ -1,5 +1,5 @@
 # ---- ask #2320: the repositories that land by `spire land` (no pull request). One switch, the top-level config key `land_repos`.
-# A list of "owner/repo" or "owner/*" globs; absent or null means LAND_REPOS_DEFAULT, which is EMPTY: no repository lands by `spire land` until the key names one, e.g. ["janus-infra/*"] (the owner's order: OFF until he says so); an empty list is the same.
+# A list of "owner/repo" or "owner/*" globs; absent or null means LAND_REPOS_DEFAULT, which is EMPTY: no repository lands by `spire land` until the key names one, e.g. ["acme-org/*"] (the owner's order: OFF until he says so); an empty list is the same.
 # This part reads no name of the entry except ConfigError (validate_land_repos); `uses_spire_land` is pure and is the one reader of the key.
 import re
 
@@ -44,7 +44,7 @@ def validate_land_repos(config, source):
 
 
 # ---- the launch text (this branch): the one landing line a launch for a land repository carries
-LAND_STEP = ('run it DETACHED: `nohup sh -c \'.spire/tool/bin/spire land > /work/land.log 2>&1; r=$?; { echo; echo "exit $r"; } >> /work/land.log\' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log\'s last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so')
+LAND_STEP = ('run it DETACHED: `nohup sh -c \'.spire/tool/bin/spire land > /work/land.log 2>&1; r=$?; { echo; echo "exit $r"; } >> /work/land.log\' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log\'s last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so; to rebut a council finding, pass `--rebut \'ROLE=Pn: why\'` (Pn = the principle number); list every rebuttal (finding, principle, accepted or not) in your final report; the same finding rejected twice: stop and report it to the orchestrator')
 LAND_SETUP_LINE = ("- This repository lands with `spire land`: when done, commit, "
                    + LAND_STEP + ".\n")
 

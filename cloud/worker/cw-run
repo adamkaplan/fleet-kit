@@ -9,6 +9,7 @@
 A run lives in /work/runs (NAME.log, NAME.exit, NAME.pid). While it lives one line goes to /work/progress.txt every 5 minutes, and one when it ends.
 """
 import os, re, shlex, subprocess, sys, time
+import base64, json, urllib.error, urllib.request
 
 RUNS = os.environ.get("CW_RUNS_DIR") or "/work/runs"
 PROGRESS = os.environ.get("CW_PROGRESS_FILE") or "/work/progress.txt"
@@ -16,6 +17,17 @@ try:
     TICK = float(os.environ.get("CW_RUN_TICK") or 300)
 except ValueError:
     TICK = 300.0
+try:
+    WAKE_GAP = float(os.environ.get("CW_RUN_WAKE_GAP") or 10)
+    WAKE_LIMIT = float(os.environ.get("CW_RUN_WAKE_LIMIT") or 300)
+except ValueError:
+    WAKE_GAP, WAKE_LIMIT = 10.0, 300.0
+WAKE_SERVER = os.environ.get("CW_RUN_SERVER") or "http://127.0.0.1:4096"
+if not re.match(r"http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$", WAKE_SERVER):
+    WAKE_SERVER = "http://127.0.0.1:4096"   # the password goes to the local server only
+WAKE_PASSWORD_FILE = os.environ.get("CW_RUN_SERVER_PASSWORD_FILE") or "/run/cw/server-password"
+WAKE_CLIENT = (os.environ.get("CW_RUN_CLIENT") if os.environ.get("CW_RUN_TEST") == "1" else None) or "cw-cloud"   # the override is for tests only
+WAKE_MAX = 3000
 MAX_WAIT = 240
 NAME_OK = re.compile(r"[A-Za-z0-9._-]+")
 
@@ -96,6 +108,105 @@ def ensure_dir():
     if not os.path.isdir(RUNS):
         os.makedirs(RUNS, mode=0o700, exist_ok=True)
 
+SECRET = re.compile(r"(?i)(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|xox[a-z]-[A-Za-z0-9-]{8,}"
+                    r"|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]*)?"
+                    r"|(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|://[^/\s:@]+:[^@\s]+@|--(password|token|secret)[= ]\S+"
+                    r"|[A-Za-z0-9_]*(token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*[\"']?\s*[=:]\s*(\"[^\"]*\"|'[^']*'|\S+)"
+                    r"|[A-Za-z0-9+/_-]{40,}={0,2})")
+
+
+def redact(text):
+    return SECRET.sub("[redacted]", text)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def wake_http(method, url, body=None, timeout=15):
+    """(status, parsed json or None); status 0 when the server does not answer."""
+    pw = read(WAKE_PASSWORD_FILE) or ""
+    cred = base64.b64encode(("opencode:" + pw).encode()).decode()
+    req = urllib.request.Request(url, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Authorization": "Basic " + cred, "Content-Type": "application/json"})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as a:
+            status, raw = a.status, a.read(1 << 20)
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, b""
+    except Exception:
+        return 0, None
+    try:
+        return status, json.loads(raw.decode() or "null")
+    except ValueError:
+        return status, None
+
+
+def wake_session():
+    status, d = wake_http("GET", WAKE_SERVER + "/api/session")
+    items = d.get("data") if isinstance(d, dict) else d
+    if status != 200 or not isinstance(items, list):
+        return None
+    best = None
+    for it in items:
+        try:
+            u = it["time"]["updated"]
+            if it["id"] and (best is None or u > best[0]):
+                best = (u, it["id"])
+        except (KeyError, TypeError):
+            pass
+    return best[1] if best else None
+
+
+def wake_send_session(text):
+    """True when the server accepted the message; retries while it is busy or refuses, up to WAKE_LIMIT."""
+    end = time.time() + WAKE_LIMIT
+    while True:
+        sid = wake_session()
+        if sid:
+            status, _ = wake_http("POST", "%s/api/session/%s/prompt" % (WAKE_SERVER, sid), {"text": text})
+            if 200 <= status < 300:
+                return True
+        if time.time() + WAKE_GAP > end:
+            return False
+        time.sleep(WAKE_GAP)
+
+
+def wake(name, code, secs):
+    """After the exit file: at most once per run (marker NAME.woke), tell the agent's session, the progress file and the boss. One failing never blocks the others."""
+    if not os.path.exists(WAKE_PASSWORD_FILE):
+        return   # not a pod with a local server: nothing to wake
+    try:
+        fd = os.open(path(name, "woke"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except OSError:
+        return
+    first = "run %s exited %d after %ds; last 20 lines:" % (name, code, secs)
+    try:
+        body = redact(first + "\n" + last_lines(name, 20))
+        if len(body) > WAKE_MAX:
+            body = body[:WAKE_MAX - 3] + "..."
+        if not wake_send_session(body):
+            raise RuntimeError("not delivered")
+    except Exception:
+        progress("wake not delivered")
+        try:
+            with open(path(name, "log"), "ab") as f:
+                f.write(b"wake not delivered\n")
+        except OSError:
+            pass
+    progress(first)
+    try:
+        boss = os.environ.get("FLEET_BOSS") or ""
+        if not boss or boss.startswith("-"):
+            return
+        text = redact(first + "\n" + last_lines(name, 5))[:2000]
+        subprocess.run(shlex.split(WAKE_CLIENT) + ["send", boss, text], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except Exception:
+        pass
+
 
 def supervise(name, cmd):
     start = time.time()
@@ -120,6 +231,10 @@ def supervise(name, cmd):
             f.write("%d\n" % code)
         os.rename(tmp, path(name, "exit"))
         progress("cw-run %s exited %d after %ds" % (name, code, int(time.time() - start)))
+        try:
+            wake(name, code, int(time.time() - start))
+        except Exception:
+            pass
 
 
 def cmd_start(args):
@@ -134,7 +249,7 @@ def cmd_start(args):
     if name is None:
         name = "run-%d" % int(time.time())
     check_name(name)
-    # the allow row for `cw-run start*` comes after the pod's hard rules, so the command is held against those rules here (the template's list, without the operator's patterns)
+    # the allow row for `cw-run start*` comes after the rows of the template, so the command is held against the template list here (the rows of the file, without the operator's patterns)
     checker = os.environ.get("CW_SHELL_CHECK") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cw-shell-check")
     if not os.path.exists(checker):
         checker = "/usr/local/bin/cw-shell-check"

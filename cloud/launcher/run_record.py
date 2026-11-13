@@ -21,6 +21,7 @@ The transcript is the worker's text, so it is hostile input: the body is size-ca
 a scan that parses nothing BEFORE `json.loads`; it is then walked with an explicit stack.
 """
 import base64
+import calendar
 import http.client
 import json
 import os
@@ -50,7 +51,31 @@ CHUNK = 64 * 1024
 RESULTS_KEEP = 4000              # characters of the pod's /work/results.txt kept in run.json (ask #2392): the end of the file
 RESULTS_READ = 16000             # bytes read to be scrubbed first
 # the worker owns the file, and `tail` follows a link: refuse anything but a regular file BEFORE reading ($1 the path, $2 the byte window; as cloud_worker.REPORT_READ)
+RESULTS_MTIME_SCRIPT = 'stat -c "MTIME %Y" "$1" 2>/dev/null; '   # ask #2472: the file's modification time, read in the same one exec as its text
+
+
+def start_epoch(started):
+    """Epoch seconds of a recorded start (`%Y-%m-%dT%H:%M:%SZ`), or None when it is empty or unreadable."""
+    try:
+        return calendar.timegm(time.strptime(str(started), "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
+
+
+def results_verdict(last_line, mtime, start, nocase=False):
+    """Ask #2472, the ONE rule for a pod's results file (the run record and the stall watch share it): "done" only when the LAST non-empty line is exactly `STATUS: done` AND the file is newer
+    than the run's start; "stale" when it is not newer (it is an earlier run's: relaunches reuse the pod's name and directory); else "unfinished". An unknown mtime or start is not held against the file."""
+    line = (last_line or "").strip()
+    if nocase:
+        line = line.lower()
+    if isinstance(mtime, (int, float)) and isinstance(start, (int, float)) and not mtime > start:
+        return "stale"
+    return "done" if line == ("status: done" if nocase else "STATUS: done") else "unfinished"
+
+
 RESULTS_SCRIPT = 'if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "not a regular file" >&2; exit 3; fi; tail -c "$2" "$1"'
+NOTES_LINES = 20                 # ask #2426: the last lines of the pod's /work/.pod-notes.log kept in run.json as `pod_notes`
+NOTES_READ = 16000               # bytes read to be scrubbed first
 TIMED_OUT = "record timed out"
 
 
@@ -332,17 +357,21 @@ class Recorder:
         sha = (out.strip().splitlines() or [""])[0]
         return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
-    def results_file(self, pod):
+    def results_file(self, pod, started=""):
         """{"done": bool, "text": the scrubbed last RESULTS_KEEP characters} of the pod's /work/results.txt, or None when it has none, is not a regular file or cannot be read. `done`: the last
         non-empty line is exactly `STATUS: done` (the idle nudge's own test). Never raises an Exception."""
         try:   # not keep_stdout: a refused read (a link, a FIFO) is an error, not a result
-            out = self._exec(pod, "sh", "-c", RESULTS_SCRIPT, "sh", "/work/results.txt", str(RESULTS_READ))
+            out = self._exec(pod, "sh", "-c", RESULTS_MTIME_SCRIPT + RESULTS_SCRIPT, "sh", "/work/results.txt", str(RESULTS_READ))
         except RecordTimeout:
             return None
         except Exception:
             return None
         if not isinstance(out, str) or not out.strip():
             return None
+        mtime = None
+        first = out.split("\n", 1)[0]
+        if re.fullmatch(r"MTIME [0-9]{1,12}", first.strip()):
+            mtime, out = int(first[6:]), out.split("\n", 1)[1] if "\n" in out else ""
         lines = [x.strip() for x in out.splitlines() if x.strip()]
         try:
             # the scrub turns every control character to `?`: the line breaks go through it as a printable mark that is not in the text (so a secret spread over lines is still
@@ -352,7 +381,37 @@ class Recorder:
             text = self.kube.scrub(marked, limit=2 * len(marked) + 100).replace(mark, "\n")
         except Exception:
             return None
-        return {"done": bool(lines) and lines[-1] == "STATUS: done", "text": text[-RESULTS_KEEP:]}
+        state = results_verdict(lines[-1] if lines else "", mtime, start_epoch(started))
+        return {"done": state == "done", "state": state, "text": text[-RESULTS_KEEP:]}
+
+    def turn_state(self, pod):
+        """Ask #2443: {"turn", "outcome", "finish"} as the pod's `cw-worker-activity` reports them (the server's own turn state), each a value of the server's schema; None when
+        unreadable or off the schema. The end notice says "a succeeded turn" from this, not from the results file's text. Never raises an Exception."""
+        try:
+            turn = json.loads(self._exec(pod, "cw-worker-activity", keep_stdout=True)).get("turn")
+        except Exception:
+            return None
+        ok = {"turn": ("running", "idle", "unknown"), "outcome": ("succeeded", "failed", "interrupted", None), "finish": ("stop", "length", "tool-calls", "content-filter", "error", "unknown", None)}
+        if not isinstance(turn, dict) or set(turn) != set(ok) or any(turn[k] not in ok[k] for k in ok):
+            return None
+        return {k: turn[k] for k in ok}
+
+    def notes_file(self, pod):
+        """The scrubbed last NOTES_LINES lines of the pod's /work/.pod-notes.log (ask #2426: one line per push to the default branch, force-push, merge, issue or ref write), or None when it has
+        none, is not a regular file or cannot be read. Read and scrubbed like `results_file`. Never raises an Exception."""
+        try:
+            out = self._exec(pod, "sh", "-c", RESULTS_SCRIPT, "sh", "/work/.pod-notes.log", str(NOTES_READ))
+        except Exception:   # a timeout too
+            return None
+        if not isinstance(out, str) or not out.strip():
+            return None
+        try:
+            mark = next(m for m in ("[NL]", "[N1]", "[N2]", "[N3]") if m not in out)
+            marked = out.replace("\n", mark)
+            text = self.kube.scrub(marked, limit=2 * len(marked) + 100).replace(mark, "\n")
+        except Exception:
+            return None
+        return "\n".join(text.splitlines()[-NOTES_LINES:]) or None
 
     def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""
@@ -376,9 +435,15 @@ class Recorder:
                     self._write_transcript(directory, msgs, info)
             finally:
                 info["head_sha"] = self.head_sha(pod)
-                found = self.results_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
+                found = self.results_file(pod, started) if getattr(self, "secrets_ok", False) else None   # ask #2392: the pod's /work/results.txt, kept for the end notice and `read` of an ended pod
                 if found is not None:
                     info["results"] = found
+                turn = self.turn_state(pod)   # ask #2443: the server's own turn state, for the end notice's wording
+                if turn is not None:
+                    info["turn"] = turn
+                notes = self.notes_file(pod) if getattr(self, "secrets_ok", False) else None   # ask #2426: the pod's notes file, for the final message
+                if notes is not None:
+                    info["pod_notes"] = notes
         except Exception as e:   # includes RecursionError and MemoryError; an interrupt (BaseException) passes through
             try:
                 info["reason"] = "the record could not be written: %s" % self.kube.scrub(e, limit=200)

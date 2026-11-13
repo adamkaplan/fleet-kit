@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""cw-worker-activity: prints one JSON line {"busy": bool, "last_activity": "<ISO UTC>"} from the worker's OWN headless server.
+"""cw-worker-activity: prints one JSON line {"busy": bool, "last_activity": "<ISO UTC>", "turn": {...}} from the worker's OWN headless server.
+
+turn (ask #2443) = the structural turn state, read from the schema fields the server's own /openapi.json names, never from text the agent wrote:
+{"turn": "running"|"idle"|"unknown", "outcome": "succeeded"|"failed"|"interrupted"|null, "finish": "stop"|"length"|"tool-calls"|"content-filter"|"error"|"unknown"|null}.
+running = /api/session/active holds an entry; idle = it does not AND the newest session's newest `idle` message (GET /api/session/<id>/message?limit=1&order=desc&type=idle:
+`outcome`) is not older than its newest `assistant` message (same call with type=assistant: `finish`, absent while the message is being written). Any unreadable or unexpected
+answer is "unknown" (never finished).
 
 busy = GET /api/session/active names a running session: the real v2 server answers {"data": {"<session id>": {"type":
 "running"}}} (an object keyed by session id; busy = at least one entry whose type is "running" or missing); a list is accepted too
@@ -98,6 +104,48 @@ def _pid1_is_the_agent(proc):
     with open("%s/1/cmdline" % proc, "rb") as f:
         argv = f.read().split(b"\0")
     return os.path.basename(argv[0].decode("utf-8", "replace")) == "opencode" and "serve" in [a.decode("utf-8", "replace") for a in argv[1:3]]
+
+
+TURN_OUTCOMES = ("succeeded", "failed", "interrupted")
+TURN_FINISHES = ("stop", "length", "tool-calls", "content-filter", "error", "unknown")
+UNKNOWN_TURN = {"turn": "unknown", "outcome": None, "finish": None}
+
+
+def _newest(port, auth, sid, kind):
+    """The newest message of one `type` of one session (limit 1, newest first) or None when there is none; raises on an unreadable answer."""
+    items = get(port, auth, "/api/session/%s/message?limit=1&order=desc&type=%s" % (sid, kind), list)
+    if not items:
+        return None
+    m = items[0]
+    if not isinstance(m, dict) or m.get("type") != kind or not isinstance(m.get("time"), dict) or to_dt(m["time"].get("created")) is None:
+        raise Unreadable("unexpected message")
+    return m
+
+
+def turn_state(port, auth, active, sessions):
+    """The structural turn state (see the module text). Never raises: anything unexpected is the unknown state."""
+    try:
+        if is_busy(active):
+            return {"turn": "running", "outcome": None, "finish": None}
+        live = [s for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict) and to_dt(s["time"].get("updated")) is not None]
+        if not live:
+            return dict(UNKNOWN_TURN)
+        sid = max(live, key=lambda s: to_dt(s["time"]["updated"])).get("id")
+        if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,80}", sid):
+            return dict(UNKNOWN_TURN)
+        idle, assistant = _newest(port, auth, sid, "idle"), _newest(port, auth, sid, "assistant")
+        if idle is None or idle.get("outcome") not in TURN_OUTCOMES:
+            return dict(UNKNOWN_TURN)
+        finish = None
+        if assistant is not None:
+            if to_dt(assistant["time"]["created"]) > to_dt(idle["time"]["created"]):
+                return dict(UNKNOWN_TURN)   # a message newer than the idle one: a turn began after it
+            finish = assistant.get("finish")
+            if finish is not None and finish not in TURN_FINISHES:
+                return dict(UNKNOWN_TURN)
+        return {"turn": "idle", "outcome": idle["outcome"], "finish": finish}
+    except Exception:
+        return dict(UNKNOWN_TURN)
 
 
 def has_live_child(proc=None, session_start=None):
@@ -209,7 +257,8 @@ def main():
     created = [to_dt((s.get("time") or {}).get("created")) for s in sessions if isinstance(s, dict) and isinstance(s.get("time"), dict)]
     created = [t for t in created if t]
     session_start = min(created).timestamp() if created else None  # the OLDEST session: a child of an older session still counts
-    print(json.dumps({"busy": is_busy(active) or has_live_child(session_start=session_start), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
+    print(json.dumps({"busy": is_busy(active) or has_live_child(session_start=session_start), "last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      "turn": turn_state(port, auth, active, sessions)}))
     return 0
 
 
