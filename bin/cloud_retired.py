@@ -836,7 +836,7 @@ def post_end(engine, state, record, name, reason, body, post, note, audit=None):
                 audit and audit("private names not checked (%s)" % unchecked)
             except Exception:
                 pass
-        if not terms and unchecked and _repo_is_public(engine, repo):   # fail closed: no list to apply and a public (or unknown) repository: no pod text at all
+        if unchecked and _repo_is_public(engine, repo):   # fail closed: a list that is missing, unreadable or only partly usable (a bad, too long or cut line) and a public (or unknown) repository: no pod text at all
             post(engine, issue, WITHHELD_LINE, author=name, repo=repo)
             return
         comment = _unwrap_redact(_hide_names(comment, terms) if terms else comment)[:END_POST_CHARS]   # then a secret folded over lines; the cut again (a short name grows)

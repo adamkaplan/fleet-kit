@@ -379,6 +379,22 @@ class TestEndOnAsk(unittest.TestCase):
         self.assertIn("my final words", posts[0][1])
         self.assertEqual(self.last_reads, [])
 
+    def test_a_partly_unusable_list_withholds_on_a_public_repository_and_posts_on_a_private_one(self):
+        line = self.retired().WITHHELD_LINE
+        part = self.retired()
+        lists = {"bad regex": "acme-secret-org\n(unclosed\nother-made-up\n", "cut": "acme-secret-org\n" + "z" * (part.NAMES_MAX_BYTES + 10),
+                 "too many": "".join("term%d\n" % i for i in range(part.NAMES_MAX_TERMS + 5))}
+        for label, names in lists.items():
+            for public in (({"private": False},), ()):
+                posts, events = self.end_with(names=names, final="words about acme-secret-org", visibility=public)
+                self.assertEqual([b for _i, b, _r in posts], [line], (label, public))
+                self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
+            posts, events = self.end_with(names=names, final="words about acme-secret-org", visibility=({"private": True},))
+            self.assertIn("words about", posts[0][1], label)
+            self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
+        control, _ = self.end_with(names=lists["bad regex"], final="words about acme-secret-org", control=True, visibility=({"private": False},))
+        self.assertIn("words about", control[0][1], "control: today's end posts the text")
+
     def test_the_list_is_read_once_and_never_printed(self):
         posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")
         self.assertNotIn("unclosed-acme-secret", repr((posts, events)))
