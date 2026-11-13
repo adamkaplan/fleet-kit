@@ -501,7 +501,7 @@ class S9(unittest.TestCase):
         self.check_cap(real)
 
     def test_mutant_group_by_pod(self):
-        mod = mutant('"lane": lane_of(', '"lane": (lambda w, b: name_text(w, 64))(')
+        mod = mutant('"lane": lane_of(', '"lane": (lambda w, b, f=None: name_text(w, 64))(')
         self.check(real)
         with self.assertRaises(AssertionError) as cm:
             self.check(mod)
@@ -703,7 +703,7 @@ class S9(unittest.TestCase):
         self.check_launch_boss(real)
 
     def test_mutant_launch_record_not_read(self):
-        mod = mutant("(boss_of(rec.get(\"worker\")) if boss_of else None)", "None")
+        mod = mutant("(lambda w=rec.get(\"worker\"): boss_of(w)) if boss_of else None", "None")
         self.check_launch_boss(real)
         with self.assertRaises(AssertionError) as cm:
             self.check_launch_boss(mod)
@@ -722,7 +722,7 @@ class S9(unittest.TestCase):
         recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
         out = mod.build(recs, bad, got, 50, (), "2026-11-12", "", ("acme-bot[bot]",))[0]
         self.assertIn("median 733 s, p90 1056 s (n=2)", out, "S14 ours only")
-        self.assertIn("landed by others: 1; land time median 9 s (n=1)", out, "S14 others one line")
+        self.assertIn("landed by others (author name as claimed, not verified): 1; land time median 9 s (n=1)", out, "S14 others one line")
         self.assertLess(len(out.splitlines()), 20)
 
     def test_authors(self):
@@ -736,6 +736,38 @@ class S9(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.check_authors(mod)
         self.assertIn("S14", str(cm.exception))
+
+    def check_boss_rule(self, mod, writer_pattern):
+        import re
+        import run_record
+        import stall_watch
+        names = ["a", "orch-one", "orch_2", "a" * 32, "a" * 33, "", "A", "1a", "-a", "a b", "a;b", "a\n", "\u0661a", "é"]
+        for n in names:
+            w = bool(writer_pattern.fullmatch(n))
+            r = bool(mod.BOSS_NAME.fullmatch(n))
+            self.assertEqual(w, r, "S15 writer and reader disagree on %r" % n)
+            self.assertEqual(w, bool(stall_watch.AGENT_NAME.fullmatch(n)), "S15 the switchboard reader disagrees on %r" % n)
+            self.assertEqual(mod.lane_of("w-1", n).endswith("(lane unknown)"), not w, "S15 lane_of on %r" % n)
+
+    def test_boss_rule_is_one(self):
+        import run_record
+        self.check_boss_rule(real, run_record.BOSS_NAME)
+        self.assertIs(real.BOSS_NAME, run_record.BOSS_NAME)
+
+    def test_mutant_reader_copy_differs(self):
+        import re
+        import run_record
+        mod = mutant("BOSS_NAME = run_record.BOSS_NAME", 'BOSS_NAME = re.compile(r"[a-z][a-z0-9_-]{0,30}")')
+        with self.assertRaises(AssertionError) as cm:
+            self.check_boss_rule(mod, run_record.BOSS_NAME)
+        self.assertIn("S15 writer and reader disagree", str(cm.exception))
+
+    def test_mutant_writer_copy_differs(self):
+        import re
+        import run_record
+        with self.assertRaises(AssertionError) as cm:
+            self.check_boss_rule(real, re.compile(r"[a-z][a-z0-9_-]{0,15}"))
+        self.assertIn("S15 writer and reader disagree", str(cm.exception))
 
     def test_record_without_boss_falls_back_through_load_records(self):
         r = Root(self)
