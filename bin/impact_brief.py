@@ -193,11 +193,42 @@ def classify(path, top_tier_hits, owner_paths=None):
     return "code"
 
 
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def recorded_pieces(entries, pr, head, roles, counts_by_block):
+    """{"rating", "mutants", "blast"} read from the ledger `entries` (#2509), each None unless a record of EXACTLY this pull request and head carries it. Pure: the caller reads the ledger, passes the
+    rating roles (the matrix's `rating_roles`) and `delegated_clear.counts_by_block`, and an unreadable ledger is passed as no entries. Only the NEWEST record of a reviewer is read, so a later record that
+    lacks a field takes it away. A record counts only when its recorded role is a rating role, it is not `incomplete` and it carries a block (a hash of the returned block; for the impact reviewer also a score that agrees
+    with the block, `counts_by_block`). Nothing here reads text of the pull request or of a pod."""
+    out = {"rating": None, "mutants": None, "blast": None}
+    if not isinstance(entries, list) or not isinstance(head, str) or not head or not isinstance(roles, (list, tuple)) or not roles:
+        return out
+    mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("pr") == pr and e.get("head") == head
+            and e.get("by_role") in roles and e.get("verdict") in ("approve", "request-changes", "comment")]
+    impact = [e for e in mine if e.get("reviewer") == "impact" and counts_by_block(e)]
+    tests = [e for e in mine if e.get("reviewer") == "test" and isinstance(e.get("block_sha256"), str) and len(e["block_sha256"]) == 64]
+    if impact:
+        last = impact[-1]
+        klass, sev, prob = last.get("impact_class"), last.get("impact_severity"), last.get("impact_probability")
+        if all(isinstance(v, str) and v.strip() for v in (klass, sev, prob)):
+            out["rating"] = {"class": klass, "severity": sev, "probability": prob}
+        blast = last.get("blast_radius")
+        if isinstance(blast, str) and blast.strip():
+            out["blast"] = blast.strip()
+    if tests:
+        ran, survived = _count(tests[-1].get("mutants_run")), _count(tests[-1].get("mutants_survived"))
+        if ran and survived is not None and survived <= ran:   # a run of no mutants is no run
+            out["mutants"] = "%d run, %d survived" % (ran, survived)
+    return out
+
+
 CI_STATES = {"green": "green", "failing": "red", "pending": "pending"}   # `pr_ci_of`'s words -> the brief's; "none" is no result at all
 
 
 def facts_from_report(raw_files, report):
-    """Facts for build_brief from `pr_floor_report`'s own reads: the files, reads and rating at the head, and `ci` (the report's `ci`, the newest run of each check at THIS head). The floor holds no mutant or blast-radius record, so those stay absent and print `not shown`.
+    """Facts for build_brief from `pr_floor_report`'s own reads: the files, reads and rating at the head, and `ci` (the report's `ci`, the newest run of each check at THIS head). `mutants`, `blast` and a `rating` with severity and probability come from the report as `recorded_pieces` read them (#2509); absent, they print `not shown`.
     `owner_paths` is the matrix's `substance_decider.owner_only_paths`, so the owner-only classes are produced from the real path list."""
     hits = report.get("top_tier_hits") or {}
     owner_paths = report.get("owner_paths") or {}
