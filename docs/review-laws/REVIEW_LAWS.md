@@ -7,7 +7,7 @@ root, edits it to extend or override, and keeps the `extends:` line above so it 
 of the pull request, never the copy in the change under review. These laws must not contradict the repository's `AGENTS.md`; where they could, `AGENTS.md` states what it
 needs to get the work built, and these laws state what a change must satisfy.
 
-The reviewers read this file together with `CODING_STANDARDS.md`, `SECURITY_STANDARDS.md` and `TEST_STANDARDS.md`. Every rule is numbered so a finding can cite it.
+The reviewers read this file together with `CODING_STANDARDS.md`, `SECURITY_STANDARDS.md` and `TEST_STANDARDS.md`.
 
 ## Rules
 
@@ -43,6 +43,10 @@ impacts:
 - <what changes> | <severity> | <probability> | <risk level> | <action>
 ```
 
+The test reviewer ends its block with `mutants-run: N`.
+It also ends it with `mutants-survived: M` (at most N).
+The impact reviewer ends its block with `blast-radius: <one line>`.
+
 ## Rating the impact: MIL-STD-882E, rewritten for software
 
 The rating uses the categories of MIL-STD-882E (system safety) directly. The definitions below are rewritten for changes to software; the standard's own text is not copied.
@@ -77,11 +81,10 @@ review, `.` = no action:
 | Marginal | Low (.) | Medium (2) | Medium (2) | Serious (H) | Serious (H) |
 | Negligible | Low (.) | Low (.) | Low (.) | Medium (2) | Medium (2) |
 
-The table equals `impact-matrix.json` in the starter set, the single source of truth (a test keeps them equal; a repository's copy of this file copies that table). The risk levels are the standard's (High, Serious, Medium, Low). The cell assignments are this repository's own and stricter than the standard in places, by design (R-LAW-12); a
+The table equals `impact-matrix.json` in the starter set, the single source of truth. The cell assignments are this repository's own and stricter than the standard in places, by design (R-LAW-12); a
 repository may tighten them but not loosen them without the owner.
 The floor of R-LAW-13 holds changes to the paths a repository names, whatever the rating says. The size of a change is an input to the rating, never a hold by itself.
 
 ## What blocks
 
-A `request-changes` verdict blocks the merge until the author resolves each blocking finding or the reviewer withdraws it. A `H` action holds the pull request for the captain: the owner
-clears a false hold by removing the label with a logged reason. Nothing else blocks.
+A `request-changes` verdict blocks the merge until the author resolves each blocking finding or the reviewer withdraws it. A `H` action holds the pull request for the captain: the owner clears a false hold by removing the label with a logged reason. Nothing else blocks.
