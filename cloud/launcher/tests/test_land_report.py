@@ -572,6 +572,36 @@ class S9(unittest.TestCase):
         got = real.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
         self.assertEqual([(c["files"], c["lines"], c["rounds"]) for c in got], [(4, None, 2), (4, None, None)])
 
+    def check_cap_by_time(self, mod):
+        mod.MAX_RECORDS = 3
+        r = Root(self)
+        def dirname(worker, day, n, hour=12):
+            rid = "%s-202611%02dT%02d0000Z-%06x" % (worker, day, hour, n)
+            os.mkdir(os.path.join(r.dir, rid))
+            end = dt.datetime(2026, 11, day, hour, 0, tzinfo=dt.timezone.utc)
+            with open(os.path.join(r.dir, rid, "run.json"), "w") as f:
+                json.dump({"worker": worker, "boss": "orch-one", "repository": "acme-org/widget-service", "start": iso(end - dt.timedelta(minutes=5)), "end": iso(end),
+                           "end_hook": {"run_logs": {"runs": [{"name": "land1", "exit": 0, "log_tail": ""}]}}}, f)
+        dirname("a-early", 12, 1, hour=13)              # alphabetically first, inside the window
+        for i in range(5):
+            dirname("z-late%d" % i, 12, 10 + i, hour=1 + i)   # more than the cap, alphabetically late, inside the window
+        dirname("zz-old", 5, 99)               # alphabetically last, a week outside the window
+        recs, _ = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        names = sorted(x["worker"] for x in recs)
+        self.assertIn("a-early", names, "S11 early name inside the window is read")
+        self.assertNotIn("zz-old", names, "S11 late name outside the window is not read")
+
+    def test_cap_is_by_time(self):
+        self.check_cap_by_time(mutant("MAX_RECORDS = 5000 ", "MAX_RECORDS = 5000 "))
+
+    def test_mutant_cap_by_name(self):
+        mod = mutant("names = [n for _, n in sorted(stamped)[-MAX_RECORDS:]]", "names = sorted(n for _, n in stamped)[-MAX_RECORDS:]")
+        mod2 = mutant("MAX_RECORDS = 5000 ", "MAX_RECORDS = 5000 ")
+        self.check_cap_by_time(mod2)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_cap_by_time(mod)
+        self.assertIn("S11 early name", str(cm.exception))
+
     def test_record_without_boss_falls_back_through_load_records(self):
         r = Root(self)
         d = r.add(worker="solo-3", code=0)

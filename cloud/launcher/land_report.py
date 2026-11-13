@@ -143,7 +143,15 @@ def load_records(root, start, end):
     """(records of the window [start, end) as dicts, number not read). A record is one directory of `root` named as a run id."""
     out, unread = [], 0
     try:
-        names = sorted(n for n in os.listdir(root) if RUN_ID.fullmatch(n))[-MAX_RECORDS:]
+        slack = dt.timedelta(days=1)
+        stamped = []
+        for n in os.listdir(root):
+            if not RUN_ID.fullmatch(n):
+                continue
+            when = dt.datetime.strptime(n.split("-")[-2], "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)   # the id's own time, not its name's place in the alphabet
+            if start - slack <= when <= end + slack:   # an id outside the window by more than a day is not read at all
+                stamped.append((when, n))
+        names = [n for _, n in sorted(stamped)[-MAX_RECORDS:]]   # newest MAX_RECORDS by time
     except OSError:
         return [], 0
     for n in names:
