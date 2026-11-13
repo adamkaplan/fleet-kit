@@ -6,6 +6,9 @@ THIS kit, resolved from the switchboard's own location) and its first argument; 
 user, its executable and its argument list; /proc where there is one, else `ps`), never anything the caller says about itself. Nothing is a secret and
 nothing is kept in a file or in the environment: the environment variable only NAMES the sender being claimed, and a claim with no proof is refused.
 
+The script file and every directory from it up to the kit root (included) must not be group- or other-writable (checked by stat, fail closed); directories above the
+kit root are not checked, so a sticky world-writable /tmp above a checkout does not refuse it.
+
 Honest limit: this is a process-level check, as the state directory's own trust is: a process of the same user can start the registered program itself
 (that runs the real program), or could run a program with a forged argument list. A person's pane, a session id, a pane variable, the claim variable
 or `--from` cannot make the parent process the reaper. Standard library only. Nothing here sends or writes."""
@@ -89,11 +92,23 @@ def parent_is(name, kit_root, parent=None, reader=read_process, uid=None, known=
     wanted = os.path.join(os.path.realpath(str(kit_root)), *row["script"])
     if not os.path.isabs(script) or os.path.realpath(script) != os.path.realpath(wanted):
         return False
-    try:
-        mode = os.stat(wanted).st_mode
-    except OSError:
-        return False
-    return not mode & 0o022   # a program that others may write is no proof
+    return tree_is_closed(wanted, os.path.realpath(str(kit_root)))
+
+
+def tree_is_closed(script, root):
+    """True only when the script file AND every directory above it up to the kit root (the root included; to / when the script is somehow not under the root) is not
+    group- or other-writable. Any stat that fails is False (fail closed). The directories ABOVE the kit root are not looked at: a checkout lives under a home or a scratch
+    directory (a sticky, world-writable /tmp, a group-writable home) that the kit does not own, and refusing there would refuse every real checkout."""
+    path = os.path.realpath(script)
+    while True:
+        try:
+            if os.stat(path).st_mode & 0o022:   # a program, or a directory holding it, that others may write is no proof
+                return False
+        except OSError:
+            return False
+        if path == root or path == os.path.dirname(path):
+            return True
+        path = os.path.dirname(path)
 
 
 def refusal(name, recipient, kit_root, from_name=None, **proof):

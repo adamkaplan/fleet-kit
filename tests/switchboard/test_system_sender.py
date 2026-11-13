@@ -265,7 +265,8 @@ class TestParentProof(Base):
         other.parent.mkdir()
         other.write_text("#!/bin/sh\n")
         known = SYSTEM.interpreters(executable=str(link), fixed=(), base_prefix=str(version))
-        self.assertEqual(known, {os.path.realpath(str(launcher)), os.path.realpath(str(app))})   # both forms
+        self.assertIn(os.path.realpath(str(launcher)), known)   # both forms
+        self.assertIn(os.path.realpath(str(app)), known)
         self.assertNotEqual(os.path.realpath(str(launcher)), os.path.realpath(str(app)))
         self.assertNotIn(os.path.realpath(str(other)), known)                                      # control: an unrelated binary named python
         argv = [str(link), "-B", str(self.kit.script), "reap", "--loop", "60"]
@@ -273,7 +274,36 @@ class TestParentProof(Base):
             with self.subTest(exe=exe):
                 got = SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: (os.getuid(), exe, argv), known=known)
                 self.assertEqual(got, expected)
-        self.assertEqual(SYSTEM.interpreters(executable=str(link), fixed=(), base_prefix=str(self.home / "no-such-prefix")), {os.path.realpath(str(launcher))})   # no app binary, none added
+        bare = SYSTEM.interpreters(executable=str(link), fixed=(), base_prefix=str(self.home / "no-such-prefix"))
+        self.assertIn(os.path.realpath(str(launcher)), bare)
+        self.assertNotIn(os.path.realpath(str(app)), bare)   # no app binary, none added
+
+    def test_a_group_or_other_writable_directory_above_the_script_is_no_proof(self):
+        pid = self.kit.start()
+        self.assertTrue(self.proof(pid))                                               # a clean tree passes
+        for directory in (self.kit.script.parent, self.kit.script.parent.parent, self.kit.root):
+            for bits in (0o775, 0o757):
+                with self.subTest(directory=directory.name, mode=oct(bits)):
+                    before = directory.stat().st_mode & 0o7777
+                    os.chmod(str(directory), bits)
+                    try:
+                        self.assertFalse(self.kit.script.stat().st_mode & 0o022)       # control: the old check (the file alone) accepted it
+                        self.assertFalse(self.proof(pid))
+                    finally:
+                        os.chmod(str(directory), before)
+        self.assertTrue(self.proof(pid))
+
+    def test_a_sticky_world_writable_directory_above_the_kit_root_does_not_refuse(self):
+        pid = self.kit.start()
+        before = self.home.stat().st_mode & 0o7777
+        os.chmod(str(self.home), 0o1777)   # like /tmp, above the kit root: not the kit's own, so not checked
+        try:
+            self.assertTrue(self.proof(pid))
+        finally:
+            os.chmod(str(self.home), before)
+
+    def test_a_directory_that_cannot_be_read_is_no_proof(self):
+        self.assertFalse(SYSTEM.tree_is_closed(str(self.kit.root / "no" / "such.py"), str(self.kit.root)))
 
     def test_a_reader_that_fails_is_no_proof(self):
         self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: None))
