@@ -501,7 +501,7 @@ class S9(unittest.TestCase):
         self.check_cap(real)
 
     def test_mutant_group_by_pod(self):
-        mod = mutant('"lane": lane_of(rec.get("worker"), rec.get("boss"))', '"lane": name_text(rec.get("worker"), 64)')
+        mod = mutant('"lane": lane_of(', '"lane": (lambda w, b: name_text(w, 64))(')
         self.check(real)
         with self.assertRaises(AssertionError) as cm:
             self.check(mod)
@@ -665,6 +665,77 @@ class S9(unittest.TestCase):
         mod = mutant('m = re.search(r"\\bround (\\d{1,9})\\b", parts[2])', 'm = None')
         with self.assertRaises(AssertionError):
             self.check_trailer_times(mod)
+
+    def launch_dirs(self):
+        """A switchboard record dir `<state>/cloud` (live launch records) and its sibling `<state>/cloud-boss` (kept at removal), neutral names."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cloud, kept = os.path.join(tmp.name, "cloud"), os.path.join(tmp.name, "cloud-boss")
+        os.makedirs(cloud)
+        os.makedirs(kept)
+        with open(os.path.join(cloud, "live-1.json"), "w") as f:
+            json.dump({"worker": "live-1", "reports_to": "orch-one"}, f)
+        with open(os.path.join(kept, "gone-2.json"), "w") as f:
+            json.dump({"worker": "gone-2", "boss": "orch-two", "ended": "2026-11-12T00:00:00Z"}, f)
+        with open(os.path.join(cloud, "bad-3.json"), "w") as f:
+            json.dump({"worker": "bad-3", "reports_to": "Not A Name; rm"}, f)
+        return cloud
+
+    def check_launch_boss(self, mod):
+        cloud = self.launch_dirs()
+        r = Root(self)
+        for w in ("live-1", "gone-2", "bad-3", "none-4"):
+            d = r.add(worker=w, code=0)
+            path = os.path.join(d, "run.json")
+            with open(path) as f:
+                rec = json.load(f)
+            del rec["boss"]   # a record from before the run record carried it
+            with open(path, "w") as f:
+                json.dump(rec, f)
+        recs, _ = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW, mod.boss_lookup({"CW_CLOUD_RECORD_DIR": cloud}))
+        lanes = {x["worker"]: x["lane"] for x in recs}
+        self.assertEqual(lanes["live-1"], "orch-one", "S13 live launch record")
+        self.assertEqual(lanes["gone-2"], "orch-two", "S13 kept boss of a removed worker")
+        self.assertEqual(lanes["bad-3"], "bad (lane unknown)", "S13 invalid boss is not used")
+        self.assertEqual(lanes["none-4"], "none (lane unknown)", "S13 no record: lane unknown")
+
+    def test_launch_boss(self):
+        self.check_launch_boss(real)
+
+    def test_mutant_launch_record_not_read(self):
+        mod = mutant("(boss_of(rec.get(\"worker\")) if boss_of else None)", "None")
+        self.check_launch_boss(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_launch_boss(mod)
+        self.assertIn("S13 live launch record", str(cm.exception))
+
+    def check_authors(self, mod):
+        def line(c, a, t, k):
+            return "\x1e%s\x1f%s\x1f%s\x1f%s" % (c * 40, t, k, a)
+        raw = (line("a", "acme-bot[bot]", self.T1, self.C1) + line("b", "acme-bot[bot]", self.T2, self.C2)
+               + line("c", "Some Person", "areas=docs tests=1 files=1 checks=x:1s total=9s tree=0123456789ab", self.C2))
+        class R: returncode = 0; stdout = raw
+        got = mod.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
+        self.assertEqual([c["author"] for c in got], ["acme-bot[bot]", "acme-bot[bot]", "Some Person"], "S14 author read in the same git call")
+        r = Root(self)
+        r.add(worker="p-1", boss="orch-one", code=0)
+        recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        out = mod.build(recs, bad, got, 50, (), "2026-11-12", "", ("acme-bot[bot]",))[0]
+        self.assertIn("median 733 s, p90 1056 s (n=2)", out, "S14 ours only")
+        self.assertIn("landed by others: 1; land time median 9 s (n=1)", out, "S14 others one line")
+        self.assertLess(len(out.splitlines()), 20)
+
+    def test_authors(self):
+        self.check_authors(real)
+        self.assertEqual(real.own_authors({"CW_LAND_REPORT_OWN_AUTHORS": "a-bot[bot], w2"}, "/nonexistent"), ("a-bot[bot]", "w2"))
+        self.assertEqual(real.own_authors({}, "/nonexistent"), ())
+
+    def test_mutant_no_author_split(self):
+        mod = mutant('if landed and own:', 'if False:')
+        self.check_authors(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_authors(mod)
+        self.assertIn("S14", str(cm.exception))
 
     def test_record_without_boss_falls_back_through_load_records(self):
         r = Root(self)

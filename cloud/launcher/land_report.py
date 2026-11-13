@@ -81,6 +81,20 @@ def first_repo(raw):
     return raw.strip() if isinstance(raw, str) and FIRST_REPO.fullmatch(raw.strip()) else ""
 
 
+def own_authors(env, ident_file="/etc/cw-default-identity"):
+    """The author names whose landed commits are 'ours' (the cloud workers): the setting CW_LAND_REPORT_OWN_AUTHORS (comma list), else the first line of the
+    pod identity file when this host has one (the launcher image does not), else () (no split)."""
+    raw = (env or {}).get("CW_LAND_REPORT_OWN_AUTHORS")
+    if isinstance(raw, str) and raw.strip():
+        return tuple(n.strip() for n in raw.split(",") if n.strip() and len(n.strip()) <= 100)
+    try:
+        with open(ident_file, encoding="utf-8") as f:
+            first = f.readline().strip()
+        return (first,) if first and len(first) <= 100 else ()
+    except (OSError, UnicodeDecodeError):
+        return ()
+
+
 def small_bound(env):
     """The small bound in changed lines: the setting, else 50; a value that is not a whole number from 1 to 100000 is the default."""
     raw = (env or {}).get("CW_LAND_REPORT_SMALL_LINES")
@@ -139,7 +153,46 @@ def land_run(rec):
     return None
 
 
-def load_records(root, start, end):
+def read_small_json(path):
+    """A small JSON object file read without following a link, or None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                return None
+            got = json.loads(os.read(fd, 65537).decode("utf-8"))
+        finally:
+            os.close(fd)
+        return got if isinstance(got, dict) else None
+    except Exception:
+        return None
+
+
+def boss_lookup(env):
+    """worker -> boss from the LAUNCH records, read only: (1) the switchboard's live worker record `<CW_CLOUD_RECORD_DIR>/<worker>.json` key `reports_to` (what
+    `--reports-to` gave at launch, bin/cloud_worker.py), (2) the one kept at the worker's removal `<state>/cloud-boss/<worker>.json` key `boss` (bin/cloud_retired.py;
+    `<state>` is the parent of CW_CLOUD_RECORD_DIR). None when neither holds a valid name. The audit `create` line carries no boss, so it is not read."""
+    rd = ((env or {}).get("CW_CLOUD_RECORD_DIR") or "").rstrip("/")
+    cache = {}
+
+    def find(worker):
+        if not rd or not isinstance(worker, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", worker):
+            return None
+        if worker not in cache:
+            boss = None
+            for path, key in ((os.path.join(rd, worker + ".json"), "reports_to"), (os.path.join(os.path.dirname(rd), "cloud-boss", worker + ".json"), "boss")):
+                found = read_small_json(path)
+                value = found.get(key) if found else None
+                if isinstance(value, str) and BOSS_NAME.fullmatch(value):
+                    boss = value
+                    break
+            cache[worker] = boss
+        return cache[worker]
+    return find
+
+
+def load_records(root, start, end, boss_of=None):
     """(records of the window [start, end) as dicts, number not read). A record is one directory of `root` named as a run id."""
     out, unread = [], 0
     try:
@@ -170,7 +223,7 @@ def load_records(root, start, end):
             continue
         began = parse_time(rec.get("start"))
         hook = rec.get("end_hook") if isinstance(rec.get("end_hook"), dict) else {}
-        out.append({"worker": name_text(rec.get("worker"), 64), "repo": name_text(rec.get("repository"), 100, "/"), "lane": lane_of(rec.get("worker"), rec.get("boss")),
+        out.append({"worker": name_text(rec.get("worker"), 64), "repo": name_text(rec.get("repository"), 100, "/"), "lane": lane_of(rec.get("worker"), rec.get("boss") if isinstance(rec.get("boss"), str) and BOSS_NAME.fullmatch(rec["boss"]) else (boss_of(rec.get("worker")) if boss_of else None)),
                     "minutes": (ended - began).total_seconds() / 60 if began and ended >= began else None, "land": land_run(rec),
                     "sha": rec.get("head_sha") if isinstance(rec.get("head_sha"), str) and re.fullmatch(r"[0-9a-f]{7,40}", rec["head_sha"]) else None,
                     "reason": name_text(rec.get("exit_reason"), 30) if isinstance(rec.get("exit_reason"), str) else "unknown",
@@ -206,7 +259,7 @@ def git_landed(git_dir, branch, since, run=subprocess.run):
     """[{sha, files, lines, rounds}] of the commits on `branch` since `since` that carry a Land-Checks trailer; None when git failed (the report says so)."""
     if not git_dir or not BRANCH.fullmatch(branch or "") or branch.startswith("-"):
         return None
-    fmt = "%x1e%H%x1f%(trailers:key=Land-Checks,valueonly,unfold)%x1f%(trailers:key=Land-Council,valueonly,unfold)"
+    fmt = "%x1e%H%x1f%(trailers:key=Land-Checks,valueonly,unfold)%x1f%(trailers:key=Land-Council,valueonly,unfold)%x1f%an"
     try:
         res = run(["git", "-C", git_dir, "log", branch, "--since=" + since.strftime(ISO), "--format=" + fmt, "--"], capture_output=True, text=True, timeout=CALL_SECONDS)
     except (OSError, subprocess.SubprocessError):
@@ -224,20 +277,22 @@ def git_landed(git_dir, branch, since, run=subprocess.run):
             m = re.search(r"\bround (\d{1,9})\b", parts[2])
             rounds = int(m.group(1)) if m else None
         item = {"sha": parts[0].strip(), "files": checks.get("files"), "lines": checks.get("lines"), "rounds": rounds}
+        if len(parts) > 3 and parts[3].strip():
+            item["author"] = parts[3].strip()[:100]
         item.update({k: checks[k] for k in ("tests", "total", "steps") if k in checks})   # only when the trailer has them
         out.append(item)
     return out
 
 
 # ---- the report
-def build(records, unread, landed, bound, previous=(), day="", first_repo=""):
+def build(records, unread, landed, bound, previous=(), day="", first_repo="", own=()):
     """(multi-line text, one comment line). `records` are the window's, `previous` the 24 h before (for the trend); `landed` the commits or None.
     Rows are per repo and lane; a lane with no land run prints nothing (one trailing line counts those pods); the repo with the most attempts comes first,
     `first_repo` (CW_LAND_REPORT_FIRST_REPO) before it; the text stays under 20 lines, the lanes that do not fit are one `N more lanes` line."""
     lanes = {}
     for r in records:
         lanes.setdefault((r["repo"], r["lane"]), []).append(r)
-    landed_shas = [c["sha"] for c in landed or []]
+    landed_shas = [c["sha"] for c in landed or []]   # all authors: a pod landed is a pod landed
     is_landed = lambda r: bool(r["sha"]) and any(s.startswith(r["sha"]) for s in landed_shas)   # noqa: E731
     prev_by = {}
     for r in previous:
@@ -280,6 +335,12 @@ def build(records, unread, landed, bound, previous=(), day="", first_repo=""):
             parts.append("%s: %s; no step data %d" % (step, "median %s s (n=%d)" % (num(median(vals)), len(vals)) if vals else "n/a", none))
         rows.append(([head, "  " + wall + "; " + "; ".join(parts)], len(att), len(ok)))
     tail = []
+    everyone = landed
+    if landed and own:   # the figures below are the cloud workers' own landings; the others are one line
+        others = [c for c in landed if c.get("author") not in own]
+        landed = [c for c in landed if c.get("author") in own]
+    else:
+        others = []
     if landed is None:
         tail.append("landed commits: not read (git failed or no repository directory set)")
     else:
@@ -300,6 +361,9 @@ def build(records, unread, landed, bound, previous=(), day="", first_repo=""):
             v = got(step)
             cells.append("%s: %s" % (step, "median %s s (n=%d)" % (num(median(v)), len(v)) if v else "no step data %d" % len(landed)))
         tail.insert(1, "; ".join(cells))
+    if others:
+        ot = [c["total"] for c in others if "total" in c]
+        tail.append("landed by others: %d; land time %s" % (len(others), "median %s s (n=%d)" % (num(median(ot)), len(ot)) if ot else "n/a"))
     unlanded = [r for r in records if not is_landed(r)]
     tail.append("pods ended unlanded: %d of %d" % (len(unlanded), len(records)))
     if skipped:
@@ -318,7 +382,7 @@ def build(records, unread, landed, bound, previous=(), day="", first_repo=""):
     out.extend("  %s (%s)" % (r["worker"], r["reason"]) for r in unlanded[:max(0, MAX_LINES - len(out))])
     comment = "Land report %s: attempted %d, landed %d, pods ended unlanded %d of %d%s" % (
         day, attempts_all, landed_all, len(unlanded), len(records), "; %d records not read" % unread if unread else "")
-    if not landed_all and not landed:
+    if not landed_all and not everyone:
         text = "Land report %s: no landings in the last 24 h (%d attempts, %d pods ended%s)" % (day, attempts_all, len(records), ", %d records not read" % unread if unread else "")
         return scrub(text), scrub(text)
     return scrub("\n".join(out))[:MESSAGE_MAX], scrub(comment)[:400]
@@ -389,10 +453,11 @@ def daily_pass(env, now, root, state_path, git_dir=None, send=send_message, comm
             log("land report: CW_LAND_REPORT_ISSUE is not set to owner/repo#N; nothing is sent")
             return "failed"
         start = now - WINDOW
-        records, unread = load_records(root, start, now)
-        earlier, _ = load_records(root, start - WINDOW, start)
+        finder = boss_lookup(env)
+        records, unread = load_records(root, start, now, finder)
+        earlier, _ = load_records(root, start - WINDOW, start, finder)
         landed = git(git_dir or (env or {}).get("CW_LAND_REPORT_GIT_DIR"), (env or {}).get("CW_LAND_REPORT_BRANCH") or "origin/main", start)
-        text, line = build(records, unread, landed, small_bound(env), earlier, day, first_repo((env or {}).get("CW_LAND_REPORT_FIRST_REPO")))
+        text, line = build(records, unread, landed, small_bound(env), earlier, day, first_repo((env or {}).get("CW_LAND_REPORT_FIRST_REPO")), own_authors(env))
         for part, call, body in (("message", send, text), ("comment", comment, line)):
             if state.get(part) is True or state.get(part + "_tries", 0) >= MAX_TRIES:
                 continue
