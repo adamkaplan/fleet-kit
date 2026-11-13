@@ -10,6 +10,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -317,15 +318,19 @@ class TwoReapersOneCluster(base.Base):
         self.assertEqual(code, 0, err.getvalue())
 
     def test_a_second_reaper_started_while_the_first_stops_exits_and_touches_nothing(self):
-        seen, real = {}, cw.Launcher.stop
+        seen, real, rival_done = {}, cw.Launcher.stop, threading.Lock()
 
         def stop_with_a_rival(self_, a, reason=None):
-            if "second" not in seen:   # the rival starts while the first reaper is in the middle of a pass
-                before = len(self.calls())
-                err = io.StringIO()
-                with redirect_stderr(err), redirect_stdout(io.StringIO()):
-                    seen["second"] = cw.main(["reap"], self.env, self.clock, lambda s: None)
-                seen["err"], seen["calls"] = err.getvalue(), len(self.calls()) - before
+            # The reaper stops its pods on parallel threads (REAP_PARALLEL), and redirect_stderr swaps the process-wide sys.stderr: two
+            # rivals started at once would orphan one buffer, and a stop's kubectl calls would be counted as the rival's. So exactly one
+            # rival runs, alone, and every stop thread waits at this lock until it has ended.
+            with rival_done:
+                if "second" not in seen:   # the rival starts while the first reaper is in the middle of a pass
+                    before = len(self.calls())
+                    err = io.StringIO()
+                    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                        seen["second"] = cw.main(["reap"], self.env, self.clock, lambda s: None)
+                    seen["err"], seen["calls"] = err.getvalue(), len(self.calls()) - before
             return real(self_, a, reason)
         cw.Launcher.stop = stop_with_a_rival
         self.addCleanup(setattr, cw.Launcher, "stop", real)
