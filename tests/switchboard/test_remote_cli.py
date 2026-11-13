@@ -230,8 +230,12 @@ class TestRemoteCli(Base):
     def test_the_land_command_comes_only_from_configuration(self):
         self.launch()
         self.assertIn(LAND, self.store.messages[0]["brief"])
-        text = (ROOT / "remote_worker" / "cli.py").read_text() + (ROOT / "remote_worker" / "launch.py").read_text()
-        self.assertNotIn("spire land", text)
+        cfg = dict(self.cfg, land_command="other-land --go")
+        task = os.path.join(self.dir.name, "t.txt")
+        open(task, "w").write(TASK)
+        self.call("launch", "widget-2", "--repo", "acme/widget-api", "--branch", "b", "--task-file", task, cfg=cfg)
+        self.assertIn("other-land --go", self.store.messages[-1]["brief"])
+        self.assertNotIn(LAND, self.store.messages[-1]["brief"])
 
     def test_the_env_of_a_spec_is_never_in_its_repr(self):
         spec = validate_spec("widget-1", "acme/widget-api", "b", "t", LAND, env=(("REPO_TOKEN", TOKEN),))
