@@ -84,7 +84,8 @@ class Run:
                  LABEL_CMD=os.path.join(self.tmp, "label"), TAINT_CMD=os.path.join(self.tmp, "taint"),
                  READY_CMD=os.path.join(self.tmp, "ready"), NODE_NAME="node-1", ONCE="1", WAIT="2", POLL="1")
         e.update(env)
-        self.rc = subprocess.run(["sh", os.path.join(self.tmp, "fix.sh")], env=e, capture_output=True, text=True, timeout=60).returncode
+        res = subprocess.run(["sh", os.path.join(self.tmp, "fix.sh")], env=e, capture_output=True, text=True, timeout=60)
+        self.rc, self.out, self.err = res.returncode, res.stdout, res.stderr
         self.calls = [l.strip() for l in open(self.log) if l.strip()]
         return self
 
@@ -154,13 +155,44 @@ class StartupTaint(unittest.TestCase):
         r = Run(config=RIGHT)
         self.addCleanup(r.close)
         p = os.path.join(r.tmp, "taint")
-        open(p, "w").write('#!/bin/sh\necho "taint \\"x\\" not found" >&2\nexit 1\n')
+        open(p, "w").write('#!/bin/sh\necho "taint \\"%s:NoSchedule\\" not found" >&2\nexit 1\n' % KEY)
         r.run()
         self.assertEqual(r.rc, 0)
+        self.assertIn("startup taint already absent", r.out)
+
+    def check_not_found(self, msg):
+        r = Run(config=RIGHT)
+        self.addCleanup(r.close)
+        open(os.path.join(r.tmp, "taint"), "w").write('#!/bin/sh\necho \'%s\' >&2\nexit 1\n' % msg)
+        r.run()
+        return r
+
+    def test_missing_node_warns_and_does_not_claim_absence(self):
+        ctl = self.check_not_found('error: taint "%s:NoSchedule" not found' % KEY)   # the control, first
+        self.assertEqual(ctl.rc, 0)
+        self.assertIn("startup taint already absent", ctl.out)
+        r = self.check_not_found('Error from server (NotFound): nodes "node-1" not found')
+        self.assertEqual(r.rc, 0)                       # the warn-and-return-0 path
+        self.assertNotIn("already absent", r.out)
+        self.assertIn("WARNING: could not remove the startup taint", r.err)
+        self.assertIn('nodes "node-1" not found', r.err)
+
+    def test_other_failure_warns_and_returns_zero(self):
+        r = self.check_not_found("connection refused")
+        self.assertEqual(r.rc, 0)
+        self.assertNotIn("already absent", r.out)
+        self.assertIn("WARNING", r.err)
 
     def test_the_default_command_names_the_key_and_the_node(self):
         self.assertIn('kubectl taint node $NODE_NAME $TAINT_KEY=true:NoSchedule-', SCRIPT)
         self.assertIn('TAINT_KEY="%s"' % KEY, SCRIPT)
+
+    def test_readme_key_matches_the_source(self):
+        with open(os.path.join(ROOT, "cloud", "README.md")) as f:
+            readme = f.read()
+        section = readme[readme.index("## Startup taint (ask #2489)"):]
+        keys = set(re.findall(r"startup-taint\.cluster-autoscaler\.kubernetes\.io/[\w.-]+", section))
+        self.assertEqual(keys, {KEY})
 
     def test_s5_manifests_tolerate_exactly_the_taint(self):
         ds = [d for d in sections(FIX_YAML) if re.search(r"^kind: DaemonSet", d, re.M)]

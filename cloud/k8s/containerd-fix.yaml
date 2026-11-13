@@ -60,7 +60,9 @@ data:
         TAINT_CMD="kubectl taint node $NODE_NAME $TAINT_KEY=true:NoSchedule-"
       fi
       if tout=$($TAINT_CMD 2>&1); then echo "startup taint removed"; return 0; fi
-      case "$tout" in *"not found"*) echo "startup taint already absent"; return 0 ;; esac
+      # Only the taint-absent message that names this key counts as absent. A missing node says `nodes "x" not found`:
+      # that is a failure (warn), never "absent".
+      case "$tout" in *'taint "'"$TAINT_KEY"*'" not found'*) echo "startup taint already absent"; return 0 ;; esac
       echo "WARNING: could not remove the startup taint (the next pass retries): $tout" >&2; return 0
     }
     # Restart containerd and check it is healthy: any failure of either is a failure.
