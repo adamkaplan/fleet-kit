@@ -146,10 +146,10 @@ class Mint(unittest.TestCase):
         os.chmod(wrap, 0o700)
         cls.wrap = wrap
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
-        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
         cls.other = http.server.HTTPServer(("127.0.0.1", 0), Other)
-        threading.Thread(target=cls.other.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.other.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):

@@ -130,7 +130,8 @@ class ScratchCleanup(unittest.TestCase):
 
     def test_s4_a_child_that_ignores_the_end_signal_is_killed(self):
         self.assertEqual(cwt.CHILD_END_WAIT_SECONDS, 15)
-        gone, entries, rec = self._run(lambda home: [sys.executable, "-c", STUBBORN % home])
+        with mock.patch.object(cwt, "CHILD_END_WAIT_SECONDS", 1):   # the real 15 is asserted above; the stubborn child is killed after 1
+            gone, entries, rec = self._run(lambda home: [sys.executable, "-c", STUBBORN % home])
         print("S4: children alive %d, directory entries %d, bounded wait %d seconds" % (int(gone), len(entries), cwt.CHILD_END_WAIT_SECONDS))
         self.assertFalse(gone)
         self.assertEqual(entries, [])
