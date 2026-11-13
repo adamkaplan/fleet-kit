@@ -728,6 +728,22 @@ Rollback: unset the setting, delete the Deployment (`kubectl -n cw delete deploy
 
 Tests: `test_copilot_front.py`, `test_copilot_manifest.py`, `test_council_url_render.py` in `cloud/launcher/tests/` (fakes only).
 
+## Shell call cap (ask #2447)
+
+Second layer: the worker image sets `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=300000` (`cloud/worker/Dockerfile`; a test holds it within 1..the plugin's `CAP_MS`), so a call that passes no timeout is capped even when the plugin is not loaded. This layer does NOT bound a call that passes its own longer timeout; only the plugin does. Whether the plugin's hook works on the pod's OpenCode build is decided by the pod proof (S5/S6, the operator's tester run after the next image). A hook that throws at call time leaves the spec as it was and prints one line.
+
+A pod plugin (`cloud/worker/plugins/cw-tool-cap`, registered by `entrypoint.sh` in the pod's running config, not in `opencode-worker.json`) sets the `timeout` of every shell spec in `shell.create.before` to at most 300000 ms (absent, zero or larger becomes 300000), and adds one fixed sentence (matched loosely on the words "timeout"/"timed out" of the result, so a result that merely mentions them may carry the sentence too) naming the limit and `cw-run` to a timed-out result. Anything longer goes through `cw-run start`. The note is best-effort, and the clamp fails open: when the build offers no shell hook API or registering throws, the plugin prints one plain line (`cw-tool-cap: shell hooks unavailable, calls are NOT capped`) and calls are not capped; a failing `run.after` registration is reported the same way without echoing any error text, and only the note is lost.
+
+Read before building: OpenCode's shell default is 120000 ms and the call takes a per-call `timeout`; the environment variable sets the default only; `mcp.timeout` bounds MCP servers and no key clamps a shell call. UNVERIFIED here (the local build is 2.1.4, no pod): whether 2.2.7 honours a changed spec `timeout`, and the exact timeout text and hook name for the result; the sentence hook is wired only if the build offers it. The tester's pod proof (S5, S6) settles both.
+
+| Input / outside call | Test | Mutant (control first, failure text) |
+|---|---|---|
+| spec `timeout` 60000/300000/300001/3600000/absent/background | index.test.mjs "S2: six specs" | clamp only a present value: assert.equal failure (undefined !== 300000) on the absent spec |
+| installed `plugin` entry | test_tool_cap test_s3_plugin_listed_once | remove the printf entry or re-add it to the template: count mismatch (and test_entrypoint_long_run checks the written file) |
+| config timeouts | test_s3_no_timeout_above_cap | add `mcp.timeout` 600000: list shows 600000 |
+| result text | index.test.mjs "S4: note" | drop sentence or the run.after hook line: endsWith(NOTE) fails |
+| image copy | test_dockerfile_copies_plugin | remove COPY: count 0 != 1 |
+
 ## The daily land report (ask #2448)
 
 `cloud/launcher/land_report.py` is READ-ONLY. The reaper's pass (`_land_report` in `cloud_worker.py`, one inserted call) runs `daily_pass`: at the first pass at or after 13:00 UTC of a day whose report is not complete, it reads the last 24 hours of run records and of landed commits, sends ONE message (the switchboard command `send cos --issue <the setting>`) and adds ONE comment line (`gh issue comment`) to the pinned issue. It edits no issue body. The last-sent day and each part's state (`message`, `comment`) are in `<run record dir>/.land-report.json` (0600, written atomically after each part); a part that failed is tried at the next pass, a part that went is not sent again. Rollback: remove the call.
