@@ -602,6 +602,25 @@ class S9(unittest.TestCase):
             self.check_cap_by_time(mod)
         self.assertIn("S11 early name", str(cm.exception))
 
+    def test_impossible_date_name_is_unread_not_an_error(self):
+        r = Root(self)
+        r.add(worker="p-1", code=0)
+        os.mkdir(os.path.join(r.dir, "a-20261399T999999Z-abcdef"))
+        recs, bad = real.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        self.assertEqual((len(recs), bad), (1, 1), "S11 impossible date")
+
+    def test_mutant_raises_on_impossible_date(self):
+        mod = mutant("            if when is None:", "            if False:")
+        with self.assertRaises(Exception):
+            self.bad_date_load(mod)
+
+    def bad_date_load(self, mod=None):
+        mod = mod or real
+        r = Root(self)
+        r.add(worker="p-1", code=0)
+        os.mkdir(os.path.join(r.dir, "a-20261399T999999Z-abcdef"))
+        return mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+
     def test_record_without_boss_falls_back_through_load_records(self):
         r = Root(self)
         d = r.add(worker="solo-3", code=0)

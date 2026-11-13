@@ -39,7 +39,7 @@ REASONS = ("council", "tests", "environment", "time limit", "other")
 STEPS = ("tests:server", "tests:pg")
 STEP_LINE = re.compile(r"\bstep=(tests:server|tests:pg) seconds=(\d{1,7}(?:\.\d{1,3})?)\b")
 LAND_NAME = re.compile(r"land(?:\d{1,9}|-[A-Za-z0-9._-]{0,60})?")   # land, land<N> (cw-run names), land-<suffix>; never dry<N>, retest, chk
-RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}-\d{8}T\d{6}Z-[0-9a-f]{6}")
+RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 ISSUE_REF = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99})#([1-9][0-9]{0,8})")
 BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,100}")
 ISO = "%Y-%m-%dT%H:%M:%SZ"
@@ -148,7 +148,10 @@ def load_records(root, start, end):
         for n in os.listdir(root):
             if not RUN_ID.fullmatch(n):
                 continue
-            when = dt.datetime.strptime(n.split("-")[-2], "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)   # the id's own time, not its name's place in the alphabet
+            when = parse_time(re.sub(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$", r"\1-\2-\3T\4:\5:\6Z", n.split("-")[-2]))   # the id's own time, not its name's place in the alphabet
+            if when is None:   # a name with an impossible date is one unread record, never an exception
+                unread += 1
+                continue
             if start - slack <= when <= end + slack:   # an id outside the window by more than a day is not read at all
                 stamped.append((when, n))
         names = [n for _, n in sorted(stamped)[-MAX_RECORDS:]]   # newest MAX_RECORDS by time
