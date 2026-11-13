@@ -199,25 +199,25 @@ def _count(value):
 
 def recorded_pieces(entries, pr, head, roles, counts_by_block):
     """{"rating", "mutants", "blast"} read from the ledger `entries` (#2509), each None unless a record of EXACTLY this pull request and head carries it. Pure: the caller reads the ledger, passes the
-    rating roles (the matrix's `rating_roles`) and `delegated_clear.counts_by_block`, and an unreadable ledger is passed as no entries. Only the NEWEST record of a reviewer is read, so a later record that
-    lacks a field takes it away. A record counts only when its recorded role is a rating role, it is not `incomplete` and it carries a block (a hash of the returned block; for the impact reviewer also a score that agrees
+    rating roles (the matrix's `rating_roles`) and `delegated_clear.counts_by_block`, and an unreadable ledger is passed as no entries. The NEWEST record of the test reviewer decides, so a later record that
+    lacks a field takes it away; for the impact reviewer EVERY record of a rating role at the head must count and agree, else nothing is shown. A record counts only when its recorded role is a rating role, its verdict is approve and it carries a block (a hash of the returned block; for the impact reviewer also a score that agrees
     with the block, `counts_by_block`). Nothing here reads text of the pull request or of a pod."""
     out = {"rating": None, "mutants": None, "blast": None}
     if not isinstance(entries, list) or not isinstance(head, str) or not head or not isinstance(roles, (list, tuple)) or not roles:
         return out
-    mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("pr") == pr and e.get("head") == head
-            and e.get("by_role") in roles and e.get("verdict") in ("approve", "request-changes", "comment")]
-    impact = [e for e in mine if e.get("reviewer") == "impact" and counts_by_block(e)]
-    tests = [e for e in mine if e.get("reviewer") == "test" and isinstance(e.get("block_sha256"), str) and len(e["block_sha256"]) == 64]
-    if impact:
+    mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("pr") == pr and e.get("head") == head and e.get("by_role") in roles]
+    impact = [e for e in mine if e.get("reviewer") == "impact"]
+    tests = [e for e in mine if e.get("reviewer") == "test"]
+    # an uncounted record (no block, an incomplete or non-approving verdict, a score that disagrees) or two counted records that rate differently is never silently dropped: nothing is shown (as `judge` refuses a higher uncounted rating)
+    if impact and all(counts_by_block(e) and e.get("verdict") == "approve" for e in impact) and len({(e.get("impact_severity"), e.get("impact_probability")) for e in impact}) == 1:
         last = impact[-1]
         klass, sev, prob = last.get("impact_class"), last.get("impact_severity"), last.get("impact_probability")
         if all(isinstance(v, str) and v.strip() for v in (klass, sev, prob)):
             out["rating"] = {"class": klass, "severity": sev, "probability": prob}
-        blast = last.get("blast_radius")
-        if isinstance(blast, str) and blast.strip():
-            out["blast"] = blast.strip()
-    if tests:
+            blast = last.get("blast_radius")
+            if isinstance(blast, str) and blast.strip():
+                out["blast"] = blast.strip()
+    if tests and tests[-1].get("verdict") == "approve" and isinstance(tests[-1].get("block_sha256"), str) and len(tests[-1]["block_sha256"]) == 64:   # the newest test record decides, whatever it carries
         ran, survived = _count(tests[-1].get("mutants_run")), _count(tests[-1].get("mutants_survived"))
         if ran and survived is not None and survived <= ran:   # a run of no mutants is no run
             out["mutants"] = "%d run, %d survived" % (ran, survived)

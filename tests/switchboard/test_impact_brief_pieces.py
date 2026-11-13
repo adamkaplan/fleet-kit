@@ -83,12 +83,16 @@ class TestBriefPiecesPure(unittest.TestCase):
             "no block kept": ([impact_entry(block_sha256="none"), test_entry(block_sha256="none")], none),
             "a score that disagrees with its block": ([impact_entry(block_impact_severity="High"), test_entry()], {"rating": None, "mutants": "12 run, 1 survived", "blast": None}),
             "no field": ([impact_entry(blast_radius=None), test_entry(mutants_run=None, mutants_survived=None)], {"rating": {"class": "code", "severity": "Minor", "probability": "Remote"}, "mutants": None, "blast": None}),
-            "no class": ([impact_entry(impact_class=None), test_entry()], {"rating": None, "mutants": "12 run, 1 survived", "blast": "one module, no data"}),
+            "no class": ([impact_entry(impact_class=None), test_entry()], {"rating": None, "mutants": "12 run, 1 survived", "blast": None}),
             "no mutant ran": ([impact_entry(), test_entry(mutants_run=0, mutants_survived=0)], {"rating": {"class": "code", "severity": "Minor", "probability": "Remote"}, "mutants": None, "blast": "one module, no data"}),
             "more survivors than mutants": ([impact_entry(), test_entry(mutants_survived=13)], {"rating": {"class": "code", "severity": "Minor", "probability": "Remote"}, "mutants": None, "blast": "one module, no data"}),
             "a count that is text": ([impact_entry(), test_entry(mutants_run="12")], {"rating": {"class": "code", "severity": "Minor", "probability": "Remote"}, "mutants": None, "blast": "one module, no data"}),
             "a count that is a flag": ([impact_entry(), test_entry(mutants_run=True)], {"rating": {"class": "code", "severity": "Minor", "probability": "Remote"}, "mutants": None, "blast": "one module, no data"}),
             "the wrong reviewer's field": ([impact_entry(blast_radius=None), test_entry(reviewer="code")], {"rating": {"class": "code", "severity": "Minor", "probability": "Remote"}, "mutants": None, "blast": None}),
+            "a newer incomplete rating beside a good one": ([impact_entry(), impact_entry(verdict="incomplete", impact_severity="High", block_impact_severity="High")], {"rating": None, "mutants": None, "blast": None}),
+            "two counted ratings that differ": ([impact_entry(), impact_entry(impact_severity="Major", block_impact_severity="Major")], none),
+            "a request for changes": ([impact_entry(verdict="request-changes"), test_entry(verdict="request-changes")], none),
+            "a newer test record without a block": ([test_entry(), test_entry(block_sha256="none")], none),
             "no entries": ([], none),
             "not a list": (None, none),
             "unreadable entries": (["x", 3, None, {"kind": []}], none),
@@ -124,6 +128,11 @@ class TestBriefPiecesPure(unittest.TestCase):
             brief = self.brief(path=path)
             self.assertEqual(brief["decider"], "owner", path)
             self.assertIn("authority widened", brief["why"], path)
+        for path in ("bin/delegated_clear.py", "bin/impact_brief.py"):   # nothing added or deleted: only the owner-only class (not a material risk) keeps the owner
+            report = {"top_tier_hits": {}, "owner_paths": OWNER_PATHS, "head": HEAD, "base": "main", "complete": True, "ci": "green", "reads": [], **pieces([impact_entry(), test_entry()])}
+            brief = IB.build_brief(IB.facts_from_report([{"path": path, "additions": 0, "deletions": 0, "changeType": "MODIFIED"}], report))
+            self.assertEqual((brief["decider"], brief["material"]), ("owner", []), path)
+            self.assertIn("who may clear or merge", brief["why"])
         # a credentials change is material too
         brief = self.brief(path="auth/login.py", top_tier_hits={"credentials": ["auth/login.py"]})
         self.assertEqual((brief["decider"], brief["material"]), ("owner", ["credentials_widened"]))
@@ -151,15 +160,18 @@ class TestBriefPiecesPure(unittest.TestCase):
 
     def test_s7_mutants_of_the_reader_fail_the_scenarios(self):
         records = [impact_entry(), test_entry()]
-        ignore_head = load_mutant('e.get("pr") == pr and e.get("head") == head\n', 'e.get("pr") == pr\n')
-        self.assertNotEqual(pieces([impact_entry(head=OTHER), test_entry(head=OTHER)], ignore_head), {"rating": None, "mutants": None, "blast": None})
-        ignore_role = load_mutant('and e.get("by_role") in roles and', "and")
-        self.assertNotEqual(pieces([impact_entry(by_role="coder"), test_entry(by_role="coder")], ignore_role), {"rating": None, "mutants": None, "blast": None})
-        ignore_block = load_mutant('if e.get("reviewer") == "impact" and counts_by_block(e)]', 'if e.get("reviewer") == "impact"]')
+        none = {"rating": None, "mutants": None, "blast": None}
+        ignore_head = load_mutant('== pr and e.get("head") == head and', "== pr and")
+        self.assertNotEqual(pieces([impact_entry(head=OTHER), test_entry(head=OTHER)], ignore_head), none)
+        ignore_role = load_mutant('and e.get("by_role") in roles]', "]")
+        self.assertNotEqual(pieces([impact_entry(by_role="coder"), test_entry(by_role="coder")], ignore_role), none)
+        ignore_block = load_mutant('all(counts_by_block(e) and e.get("verdict") == "approve" for e in impact)', 'all(e.get("verdict") == "approve" for e in impact)')
         self.assertIsNotNone(pieces([impact_entry(block_sha256="none")], ignore_block)["blast"])
+        newest_only = load_mutant('all(counts_by_block(e) and e.get("verdict") == "approve" for e in impact)', 'counts_by_block(impact[-1]) and impact[-1].get("verdict") == "approve"')
+        self.assertIsNotNone(pieces([impact_entry(verdict="incomplete"), impact_entry()], newest_only)["rating"])
         ignore_survivors = load_mutant("if ran and survived is not None and survived <= ran:", "if survived is not None:")
         self.assertIsNotNone(pieces([test_entry(mutants_run=0, mutants_survived=0)], ignore_survivors)["mutants"])
-        for mutant in (ignore_head, ignore_role, ignore_block, ignore_survivors):
+        for mutant in (ignore_head, ignore_role, ignore_block, newest_only, ignore_survivors):
             self.assertEqual(pieces(records, mutant), pieces(records), "a mutant that changes nothing for good records is no mutant of the scenario above")
 
 
