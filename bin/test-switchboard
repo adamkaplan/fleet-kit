@@ -32537,6 +32537,14 @@ class TestRegistrarFloor(LedgerBase):
                     refs = sorted({x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in names and x.id != node.name})
                     stub = ast.FunctionDef(node.name, node.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], node.decorator_list, None)
                     body.append(ast.fix_missing_locations(ast.copy_location(stub, node)))
+            elif isinstance(node, ast.ClassDef):   # a class keeps its own statements; each method is cut to the bare references it makes to the closure's names, as a function is
+                kept = []
+                for member in node.body:
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        refs = sorted({x.id for x in ast.walk(member) if isinstance(x, ast.Name) and x.id in names})
+                        member = ast.fix_missing_locations(ast.copy_location(ast.FunctionDef(member.name, member.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], member.decorator_list, None), member))
+                    kept.append(member)
+                body.append(ast.fix_missing_locations(ast.copy_location(ast.ClassDef(node.name, node.bases, node.keywords, kept, node.decorator_list), node)))
             else:
                 body.append(node)
         return ast.unparse(ast.Module(body, []))
