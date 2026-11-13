@@ -1877,6 +1877,39 @@ class TestHeavySlots(Base):
         self.assertEqual(err.count("already inside a slot"), 3)
         self.assertNotIn("no slot after", err)
 
+    def test_a_heavy_that_ran_without_a_slot_still_marks_its_command_so_a_nested_heavy_runs_directly(self):   # #2387: bin/test-switchboard re-wraps itself under heavy; without the marker each level wrapped the next, forever
+        self.state().chmod(0o755)   # a state directory that is not private: no slot, the command still runs
+        inner = " ".join(['"%s"' % sys.executable, '"%s"' % SWITCHBOARD, "heavy", "--", "sh", "-c", "'echo level-2'"])
+        proc = self.start("sh", "-c", inner)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual((proc.returncode, out.strip()), (0, "level-2"), err)
+        self.assertEqual(err.count("running without one"), 1, "the outer heavy found no slot; the inner one did not try again")
+        self.assertEqual(err.count("already inside a slot"), 1, err)
+
+    def test_a_slot_that_cannot_be_locked_marks_the_command_as_run_without_one(self):   # the "unusable" path (#2387): every lock file is a link, which is refused
+        for index in range(3):
+            os.symlink(str(self.home / "nowhere"), str(self.state() / ("heavy-slot-%d.lock" % index)))
+        out = self.home / "marker-out"
+        proc = self.start("sh", "-c", 'echo "$FLEET_HEAVY_SLOT" > "%s"' % out)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn("running without one", err)
+        self.assertEqual(out.read_text().strip(), "none")
+
+    def test_a_marked_heavy_still_opens_the_state_directory_for_a_quick_run(self):   # the quick/changed-slot exception of cmd_heavy: without it the quick run would be refused for "no state directory"
+        self.state()
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy", "--quick", "--", "true", "-k", "x"], env=self.env(FLEET_HEAVY_SLOT="none"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("no state directory", err)
+
+    def test_a_marked_heavy_still_opens_the_state_directory_for_a_changed_slot_run(self):   # the other half of the cmd_heavy exception
+        self.state()
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy", "--changed-slot", "--", "true"], env=self.env(FLEET_HEAVY_SLOT="none"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("no state directory", err)
+
     def test_heavy_off_runs_the_command_directly_with_no_slot_and_no_line(self):
         out = self.home / "off-out"
         proc = self.start("sh", "-c", 'echo "$FLEET_HEAVY_SLOT" > "%s"' % out, env=self.env(FLEET_HEAVY="off"))

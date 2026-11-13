@@ -40,6 +40,7 @@ EXIT_USAGE = 64
 EXIT_NOT_FOUND = 127
 INFO_MAX = 4096         # bytes of a slot file read
 SLOT_ENV = "FLEET_HEAVY_SLOT"   # set in the command's environment: a command already in a slot does not take a second one
+NOSLOT_VALUE = "none"        # SLOT_ENV when the wrapper ran its command without a slot: a nested heavy still takes none
 OFF_ENV = "FLEET_HEAVY"         # "off": bypass (CI never uses slots)
 SLOTS_MAX = 64
 MEM_ENV = "FLEET_HEAVY_MEM_MB"           # memory ceiling of the command's whole process tree, in MB; 0 = off
@@ -984,6 +985,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             _record(fd, name, os.getpid(), command[0], clock(), extra)   # at once, so a killed holder's old record is never shown for this one
             os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
             env[SLOT_ENV] = str(index)    # and a heavy inside it knows it is in a slot: it takes no second one (nested heavy never deadlocks)
+        elif unslotted in ("unusable", "no slot directory"):   # no slot could be had: the command still runs inside THIS wrapper, and a heavy it starts (bin/test-switchboard re-wraps itself) runs directly: without the marker each level wrapped the next, forever (#2387)
+            env[SLOT_ENV] = NOSLOT_VALUE
         argv = (command_prefix(which) if unslotted not in ("", "inside") else []) + list(command)   # off or nested: the command as it is
         progress_every = _progress_interval(environ, out)   # before the child starts
         try:
