@@ -8,6 +8,7 @@ old watcher must fail the harness. No thread is started here (every test thread 
 import importlib.machinery
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,10 +41,9 @@ EXTRACT = r'''awk '/^cleanup\(\) /{print} /^run_to\(\) \{/{p=1} p{print} p&&/^}/
 
 HARNESS = EXTRACT + r'''
 n="$2"; stop="$3"
-# n=0 with stop=1: no count of starts is assumed; run until the first early removal is seen (the event).
 . "$HDIR/fn.sh"
 bad=0; i=0
-while [ "$n" -eq 0 ] || [ "$i" -lt "$n" ]; do
+while [ "$i" -lt "$n" ]; do
   TMPDIR_FD=$(mktemp -d "$HDIR/d.XXXXXX"); OUT="$TMPDIR_FD/out"
   trap cleanup EXIT INT TERM
   run_to "$CAP" true
@@ -85,9 +85,8 @@ def run_scratch(shell, script, doctor_text, *args):
 
 
 def early_removals(doctor_text, n, stop=0):
-    """Count early removals over n starts; n=0 with stop=1 waits for the first one (the event), however many
-    starts that takes: the chance of the race window depends on how the scheduler places the new process."""
-    assert n > 0 or stop == 1, "an unbounded run needs stop=1"
+    """Count early removals over n starts (a bounded count; used for the fixed watcher, where 0 is expected)."""
+    assert n > 0
     return int(run_scratch(["bash"], HARNESS, doctor_text, n, stop)[-2])
 
 
@@ -95,6 +94,32 @@ def check_harness(doctor_text, n):
     bad = early_removals(doctor_text, n, stop=1)
     if bad:
         raise AssertionError("the doctor removed its own temporary directory: %d early removal(s)" % bad)
+
+
+MECHANISM = EXTRACT + r'''
+. "$HDIR/fn.sh"; TMPDIR_FD=$(mktemp -d "$HDIR/d.XXXXXX")
+trap cleanup TERM
+# a process that still holds the doctor's trap (a fork before the trap reset) when the TERM arrives:
+kill -TERM $$
+[ -d "$TMPDIR_FD" ] && echo kept || echo removed
+'''
+
+
+def run_to_body(doctor_text):
+    m = re.search(r"^run_to\(\) \{\n.*?^}\n", doctor_text, re.S | re.M)
+    assert m, "run_to not found"
+    return m.group(0)
+
+
+def check_by_construction(doctor_text):
+    """Deterministic: the defect exists iff run_to starts a forked watcher subshell and then SIGNALS it (the signal
+    can reach the fork while it still holds the inherited cleanup trap), and nothing in run_to resets the traps."""
+    body = run_to_body(doctor_text)
+    if not (re.search(r"^\s*\(.*\) >/dev/null 2>&1 &\n\s*watchpid=\$!", body, re.M)
+            and re.search(r'kill(?! -9| -0)\s+"\$watchpid"', body) and "trap" not in body):
+        return
+    raise AssertionError("the doctor removed its own temporary directory: its watcher is signalled while it holds "
+                         "the inherited cleanup trap")
 
 
 def load_liveness():
@@ -114,7 +139,11 @@ class TestWatcher(unittest.TestCase):
                          "on macOS the old watcher showed 0 early removals in 20000 starts (run 41585441923), so this half is measured on Linux only")
     def test_s1_old_watcher_shows_the_cause(self):
         old = mutate(self.text, NEW, OLD)
-        self.assertGreaterEqual(early_removals(old, 0, stop=1), 1, "the cause is not established")
+        with self.assertRaises(AssertionError):
+            check_by_construction(old)
+        check_by_construction(self.text)                      # the fixed watcher is never signalled
+        # the consequence, deterministically: a holder of the inherited trap that receives TERM removes the directory
+        self.assertEqual(run_scratch(["bash"], MECHANISM, self.text)[0], "removed")
 
     def test_s2_no_early_removal(self):
         self.assertEqual(early_removals(self.text, RUNS), 0)
@@ -139,7 +168,7 @@ class TestWatcher(unittest.TestCase):
         check_harness(self.text, RUNS)                       # the control first: passes
         old = mutate(self.text, NEW, OLD)
         with self.assertRaises(AssertionError) as cm:
-            check_harness(old, 0)
+            check_by_construction(old)
         self.assertIn("the doctor removed its own temporary directory:", str(cm.exception))
 
     def test_noop_mutation_fails_the_computation(self):
