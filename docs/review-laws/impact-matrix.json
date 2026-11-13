@@ -377,7 +377,8 @@
         "bin/switchboard/heavy_budget.py",
         "bin/switchboard/config_reload.py",
         "bin/switchboard/labels_ensure.py",
-        "bin/switchboard/land.py"
+        "bin/switchboard/land.py",
+        "bin/switchboard/land_gate.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -817,6 +818,9 @@
         ],
         "bin/switchboard/land.py": [
           "validate_land_repos"
+        ],
+        "bin/switchboard/land_gate.py": [
+          "validate_land_gate"
         ]
       },
       "registrar_allow": {
