@@ -97,13 +97,13 @@ note() {   # $1 kind, $2 ref, $3 sha
 GATE_AUDIT=${CW_LAND_GATE_AUDIT:-/work/.land-gate-audit.log}
 
 url_repo() {   # owner/repo of the remote URL, or nothing
-  u=${url%.git}
+  u=${url%/}; u=${u%.git}; u=${u%/}
   case "$u" in
     https://*|http://*|ssh://*|git://*) u=${u#*://}; u=${u#*@}; u=${u#*/} ;;
     *:*) u=${u#*:} ;;
     *) return 0 ;;
   esac
-  case "$u" in */*/*|""|*/|/*) return 0 ;; */*) printf '%s\n' "$u" ;; esac
+  case "$u" in */*/*|""|*/|/*|-*) return 0 ;; */*) printf '%s\n' "$u" ;; esac
 }
 
 gate_unchecked() {   # $1 repo, $2 ref
@@ -120,11 +120,13 @@ gate_unchecked() {   # $1 repo, $2 ref
 
 land_gate() {   # $1 remote ref: refuse (exit 3) when the pod does not hold the token
   gr=$(url_repo)
-  [ -n "$gr" ] || return 0
+  [ -n "$gr" ] || { gate_unchecked "-" "$1"; return 0; }   # no owner/repo to ask about: the gate was not checked (one audit line; refused under enforce)
   gname=${FLEET_AGENT_NAME:-}
   case "$gname" in ""|*[!A-Za-z0-9._-]*) gate_unchecked "$gr" "$1"; return 0 ;; esac
   gcmd=${CW_LAND_GATE_CMD:-fleet-switchboard land-gate check}
+  set -f
   gout=$(timeout 20 $gcmd "$gr" --name "$gname" 2>/dev/null </dev/null); gs=$?
+  set +f
   case $gs in
     0) return 0 ;;
     3) printf '%s\n' "$(printf '%s' "$gout" | head -n 1 | tr -c '[:print:]' '?')" >&2; exit 3 ;;

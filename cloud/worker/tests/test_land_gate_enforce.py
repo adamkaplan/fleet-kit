@@ -111,6 +111,21 @@ class TestHook(Gate):
         self.assertEqual((r.returncode, r.stderr), (0, ""))
         self.assertEqual(len(self.asked()), 1)   # only the default branch was asked about
 
+    def test_a_url_with_a_trailing_slash_or_dot_git_slash_is_still_asked(self):
+        self.fake(3, REFUSAL)
+        for url in (URL + "/", URL[:-4] + "/", URL[:-4], "git@example.invalid:acme-org/widget-service.git"):
+            self.assertEqual(self.hook(url).returncode, 3, url)
+
+    def test_s6_a_url_that_names_no_owner_and_repository_is_unchecked_audited_and_refused_under_the_word(self):
+        self.fake(3, REFUSAL)
+        url = "https://user:secret-value@example.invalid/a/b/c.git"
+        r = self.hook(url)
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(len(self.audit_lines()), 1)
+        self.assertNotIn("secret", open(self.audit).read())
+        self.assertEqual(self.asked(), [])
+        self.assertEqual(self.hook(url, env={"CW_LAND_GATE": "enforce"}).returncode, 3)
+
     def test_the_existing_land_record_rule_still_comes_first(self):
         self.fake(0, "ok")
         line = "refs/heads/x %s refs/heads/main %s\n" % (self.base, self.base)   # no Land trailers
@@ -163,9 +178,21 @@ class TestWrapper(Gate):
         self.assertEqual(r.returncode, 3)
         self.assertIn("could not be checked", r.stderr)
 
-    def test_s6_a_command_that_is_not_a_land_and_a_dry_run_are_not_asked(self):
+    def test_a_stray_flag_does_not_switch_the_gate_off_and_an_unknown_repository_is_unchecked(self):
         self.fake(3, REFUSAL)
-        for cmd in (["echo", "hello"], ["sh", "-c", "echo spirit lander"], [".spire/tool/bin/spire", "land", "--dry-run"]):
+        for cmd in (["sh", "-c", "spire land", "--dry-run"], ["sh", "-c", "spire land --note --dry-run"], ["sh", "-c", "{ spire land; }"]):
+            r = self.cw("start", "--name", "x", "--", *cmd)
+            self.assertEqual(r.returncode, 3, (cmd, r.stderr))
+        self.git("remote", "set-url", "origin", "https://example.invalid/a/b/c/d")
+        r = self.cw("start", "--name", "y", "--", "sh", "-c", "spire land")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.audit_lines()), 1)
+        r = self.cw("start", "--name", "z", "--", "sh", "-c", "spire land", env={"CW_LAND_GATE": "enforce"})
+        self.assertEqual(r.returncode, 3)
+
+    def test_s6_a_command_that_is_not_a_land_is_not_asked(self):
+        self.fake(3, REFUSAL)
+        for cmd in (["echo", "hello"], ["sh", "-c", "echo spirit lander"]):
             r = self.cw("start", "--name", "other", "--", *cmd)
             self.assertEqual(r.returncode, 0, (cmd, r.stderr))
             self.cw("wait", "other", "5")
