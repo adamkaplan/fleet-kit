@@ -922,6 +922,7 @@ def build_late():
             argv = ["launch", "newcoder", "--agent", "coder", "--dir", str(self.work), "--role", "coder", "--reports-to", "own",
                     "--issue", "7", "--brief-file", "-", "--terminal"]
             daemons = []
+            module.memory_sleep = lambda seconds: None   # the copy's own 30 s memory wait is the one a test replaces (as the host's tests do for the real module): nothing waits
 
             def spawn(*args, **kwargs):   # the launch starts the copy's daemon for real (a detached `<copy>/bin/fleet-switchboard run`, which writes into the copy): keep the handle to end it
                 daemons.append(sp.Popen(*args, **kwargs))
