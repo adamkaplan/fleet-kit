@@ -129,6 +129,15 @@ class Capacity(unittest.TestCase):
 class NoAzureCreate(unittest.TestCase):
     PATTERN = re.compile(r"\baz\s+(aks|group|vm|network|acr)\b[^\n]*\b(create|nodepool|scale)\b|\bnodepool\s+(add|scale|update)\b|\bscale\b[^\n]*--node-count", re.I)
 
+    # The ONE exemption: the three administrator commands of the HELD startup-taint README section (ask #2489) are
+    # `az aks nodepool update --node-taints` (the pool's taint setting), plus the read-only `nodepool show` that records the
+    # taints first. None of the three creates a pool or scales it.
+    EXEMPT = (
+        'az aks nodepool show -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --query nodeTaints -o tsv | tee /tmp/workers-taints-before.txt',
+        "az aks nodepool update -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --node-taints 'startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule'",
+        'az aks nodepool update -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --node-taints "$(cat /tmp/workers-taints-before.txt)"   # empty: --node-taints ""',
+    )
+
     def added(self):
         for ref in ("origin/integration", "integration"):
             out = subprocess.run(["git", "diff", "-U0", ref + "...HEAD", "--", ".", ":!cloud/launcher/tests/test_land_shape.py"], cwd=ROOT, capture_output=True, text=True)
@@ -137,7 +146,11 @@ class NoAzureCreate(unittest.TestCase):
         self.fail("no base ref to diff against (origin/integration or integration): the scan cannot run")
 
     def test_s7_the_diff_has_no_azure_create_nodepool_or_scale_command(self):
-        self.assertEqual([l for l in self.added() if self.PATTERN.search(l)], [])
+        self.assertEqual([l for l in self.added() if self.PATTERN.search(l) and l.strip() not in self.EXEMPT], [])
+
+    def test_s7_the_exemption_is_exact(self):
+        self.assertTrue(self.PATTERN.search(self.EXEMPT[1]))
+        self.assertFalse(any(l.strip() in self.EXEMPT for l in ("az aks nodepool add -n x", "az aks nodepool update -n other")))
 
     def test_s7_the_scan_finds_a_planted_command(self):
         for line in ("az aks nodepool add --name land", "az aks scale --node-count 3", "az group create -n x"):
