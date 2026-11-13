@@ -103,6 +103,15 @@ class TestOrder(GateBase):
         self.assertIn("land-gate", sb.build_parser().commands)   # the code before the change has no such command: nothing in it could serialise two landings
         self.assertEqual(self.gate("take", REPO, who="lane-a")[0], 0)
 
+    def test_s8_with_no_queue_the_second_taker_is_refused_queued_and_the_holder_named(self):
+        # Only the half that fails on the old code (where a second taker simply held) is kept; a hand-written double of the old behaviour would assert itself.
+        self.assertEqual(self.gate("take", REPO, who="lane-a")[0], 0)
+        self.t += 5
+        code, out, _ = self.gate("take", REPO, who="lane-b")
+        self.assertEqual(code, 1)   # the new code: the second is refused, queued, the holder named
+        self.assertIn("QUEUED %s at place 1 behind lane-a" % REPO, out)
+        self.assertEqual((self.holder(), self.queue()), ("lane-a", ["lane-b"]))
+
     def test_asking_again_only_shows_the_waiter_is_alive_and_keeps_its_place(self):
         self.gate("take", REPO, who="lane-a")
         self.t += 1
@@ -317,3 +326,50 @@ class TestCheckRule(GateBase):
         self.assertEqual(sb.lg_check(data, REPO, "lane-a", 150, 600, lambda name: True)[0], True)
         self.assertEqual(sb.lg_check(data, REPO, "lane-a", 800, 600, lambda name: True)[0], False)   # past its limit
         self.assertEqual(json.dumps(data, sort_keys=True), before)
+
+
+class TestCheckCommand(GateBase):
+    """`land-gate check` (second slice): the one question the land wrapper and the pod's pre-push hook ask. Exit 0 allowed, 3 refused with the words; it reads and writes nothing."""
+
+    def check(self, repo, name):
+        return self.gate("check", repo, "--name", name)
+
+    def test_s5_the_holder_is_allowed_and_another_name_is_refused_naming_the_holder_and_the_queue(self):
+        self.gate("take", REPO, who="lane-a")
+        self.gate("take", REPO, who="lane-b")
+        self.assertEqual(self.check(REPO, "lane-a")[0], 0)
+        code, out, _ = self.check(REPO, "lane-b")
+        self.assertEqual(code, 3)
+        self.assertIn("lane-b does not hold the land token of %s" % REPO, out)
+        self.assertIn("held by lane-a", out)
+        self.assertIn("queue length 1", out)
+        code, out, _ = self.check(REPO, "lane-z")   # nobody asked at all
+        self.assertEqual(code, 3)
+
+    def test_s5_a_holder_past_the_limit_is_refused_and_a_free_gate_refuses_everyone(self):
+        self.gate("take", REPO, who="lane-a")
+        self.t += 601
+        self.assertEqual(self.check(REPO, "lane-a")[0], 3)
+        self.assertEqual(self.holder(), "lane-a", "a check changes nothing")
+        self.assertIn("nobody holds it", self.check(REPO, "lane-b")[1])   # the dead holder is gone at once and nobody is next
+
+    def test_s6_a_repository_off_the_land_list_is_untouched(self):
+        code, out, _ = self.check(OTHER, "lane-a")
+        self.assertEqual(code, 0)
+        self.assertIn("not on the land list", out)
+        self.assertEqual(self.state(), {})
+
+    def test_the_name_is_a_fleet_name(self):
+        self.assertEqual(self.check(REPO, "a b;c")[0], 2)
+
+    def test_the_check_sees_a_gone_holder_and_a_free_gate_leaves_no_state(self):
+        self.gate("take", REPO, who="lane-a")
+        self.gone.add("lane-a")
+        code, out, _ = self.check(REPO, "lane-a")
+        self.assertEqual(code, 3)
+        self.assertIn("nobody holds it", out)
+        self.assertIn("queue length 0", out)
+        self.assertEqual(self.holder(), "lane-a", "the check wrote nothing")
+        (self.state_dir / sb.LAND_GATE_FILE).unlink()
+        self.assertEqual(self.check(REPO, "lane-a")[0], 3)
+        self.assertFalse((self.state_dir / sb.LAND_GATE_FILE).exists())

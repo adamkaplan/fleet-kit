@@ -6,15 +6,15 @@ description: Write the why-block of a pull request description. Use when you ope
 # The PR explainer
 
 The explainer is **not a reviewer**: it explains, once, for a reader who has not read the diff. It is **read-only** (it never writes a
-file or a comment), has a **50-turn limit**, and the author pastes its output into the PR.
+file or a comment), has a **50-turn limit**; the author pastes its output into the PR.
 
 ## What goes in the description
 
 One block, between `<!-- pr-explainer:begin -->` and `<!-- pr-explainer:end -->`, right after the lines the body opens with
-(`PLAN:`, `MERGE:`, `canon:`), so a gate that reads the first line sees it:
+(`PLAN:`, `MERGE:`, `canon:`):
 
-1. **Every PR: the why-block**, a short ```text block with exactly two lines: `before: ...` the behaviour as it was, `after: ...` the
-   behaviour now. Behaviour, not code: what a person or a caller sees.
+1. **Every PR: the why-block**, a ```text block with exactly two lines: `before: ...` the behaviour as it was, `after: ...` the
+   behaviour now. Behaviour, not code.
 
 ## Held pull requests
 
@@ -23,15 +23,15 @@ A PR held for the owner opens, after the opening lines and in this order, with:
 1. `## Why this needs you`: one to three sentences naming the reason.
 2. `## What changes for you`: a `Before | After` table of 2 to 4 rows, each cell what a person sees or does.
 3. `## Example`: one concrete case.
-4. Optional: a real screenshot, before and after. Never a box-and-arrow diagram.
+4. Optional: a real screenshot, before and after.
 5. `## Questions for you`: a numbered list, each ending `Recommendation: ...`; or the one line `Questions: none (reason)`.
 
-Any diagram in the top fails; the summary flowchart fails anywhere in a held body. `pr-explain --check` and gate `G6b` name each missing part and the question that lacks its recommendation.
+Any diagram in the top fails; the summary flowchart fails anywhere in a held body. `pr-explain --check` and gate `G6b` name each missing part.
 
 ## The command
 
 `fleet-switchboard pr-explain <owner/repo#N> --before "..." --after "..."` reads the PR once and prints the block.
-`--body-file F` (or `-` for the PR's own body) prints the whole new body with the block in **once**: a block already there is replaced.
+`--body-file F` prints the whole new body with the block in **once**: a block already there is replaced.
 `--check` judges a description: exactly one block, a real before and after (no `<placeholder>`), no summary flowchart.
 
 ## Diagrams
@@ -44,4 +44,4 @@ No advice, no review findings, no "consider", no restating the PR's text, no sec
 
 ## acme-org repositories (spire land)
 
-When your setup text says "This repository lands with `spire land`" there is no pull request and no explainer block: commit, run it DETACHED: `nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1; r=$?; { echo; echo "exit $r"; } >> /work/land.log' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log's last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so; to rebut a council finding, pass `--rebut 'ROLE=Pn: why'` (Pn = the principle number); list every rebuttal (finding, principle, accepted or not) in your final report; the same finding rejected twice: stop and report it to the orchestrator. Without that line, this skill stands.
+When your setup text says "This repository lands with `spire land`" there is no pull request and no explainer block: commit, take the land token (`fleet-switchboard land-gate take <owner/repo>` until HELD, `touch` it every 5 minutes, `release` it after: a push without it is refused), run it DETACHED: `nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1; r=$?; { echo; echo "exit $r"; } >> /work/land.log' > /dev/null 2>&1 &`, then poll with short calls (`sleep 120; tail -n 20 /work/land.log`, each under 5 minutes) and report `fleet-switchboard report working "land step <where it is>"` about every 10 minutes; never one foreground `spire land` call (it is moved to a background shell and your turn ends unwoken). The run is over when the log's last line is `exit <code>`: report `landed <sha>` or the exit code and what stopped it; exit 22 = held for a person: stop and say so; to rebut a council finding, pass `--rebut 'ROLE=Pn: why'` (Pn = the principle number); list every rebuttal (finding, principle, accepted or not) in your final report; the same finding rejected twice: stop and report it to the orchestrator. Without that line, this skill stands.
