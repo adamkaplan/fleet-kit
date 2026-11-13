@@ -3766,7 +3766,7 @@ class Launcher:
             info["cost"] = self.cost(pod if pod else {"metadata": {"annotations": ((workload.get("spec") or {}).get("template") or {}).get("metadata", {}).get("annotations") or {}}})
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
                 where = self.recorder.record(worker, target, reason or "stop", repo=_pod_repo(pod) if pod else "", started=ann(pod, "started") or "" if pod else "",
-                                             root=getattr(a, "record_dir", None), **({"persistent": True} if persistent else {}))
+                                             root=getattr(a, "record_dir", None), boss=_stall("boss_of", self, worker), **({"persistent": True} if persistent else {}))
                 if where:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
@@ -5261,7 +5261,7 @@ SETTINGS = (
     ("CW_COUNCIL_URL", False, "name"),             # the address of the Copilot bridge front (cloud/k8s/copilot-bridge.yaml) a worker pod is told as COUNCIL_MODEL_URL; an address, never a key
     ("CW_LONG_RUN_DENY", False, "name"),           # 1 to 8 comma-separated shell patterns (letters, digits . - / _ * ?, each at most 80 characters): a worker pod refuses a foreground shell command matching one and lets it run through cw-run; operator settings only
 )
-SETTINGS = SETTINGS + tuple((n, False, k) for n, k in (("CW_LAND_REPORT_ISSUE", "name"), ("CW_LAND_REPORT_SMALL_LINES", "number"), ("CW_LAND_REPORT_GIT_DIR", "path"), ("CW_LAND_REPORT_BRANCH", "name")))   # ask #2448: see cloud/README.md
+SETTINGS = SETTINGS + tuple((n, False, k) for n, k in (("CW_LAND_REPORT_ISSUE", "name"), ("CW_LAND_REPORT_SMALL_LINES", "number"), ("CW_LAND_REPORT_GIT_DIR", "path"), ("CW_LAND_REPORT_BRANCH", "name"), ("CW_LAND_REPORT_FIRST_REPO", "name"), ("CW_LAND_REPORT_OWN_AUTHORS", "name")))   # ask #2448: see cloud/README.md
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
 # The secret shapes a value is refused for: (shape name, pattern, kinds it applies to; None = every kind). One row per shape.
@@ -5437,7 +5437,7 @@ VALIDATORS = {
     "CW_COUNCIL_URL": ("an http or https URL: a host, an optional port, an optional /v1, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/v1)?", v))),
     "CW_LONG_RUN_DENY": ("1 to 8 comma-separated patterns of letters, digits, dot, dash, slash, underscore, * and ?, each at most 80 characters", lambda v: 1 <= len(v.split(",")) <= 8 and all(re.fullmatch(r"[A-Za-z0-9./_*?][A-Za-z0-9./_*?-]{0,79}", x) for x in v.split(","))),
 }
-VALIDATORS.update({"CW_LAND_REPORT_ISSUE": ("an issue as owner/repo#N", lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}#[1-9][0-9]{0,8}", v))), "CW_LAND_REPORT_SMALL_LINES": ("a whole number from 1 to 999999", lambda v: bool(re.fullmatch(r"[1-9][0-9]{0,5}", v))), "CW_LAND_REPORT_GIT_DIR": ("an absolute path with no .. segment", _path_ok), "CW_LAND_REPORT_BRANCH": ("a branch name of letters, digits, dot, dash, slash and underscore, not starting with a dash", lambda v: bool(re.fullmatch(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,99}", v)))})   # ask #2448
+VALIDATORS.update({"CW_LAND_REPORT_ISSUE": ("an issue as owner/repo#N", lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}#[1-9][0-9]{0,8}", v))), "CW_LAND_REPORT_SMALL_LINES": ("a whole number from 1 to 999999", lambda v: bool(re.fullmatch(r"[1-9][0-9]{0,5}", v))), "CW_LAND_REPORT_GIT_DIR": ("an absolute path with no .. segment", _path_ok), "CW_LAND_REPORT_OWN_AUTHORS": ("a comma list of author names (letters, digits, space, dot, dash, underscore, brackets)", lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\[\] -]{0,99}(,[A-Za-z0-9][A-Za-z0-9._\[\] -]{0,99}){0,19}", v))), "CW_LAND_REPORT_FIRST_REPO": ("a repository as owner/repo", lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}", v))), "CW_LAND_REPORT_BRANCH": ("a branch name of letters, digits, dot, dash, slash and underscore, not starting with a dash", lambda v: bool(re.fullmatch(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,99}", v)))})   # ask #2448
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
 
