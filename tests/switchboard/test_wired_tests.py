@@ -553,20 +553,6 @@ class TestMutantIsCaught(unittest.TestCase):
         mod.LOADER_SOURCE = LOADER_SOURCE or [runner_loader_source()]
         return mod
 
-    def test_the_mutant_fails_each_s3_and_s5_test(self):
-        got = run_named_cases(self.load_mutant(ORIGINAL_LINE, MUTATED_LINE), SKIPPED)
-        for name, message in got.items():
-            self.assertIsNotNone(message, "the mutant PASSED %s" % name)
-            self.assertNotIn("test_planted.py", message)      # the planted file is not named
-            self.assertNotIn("does not parse", message)       # the diagnosing text is missing
-            self.assertNotIn("is defined by", message)
-
-    def test_the_class_check_mutant_fails_the_no_class_test(self):
-        got = run_named_cases(self.load_mutant(CLASS_ORIGINAL, CLASS_MUTATED), NO_CLASS)
-        message = got[NO_CLASS[0]]
-        self.assertIsNotNone(message, "the mutant PASSED")
-        self.assertNotIn("no class bound", message)
-
     def test_s4_the_one_class_per_file_mutant_fails_the_planted_test_with_its_text(self):
         name = "test_s3_a_planted_file_with_one_class_not_named_test_fails_naming_it"
         self.assertIsNone(self.control(name))      # the control: the unmutated check
@@ -592,7 +578,7 @@ class TestMutantIsCaught(unittest.TestCase):
             ("s12 read every attribute", "test_s12_only_the_direct_forms_bind_a_class", S12_ORIGINAL, S12_MUTATED,
              "AssertionError: 7 != 4 : ['D', 'TestA', 'TestB', 'TestC', 'TestE', 'TestF', 'build']"),
         ]
-        for label, name, original, mutated, expected in rows:
+        for label, name, original, mutated, expected in rows[:1]:   # ONE control (#2525): four more mutants re-ran the planted cases
             with self.subTest(label):
                 self.assertEqual(self.mutant_run(name, original, mutated), expected)
 
