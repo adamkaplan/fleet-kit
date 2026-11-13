@@ -33,7 +33,7 @@ def interpreters(executable=None, fixed=FIXED_INTERPRETERS, base_prefix=None):
     (`/usr/local/bin/python3`) runs that app binary, whose real path differs from the link's. NEVER the PATH of the process asking: the process being checked chooses its own PATH,
     so a copy of a shell named python placed first in it would be trusted. A copy or a link to a shell is none of these."""
     own = sys.executable if executable is None else executable
-    prefix = sys.base_prefix if base_prefix is None else base_prefix
+    prefix = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable))) if base_prefix is None else base_prefix   # <prefix>/bin/pythonX.Y of a framework build
     app = os.path.join(prefix, "Resources", "Python.app", "Contents", "MacOS", "Python") if prefix else None
     return {os.path.realpath(p) for p in (own,) + tuple(fixed) + (app,) if p and os.path.exists(p)}
 
