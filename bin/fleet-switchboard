@@ -21560,7 +21560,7 @@ def cmd_heavy(args, runner=subprocess.run, now=time.time):
         sys.stderr.write("%s: heavy: %s\n" % (PROG, err))
         return EXIT_USAGE
     try:
-        state = ensure_state_dir()
+        state = None if module.should_take_slot(os.environ) == "inside" and not (getattr(args, "changed_slot", False) or getattr(args, "quick", False)) else ensure_state_dir()   # already in a slot (or marked as run without one): no state directory is needed or tried again, run() says so and runs the command
     except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
