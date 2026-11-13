@@ -693,6 +693,9 @@ class TestGitShim(Base):
          "reads the entrypoint's text for the helper line (#2371): writes no git configuration"),
         ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.assertTrue(e[i[0] + 1].startswith("  git con' + "fig --" + _G + ' core.hooksPath /usr/local/lib/cw-hooks"))',
          "reads the entrypoint's text for the hooksPath line (#2371): writes no git configuration"),
+        # The vendored spire tool test, exactly this one added line of that one file: isolates a child process from the user's git config (points both variables at /dev/null).
+        (".spire/tool/spire.test.mjs", "  return { ...env, PATH: `${NODE_DIR}:${env.PATH ?? \"/usr/bin:/bin\"}`, GIT_CONFIG_" + _G.upper() + ': "/dev/null", GIT_CONFIG_' + _S.upper() + ': "/dev/null", GIT_TERMINAL_PROMPT: "0" };',
+         "vendored as-is: isolates the child process from the user's git config"),
     )
 
     @classmethod
@@ -720,6 +723,19 @@ class TestGitShim(Base):
         self.assertEqual(self.unallowed_config_write_hits(self.diff_adding(f, text)), [])
         self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding("tests/switchboard/test_other.py", text))), 1)
         self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding(f, text + " "))), 1)
+
+    def test_s7_u1_the_vendored_spire_test_row_exempts_only_its_one_line_of_its_one_file(self):
+        f, text, _ = [r for r in self.CONFIG_WRITE_ALLOWED if r[0] == ".spire/tool/spire.test.mjs"][0]
+        self.assertEqual(self.unallowed_config_write_hits(self.diff_adding(f, text)), [])
+        override = "GIT_CONFIG_" + self._G.upper() + ' = "/dev/null"'
+        for name, path, line in (
+            ("a real global write elsewhere", "tools/x.sh", "git con" + "fig --" + self._G + " user.name x"),
+            ("the same variables in another file", ".spire/tool/other.mjs", text),
+            ("a real global write in the exempt file", f, "git con" + "fig --" + self._G + " user.name x"),
+            ("another override line in the exempt file", f, override),
+        ):
+            with self.subTest(name):
+                self.assertGreaterEqual(len(self.unallowed_config_write_hits(self.diff_adding(path, line))), 1)
 
     def test_s7_u1_the_hooks_path_row_allows_only_its_one_line_of_the_entrypoint(self):
         f, text = "cloud/worker/entrypoint.sh", "  git con" + "fig --" + self._G + " core.hooksPath /usr/local/lib/cw-hooks   # the pre-push hook of the image (a convenience, not the guard)"

@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# box: the project's environment, in a box that destroys itself. THE DEFAULT IS A CHECKOUT AND NOTHING ELSE: with no .spire/box.json (or an empty one) `up` starts nothing, installs nothing and
+# assumes no language and no stack. Everything more is DECLARED by the project in its own .spire/box.json (docs/BOX.md of spire-land is its schema): the box runs what is declared, and nothing more.
+#
+#   box up [--ttl-min N]       run the declared setup steps, start the declared services (once, in order), seed, wait until each answers; prints the box's env file
+#   box run [-- CMD...]        up, run CMD with the box's env (BOX_URL, the wrap's exports, ...), down on EVERY exit path; exit status = CMD's
+#   box land [land args]       box run -- .spire/tool/land: the steps that name an environment run against the box's own server (the recipe's `attach`), `box capture` takes its pictures from this box's app
+#   box land --box ID [land args]            the same inside a box that is ALREADY up (and BOX_ID alone does it): starts and destroys nothing, so a failing run leaves the instance usable
+#   box land --url URL ...                   the same inside an instance that is not this box's: its app is URL, the server the recipe attaches to (wrap.instance) is LAND_INSTANCE_DB in the ENVIRONMENT (a secret: never argv)
+#   box capture [--scene S] [--out DIR] [--box ID]    the scene's pictures at the head of this tree; with no box up, a one-shot box (up, capture, down)
+#   box capture --url URL ...                        the same against an instance that is ALREADY running (not this box's): starts nothing, makes no state; its URL is BOX_URL, whatever else it needs is in the caller's environment
+#   box refresh [--box ID]     the tree changed (edit, rebase): rebuild what the config marks "refresh", restart the services on the same data
+#   box reset [--box ID]       the fast reset: each service's `reset` command, then the project's `reset` (the data back to the seed); nothing restarts
+#   box status | box down [ID] who is up / destroy one (default: the only one, or $BOX_ID)
+#
+# The MECHANISM is here and names no project. The PROJECT's `.spire/box.json` (BOX_CONFIG overrides; beside land's .spire/land.json) says how: the `environment` (plain variables), a `wrap` (a command the
+# supervisor runs inside, and the variables it provides), the setup steps (`when` is a test: run the step when it succeeds), the `services` (each: name, dir, prepare, start, env, port variable, ready
+# path or command, restarts, reset; started once, in order, each told the URL of those before it as BOX_URL_<NAME>; BOX_URL is the first with a port), the seed
+# command, the data `reset`, the capture command. Every command runs from the repo root in bash. A launcher that cannot start (command not found) fails at once, with that reason.
+#
+# DESTROYS WHAT IT CREATES, BY ITS OWN HANDLES. `up` starts one supervisor, detached (setsid), and records its HANDLE outside the state dir it can lose:
+# $BOX_HANDLES (default $BOX_HOME.handles)/<id> (the state dir's path) and <id>.lock, held by the supervisor for its life. The supervisor runs inside
+# the project's wrap (when it declares one) and each service as its own child. `down` signals nothing: from the handle it
+# (re)creates the state dir ($BOX_HOME/<id>, default /tmp/box-<uid>/<id>) and writes the stop file; the supervisor stops its services and its wrap, removes
+# the state dir and its handle, and exits. A supervisor whose state dir vanishes stops itself; a TTL (120 min) ends a forgotten one (`up`'s); the box of a one-shot `run`/`land` has no TTL: it lives while its caller does and stops when the caller is gone, however it went (a land runs for hours). A service runs under `env -i`
+# with an allowlist (the box's own variables, the project's `environment`, the wrap's `exports`, the service's own `env`): no other key of the caller reaches it. A failed start leaves its logs (printed, then removed by `up`); `status` names a supervisor that is gone.
+# Exit: 0 ok | 1 failed (what, and the log tail, are printed) | 2 usage or no such box.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd -P); spire=$(cd "$here/.." && pwd -P)   # the tool's folder and .spire/, resolved from where this file is (LAYOUT.md)
+# the project's pinned tool versions first (versions.mjs), for every command that runs the project's code (never `down` or `status`: a box must always be destroyable); a pin the host cannot honour stops here
+case ${1:-} in up | run | land | capture | refresh | reset) . "$here/versions.sh"; spire_versions "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1;; esac
+home=${BOX_HOME:-/tmp/box-$(id -u)}
+handles=${BOX_HANDLES:-$home.handles}   # each supervisor's handle (its state dir's path) and its lock: OUTSIDE the state dir, which it can lose
+say() { echo "box: $*" >&2; }
+die() { say "$*"; exit "${2:-1}"; }
+now() { date +%s%3N; }
+root() { git rev-parse --show-toplevel 2>/dev/null || die "not in a git worktree" 2; }
+
+# The config as shell assignments (one node call; values quoted), read from the manifest: box.json and land.json as ONE view.
+load_config() {
+  cfg=${BOX_CONFIG:-$spire/box.json}   # no file: an empty recipe, a checkout and nothing else
+  view=$(node "$here/manifest.mjs" "$cfg" "${LAND_CONFIG:-$spire/land.json}" 2>&1) || die "$view" 2
+  cfgsh=$(node -e '
+    const c = JSON.parse(process.argv[1]), q = (s) => "\x27" + String(s ?? "").replace(/\x27/g, "\x27\\\x27\x27") + "\x27";
+    const out = [], names = new Set();
+    // the wrap: a command the supervisor runs inside (it provides what the services need: a server, a device, a mount ...) and the variables it provides (`exports`). The recipe may be land\x27s own
+    // (`wrap.environment` names an entry of .spire/land.json: ONE definition of how a host gets the wrapped thing), else `ensure` and `run` here
+    let wr = c.wrap ?? {};
+    if (wr.environment) {
+      const l = c.environments?.[wr.environment];
+      if (!l) { console.error("wrap.environment " + wr.environment + " is not in environments (land.json)"); process.exit(1); }
+      const sub = (x) => x.replaceAll("{tool}", process.argv[3]).replaceAll("{root}", process.argv[2]), sh = (argv) => argv.map((x) => q(sub(x))).join(" ");
+      const wrap = l.wrap.filter((x, i) => !(i === l.wrap.length - 1 && x === "--"));
+      wr = { ...wr, ensure: l.bundle ? `${sh(l.bundle.have)} || ${l.bundle.ensure ? sh(l.bundle.ensure) : "false"}` : "",
+        run: wrap.map((x) => (x === "{bundle}" ? `"$(${sh(l.bundle.path)})"` : q(sub(x)))).join(" ") };
+    }
+    const ident = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    for (const n of [...(wr.exports ?? []), ...(wr.instance ? [wr.instance] : []), ...Object.keys(c.environment ?? {})]) if (!ident.test(n)) { console.error("a variable name is letters, digits and _ (got " + JSON.stringify(n) + ")"); process.exit(1); }
+    out.push(`WRAP_ENSURE=${q(wr.ensure)} WRAP_RUN=${q(wr.run)} WRAP_EXPORTS=${q([...new Set([...(wr.exports ?? []), ...(wr.instance ? [wr.instance] : [])])].join(" "))} WRAP_INSTANCE=${q(wr.instance)} SEED=${q(c.seed)} RESET_CMD=${q(c.reset)}`);
+    out.push(`ENVV=(${Object.entries(c.environment ?? {}).map(([k, v]) => q(k + "=" + v)).join(" ")})`);
+    // the services: the processes the box starts once, in order. A row is name, dir, prepare, start, portEnv, restarts, ready path, ready command, ready seconds, reset, env (K=V joined by RS)
+    const svcs = c.services ?? [];
+    for (const s of svcs) {
+      const key = String(s.name).toUpperCase().replace(/-/g, "_");   // the variable BOX_URL_<key>: two names must not make the same one (api-x, api_x)
+      if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(s.name ?? "") || names.has(key)) { console.error("services: name " + JSON.stringify(s.name) + " is not a unique name of letters, digits, _ and - (BOX_URL_" + key + ")"); process.exit(1); }
+      if (!s.start) { console.error("services: " + s.name + " has no start command"); process.exit(1); }
+      names.add(key);
+    }
+    out.push(`READY_SECONDS=${q(svcs.reduce((n, s) => n + (s.ready?.seconds ?? 60), 0))}`);
+    out.push(`SVC=(${svcs.map((s) => q([s.name, s.dir ?? ".", s.prepare ?? "", s.start, s.portEnv ?? "", s.restarts ?? 5, s.ready?.path ?? "", s.ready?.cmd ?? "", s.ready?.seconds ?? 60, s.reset ?? "", Object.entries(s.env ?? {}).map(([k, v]) => k + "=" + v).join("\x1e")].join("\x1f"))).join(" ")})`);
+    out.push(`CAP_SCENE=${q(c.capture?.scene)} CAP_RUN=${q(c.capture?.run)}`);
+    out.push(`STEPS=(${(c.setup ?? []).map((s) => q([s.name, s.refresh ? 1 : 0, s.when ?? "", s.run].join("\x1f"))).join(" ")})`);
+    console.log(out.join("\n"));' "$view" "$1" "$here") || die "cannot read $cfg"   # assigned first: `eval "$(...)"` returns 0 whatever the reader said
+  eval "$cfgsh"
+  for kv in "${ENVV[@]}"; do export "$kv"; done   # the project's plain variables: every command the box runs (setup, wrap, seed, capture) sees them
+}
+
+# Setup steps (foreground, before anything is created): `only_refresh=1` runs the refresh-marked ones.
+setup_steps() {
+  local row name ref when run t
+  for row in "${STEPS[@]}"; do
+    IFS=$'\x1f' read -r name ref when run <<<"$row"
+    [ "${only_refresh:-0}" = 0 ] || [ "$ref" = 1 ] || continue
+    [ -z "$when" ] || (cd "$1" && bash -c "$when") >/dev/null 2>&1 || continue
+    t=$(now); say "setup $name ..."; mkdir -p "$2"
+    (cd "$1" && bash -c "$run") >"$2/$name.log" 2>&1 || { rc=$?; tail -25 "$2/$name.log" >&2; rm -rf "$2"; die "setup step $name failed$(why_exit "$rc")"; }
+    say "setup $name $(( $(now) - t )) ms"
+  done
+}
+
+why_exit() { case $1 in 127) echo " (a command it runs was not found)";; 126) echo " (a command it runs cannot be executed)";; *) echo " (exit $1)";; esac; }   # the plain reason of an exit status
+free_port() { node -e 'const s=require("net").createServer().listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})'; }
+alive() { [ -e "$handles/$1.lock" ] && ! flock -n "$handles/$1.lock" true 2>/dev/null; }   # box ID: the supervisor holds its lock; a free (or no) lock means it is gone
+hdir() { sed -n 's/^dir=//p' "$handles/$1" 2>/dev/null; }                                    # box ID: its state dir, from its handle
+forget() { rm -f "$handles/$1" "$handles/$1.lock"; rmdir "$handles" 2>/dev/null; rmdir "$home" 2>/dev/null; return 0; }
+
+# ---- the supervisor (inside the wrap) ------------------------------------------------------------------------------------------
+inner() {
+  id=$1 top=$2 dir=$home/$1; local deadline  # globals: the EXIT trap reads them
+  load_config "$top"
+  # the wrap may have put its own libraries and binaries first: they are for the wrap's tools, not for the services
+  if [ -n "${BOX_HOST_LD:-}" ]; then export LD_LIBRARY_PATH=$BOX_HOST_LD; else unset LD_LIBRARY_PATH; fi
+  export PATH=$BOX_HOST_PATH
+  local shared=() xn
+  for xn in $WRAP_EXPORTS; do   # what the wrap provides goes to the services; with no wrap, the caller's own value of such a name (maybe a secret of another project) never does
+    if [ -z "$WRAP_RUN" ]; then unset "$xn"; elif [ -n "${!xn+x}" ]; then shared+=("$xn=${!xn}"); fi
+  done
+  shared+=("${ENVV[@]}")
+  unset BOX_URL BOX_PORT; export BOX_ID=$id BOX_DIR=$dir
+  mkdir -p "$dir/tmp"
+  # the services, in order. Per service: its pid, its port, the restarts it has used. Each is told the URL and port of those before it (BOX_URL_<NAME>, BOX_PORT_<NAME>); BOX_URL and BOX_PORT are the first one that has a port.
+  pid=() sport=() used=() peers=() npeers=(); n=${#SVC[@]}   # globals: the EXIT trap reads them
+  local i nm d pre st pe rs rp rc rsec rst ev
+  svc() { IFS=$'\x1f' read -r nm d pre st pe rs rp rc rsec rst ev <<<"${SVC[$1]}"; }
+  vname() { local u=${1^^}; echo "${u//-/_}"; }
+  start_svc() {
+    svc "$1"; local -a e=() kv=(); [ -z "$pe" ] || e+=("$pe=${sport[$1]}"); IFS=$'\x1e' read -ra kv <<<"$ev"
+    ( cd "$top/$d" && exec env -i PATH="$PATH" HOME="${HOME:-/tmp}" LANG=C.UTF-8 TMPDIR="$dir/tmp" BOX_BIND_HOST="${BOX_BIND_HOST:-127.0.0.1}" "${shared[@]}" "${e[@]}" "${kv[@]}" "${peers[@]:0:${npeers[$1]}}" bash -c "exec $st" ) >>"$dir/$nm.log" 2>&1 &
+    pid[$1]=$!
+  }
+  stop_svc() { local p=${pid[$1]:-}; [ -z "$p" ] || { kill "$p" 2>/dev/null; for _ in $(seq 1 40); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done; kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; pid[$1]=; }; }
+  stop_all() { local k; for ((k = n - 1; k >= 0; k--)); do stop_svc "$k"; done; }
+  wait_ready() { # a service answers: its path over HTTP, or its command succeeding; with neither, it is ready once it runs
+    svc "$1"; local k url=http://127.0.0.1:${sport[$1]}
+    for k in $(seq 1 $((rsec * 4))); do   # a launcher that did not run is told at once, by the first look: readiness is only waited for after one ran
+      kill -0 "${pid[$1]}" 2>/dev/null || { wait "${pid[$1]}" 2>/dev/null; echo "$nm exited before it was ready$(why_exit $?): $(grep -v '^\s*$' "$dir/$nm.log" 2>/dev/null | tail -n1)" >"$dir/failed"; return 1; }
+      if [ -n "$rp" ]; then curl -sf -o /dev/null "$url$rp" && return 0
+      elif [ -n "$rc" ]; then (cd "$top" && bash -c "$rc") >/dev/null 2>&1 && return 0
+      elif [ "$k" -ge 2 ]; then return 0; fi
+      sleep 0.25; done
+    echo "$nm was not ready within $rsec s" >"$dir/failed"; return 1; }
+  trap stop_all EXIT
+  local t pv=(); t=$(now)
+  for ((i = 0; i < n; i++)); do
+    svc "$i"; t=$(now); sport[$i]=; used[$i]=0; npeers[$i]=${#peers[@]}   # a service is told only of those before it, on a restart too
+    if [ -n "$pe" ]; then
+      sport[$i]=$(free_port); local v; v=$(vname "$nm"); export "BOX_URL_$v=http://127.0.0.1:${sport[$i]}" "BOX_PORT_$v=${sport[$i]}"; pv+=("BOX_URL_$v" "BOX_PORT_$v"); peers+=("BOX_URL_$v=http://127.0.0.1:${sport[$i]}" "BOX_PORT_$v=${sport[$i]}")
+      [ -n "${BOX_URL:-}" ] || export BOX_URL=http://127.0.0.1:${sport[$i]} BOX_PORT=${sport[$i]}
+    fi
+    [ -z "$pre" ] || (cd "$top/$d" && env -u LD_LIBRARY_PATH timeout "${BOX_STEP_SECONDS:-120}" bash -c "$pre") >"$dir/$nm-prepare.log" 2>&1 || { echo "the $nm prepare step failed$(why_exit $?)" >"$dir/failed"; return 1; }
+    start_svc "$i"; wait_ready "$i" || return 1
+    say "$nm ${sport[$i]:+answers at http://127.0.0.1:${sport[$i]} }($(( $(now) - t )) ms)"
+  done
+  if [ -n "$SEED" ]; then t=$(now); (cd "$top" && timeout "${BOX_STEP_SECONDS:-120}" bash -c "$SEED") >"$dir/seed.log" 2>&1 || { echo "the seed failed$(why_exit $?)" >"$dir/failed"; return 1; }; say "seeded ($(( $(now) - t )) ms)"; fi
+  # the env file is what a client of this box reads (the box's own commands too: a box bound to 0.0.0.0 answers on its advertised address from its own host as well): its addresses name BOX_ADVERTISE_HOST (default 127.0.0.1, this host's own), so a specialist
+  # attached over a docker network reaches the services by the instance's address; the services themselves still talk to each other on 127.0.0.1
+  local adv=${BOX_ADVERTISE_HOST:-127.0.0.1} val
+  local ev=(); for v in "${ENVV[@]}"; do ev+=("${v%%=*}"); done
+  { for v in BOX_ID BOX_DIR BOX_URL BOX_PORT PATH $WRAP_EXPORTS "${ev[@]}" "${pv[@]}"; do [ -n "${!v+x}" ] || continue; val=${!v}; val=${val//http:\/\/127.0.0.1:/http:\/\/$adv:}; val=${val//@127.0.0.1:/@$adv:}; printf 'export %s=%q\n' "$v" "$val"; done; } >"$dir/env"
+  alive_until() { if [ -n "${BOX_OWNER:-}" ]; then kill -0 "$BOX_OWNER" 2>/dev/null; else [ "$(date +%s)" -lt "$deadline" ]; fi; }
+  touch "$dir/ready"; deadline=$(( $(date +%s) + ${BOX_TTL_MIN:-120} * 60 ))
+  while [ ! -e "$dir/stop" ] && [ -d "$dir" ] && alive_until; do   # no state dir: nobody can ask it to stop any more, so it stops
+    if [ -e "$dir/restart" ]; then   # refresh: every service restarts, in order, on its own port and the same data
+      stop_all; for ((i = 0; i < n; i++)); do start_svc "$i"; wait_ready "$i" || return 1; done; rm -f "$dir/restart"
+    fi
+    for ((i = 0; i < n; i++)); do
+      if ! kill -0 "${pid[$i]}" 2>/dev/null; then   # like a container's restart policy: a service exits on purpose (the venue's demo reset) and comes back, a few times at most
+        svc "$i"; wait "${pid[$i]}" 2>/dev/null; used[$i]=$(( ${used[$i]} + 1 ))
+        [ "${used[$i]}" -le "$rs" ] || { echo "$nm exited ${used[$i]} times" >"$dir/failed"; return 1; }
+        echo "box: $nm exited; starting it again (${used[$i]} of $rs)" >>"$dir/$nm.log"; start_svc "$i"; wait_ready "$i" || return 1
+      fi
+    done
+    sleep 0.5
+  done
+  return 0
+}
+
+serve() { # serve ID TOP: detached; the one process that owns the box
+  local id=$1 top=$2 dir=$home/$1
+  exec 8>"$handles/$id.lock"; flock -n 8 || exit 1
+  load_config "$top"; export BOX_HOST_LD=${LD_LIBRARY_PATH:-} BOX_HOST_PATH=$PATH
+  # a project that declares no `wrap` has none (an empty one made `bash -c "-- ..."`, exit 127); `run` is a command prefix: the box adds `--` and its own supervisor after it
+  ( cd "$top" && exec bash -c "${WRAP_RUN:+$WRAP_RUN -- }\"$here/box\" _inner $id $top" ) >"$dir/serve.log" 2>&1 || { rc=$?; [ -e "$dir/failed" ] || echo "the supervisor crashed$(why_exit "$rc") (wrap.run: ${WRAP_RUN:-none}): $(grep -v '^\s*$' "$dir/serve.log" | tail -n1)" >"$dir/failed"; }   # a crash keeps its logs: serve.log has the words
+  [ -e "$dir/failed" ] || { rm -rf "$dir"; forget "$id"; }   # a failed box keeps its logs for whoever asked for it; they remove it
+}
+
+# ---- the commands ---------------------------------------------------------------------------------------------------------------------------
+boxes() { ls "$handles" 2>/dev/null | grep -v '\.lock$'; }
+pick() { # the box a command means: --box, $BOX_ID, or the only one
+  local id=${1:-${BOX_ID:-}}
+  if [ -z "$id" ]; then local all; all=$(boxes); [ "$(grep -c . <<<"$all")" = 1 ] && id=$all; fi
+  case $id in box-*) ;; *) id=;; esac
+  [ -n "$id" ] && [ -e "$handles/$id" ] || die "no box to use (box status; --box ID or BOX_ID)" 2
+  echo "$id"
+}
+cmd_up() {
+  local ttl= top id dir t0 i d; while [ $# -gt 0 ]; do case $1 in --ttl-min) ttl=${2:?}; shift;; *) die "usage: box up [--ttl-min N]" 2;; esac; shift; done
+  top=$(root); load_config "$top"; t0=$(now)
+  [ "${#SVC[@]}" -gt 0 ] || [ -n "$WRAP_RUN$WRAP_ENSURE$SEED" ] || [ "${#STEPS[@]}" -gt 0 ] || say "the project declares nothing (.spire/box.json): a checkout and nothing else"
+  case ${BOX_BIND_HOST:-127.0.0.1} in 127.0.0.1 | 0.0.0.0) ;; *) die "BOX_BIND_HOST is 127.0.0.1 (this host only: the default) or 0.0.0.0 (every address of this host: a box in a shared workroom instance); the services are probed and told of each other on 127.0.0.1, which only those two answer" 2;; esac
+  # 0.0.0.0 on a bare host is every network the host is on (a LAN peer reaches the app and its development sign-in): only in a container whose one network is the work item's own
+  [ "${BOX_BIND_HOST:-127.0.0.1}" != 0.0.0.0 ] || { [ -e "${BOX_DOCKERENV:-/.dockerenv}" ] && [ "$(echo ${BOX_ADDRS:-$(hostname -I 2>/dev/null)} | wc -w)" = 1 ]; } || die "BOX_BIND_HOST=0.0.0.0 is for a box inside a container with ONE address, on its own docker network (a shared workroom instance): anywhere else it would serve every network the host or the container is on" 2
+  [ "${BOX_ADVERTISE_HOST:-127.0.0.1}" = 127.0.0.1 ] || [ "${BOX_BIND_HOST:-127.0.0.1}" = 0.0.0.0 ] || die "BOX_ADVERTISE_HOST names an address clients are to use, and the services listen on it only when BOX_BIND_HOST is 0.0.0.0" 2
+  [ -z "$WRAP_ENSURE" ] || (cd "$top" && bash -c "$WRAP_ENSURE") >&2 || die "what the wrap needs is not available on this host (wrap.ensure failed$(why_exit $?)): a box never runs without it"
+  mkdir -p "$home"; chmod 700 "$home"
+  for d in "$home"/setup-*; do [ -d "$d" ] && ! kill -0 "${d##*setup-}" 2>/dev/null && rm -rf "$d"; done   # a killed `up`'s setup directory is named for its pid
+  trap 'rm -rf "$home/setup-$$"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  setup_steps "$top" "$home/setup-$$"; rm -rf "$home/setup-$$"; trap - EXIT INT TERM
+  id=box-$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n'); dir=$home/$id; mkdir -m 700 "$dir"; mkdir -p -m 700 "$handles"; printf 'dir=%s\n' "$dir" >"$handles/$id"
+  BOX_OWNER=${run_owner:-} BOX_TTL_MIN=${ttl:-${BOX_TTL_MIN:-120}} setsid nohup "$here/box" _serve "$id" "$top" >/dev/null 2>&1 </dev/null &
+  for i in $(seq 1 $(( (${READY_SECONDS:-60} + 120) * 4 ))); do
+    [ -e "$dir/ready" ] && { grep '^box: ' "$dir/serve.log" >&2; say "up $id in $(( $(now) - t0 )) ms"; echo "$dir/env"; return 0; }
+    if [ -e "$dir/failed" ] || { [ "$i" -gt 8 ] && ! alive "$id"; }; then
+      say "FAILED: $(cat "$dir/failed" 2>/dev/null || echo "the supervisor ended")"; tail -15 "$dir"/*.log >&2 2>/dev/null
+      for _ in $(seq 1 60); do alive "$id" || break; sleep 0.25; done; rm -rf "$dir"; forget "$id"; return 1; fi
+    sleep 0.25
+  done
+  say "FAILED: no answer in time"; tail -15 "$dir"/*.log >&2 2>/dev/null; cmd_down "$id"; return 1
+}
+cmd_down() {
+  local id dir t0 i; id=$(pick "${1:-}") || exit 2; dir=$(hdir "$id"); t0=$(now)
+  # the state dir may be gone (a supervisor stops itself then, but may not have seen it yet): the handle says where it watches, so ask again there
+  if alive "$id"; then mkdir -p "$dir" && touch "$dir/stop"; for i in $(seq 1 240); do alive "$id" || break; sleep 0.25; done; fi
+  alive "$id" && die "$id did not stop within 60 s (state: $dir)"
+  rm -rf "$dir"; forget "$id"; say "down $id in $(( $(now) - t0 )) ms"
+}
+keep_logs() { local d; [ -n "${LAND_STATE_DIR:-}" ] && d=$(hdir "$1" 2>/dev/null) && [ -d "$d" ] || return 0; mkdir -p "$LAND_STATE_DIR/box-logs" && cp -f "$d"/*.log "$LAND_STATE_DIR/box-logs/" || echo "box: could not keep the logs in $LAND_STATE_DIR/box-logs" >&2; return 0; }
+cmd_run() {
+  [ "${1:-}" != -- ] || shift
+  # the caller of a one-shot run owns the box: it lives as long as that caller does (a land runs for hours; a TTL ended its PostgreSQL mid-run), and stops when the caller is gone, however it went
+  local envf rc; run_owner=$$; envf=$(cmd_up) || exit 1; run_id=$(basename "$(dirname "$envf")")   # global: the EXIT trap outlives this function
+  # the wrap's and the services' logs (the PostgreSQL's too) are evidence: kept in the land's state dir before the box is destroyed
+  trap 'keep_logs "$run_id"; cmd_down "$run_id" >&2' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  # shellcheck disable=SC1090
+  . "$envf"; if [ $# -gt 0 ]; then "$@"; else say "up as $id; no command: stopping"; fi; rc=$?
+  return "$rc"
+}
+cmd_land() { # box land [--box ID | --url URL] [land args]: land inside an instance. With none, a one-shot box (up, land, down).
+  local id= url= top; while [ $# -gt 0 ]; do case $1 in --box) id=${2:?}; shift 2;; --url) url=${2:?}; shift 2;; --db) die "box land: the instance server's address is a secret and never argv: LAND_INSTANCE_DB in the environment" 2;; *) break;; esac; done
+  [ -z "$url" ] || [ -z "$id" ] || die "box land: --box and --url are two instances: name one" 2
+  [ -n "$url" ] || [ -n "$id" ] || id=${BOX_ID:-}
+  # the instance is already running: nothing is started, nothing is destroyed (a failed run leaves it as it was, but for what `land` itself made and drops)
+  if [ -n "$url" ]; then top=$(root); load_config "$top"; [ -z "$WRAP_INSTANCE" ] || [ -n "${LAND_INSTANCE_DB:-}" ] || die "box land: --url wants LAND_INSTANCE_DB in the environment (the instance's server, the project's wrap.instance: a secret, never argv)" 2
+    unset BOX_ID; export LAND_INSTANCE_URL=$url LAND_BOX_EXPORTS="$WRAP_EXPORTS"; "$here/land" "$@"; return
+  elif [ -n "$id" ]; then id=$(pick "$id") || exit 2; [ -e "$(hdir "$id")/env" ] || die "$id has no state dir any more (box down $id)"; load_config "$(root)"; . "$(hdir "$id")/env"; land_here "$@"; return; fi
+  load_config "$(root)"; cmd_run -- land_here "$@"   # cmd_up loads the recipe in a subshell: land_here needs it in this one, whatever the recipe declares (a checkout-only box declares nothing)
+}
+land_here() { export LAND_INSTANCE_URL=${BOX_URL:-} LAND_BOX_EXPORTS="$WRAP_EXPORTS"; [ -z "$WRAP_INSTANCE" ] || export LAND_INSTANCE_DB=${!WRAP_INSTANCE:-}; "$here/land" "$@"; }   # in a box's env: its app (and the server the wrap says is the instance) are the instance
+cmd_capture() {
+  local scene= out= id= url= top
+  while [ $# -gt 0 ]; do case $1 in --scene) scene=${2:?}; shift;; --out) out=${2:?}; shift;; --box) id=${2:?}; shift;; --db) die "box capture: a secret is never argv: it is in the environment" 2;; --url) url=${2:?}; shift;; *) die "usage: box capture [--scene S] [--out DIR] [--box ID | --url URL]" 2;; esac; shift; done
+  [ -z "$url" ] || [ -z "$id" ] || die "box capture: --url and --box are two instances: name one" 2
+  top=$(root); load_config "$top"; out=$(realpath -m "${out:-box-capture-$(date -u +%Y%m%dT%H%M%SZ)}")   # absolute: the capture runs from the repo root
+  if [ -n "$url" ]; then
+    # an instance that is already running (the box did not start it and starts nothing: no wrap, no setup, no service, no state): its URL is what the capture needs;
+    # whatever else the capture needs (a server's address ...) is in the caller's environment; the wrap's instance variable may come as LAND_INSTANCE_DB (what `box land --url` is given)
+    export BOX_URL=$url; [ -z "$WRAP_INSTANCE" ] || [ -z "${LAND_INSTANCE_DB:-}" ] || export "$WRAP_INSTANCE=$LAND_INSTANCE_DB"
+  else
+    if [ -z "$id" ] && [ -z "${BOX_ID:-}" ] && [ "$(boxes | grep -c .)" != 1 ]; then exec "$here/box" run -- "$here/box" capture --scene "${scene:-$CAP_SCENE}" --out "$out"; fi
+    id=$(pick "$id") || exit 2; [ -e "$(hdir "$id")/env" ] || die "$id has no state dir any more (box down $id)"; . "$(hdir "$id")/env"
+  fi
+  export BOX_SCENE=${scene:-$CAP_SCENE} BOX_OUT=$out BOX_REF=$(git rev-parse --abbrev-ref HEAD) BOX_REV=$(git rev-parse --short HEAD)
+  mkdir -p "$out"; local t; t=$(now); (cd "$top" && bash -c "$CAP_RUN") || die "the capture failed"; say "captured $BOX_SCENE in $(( $(now) - t )) ms: $out"
+}
+cmd_refresh() {
+  local id=; [ "${1:-}" != --box ] || id=${2:?}; id=$(pick "$id") || exit 2; local top dir i; dir=$(hdir "$id"); top=$(root); load_config "$top"
+  only_refresh=1 setup_steps "$top" "$dir/refresh-logs"; touch "$dir/restart"
+  for i in $(seq 1 $(( (READY_SECONDS + 30) * 4 ))); do [ -e "$dir/restart" ] || break; [ ! -e "$dir/failed" ] || die "refresh failed: $(cat "$dir/failed")"; sleep 0.25; done
+  [ ! -e "$dir/restart" ] || die "refresh: the services did not come back"; say "refreshed $id"
+}
+cmd_reset() { # box reset [--box ID]: each service's own reset, then the project's `reset` (the data back to the seed). Nothing restarts: that is what makes it fast.
+  local id=; [ "${1:-}" != --box ] || id=${2:?}; id=$(pick "$id") || exit 2; local top dir row nm rst n=0; dir=$(hdir "$id"); top=$(root); load_config "$top"
+  [ -e "$dir/env" ] || die "$id has no state dir any more (box down $id)"; . "$dir/env"
+  run_reset() { local t; t=$(now); (cd "$top" && timeout "${BOX_STEP_SECONDS:-120}" bash -c "$2") >"$dir/reset-$1.log" 2>&1 || { tail -15 "$dir/reset-$1.log" >&2; die "reset $1 failed"; }; n=$((n + 1)); say "reset $1 ($(( $(now) - t )) ms)"; }
+  for row in "${SVC[@]}"; do IFS=$'\x1f' read -r nm _ _ _ _ _ _ _ _ rst _ <<<"$row"; [ -z "$rst" ] || run_reset "$nm" "$rst"; done
+  [ -z "$RESET_CMD" ] || run_reset data "$RESET_CMD"
+  [ "$n" -gt 0 ] || die "nothing to reset: the project declares no reset (a service's reset, or the top-level reset)" 2
+}
+cmd_status() {
+  local id d s; for id in $(boxes); do d=$(hdir "$id")
+    if ! alive "$id"; then s="supervisor gone (box down $id removes it)"; elif [ ! -d "$d" ]; then s="state dir gone, stopping itself (box down $id)"
+    elif [ -e "$d/ready" ]; then s=$(sed -n 's/^export BOX_URL=//p' "$d/env"); s=${s:-up}; else s=starting; fi
+    printf '%s %s\n' "$id" "$s"; done; return 0; }
+
+c=${1:-}; [ $# -eq 0 ] || shift
+case $c in
+  up) cmd_up "$@";; run) cmd_run "$@";; down) cmd_down "$@";; capture) cmd_capture "$@";; refresh) cmd_refresh "$@";; reset) cmd_reset "$@";; status) cmd_status;;
+  land) cmd_land "$@";;
+  _serve) serve "$@";; _inner) inner "$@";;
+  *) sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p}' "$0"; [ -z "$c" ] || exit 2;;
+esac
