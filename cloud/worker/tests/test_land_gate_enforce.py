@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -139,12 +138,11 @@ class TestHook(Gate):
 class TestWrapper(Gate):
     LAND = ["start", "--name", "land", "--", "sh", "-c", ".spire/tool/bin/spire land > /dev/null 2>&1; echo ran > ran.txt"]
 
-    def ran(self):
-        for _ in range(50):
-            if os.path.exists(os.path.join(self.repo, "ran.txt")):
-                return True
-            time.sleep(0.1)
-        return False
+    def ran(self, name="land"):
+        # No polling: if the run was started, wait on its own exit marker (cw-run wait); a refused start has no pid file, so there is nothing to wait for.
+        if os.path.exists(os.path.join(self.d, "runs", name + ".pid")):
+            self.cw("wait", name, "60")
+        return os.path.exists(os.path.join(self.repo, "ran.txt"))
 
     def test_s9_a_start_and_a_restart_without_the_token_are_refused_saying_why_and_with_it_the_land_runs(self):
         self.fake(3, REFUSAL)

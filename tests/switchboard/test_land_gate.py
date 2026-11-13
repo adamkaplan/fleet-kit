@@ -103,18 +103,8 @@ class TestOrder(GateBase):
         self.assertIn("land-gate", sb.build_parser().commands)   # the code before the change has no such command: nothing in it could serialise two landings
         self.assertEqual(self.gate("take", REPO, who="lane-a")[0], 0)
 
-    def test_s8_control_with_no_queue_two_takers_both_get_through_and_the_new_code_refuses_the_second(self):
-        def old_behaviour(entry, name, now):   # the behaviour before the gate: nothing serialises, the newest asker simply holds
-            entry["holder"] = {"name": name, "since": now, "touched": now}
-            return "held", 0
-        with mock.patch.object(sb, "lg_take", old_behaviour):
-            self.assertEqual(self.gate("take", REPO, who="lane-a")[0], 0)
-            self.t += 5
-            code, out, _ = self.gate("take", REPO, who="lane-b")
-            self.assertEqual(code, 0)   # the second taker is NOT refused: two landings run at once
-            self.assertIn("HELD %s by lane-b" % REPO, out)
-            self.assertNotIn("QUEUED", out)
-        (self.state_dir / sb.LAND_GATE_FILE).unlink()
+    def test_s8_with_no_queue_the_second_taker_is_refused_queued_and_the_holder_named(self):
+        # Only the half that fails on the old code (where a second taker simply held) is kept; a hand-written double of the old behaviour would assert itself.
         self.assertEqual(self.gate("take", REPO, who="lane-a")[0], 0)
         self.t += 5
         code, out, _ = self.gate("take", REPO, who="lane-b")

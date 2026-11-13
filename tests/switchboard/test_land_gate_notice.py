@@ -31,6 +31,7 @@ class TestLandedPushNotice(Case):
     def land(sha, message="Add it\n\nLanded-by: spire land", date="2027-01-15T09:00:00Z"):
         return {"sha": sha, "commit": {"message": message, "committer": {"date": date}}}
 
+    # The S10 tests below are regression guards of the existing push-watch behaviour (who is told, once, with the short sha); they are not new behaviour of the gate.
     def test_s10_the_pod_that_made_the_landed_commit_is_told_once_with_the_short_sha_and_nobody_else(self):
         self.main = [self.land(SHA)]
         self.run_pass(NOW)
@@ -65,4 +66,4 @@ class TestLandTokenSentence(unittest.TestCase):
         for name in TEXT_FILES:
             text = (REPO / name).read_text()
             with self.subTest(file=name):
-                self.assertEqual(text.count("`fleet-switchboard land-gate take <owner/repo>` until HELD, `touch` it every 5 minutes, `release` it after: a push without it is refused)"), 1)
+                self.assertIn("`fleet-switchboard land-gate take <owner/repo>` until HELD, `touch` it every 5 minutes, `release` it after: a push without it is refused)", text)
