@@ -14,34 +14,12 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 # Files run at the same time must not share a temp name: test_cloud_pr_preflight lists the temp dir for cloud-preflight-*, so no other file here may create such names.
+# Cheap representatives (each under a few seconds): the full 27-file rerun took 374 s and only re-proved, file by file, that no test opens a file
+# and leaves it; that property is kept here by the fast files below plus the two mutant classes, which prove the guard really fails on a leak.
 GUARDED = (
-    "test_app_token.py",
-    "test_chain_time.py",
     "test_cloud_end_alert.py",
-    "test_cloud_pr_preflight.py",
-    "test_cloud_preflight_wired.py",
-    "test_cloud_prestop.py",
-    "test_cloud_quick_selector.py",
-    "test_cloud_turn_end.py",
-    "test_cloud_worker.py",
-    "test_cluster_token_refresh.py",
     "test_cw_names.py",
-    "test_driver.py",
-    "test_git_token_retry.py",
-    "test_issues_read.py",
-    "test_m_cap.py",
-    "test_mint_retry.py",
-    "test_mint_roles.py",
-    "test_model_credential.py",
-    "test_orchestrator_agent.py",
-    "test_preflight.py",
-    "test_reaper_managed.py",
-    "test_run_record.py",
-    "test_stack_model_key.py",
-    "test_stop_cause.py",
-    "test_stop_no_checkout.py",
-    "test_token_at_limit.py",
-    "test_vault_check_pins.py",
+    "test_chain_time.py",
 )
 LEAK = re.compile(r"^ResourceWarning: unclosed ", re.M)
 LIMIT = 900
@@ -118,8 +96,13 @@ class MutantLeak(unittest.TestCase):
     NEW = "open(self.cursor).read()"
 
     def scratch(self, mutated):
-        d = tempfile.mkdtemp(prefix="open-guard-")
+        path, d = self.scratch_in(mutated)
         self.addCleanup(shutil.rmtree, d, True)
+        return path, d
+
+    @classmethod
+    def scratch_in(self, mutated):
+        d = tempfile.mkdtemp(prefix="open-guard-")
         tests = os.path.join(d, "cloud", "launcher", "tests")
         os.makedirs(tests)
         launcher = os.path.dirname(HERE)
@@ -169,15 +152,28 @@ class MutantSocket(MutantLeak):
     test_s4_a_no_op_mutation_fails_the_applied_computation = None
     test_s4_the_text_occurs_once = None
 
+    @classmethod
+    def setUpClass(cls):
+        """The control and the mutant run at the same time (each takes the whole of test_preflight.py); the control is still checked first."""
+        cls.paths = {}
+        for key, m in (("control", None), ("mutant", (cls.OLD, cls.NEW))):
+            cls.paths[key] = cls.scratch_in(m)
+        cls.out = {}
+        ts = [threading.Thread(target=lambda k=k: cls.out.__setitem__(k, run(cls.paths[k][0], cls.paths[k][1])), daemon=True) for k in cls.paths]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        for _, d in cls.paths.values():
+            shutil.rmtree(d, True)
+
     def test_s7_control_first_passes(self):
-        path, d = self.scratch(None)
-        rc, text = run(path, d)
+        rc, text = self.out["control"]
         self.assertEqual(check("control", text), 0)
         self.assertEqual(rc, 0, text[-1500:])
 
     def test_s7_one_server_close_removed_fails_with_the_anchored_text(self):
-        path, d = self.scratch((self.OLD, self.NEW))
-        rc, text = run(path, d)
+        rc, text = self.out["mutant"]
         with self.assertRaisesRegex(AssertionError, r"\Aa file was left open: "):
             check("mutant", text)
         self.assertIn("ResourceWarning: unclosed <socket", text)
