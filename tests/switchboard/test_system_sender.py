@@ -28,7 +28,9 @@ SYSTEM = sb.load_module("system_sender")
 def load_land_report():
     spec = importlib.util.spec_from_file_location("land_report_for_2518", str(REPO / "cloud" / "launcher" / "land_report.py"))
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    launcher = str(REPO / "cloud" / "launcher")   # land_report imports its sibling modules (run_record)
+    with mock.patch.object(sys, "path", [launcher] + sys.path):
+        spec.loader.exec_module(module)
     return module
 
 
