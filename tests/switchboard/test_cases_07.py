@@ -1903,6 +1903,13 @@ class TestHeavySlots(Base):
         self.assertEqual(proc.returncode, 0, err)
         self.assertNotIn("no state directory", err)
 
+    def test_a_marked_heavy_still_opens_the_state_directory_for_a_changed_slot_run(self):   # the other half of the cmd_heavy exception
+        self.state()
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy", "--changed-slot", "--", "true"], env=self.env(FLEET_HEAVY_SLOT="none"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("no state directory", err)
+
     def test_heavy_off_runs_the_command_directly_with_no_slot_and_no_line(self):
         out = self.home / "off-out"
         proc = self.start("sh", "-c", 'echo "$FLEET_HEAVY_SLOT" > "%s"' % out, env=self.env(FLEET_HEAVY="off"))
