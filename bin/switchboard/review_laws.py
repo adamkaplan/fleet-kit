@@ -80,6 +80,13 @@ def local_review_overlay(repo):
         return ""
 
 
+# The three block-line names the parser reads (#2521): the one place they are written; the reviewer-agent tie test reads them from here.
+MUTANTS_RUN_LINE = "mutants-run"
+MUTANTS_SURVIVED_LINE = "mutants-survived"
+BLAST_RADIUS_LINE = "blast-radius"
+BLOCK_LINE_NAMES = (MUTANTS_RUN_LINE, MUTANTS_SURVIVED_LINE, BLAST_RADIUS_LINE)
+
+
 def parse_review_block(text):
     """(fields, why not) from the verdict block a reviewer RETURNS as text (the reviewers hold no write command: the coder session records what
     they returned). Lines: `verdict: ...`, `head: <sha>`, optional `impact-action: ...`, `findings:` and one `- <rule> | block|note | ...` per finding. Counts
@@ -106,11 +113,11 @@ def parse_review_block(text):
             fields["impact_probability"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-reason:"):
             fields["impact_reason"] = line.split(":", 1)[1].strip()
-        elif started and line.startswith("mutants-run:"):
+        elif started and line.startswith(MUTANTS_RUN_LINE + ":"):
             fields["mutants_run"] = line.split(":", 1)[1].strip()   # (#2509) the test reviewer's mutant run: kept only as the numbers the check below accepts
-        elif started and line.startswith("mutants-survived:"):
+        elif started and line.startswith(MUTANTS_SURVIVED_LINE + ":"):
             fields["mutants_survived"] = line.split(":", 1)[1].strip()
-        elif started and line.startswith("blast-radius:"):
+        elif started and line.startswith(BLAST_RADIUS_LINE + ":"):
             fields["blast_radius"] = line.split(":", 1)[1].strip()   # (#2509) the impact reviewer's stated blast radius: one short line
         elif started and line.startswith("files-read:"):
             section = "files"
