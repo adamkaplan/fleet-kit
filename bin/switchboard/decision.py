@@ -53,6 +53,22 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     the agent is gone, blocked, unknown or unreadable; else a note if you are
     engaged with it, else a wake.
     """
+    def batches(fact):
+        """Whether `fact` waits for the batch window. Immediate only for `--interrupt`, `AT ONCE`, `blocked`/`failed`/`question`
+        reports and decisions; routine sends, `worker.idle` notices and routine reminders batch."""
+        summary, key = fact.summary or "", fact.key or ""
+        if getattr(fact, "interrupt", False) or "AT ONCE" in summary:
+            return False
+        if fact.kind == "report" and summary.startswith(("blocked:", "failed:", "question:")):
+            return False
+        if getattr(fact, "wake_class", None):
+            return False   # a load alert is a system notice, never a routine reminder
+        if fact.kind in ("decoration", "decision") or key.startswith(("decoration:", "decision:")):
+            return False
+        if fact.kind in ("send", "worker.idle", "reminder") and key.startswith(("send:", "worker.idle:", "reminder:")):
+            return True
+        return bool(fact.batch)
+
     pending = sorted(pending, key=lambda fact: (fact.created, fact.key))
     # PR 17: standing orders go first and alone, at once, as a note (a wake only under `orders-wake`)
     standing = [fact for fact in pending if fact.orders]
@@ -69,7 +85,7 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider]
     if not chosen:
         return None
-    if not fault("no-batch") and all(fact.batch for fact in chosen):
+    if not fault("no-batch") and all(batches(fact) for fact in chosen):
         ready_at = chosen[0].created + batch_seconds
         if now < ready_at:
             return Plan(recipient, "wait", "batching until %s" % iso(ready_at), pending, observation, ready_at)

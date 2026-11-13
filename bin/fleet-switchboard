@@ -2269,17 +2269,17 @@ class Switchboard:
             keys.add_all(_fleet_keys(item), _created(item))
         return keys, complete
 
-    def plan(self, recipient, facts, discovery, now):
+    def plan(self, recipient, facts, discovery, now, batch_seconds=None):
         """Pending = facts minus delivered keys, then the rule. None if nothing is pending."""
-        return self.plan_with_riders(recipient, facts, discovery, now)[0]
+        return self.plan_with_riders(recipient, facts, discovery, now, batch_seconds)[0]
 
-    def plan_with_riders(self, recipient, facts, discovery, now):
+    def plan_with_riders(self, recipient, facts, discovery, now, batch_seconds=None):
         """(plan, riders): the plan `plan` returns, and the riders that wait for a message to ride in
         when the plan is None because only riders are pending (PR 13; `pending` and `status` show them)."""
         facts = collapse_riders(facts, now, self.config["rider_max_age_seconds"])
         if not facts:
             return None, []
-        plan = self._plan_pending(recipient, facts, discovery, now)
+        plan = self._plan_pending(recipient, facts, discovery, now, batch_seconds)
         if plan is not None:
             return plan, []
         return None, self._undelivered(recipient, facts, discovery)
@@ -2296,10 +2296,12 @@ class Switchboard:
             return list(facts)
         return [fact for fact in facts if fact.key not in delivered]
 
-    def _plan_pending(self, recipient, facts, discovery, now):
+    def _plan_pending(self, recipient, facts, discovery, now, batch_seconds=None):
+        if batch_seconds is None:
+            batch_seconds = self.batch_seconds
         observation = discovery.agents.get(recipient)
         if observation is None:
-            return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
+            return decide(recipient, facts, None, now, batch_seconds, self.engaged_seconds,
                           discovery.missing(recipient))
         pending = facts
         if not fault("no-dedupe"):
@@ -2307,7 +2309,7 @@ class Switchboard:
             try:
                 delivered, complete = self.delivered_keys(observation.session_id, since)
             except V2Error as err:
-                return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
+                return decide(recipient, facts, None, now, batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
             self._record_told(delivered, recipient)
@@ -2316,10 +2318,10 @@ class Switchboard:
                                                          "keys": sorted(fact.key for fact in facts if fact.key in delivered)})
             self._acknowledge(delivered)
             if pending and not complete:
-                return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
+                return decide(recipient, pending, None, now, batch_seconds, self.engaged_seconds,
                               "the last %d messages of %s reach back less than to %s, so what it "
                               "already has is unknown" % (READ_LIMIT, recipient, iso(since)))
-        plan = decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+        plan = decide(recipient, pending, observation, now, batch_seconds, self.engaged_seconds)
         if self.light and plan is not None and plan.action in ("note", "wake"):
             # v2_light: nothing reads a person's prompt in the background. A delivery is about to happen (the batch is ripe and nothing
             # holds it): only now does the engagement gate get its one small read, so a note is still a note and a wake still a wake.
@@ -2328,9 +2330,9 @@ class Switchboard:
                 observation.last_human_prompt = self.last_human_prompt(
                     observation.session_id, now, inbox=(observation.fleet or {}).get("role") == "chief-of-staff", info={}, fresh=True)
             except V2Error as err:
-                return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
+                return decide(recipient, pending, None, now, batch_seconds, self.engaged_seconds,
                               "cannot read %s's transcript: %s" % (recipient, err))
-            plan = decide(recipient, pending, observation, now, self.batch_seconds, self.engaged_seconds)
+            plan = decide(recipient, pending, observation, now, batch_seconds, self.engaged_seconds)
         return plan
 
     # -- deliver
@@ -2348,7 +2350,7 @@ class Switchboard:
         observation = plan.observation
         if not fault("no-recheck"):
             fresh, why = self.reobserve(observation, self.now())
-            again = decide(plan.recipient, plan.pending, fresh, self.now(), self.batch_seconds,
+            again = decide(plan.recipient, plan.pending, fresh, self.now(), 0,
                            self.engaged_seconds, why)
             if plan.folded and again.action == "wake":
                 again.action = "note"   # #352: a folded report stays a note
@@ -2382,7 +2384,7 @@ class Switchboard:
                 if not kept_facts:
                     return {"sent": False, "action": "dropped", "reason": "every reminder on its way was superseded or cancelled"}
                 # the plan is decided again from what remains: a wake planned for a dropped fact does not carry the lower-class rest
-                redone = decide(plan.recipient, kept_facts, observation, self.now(), self.batch_seconds, self.engaged_seconds)
+                redone = decide(plan.recipient, kept_facts, observation, self.now(), 0, self.engaged_seconds)
                 if plan.folded and redone.action == "wake":
                     redone.action = "note"
                 if redone.action != plan.action and not (interrupt and redone.action in ("note", "wake")):
@@ -3024,7 +3026,7 @@ class Switchboard:
         """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule. `folded` (#352): a report that
         follows the sender's own earlier send is delivered as a note: it never wakes the boss a second time."""
         recipient = fact.recipient
-        plan = self.plan(recipient, [fact] + list(carried), discovery, now)
+        plan = self.plan(recipient, [fact] + list(carried), discovery, now, 0)   # a direct send is immediate: only run_pass batches
         if folded and plan is not None and plan.action == "wake":
             plan.action, plan.reason, plan.folded = "note", "folded into the sender's earlier message: no second wake", True
         if plan.action == "hold":

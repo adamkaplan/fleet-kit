@@ -153,6 +153,26 @@ class TestDecide(Base):
         self.assertIsNone(self.decide([], observation()))
         self.assertEqual(self.decide([fact("a")], None, missing="herdr unreachable").reason, "herdr unreachable")
 
+    def test_wake_batching_rule(self):
+        young, now = EPOCH + 99, EPOCH + 100
+        load_alert = fact("reminder:2", young, kind="reminder", batch=False)
+        cases = [
+            ("routine send batches", fact("send:1", young, kind="send", batch=False), "wait"),
+            ("worker.idle batches", fact("worker.idle:1", young, kind="worker.idle", batch=False), "wait"),
+            ("routine reminder batches", fact("reminder:1", young, kind="reminder", batch=False), "wait"),
+            ("AT ONCE wakes", fact("send:2", young, kind="send", summary="AT ONCE: stop", batch=False), "wake"),
+            ("blocked report wakes", fact("r1", young, kind="report", summary="blocked: x", batch=False), "wake"),
+            ("failed report wakes", fact("r2", young, kind="report", summary="failed: x", batch=False), "wake"),
+            ("question report wakes", fact("r3", young, kind="report", summary="question: x", batch=False), "wake"),
+            ("done report follows its batch flag", fact("r4", young, kind="report", summary="done: x", batch=True), "wait"),
+            ("load alert reminder wakes", vars(load_alert).update(wake_class="load") or load_alert, "wake"),
+            ("decision wakes", fact("d1", young, kind="decision", batch=True), "wake"),
+            ("decoration wakes", fact("decoration:1", young, kind="decoration", batch=True), "wake"),
+        ]
+        for what, one, action in cases:
+            with self.subTest(what=what):
+                self.assertEqual(self.decide([one], observation(), now).action, action)
+
     def test_faults_switch_one_safeguard_each_only_in_the_lab(self):
         young = [fact("a", EPOCH + 99)]
         engaged = observation(human=EPOCH + 90)
