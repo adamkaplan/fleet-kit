@@ -12615,6 +12615,10 @@ def _cmd_launch(args, runner, now, socket_call=None):
             load_module("cloud_worker").cloud_launch_again.RETURNED.discard(args.name)
             return code
         return arm_cloud_checkpoints(args, runner, now) if code == EXIT_OK else code   # #1790
+    if getattr(args, "remote", False):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+        argv = ["launch", args.name, "--repo", args.repo or "", "--branch", args.branch or "", "--task-file", args.brief_file or ""]
+        return importlib.import_module("remote_worker.cli").main(argv + (["--idle", args.idle] if getattr(args, "idle", None) else []) + (["--hard", args.hard] if getattr(args, "hard", None) else []))
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     choice = launch_model_choice(args, engine)   # #1642: before any session or pane
@@ -21937,6 +21941,7 @@ def add_core_parsers(sub):
     launch.add_argument("--allow-brief-mismatch", dest="allow_brief_mismatch", metavar="REASON", help="Start although the brief names another issue or a stale PR head than --issue (audited with the reason)")
     launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
+    launch.add_argument("--remote", action="store_true", help="Run the worker on the configured remote execution service (see FLEET_REMOTE_CONFIG)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--base", help="With --cloud: the branch the worker's branch is created from (a branch name of the repository, checked like --branch); the setup text names it in place of the default branch. Without it the text is unchanged")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 60m; 30m for an orchestrator)")

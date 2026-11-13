@@ -4,8 +4,8 @@
    `FLEET_REMOTE_CONFIG`) names the backend and the carrier settings (storage account, floor id, caller id, queue and container SAS file paths, git
    base), the land command, the token command and a state directory.
 2. **The module is imported where it is used.** The code behind the route is `remote_worker/cli.py` (also runnable alone: `python3 -m remote_worker`).
-   The switchboard script gets ONE call site, in `_cmd_launch` beside the `--cloud` branch (about 5 lines plus the option line, nothing else: no new module
-   of `bin/`, no new subcommand). Until that diff is agreed the route is reachable only through `python3 -m remote_worker launch`.
+   The switchboard script has ONE call site, in `_cmd_launch` beside the `--cloud` branch (plus the `--remote` option line, nothing else: no new module
+   of `bin/`, no new subcommand).
 3. **The repo token.** A configured command (an argument list, never a shell) writes a short-lived token to a pipe: one argument holds `{fd}`, which becomes the write end's number (the command prints nothing on stdout); it runs once per launch, what it wrote is
    checked for plain token characters and goes into the launch command's `env` under a configured name. It is never stored (only the queue message,
    in memory, holds it), never logged, never in an error or a repr (`WorkerSpec.env` is hidden from `repr`).

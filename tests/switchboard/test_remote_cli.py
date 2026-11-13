@@ -264,6 +264,18 @@ class TestRemoteCli(Base):
                     validate_spec("widget-1", "acme/widget-api", "b", "t", LAND, env=env)
                 self.assertNotIn("x" * 50, str(cm.exception))
 
+    def test_switchboard_launch_remote_routes_to_cli_main(self):
+        from support.core import sb
+        from unittest import mock
+        args = sb.build_parser().parse_args(["launch", "widget-1", "--remote", "--repo", "acme/widget-api", "--branch", "work/widget-1",
+                                             "--brief-file", "/tmp/brief.txt", "--idle", "45m", "--hard", "90m"])
+        self.assertTrue(args.remote)
+        seen = []
+        with mock.patch("remote_worker.cli.main", side_effect=lambda argv: (seen.append(argv), 0)[1]):
+            self.assertEqual(sb._cmd_launch(args, self.runner, 0), 0)
+        self.assertEqual(seen, [["launch", "widget-1", "--repo", "acme/widget-api", "--branch", "work/widget-1",
+                                 "--task-file", "/tmp/brief.txt", "--idle", "45m", "--hard", "90m"]])
+
 
 if __name__ == "__main__":
     unittest.main()
