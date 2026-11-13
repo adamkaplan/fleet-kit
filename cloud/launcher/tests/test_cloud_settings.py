@@ -35,6 +35,7 @@ OPTIONAL_SAMPLES["CW_LAND_REPORT_ISSUE"] = "owner/repo#7"   # ask #2448
 OPTIONAL_SAMPLES["CW_LAND_REPORT_SMALL_LINES"] = "50"
 OPTIONAL_SAMPLES["CW_LAND_REPORT_GIT_DIR"] = "/srv/checkout"
 OPTIONAL_SAMPLES["CW_LAND_REPORT_BRANCH"] = "origin/main"
+OPTIONAL_SAMPLES["CW_LAND_REPORT_FIRST_REPO"] = "acme-org/widget-service"
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -102,6 +103,7 @@ HOSTILE["CW_LONG_RUN_DENY"] = [",".join("*p%d*" % i for i in range(9)), "*a b*",
 HOSTILE["CW_LAND_REPORT_ISSUE"] = ["7", "#7", "o/r#0", "o/r#", "o/r#1x", "o r/x#1", "../r#1"]   # ask #2448
 HOSTILE["CW_LAND_REPORT_SMALL_LINES"] = ["0", "-5", "1.5", "abc", "1000000", "05", "\u0662"]
 HOSTILE["CW_LAND_REPORT_GIT_DIR"] = ["relative", "/a/../b", "-x"]
+HOSTILE["CW_LAND_REPORT_FIRST_REPO"] = ["-x/y", "a b/c", "a;b/c", "noslash", "a/" + "b" * 101]
 HOSTILE["CW_LAND_REPORT_BRANCH"] = ["-x", "a b", "a;b", "$(x)", "a" * 101]
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
