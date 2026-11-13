@@ -805,7 +805,7 @@ WITHHELD_LINE = "final message withheld: names list unreadable"
 
 
 def _repo_is_public(engine, repo):
-    """True unless GitHub says the repository is private: ONE bounded read of `repos/<owner>/<repo>` (the engine's reader, as `gh api repos/<owner>/<repo> --jq .private`).
+    """True unless GitHub says the repository is private: ONE bounded read of `repos/<owner>/<repo>` (the engine's `gh_api`, the same bare `repos/<owner>/<repo>` read as the hub's own route read: the `private` field of `gh api repos/<owner>/<repo>`; no account-specific token, so a repository the daemon's default login cannot see counts as public).
     A visibility that cannot be read counts as public (fail closed)."""
     try:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or ".." in repo:
