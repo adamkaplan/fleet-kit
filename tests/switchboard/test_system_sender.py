@@ -251,6 +251,30 @@ class TestParentProof(Base):
         link.symlink_to(shutil.which("sh"))
         self.assertFalse(self.proof(self.kit.start("-B", str(self.kit.script), "reap", program=str(link))))
 
+    def test_the_framework_app_binary_of_the_same_version_is_an_interpreter_and_an_unrelated_python_is_not(self):
+        """macOS framework build: the service runs the launcher link, whose process executable is the app binary (a different real path)."""
+        version = self.home / "Frameworks" / "Python.framework" / "Versions" / "3.13"
+        launcher = version / "bin" / "python3.13"
+        app = version / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+        for path in (launcher, app):
+            path.parent.mkdir(parents=True)
+            path.write_text("#!/bin/sh\n")
+        link = self.home / "usr-local-bin-python3"
+        link.symlink_to(launcher)
+        other = self.home / "elsewhere" / "python"
+        other.parent.mkdir()
+        other.write_text("#!/bin/sh\n")
+        known = SYSTEM.interpreters(executable=str(link), fixed=(), base_prefix=str(version))
+        self.assertEqual(known, {os.path.realpath(str(launcher)), os.path.realpath(str(app))})   # both forms
+        self.assertNotEqual(os.path.realpath(str(launcher)), os.path.realpath(str(app)))
+        self.assertNotIn(os.path.realpath(str(other)), known)                                      # control: an unrelated binary named python
+        argv = [str(link), "-B", str(self.kit.script), "reap", "--loop", "60"]
+        for exe, expected in ((str(app), True), (str(launcher), True), (str(other), False)):
+            with self.subTest(exe=exe):
+                got = SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: (os.getuid(), exe, argv), known=known)
+                self.assertEqual(got, expected)
+        self.assertEqual(SYSTEM.interpreters(executable=str(link), fixed=(), base_prefix=str(self.home / "no-such-prefix")), {os.path.realpath(str(launcher))})   # no app binary, none added
+
     def test_a_reader_that_fails_is_no_proof(self):
         self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: None))
         self.assertFalse(SYSTEM.parent_is("nobody", self.kit.root, parent=1))

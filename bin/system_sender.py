@@ -27,10 +27,15 @@ PLAIN_OPTIONS = ("-B", "-u", "-E", "-s", "-S", "-I", "-O", "-OO", "-b", "-bb", "
 FIXED_INTERPRETERS = ("/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python", "/bin/python3")
 
 
-def interpreters():
-    """The real paths of the Python interpreters that count: this switchboard's own, and the fixed system places. NEVER the PATH of the process asking: the process being checked
-    chooses its own PATH, so a copy of a shell named python placed first in it would be trusted. A copy or a link to a shell is none of these."""
-    return {os.path.realpath(p) for p in (sys.executable,) + FIXED_INTERPRETERS if p and os.path.exists(p)}
+def interpreters(executable=None, fixed=FIXED_INTERPRETERS, base_prefix=None):
+    """The real paths of the Python interpreters that count: this switchboard's own, the fixed system places, and (macOS framework builds) the framework's app binary of the SAME
+    framework version, derived from this interpreter's own base prefix (`<prefix>/Resources/Python.app/Contents/MacOS/Python`): a service started through the launcher link
+    (`/usr/local/bin/python3`) runs that app binary, whose real path differs from the link's. NEVER the PATH of the process asking: the process being checked chooses its own PATH,
+    so a copy of a shell named python placed first in it would be trusted. A copy or a link to a shell is none of these."""
+    own = sys.executable if executable is None else executable
+    prefix = sys.base_prefix if base_prefix is None else base_prefix
+    app = os.path.join(prefix, "Resources", "Python.app", "Contents", "MacOS", "Python") if prefix else None
+    return {os.path.realpath(p) for p in (own,) + tuple(fixed) + (app,) if p and os.path.exists(p)}
 
 
 def registered(name):
