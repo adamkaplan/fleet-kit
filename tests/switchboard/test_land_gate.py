@@ -352,3 +352,15 @@ class TestCheckCommand(GateBase):
 
     def test_the_name_is_a_fleet_name(self):
         self.assertEqual(self.check(REPO, "a b;c")[0], 2)
+
+    def test_the_check_sees_a_gone_holder_and_a_free_gate_leaves_no_state(self):
+        self.gate("take", REPO, who="lane-a")
+        self.gone.add("lane-a")
+        code, out, _ = self.check(REPO, "lane-a")
+        self.assertEqual(code, 3)
+        self.assertIn("nobody holds it", out)
+        self.assertIn("queue length 0", out)
+        self.assertEqual(self.holder(), "lane-a", "the check wrote nothing")
+        (self.state_dir / sb.LAND_GATE_FILE).unlink()
+        self.assertEqual(self.check(REPO, "lane-a")[0], 3)
+        self.assertFalse((self.state_dir / sb.LAND_GATE_FILE).exists())

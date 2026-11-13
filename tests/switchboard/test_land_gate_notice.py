@@ -38,10 +38,18 @@ class TestLandedPushNotice(Case):
         self.assertEqual([(r[0], r[1]) for r in self.reports], [("w-a", "done")])   # the count of wrong or repeated notices is 0
         self.assertIn(SHA[:12], self.reports[0][2])
 
-    def test_s10_a_commit_of_neither_pod_tells_no_pod(self):
+    def test_s10_a_commit_of_neither_pod_tells_no_pod_it_landed(self):
         self.main = [self.land(OLD_SHA)]
         self.run_pass(NOW)
-        self.assertEqual(self.reports, [])
+        self.assertEqual(self.reports, [])   # no `done` to anyone
+        told = [text for _, text in self.engine.sent]
+        self.assertTrue(all("someone else" in t or "landed %s" % OLD_SHA[:12] not in t for t in told), told)   # at most the one line that says another landed, never a credit
+
+    def test_s10_control_when_the_other_pod_reported_that_sha_it_is_the_one_told(self):
+        self.ns.reported_text = lambda worker: "landed %s" % OLD_SHA if worker == "w-b" else None
+        self.main = [self.land(OLD_SHA)]
+        self.run_pass(NOW)
+        self.assertEqual([(r[0], r[1]) for r in self.reports], [("w-b", "done")])   # the attribution decides: the check above can see a wrong notice
 
 
 class TestLandTokenSentence(unittest.TestCase):
@@ -49,4 +57,4 @@ class TestLandTokenSentence(unittest.TestCase):
         for name in TEXT_FILES:
             text = (REPO / name).read_text()
             with self.subTest(file=name):
-                self.assertEqual(text.count("`fleet-switchboard land-gate take <owner/repo>` until HELD, `touch` it every 5 minutes, `release` it after"), 1)
+                self.assertEqual(text.count("`fleet-switchboard land-gate take <owner/repo>` until HELD, `touch` it every 5 minutes, `release` it after: a push without it is refused)"), 1)

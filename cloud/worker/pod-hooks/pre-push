@@ -129,7 +129,7 @@ land_gate() {   # $1 remote ref: refuse (exit 3) when the pod does not hold the 
   set +f
   case $gs in
     0) return 0 ;;
-    3) printf '%s\n' "$(printf '%s' "$gout" | head -n 1 | tr -c '[:print:]' '?')" >&2; exit 3 ;;
+    3) printf '%s\n' "$(printf '%s' "${gout:-refused: the land gate}" | head -n 1 | tr -c '[:print:]' '?' | cut -c1-300)" >&2; exit 3 ;;
   esac
   gate_unchecked "$gr" "$1"
 }
