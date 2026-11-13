@@ -89,6 +89,7 @@ cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
+cloud/launcher/tests/test_pdb.py
 cloud/launcher/tests/test_persistent_merge_fix.py
 cloud/launcher/tests/test_persistent_orchestrator.py
 cloud/launcher/tests/test_pod_boundaries.py
@@ -130,6 +131,7 @@ cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
 cloud/launcher/tests/test_stall_structural.py
 cloud/launcher/tests/test_stall_watch.py
+cloud/launcher/tests/test_startup_taint.py
 cloud/launcher/tests/test_stop_cause.py
 cloud/launcher/tests/test_stop_failed_pod.py
 cloud/launcher/tests/test_stop_no_checkout.py
@@ -187,4 +189,6 @@ cloud/worker/tests/test_shell_check.py
 cloud/worker/tests/test_stack_pull.py
 cloud/worker/tests/test_stack_up.py
 cloud/worker/tests/test_token_table.py
+cloud/worker/tests/test_tool_cap.py
+cloud/worker/tests/test_tool_cap_env.py
 cloud/worker/tests/test_cloud_prepush_preflight.py

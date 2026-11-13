@@ -1,7 +1,9 @@
 """Ask #2448: the daily land report (cloud/launcher/land_report.py), scenarios S1 to S8. Offline: fake run records in a temporary directory, a fake clock,
 recording senders, a fake git. Each mutant is a scratch copy of the module with one text replaced (asserted to occur once); its control (the real module
 through the same check) runs first and must pass, and the mutant must fail with the anchored text."""
+import contextlib
 import datetime as dt
+import io
 import importlib.util
 import json
 import os
@@ -34,20 +36,31 @@ def mutant(old, new):
     return mod
 
 
+def load_copy():
+    """A fresh copy of the real module (no change), loaded the way the mutants are."""
+    with open(SOURCE) as f:
+        src = f.read()
+    spec = importlib.util.spec_from_loader("land_report_copy", loader=None)
+    mod = importlib.util.module_from_spec(spec)
+    exec(compile(src, "land_report_copy", "exec"), mod.__dict__)
+    return mod
+
+
 class Root:
     def __init__(self, case):
         self.tmp = tempfile.TemporaryDirectory()
         case.addCleanup(self.tmp.cleanup)
         self.dir, self.n = self.tmp.name, 0
 
-    def add(self, worker="bob-1", repo="o/r", end=None, minutes=10, code=0, tail="", sha=None, reason="stop", land=True, raw=None):
+    def add(self, worker="bob-1", repo="o/r", end=None, minutes=10, code=0, tail="", sha=None, reason="stop", land=True, raw=None, boss=None):
         self.n += 1
         end = end or NOW - dt.timedelta(hours=2)
         rid = "%s-20261112T0%05dZ-%06x" % (worker, self.n, self.n)
         d = os.path.join(self.dir, rid)
         os.mkdir(d)
         runs = [{"name": "land", "exit": code, "woke": False, "log_tail": tail}] if land else []
-        rec = {"worker": worker, "repository": repo, "start": iso(end - dt.timedelta(minutes=minutes)), "end": iso(end), "exit_reason": reason,
+        boss = boss or __import__("re").sub(r"-\d+$", "", worker)   # the lane: the boss the record carries
+        rec = {"worker": worker, "boss": boss, "repository": repo, "start": iso(end - dt.timedelta(minutes=minutes)), "end": iso(end), "exit_reason": reason,
                "head_sha": sha, "end_hook": {"pushed": True, "run_logs": {"runs": runs, "wake_lines": []}}}
         with open(os.path.join(d, "run.json"), "w") as f:
             f.write(raw if raw is not None else json.dumps(rec))
@@ -103,7 +116,7 @@ class S2(unittest.TestCase):
         out = self.build(mod)
         self.assertIn("median 30 min, p90 100 min (n=5), trend +5 min", out, "S2 numbers")
         self.assertIn("/ small: attempted 1", out)
-        self.assertIn("land wall time: n/a", [l for l in out.splitlines() if "land wall time" in l][-1], "S2 small lane")
+        self.assertIn("pod time: n/a", [l for l in out.splitlines() if "pod time" in l][-1], "S2 small lane")
 
     def test_control(self):
         self.check(real)
@@ -451,6 +464,445 @@ class RunCall(unittest.TestCase):
         with self.assertRaises(OSError) as cm:
             self.check_raise(m)
         self.assertEqual(str(cm.exception), "no root", "RUN exception escaped")
+
+
+class S9(unittest.TestCase):
+    """Lanes by boss, rows without a land run skipped, the first-repo setting, the line cap (ask #2448, the first report was unreadable)."""
+    def build(self, mod, first=""):
+        r = Root(self)
+        for i in range(3):   # one boss, three pods: ONE lane (the pod names differ)
+            r.add(worker="pod%d-%d" % (i, i), boss="orch-one", repo="acme-org/widget-service", code=0)
+        for i in range(2):
+            r.add(worker="idle%d-1" % i, boss="orch-one", repo="acme-org/widget-service", land=False)
+        r.add(worker="idle9-1", boss="orch-three", repo="acme-org/widget-service", land=False)
+        r.add(worker="other-1", boss="orch-two", repo="acme-org/gadget-api", code=18)
+        r.add(worker="solo-3", repo="acme-org/gadget-api", code=13, boss="x")
+        recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        for rec in recs:
+            if rec["worker"] == "solo-3":
+                rec["lane"] = mod.lane_of("solo-3")
+        return mod.build(recs, bad, [commit("1", 5)], 50, (), "2026-11-12", first)[0]
+
+    def check(self, mod):
+        out = self.build(mod)
+        self.assertIn("acme-org/widget-service / orch-one: attempted 3, landed 3", out, "S9 by boss")
+        self.assertEqual(out.count("acme-org/widget-service /"), 1, "S9 one lane per boss")
+        self.assertNotIn("idle0", out.split("pods ended unlanded")[0], "S9 no row for a pod without a land run")
+        self.assertIn("3 pods with no land run skipped", out, "S9 skipped line")
+        self.assertNotIn("orch-three", out, "S9 no row for a lane with attempted 0")
+        self.assertIn("solo (lane unknown)", out, "S9 fallback names the prefix")
+        self.assertLess(out.index("widget-service"), out.index("gadget-api"), "S9 most attempts first")
+        first = self.build(mod, "acme-org/gadget-api")
+        self.assertLess(first.index("gadget-api"), first.index("widget-service"), "S9 first repo")
+
+    def many(self, mod):
+        r = Root(self)
+        for i in range(40):
+            r.add(worker="p-%d" % i, boss="orch%02d" % i, repo="acme-org/widget-service", code=0, tail="x" * 50)
+        return report(mod, r, landed=[commit("1", 5)])
+
+    def check_cap(self, mod):
+        out = self.many(mod)
+        self.assertLess(len(out.splitlines()), 20, "S9 line cap")
+        self.assertLessEqual(len(out), 3500, "S9 char cap")
+        self.assertRegex(out, r"\d+ more lanes: attempted \d+, landed \d+", "S9 more lanes")
+        self.assertIn("pods ended unlanded", out)
+
+    def test_control(self):
+        self.check(real)
+        self.check_cap(real)
+
+    def test_mutant_group_by_pod(self):
+        mod = mutant('"lane": lane_of(', '"lane": (lambda w, b, f=None: name_text(w, 64))(')
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9 by boss", str(cm.exception))
+
+    def test_mutant_prints_rows_without_land_run(self):
+        mod = mutant("for k, rs in lanes.items() if any(r[\"land\"] for r in rs))", "for k, rs in lanes.items())")
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9", str(cm.exception))
+
+    def test_mutant_first_repo_ignored(self):
+        mod = mutant("(kv[0][0] != first_repo, ", "(False, ")
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9 first repo", str(cm.exception))
+
+    def test_mutant_no_cap(self):
+        mod = mutant("fit = len(rows) if 2 * len(rows) <= room else max(0, (room - 1) // 2)", "fit = len(rows)")
+        self.check_cap(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_cap(mod)
+        self.assertIn("S9 line cap", str(cm.exception))
+
+    def test_mutant_fallback_not_marked(self):
+        mod = mutant('+ " (lane unknown)"', '+ ""')
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9 fallback", str(cm.exception))
+
+    def lands(self, mod, names):
+        r = Root(self)
+        d = r.add(worker="p-1", boss="orch-one", repo="acme-org/widget-service")
+        path = os.path.join(d, "run.json")
+        rec = json.load(open(path))
+        rec["end_hook"]["run_logs"]["runs"] = [{"name": n, "exit": c, "woke": False, "log_tail": ""} for n, c in names]   # newest first
+        json.dump(rec, open(path, "w"))
+        recs, _ = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        return recs[0]["land"]
+
+    def check_names(self, mod):
+        self.assertEqual(self.lands(mod, [("land1", 0)]), {"exit": 0, "tail": ""}, "S10 land1")
+        self.assertEqual(self.lands(mod, [("land12", 18)])["exit"], 18, "S10 land12")
+        self.assertEqual(self.lands(mod, [("land-x", 13)])["exit"], 13, "S10 land-suffix")
+        self.assertEqual(self.lands(mod, [("dry3", 0), ("land1", 13)])["exit"], 13, "S10 dry3 ignored, the newest land-named run decides")
+        self.assertEqual(self.lands(mod, [("land2", 0), ("land1", 13)])["exit"], 0, "S10 newest land wins")
+        for n in ("dry1", "retest", "chk", "t10", "wbase", "mise"):
+            self.assertIsNone(self.lands(mod, [(n, 0)]), "S10 not a landing: " + n)
+
+    def test_land_names(self):
+        self.check_names(real)
+
+    def test_mutant_old_land_pattern(self):
+        mod = mutant('(?:\\d{1,9}|-[A-Za-z0-9._-]{0,60})?', '(?:-[A-Za-z0-9._-]{0,60})?')
+        self.check_names(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_names(mod)
+        self.assertIn("S10 land1", str(cm.exception))
+
+    def test_real_trailer_forms(self):
+        checks = "areas=docs tests=0 files=4 checks=doc-check:2s total=3s tree=0123456789ab"
+        self.assertEqual(real.parse_trailer(checks), {"files": 4, "tests": 0, "total": 3, "steps": {"doc-check": 2}})
+        out = []
+        class R: returncode = 0; stdout = "\x1e" + "a" * 40 + "\x1f" + checks + "\x1f" + "ran: warden=approve (models fast, round 2, diff abc123)" + "\x1e" + "b" * 40 + "\x1f" + checks + "\x1f" + "none needed (no path calls for a member)"
+        got = real.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
+        self.assertEqual([(c["files"], c["lines"], c["rounds"]) for c in got], [(4, None, 2), (4, None, None)])
+        self.assertEqual(got[0]["total"], 3)
+
+    def check_cap_by_time(self, mod):
+        mod.MAX_RECORDS = 3
+        r = Root(self)
+        def dirname(worker, day, n, hour=12):
+            rid = "%s-202611%02dT%02d0000Z-%06x" % (worker, day, hour, n)
+            os.mkdir(os.path.join(r.dir, rid))
+            end = dt.datetime(2026, 11, day, hour, 0, tzinfo=dt.timezone.utc)
+            with open(os.path.join(r.dir, rid, "run.json"), "w") as f:
+                json.dump({"worker": worker, "boss": "orch-one", "repository": "acme-org/widget-service", "start": iso(end - dt.timedelta(minutes=5)), "end": iso(end),
+                           "end_hook": {"run_logs": {"runs": [{"name": "land1", "exit": 0, "log_tail": ""}]}}}, f)
+        dirname("a-early", 12, 1, hour=13)              # alphabetically first, inside the window
+        for i in range(5):
+            dirname("z-late%d" % i, 12, 10 + i, hour=1 + i)   # more than the cap, alphabetically late, inside the window
+        dirname("zz-old", 5, 99)               # alphabetically last, a week outside the window
+        recs, _ = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        names = sorted(x["worker"] for x in recs)
+        self.assertIn("a-early", names, "S11 early name inside the window is read")
+        self.assertNotIn("zz-old", names, "S11 late name outside the window is not read")
+
+    def test_cap_is_by_time(self):
+        self.check_cap_by_time(load_copy())
+
+    def test_mutant_cap_by_name(self):
+        mod = mutant("names = [n for _, n in sorted(stamped)[-MAX_RECORDS:]]", "names = sorted(n for _, n in stamped)[-MAX_RECORDS:]")
+        self.check_cap_by_time(load_copy())
+        with self.assertRaises(AssertionError) as cm:
+            self.check_cap_by_time(mod)
+        self.assertIn("S11 early name", str(cm.exception))
+
+    def test_impossible_date_name_is_unread_not_an_error(self):
+        r = Root(self)
+        r.add(worker="p-1", code=0)
+        os.mkdir(os.path.join(r.dir, "a-20261399T999999Z-abcdef"))
+        recs, bad = real.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        self.assertEqual((len(recs), bad), (1, 1), "S11 impossible date")
+
+    def test_mutant_raises_on_impossible_date(self):
+        mod = mutant("            if when is None:", "            if False:")
+        with self.assertRaises(Exception):
+            self.bad_date_load(mod)
+
+    def bad_date_load(self, mod=None):
+        mod = mod or real
+        r = Root(self)
+        r.add(worker="p-1", code=0)
+        os.mkdir(os.path.join(r.dir, "a-20261399T999999Z-abcdef"))
+        return mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+
+    T1 = "areas=docs,app,server tests=20370 files=3245 checks=tests:docs(5):6s,proof-test-refs:0s,tests:app(780):688s,ssr:39s,tests:server(1539):575s,tests:pg(921):1055s,existing-startup:157s total=1056s tree=e4fee3f98d4f"
+    T2 = "areas=server tests=1600 files=40 checks=lint:3s,tests:server(40):200s,tests:pg(20):400s total=410s tree=0123456789ab"
+    C1 = "ran: architect=approve,warden=approve (models fast, round 9, diff a0cba6c30416 x)"
+    C2 = "ran: warden=approve (models fast, round 1, diff b0cba6c30416)"
+
+    def landed(self, mod):
+        raw = "".join("\x1e%s\x1f%s\x1f%s" % (c * 40, t, k) for c, t, k in (("a", self.T1, self.C1), ("b", self.T2, self.C2)))
+        class R: returncode = 0; stdout = raw
+        return mod.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
+
+    def check_trailer_times(self, mod):
+        got = self.landed(mod)
+        self.assertEqual((got[0].get("total"), got[0].get("tests"), got[0].get("files"), got[0].get("rounds")), (1056, 20370, 3245, 9), "S12 real trailer fields")
+        self.assertEqual(tuple(got[0].get("steps", {}).get(k) for k in ("tests:server", "tests:pg", "ssr")), (575, 1055, 39), "S12 steps with a (count)")
+        r = Root(self)
+        r.add(worker="p-1", boss="orch-one", code=0)
+        recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        out = mod.build(recs, bad, got, 50, (), "2026-11-12")[0]
+        self.assertIn("land time (Land-Checks total=): median 733 s, p90 1056 s (n=2)", out, "S12 total")
+        self.assertIn("tests:server: median 387.5 s (n=2); tests:pg: median 727.5 s (n=2)", out, "S12 per step")
+        self.assertIn("median 5, max 9, 3 or more: 1", out, "S12 rounds")
+        self.assertIn("median 1642.5 files (test files run)", out, "S12 files label")
+        self.assertIn("pod time:", out, "S12 pod time column")
+        self.assertLess(len(out.splitlines()), 20)
+
+    def test_trailer_times(self):
+        self.check_trailer_times(real)
+
+    def test_mutant_total_is_not_read(self):
+        mod = mutant('r"\\btotal=(\\d{1,7})s\\b"', 'r"\\btotalx=(\\d{1,7})s\\b"')
+        self.check_trailer_times(real)   # control first
+        self.assertEqual(real.parse_trailer(self.T2)["total"], 410)
+        self.assertNotIn("total", mod.parse_trailer(self.T2), "S12 the mutant does not read total")
+        with self.assertRaises(AssertionError):
+            self.check_trailer_times(mod)
+
+    def test_mutant_count_in_step_name(self):
+        mod = mutant('(?:\\((\\d{1,9})\\))?:', '(?:(\\d{1,9}))?:')
+        self.check_trailer_times(real)   # control first
+        self.assertEqual(real.parse_trailer(self.T2)["steps"]["tests:server"], 200)
+        self.assertNotIn("tests:server", mod.parse_trailer(self.T2).get("steps", {}), "S12 the mutant cannot read name(count)")
+        with self.assertRaises(AssertionError):
+            self.check_trailer_times(mod)
+
+    def test_mutant_rounds_not_from_council(self):
+        mod = mutant('m = re.search(r"\\bround (\\d{1,9})\\b", parts[2])', 'm = None')
+        self.check_trailer_times(real)   # control first
+        with self.assertRaises(AssertionError):
+            self.check_trailer_times(mod)
+
+    def launch_dirs(self):
+        """A switchboard record dir `<state>/cloud` (live launch records) and its sibling `<state>/cloud-boss` (kept at removal), neutral names."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cloud, kept = os.path.join(tmp.name, "cloud"), os.path.join(tmp.name, "cloud-boss")
+        os.makedirs(cloud)
+        os.makedirs(kept)
+        with open(os.path.join(cloud, "live-1.json"), "w") as f:
+            json.dump({"worker": "live-1", "reports_to": "orch-one"}, f)
+        with open(os.path.join(kept, "gone-2.json"), "w") as f:
+            json.dump({"worker": "gone-2", "boss": "orch-two", "ended": "2026-11-12T00:00:00Z"}, f)
+        with open(os.path.join(cloud, "bad-3.json"), "w") as f:
+            json.dump({"worker": "bad-3", "reports_to": "Not A Name; rm"}, f)
+        return cloud
+
+    def check_launch_boss(self, mod):
+        cloud = self.launch_dirs()
+        r = Root(self)
+        for w in ("live-1", "gone-2", "bad-3", "none-4"):
+            d = r.add(worker=w, code=0)
+            path = os.path.join(d, "run.json")
+            with open(path) as f:
+                rec = json.load(f)
+            del rec["boss"]   # a record from before the run record carried it
+            with open(path, "w") as f:
+                json.dump(rec, f)
+        recs, _ = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW, mod.boss_lookup({"CW_CLOUD_RECORD_DIR": cloud}))
+        lanes = {x["worker"]: x["lane"] for x in recs}
+        self.assertEqual(lanes["live-1"], "orch-one", "S13 live launch record")
+        self.assertEqual(lanes["gone-2"], "orch-two", "S13 kept boss of a removed worker")
+        self.assertEqual(lanes["bad-3"], "bad (lane unknown)", "S13 invalid boss is not used")
+        self.assertEqual(lanes["none-4"], "none (lane unknown)", "S13 no record: lane unknown")
+
+    def test_launch_boss(self):
+        self.check_launch_boss(real)
+
+    def test_mutant_launch_record_not_read(self):
+        mod = mutant("(lambda w=rec.get(\"worker\"): boss_of(w)) if boss_of else None", "None")
+        self.check_launch_boss(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_launch_boss(mod)
+        self.assertIn("S13 live launch record", str(cm.exception))
+
+    def check_authors(self, mod):
+        def line(c, a, t, k):
+            return "\x1e%s\x1f%s\x1f%s\x1f%s" % (c * 40, t, k, a)
+        raw = (line("a", "acme-bot[bot]", self.T1, self.C1) + line("b", "acme-bot[bot]", self.T2, self.C2)
+               + line("c", "Some Person", "areas=docs tests=1 files=1 checks=x:1s total=9s tree=0123456789ab", self.C2))
+        class R: returncode = 0; stdout = raw
+        got = mod.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
+        self.assertEqual([c["author"] for c in got], ["acme-bot[bot]", "acme-bot[bot]", "Some Person"], "S14 author read in the same git call")
+        r = Root(self)
+        r.add(worker="p-1", boss="orch-one", code=0)
+        recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        out = mod.build(recs, bad, got, 50, (), "2026-11-12", "", ("acme-bot[bot]",))[0]
+        self.assertIn("median 733 s, p90 1056 s (n=2)", out, "S14 ours only")
+        self.assertIn("landed by others (author name as claimed, not verified): 1; land time median 9 s (n=1)", out, "S14 others one line")
+        self.assertLess(len(out.splitlines()), 20)
+
+    def test_authors(self):
+        self.check_authors(real)
+        self.assertEqual(real.own_authors({"CW_LAND_REPORT_OWN_AUTHORS": "a-bot[bot], w2"}, "/nonexistent"), ("a-bot[bot]", "w2"))
+        self.assertEqual(real.own_authors({}, "/nonexistent"), ())
+
+    def test_mutant_no_author_split(self):
+        mod = mutant('if landed and own:', 'if False:')
+        self.check_authors(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_authors(mod)
+        self.assertIn("S14", str(cm.exception))
+
+    def check_boss_rule(self, mod, writer_pattern):
+        import re
+        import run_record
+        import stall_watch
+        names = ["a", "orch-one", "orch_2", "a" * 32, "a" * 33, "", "A", "1a", "-a", "a b", "a;b", "a\n", "\u0661a", "é"]
+        for n in names:
+            w = bool(writer_pattern.fullmatch(n))
+            r = bool(mod.BOSS_NAME.fullmatch(n))
+            self.assertEqual(w, r, "S15 writer and reader disagree on %r" % n)
+            self.assertEqual(w, bool(stall_watch.AGENT_NAME.fullmatch(n)), "S15 the switchboard reader disagrees on %r" % n)
+            self.assertEqual(mod.lane_of("w-1", n).endswith("(lane unknown)"), not w, "S15 lane_of on %r" % n)
+
+    def test_boss_rule_is_one(self):
+        import run_record
+        self.check_boss_rule(real, run_record.BOSS_NAME)
+        self.assertIs(real.BOSS_NAME, run_record.BOSS_NAME)
+
+    def test_mutant_reader_copy_differs(self):
+        import re
+        import run_record
+        mod = mutant("BOSS_NAME = run_record.BOSS_NAME", 'BOSS_NAME = re.compile(r"[a-z][a-z0-9_-]{0,30}")')
+        with self.assertRaises(AssertionError) as cm:
+            self.check_boss_rule(mod, run_record.BOSS_NAME)
+        self.assertIn("S15 writer and reader disagree", str(cm.exception))
+
+    def test_mutant_writer_copy_differs(self):
+        import re
+        import run_record
+        with self.assertRaises(AssertionError) as cm:
+            self.check_boss_rule(real, re.compile(r"[a-z][a-z0-9_-]{0,15}"))
+        self.assertIn("S15 writer and reader disagree", str(cm.exception))
+
+    def lookup_case(self, mod, make):
+        """boss_lookup on a worker record `bad-1.json` made by make(path); returns the lane of a pod 'bad-1'."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cloud = os.path.join(tmp.name, "cloud")
+        os.makedirs(cloud)
+        make(os.path.join(cloud, "bad-1.json"), tmp.name)
+        return mod.lane_of("bad-1", None, lambda: mod.boss_lookup({"CW_CLOUD_RECORD_DIR": cloud})("bad-1"))
+
+    @staticmethod
+    def good(path, _):
+        with open(path, "w") as f:
+            json.dump({"reports_to": "orch-one"}, f)
+
+    @staticmethod
+    def a_link(path, tmpdir):
+        target = os.path.join(tmpdir, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"reports_to": "orch-one"}, f)
+        os.symlink(target, path)
+
+    @staticmethod
+    def a_dir(path, _):
+        os.mkdir(path)
+
+    @staticmethod
+    def too_big(path, _):
+        with open(path, "w") as f:
+            f.write(json.dumps({"reports_to": "orch-one"}) + " " * 70000)   # valid JSON in its first 64 KiB: only the size check refuses it
+
+    def check_untrusted_files(self, mod):
+        self.assertEqual(self.lookup_case(mod, self.good), "orch-one", "S16 control: a good record is read")
+        self.assertEqual(self.lookup_case(mod, self.a_link), "bad (lane unknown)", "S16 symlink refused")
+        self.assertEqual(self.lookup_case(mod, self.a_dir), "bad (lane unknown)", "S16 non-regular file refused")
+        self.assertEqual(self.lookup_case(mod, self.too_big), "bad (lane unknown)", "S16 file over 64 KiB refused")
+
+    def test_untrusted_files(self):
+        self.check_untrusted_files(real)
+
+    def test_mutant_follows_links(self):
+        mod = mutant("fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)", "fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)")
+        self.check_untrusted_files(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_untrusted_files(mod)
+        self.assertIn("S16 symlink", str(cm.exception))
+
+    def test_mutant_no_size_check(self):
+        mod = mutant("info.st_size > 65536", "False")
+        self.check_untrusted_files(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_untrusted_files(mod)
+        self.assertIn("S16 file over", str(cm.exception))
+
+    def test_record_with_its_own_invalid_boss_falls_to_the_launch_record(self):
+        cloud = self.launch_dirs()
+        r = Root(self)
+        for w, b in (("live-1", "Not A Name; x"), ("none-4", "Not A Name; x")):
+            r.add(worker=w, code=0, boss=b)
+        recs, _ = real.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW, real.boss_lookup({"CW_CLOUD_RECORD_DIR": cloud}))
+        lanes = {x["worker"]: x["lane"] for x in recs}
+        self.assertEqual(lanes, {"live-1": "orch-one", "none-4": "none (lane unknown)"})
+
+    def test_own_authors_file_and_limit(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ident = os.path.join(tmp.name, "ident")
+        with open(ident, "w") as f:
+            f.write("acme-bot[bot]\nbot@example.invalid\n")
+        self.assertEqual(real.own_authors({}, ident), ("acme-bot[bot]",))
+        self.assertEqual(real.own_authors({"CW_LAND_REPORT_OWN_AUTHORS": "x-bot"}, ident), ("x-bot",), "the setting wins")
+        self.assertEqual(real.own_authors({"CW_LAND_REPORT_OWN_AUTHORS": "ok," + "a" * 101}, ident), ("ok",), "a name over 100 characters is dropped")
+        with open(ident, "w") as f:
+            f.write("b" * 101 + "\n")
+        self.assertEqual(real.own_authors({}, ident), (), "an identity line over 100 characters is not used")
+
+    def check_slack(self, mod):
+        start, end = NOW - dt.timedelta(hours=24), NOW
+        r = Root(self)
+        for name, when in (("in-lo", start - dt.timedelta(days=1)), ("out-lo", start - dt.timedelta(days=1, seconds=1)),
+                           ("in-hi", end + dt.timedelta(days=1)), ("out-hi", end + dt.timedelta(days=1, seconds=1))):
+            os.mkdir(os.path.join(r.dir, "%s-%s-%06x" % (name, when.strftime("%Y%m%dT%H%M%SZ"), 1)))   # no run.json: a directory that is read counts as unread
+        recs, unread = mod.load_records(r.dir, start, end)
+        self.assertEqual((recs, unread), ([], 2), "S17 both boundary ids read, both ids beyond not read")
+
+    def test_slack_boundary(self):
+        self.check_slack(real)
+
+    def test_mutant_slack_boundary_exclusive(self):
+        mod = mutant("if start - slack <= when <= end + slack:", "if start - slack < when < end + slack:")
+        self.check_slack(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_slack(mod)
+        self.assertIn("S17", str(cm.exception))
+
+    def test_stop_path_boss_lookup_never_raises(self):
+        import cloud_worker
+        class Bad:
+            @property
+            def env(self):
+                raise RuntimeError("boom")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(cloud_worker._stall("boss_of", Bad(), "w-1"), "the stop path gets boss=None, not an exception")
+
+    def test_record_without_boss_falls_back_through_load_records(self):
+        r = Root(self)
+        d = r.add(worker="solo-3", code=0)
+        path = os.path.join(d, "run.json")
+        rec = json.load(open(path))
+        del rec["boss"]
+        json.dump(rec, open(path, "w"))
+        recs, _ = real.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        self.assertEqual(recs[0]["lane"], "solo (lane unknown)")
+
+    def test_setting_validated(self):
+        self.assertEqual(real.first_repo("acme-org/widget-service"), "acme-org/widget-service")
+        self.assertEqual(real.first_repo("bad name"), "")
+        self.assertEqual(real.first_repo(None), "")
 
 
 def reaper_module_name(src):

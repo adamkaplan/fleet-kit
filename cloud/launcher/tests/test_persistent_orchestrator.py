@@ -778,15 +778,28 @@ class S10Manifest(unittest.TestCase):
     OLD_RULES = [(("",), ("pods",), ("get", "list", "watch", "create", "patch", "delete")), (("",), ("pods/log",), ("get",)), (("",), ("pods/exec",), ("create",)),
                  (("",), ("pods/portforward",), ("create",)), (("",), ("secrets",), ("get", "list", "create", "patch", "delete"))]
 
-    def test_s10_exactly_one_rule_is_added_and_no_other_is_widened(self):
-        role = [d for d in k1.rbac_docs() if d["kind"] == "Role"][0]
+    # Documented additions relative to OLD_RULES: the StatefulSet rule (the persistent workload) and the PodDisruptionBudget rule (one budget per worker pod).
+    EXPECTED_ADDED = [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete")),
+                      (("policy",), ("poddisruptionbudgets",), ("get", "list", "create", "delete"))]
+
+    def check_rules(self, role):
         rules = [(tuple(r["groups"]), tuple(r["resources"]), tuple(r["verbs"])) for r in role["rules"]]
         added = [r for r in rules if r not in self.OLD_RULES]
-        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete"))])
+        self.assertEqual(sorted(added), sorted(self.EXPECTED_ADDED))   # the order in the file is not a rule
         self.assertEqual([r for r in self.OLD_RULES if r not in rules], [])
-        self.assertEqual(len(rules), len(self.OLD_RULES) + 1)
-        self.assertEqual(len(added[0][2]), 5)
+        self.assertEqual(len(rules), len(self.OLD_RULES) + len(self.EXPECTED_ADDED))
+        self.assertEqual([len(r[2]) for r in added if r[1] == ("statefulsets",)], [5])
         self.assertNotIn("*", role["text"].replace('apiGroups: [""]', ""))
+
+    def test_s10_mutant_a_widened_budget_rule_fails_the_check(self):
+        text = open(os.path.join(ROOT, "cloud/k8s/operator-rbac.yaml")).read()
+        changed = text.replace('verbs: ["get", "list", "create", "delete"]', 'verbs: ["get", "list", "create", "patch", "delete"]')
+        self.assertNotEqual(changed, text)
+        with self.assertRaises(AssertionError):
+            self.check_rules([d for d in k1.rbac_docs(changed) if d["kind"] == "Role"][0])
+
+    def test_s10_exactly_the_documented_rules_are_added_and_no_other_is_widened(self):
+        self.check_rules([d for d in k1.rbac_docs() if d["kind"] == "Role"][0])
 
 
 class S10Verbs(unittest.TestCase):

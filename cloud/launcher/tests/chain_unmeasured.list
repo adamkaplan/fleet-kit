@@ -48,6 +48,7 @@ cloud/launcher/tests/test_no_open_files.py
 cloud/launcher/tests/test_nudge_reused.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
+cloud/launcher/tests/test_pdb.py
 cloud/launcher/tests/test_persistent_merge_fix.py
 cloud/launcher/tests/test_persistent_orchestrator.py
 cloud/launcher/tests/test_pod_boundaries.py
@@ -80,6 +81,7 @@ cloud/launcher/tests/test_secret_dir.py
 cloud/launcher/tests/test_secret_dir_publish.py
 cloud/launcher/tests/test_stall_structural.py
 cloud/launcher/tests/test_stall_watch.py
+cloud/launcher/tests/test_startup_taint.py
 cloud/launcher/tests/test_stop_failed_pod.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
@@ -115,3 +117,5 @@ cloud/worker/tests/test_reach.py
 cloud/worker/tests/test_scan_dpkg_skip.py
 cloud/worker/tests/test_shell_check.py
 cloud/worker/tests/test_token_table.py
+cloud/worker/tests/test_tool_cap.py
+cloud/worker/tests/test_tool_cap_env.py

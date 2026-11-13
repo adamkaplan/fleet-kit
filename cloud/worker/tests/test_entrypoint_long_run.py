@@ -51,6 +51,9 @@ class Rows(Base):
         with open(self.conf()) as f, open(os.path.join(self.share, "opencode-worker.json")) as t:
             got, tpl = f.read().split("\n", 1)[1], t.read().split("\n", 1)[1]
         self.assertEqual(got, tpl)
+        # the written config (valid JSON) lists the clamp plugin once, under the share dir
+        with open(self.conf()) as f:
+            self.assertEqual(json.load(f)["plugin"], [os.path.join(self.share, "plugins/cw-tool-cap/index.js")])
 
     def test_s7_rows_and_order(self):
         r = self.start(PATTERNS)

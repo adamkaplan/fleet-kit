@@ -8,11 +8,13 @@ small private state file, per part (message, comment), so a part that failed is 
 What the data holds (read on 12 November 2026, stated first):
   run_logs    {"runs": [{"name", "exit", "woke", "log_tail"}], "wake_lines": []}: NO time field. A per-step time of `tests:server` or `tests:pg` is therefore NOT
               recorded; the report reads one only from a line `step=<name> seconds=<n>` in a run's log tail, and a land run without it is counted as `no step data`
-              (never as zero). The follow-up is that the land tool prints that line. The land wall time is the run record's own `end` minus `start`.
+              (never as zero). The follow-up is that the land tool prints that line. The `pod time` is the run record's own `end` minus `start`.
   attempt     a record whose newest run named `land` or `land-...` exists; its exit is 0 landed, 18 council, 13 tests, 3 environment, 124 or 137 time limit, else other.
               A record with no such run is not an attempt (`no land run`).
-  trailer     `Land-Checks: files=<n> lines=<n> rounds=<n>` (key=value pairs; `rounds` may be in `Land-Council` instead); a missing key is counted as unread, not 0.
-  lane        the worker name without its trailing `-<digits>`.
+  trailer     REAL form (checked in .spire/tool/checks.sh and the land tests): `Land-Checks: areas=<areas> tests=<n> files=<n> checks=<step:Ns,...> total=<n>s tree=<12 hex>`; its `files` is the
+              number of TEST files run, NOT the files a change touched, and it has no `lines`; `Land-Council: ran: warden=approve (models fast, round <n>, diff <id>)` or
+              `none needed (...)`. The LAND time and per-step times come from the trailer (`total=<n>s`, `checks=name(count):<n>s,...`; owner decision), the pod's life is only the `pod time` column. So change size in lines is unread for such commits (never 0), rounds come from `round <n>`; a `lines=`/`rounds=` key is read when present.
+  lane        the boss the worker reports to (run record `boss`); a record without it: the worker name up to its first `-`, printed `(lane unknown)`.
 Everything read is untrusted: a corrupt record, a link, a file over RECORD_MAX bytes is skipped and counted (`N records not read`); the output goes through one scrub."""
 import datetime as dt
 import json
@@ -23,6 +25,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+
+import run_record
 
 RECORD_MAX = 1 << 20          # a run.json over this is not read (the real one is a few KB)
 MAX_RECORDS = 5000            # directories looked at in one pass
@@ -36,8 +40,8 @@ EXIT_REASON = {0: "landed", 18: "council", 13: "tests", 3: "environment", 124: "
 REASONS = ("council", "tests", "environment", "time limit", "other")
 STEPS = ("tests:server", "tests:pg")
 STEP_LINE = re.compile(r"\bstep=(tests:server|tests:pg) seconds=(\d{1,7}(?:\.\d{1,3})?)\b")
-LAND_NAME = re.compile(r"land(?:-[A-Za-z0-9._-]{0,60})?")
-RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}-\d{8}T\d{6}Z-[0-9a-f]{6}")
+LAND_NAME = re.compile(r"land(?:\d{1,9}|-[A-Za-z0-9._-]{0,60})?")   # land, land<N> (cw-run names), land-<suffix>; never dry<N>, retest, chk
+RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 ISSUE_REF = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99})#([1-9][0-9]{0,8})")
 BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,100}")
 ISO = "%Y-%m-%dT%H:%M:%SZ"
@@ -54,8 +58,18 @@ def name_text(value, limit=40, extra=""):
     return (re.sub(r"[^A-Za-z0-9._%s-]" % re.escape(extra), "", value) if isinstance(value, str) else "")[:limit] or "unknown"
 
 
-def lane_of(worker):
-    return re.sub(r"-\d+$", "", name_text(worker, 64))
+BOSS_NAME = run_record.BOSS_NAME   # the one definition (run_record.py is shipped everywhere; this module is loaded by name beside it)
+MAX_LINES = 19                # the whole message stays under 20 lines
+FIRST_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+
+def lane_of(worker, boss=None, fallback=None):
+    """The lane is the boss the worker reports to (the run record's `boss`); a record without it falls back to the worker name's prefix up to the first
+    `-` (its trailing letters-digits suffix goes with the rest) and says `lane unknown`."""
+    for candidate in (boss, fallback() if callable(fallback) else None):   # the run record's, then the launch records' (looked up only when needed)
+        if isinstance(candidate, str) and BOSS_NAME.fullmatch(candidate):
+            return candidate
+    return name_text(worker, 64).split("-")[0] + " (lane unknown)"
 
 
 def parse_time(text):
@@ -63,6 +77,25 @@ def parse_time(text):
         return dt.datetime.strptime(text, ISO).replace(tzinfo=dt.timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+def first_repo(raw):
+    """The setting CW_LAND_REPORT_FIRST_REPO (owner/repo), else "" (none)."""
+    return raw.strip() if isinstance(raw, str) and FIRST_REPO.fullmatch(raw.strip()) else ""
+
+
+def own_authors(env, ident_file="/etc/cw-default-identity"):
+    """The author names whose landed commits are 'ours' (the cloud workers): the setting CW_LAND_REPORT_OWN_AUTHORS (comma list), else the first line of the
+    pod identity file when this host has one (the launcher image does not), else () (no split)."""
+    raw = (env or {}).get("CW_LAND_REPORT_OWN_AUTHORS")
+    if isinstance(raw, str) and raw.strip():
+        return tuple(n.strip() for n in raw.split(",") if n.strip() and len(n.strip()) <= 100)
+    try:
+        with open(ident_file, encoding="utf-8") as f:
+            first = f.readline().strip()
+        return (first,) if first and len(first) <= 100 else ()
+    except (OSError, UnicodeDecodeError):
+        return ()
 
 
 def small_bound(env):
@@ -123,11 +156,61 @@ def land_run(rec):
     return None
 
 
-def load_records(root, start, end):
+def read_small_json(path):
+    """A small JSON object file read without following a link, or None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                return None
+            got = json.loads(os.read(fd, 65537).decode("utf-8"))
+        finally:
+            os.close(fd)
+        return got if isinstance(got, dict) else None
+    except (OSError, ValueError, UnicodeDecodeError):   # json.JSONDecodeError is a ValueError
+        return None
+
+
+def boss_lookup(env):
+    """worker -> boss from the LAUNCH records, read only: (1) the switchboard's live worker record `<CW_CLOUD_RECORD_DIR>/<worker>.json` key `reports_to` (what
+    `--reports-to` gave at launch, bin/cloud_worker.py), (2) the one kept at the worker's removal `<state>/cloud-boss/<worker>.json` key `boss` (bin/cloud_retired.py;
+    `<state>` is the parent of CW_CLOUD_RECORD_DIR). None when neither holds a valid name. The audit `create` line carries no boss, so it is not read."""
+    rd = ((env or {}).get("CW_CLOUD_RECORD_DIR") or "").rstrip("/")
+    cache = {}
+
+    def find(worker):
+        if not rd or not isinstance(worker, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", worker):
+            return None
+        if worker not in cache:
+            boss = None
+            for path, key in ((os.path.join(rd, worker + ".json"), "reports_to"), (os.path.join(os.path.dirname(rd), "cloud-boss", worker + ".json"), "boss")):
+                found = read_small_json(path)
+                value = found.get(key) if found else None
+                if isinstance(value, str) and BOSS_NAME.fullmatch(value):
+                    boss = value
+                    break
+            cache[worker] = boss
+        return cache[worker]
+    return find
+
+
+def load_records(root, start, end, boss_of=None):
     """(records of the window [start, end) as dicts, number not read). A record is one directory of `root` named as a run id."""
     out, unread = [], 0
     try:
-        names = sorted(n for n in os.listdir(root) if RUN_ID.fullmatch(n))[-MAX_RECORDS:]
+        slack = dt.timedelta(days=1)
+        stamped = []
+        for n in os.listdir(root):
+            if not RUN_ID.fullmatch(n):
+                continue
+            when = parse_time(re.sub(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$", r"\1-\2-\3T\4:\5:\6Z", n.split("-")[-2]))   # the id's own time, not its name's place in the alphabet
+            if when is None:   # a name with an impossible date is one unread record, never an exception
+                unread += 1
+                continue
+            if start - slack <= when <= end + slack:   # an id outside the window by more than a day is not read at all
+                stamped.append((when, n))
+        names = [n for _, n in sorted(stamped)[-MAX_RECORDS:]]   # newest MAX_RECORDS by time
     except OSError:
         return [], 0
     for n in names:
@@ -143,7 +226,7 @@ def load_records(root, start, end):
             continue
         began = parse_time(rec.get("start"))
         hook = rec.get("end_hook") if isinstance(rec.get("end_hook"), dict) else {}
-        out.append({"worker": name_text(rec.get("worker"), 64), "repo": name_text(rec.get("repository"), 100, "/"), "lane": lane_of(rec.get("worker")),
+        out.append({"worker": name_text(rec.get("worker"), 64), "repo": name_text(rec.get("repository"), 100, "/"), "lane": lane_of(rec.get("worker"), rec.get("boss"), (lambda w=rec.get("worker"): boss_of(w)) if boss_of else None),
                     "minutes": (ended - began).total_seconds() / 60 if began and ended >= began else None, "land": land_run(rec),
                     "sha": rec.get("head_sha") if isinstance(rec.get("head_sha"), str) and re.fullmatch(r"[0-9a-f]{7,40}", rec["head_sha"]) else None,
                     "reason": name_text(rec.get("exit_reason"), 30) if isinstance(rec.get("exit_reason"), str) else "unknown",
@@ -157,9 +240,21 @@ def reason_of(code):
 
 # ---- the landed commits
 def parse_trailer(text):
+    text = text if isinstance(text, str) else ""
     out = {}
-    for k, v in re.findall(r"\b(files|lines|rounds)=(\d{1,9})\b", text if isinstance(text, str) else ""):
+    for k, v in re.findall(r"\b(files|lines|rounds|tests)=(\d{1,9})\b", text):
         out.setdefault(k, int(v))
+    m = re.search(r"\btotal=(\d{1,7})s\b", text)   # the land wall time, seconds
+    if m:
+        out["total"] = int(m.group(1))
+    m = re.search(r"\bchecks=(\S{1,4000})", text)    # `name(count):<n>s,name:<n>s,...`; the count in brackets is optional
+    steps = {}
+    for entry in m.group(1).split(",") if m else []:
+        e = re.fullmatch(r"([A-Za-z0-9_.:-]{1,60}?)(?:\((\d{1,9})\))?:(\d{1,7})s", entry)
+        if e:
+            steps[e.group(1)] = int(e.group(3))
+    if steps:
+        out["steps"] = steps
     return out
 
 
@@ -167,7 +262,7 @@ def git_landed(git_dir, branch, since, run=subprocess.run):
     """[{sha, files, lines, rounds}] of the commits on `branch` since `since` that carry a Land-Checks trailer; None when git failed (the report says so)."""
     if not git_dir or not BRANCH.fullmatch(branch or "") or branch.startswith("-"):
         return None
-    fmt = "%x1e%H%x1f%(trailers:key=Land-Checks,valueonly,unfold)%x1f%(trailers:key=Land-Council,valueonly,unfold)"
+    fmt = "%x1e%H%x1f%(trailers:key=Land-Checks,valueonly,unfold)%x1f%(trailers:key=Land-Council,valueonly,unfold)%x1f%an"
     try:
         res = run(["git", "-C", git_dir, "log", branch, "--since=" + since.strftime(ISO), "--format=" + fmt, "--"], capture_output=True, text=True, timeout=CALL_SECONDS)
     except (OSError, subprocess.SubprocessError):
@@ -181,17 +276,26 @@ def git_landed(git_dir, branch, since, run=subprocess.run):
             continue
         checks = parse_trailer(parts[1])
         rounds = checks.get("rounds", parse_trailer(parts[2]).get("rounds"))
-        out.append({"sha": parts[0].strip(), "files": checks.get("files"), "lines": checks.get("lines"), "rounds": rounds})
+        if rounds is None:   # the real Land-Council form: `ran: warden=approve (models fast, round 2, diff abc)`; `none needed (...)` has no round
+            m = re.search(r"\bround (\d{1,9})\b", parts[2])
+            rounds = int(m.group(1)) if m else None
+        item = {"sha": parts[0].strip(), "files": checks.get("files"), "lines": checks.get("lines"), "rounds": rounds}
+        if len(parts) > 3 and parts[3].strip():
+            item["author"] = parts[3].strip()[:100]
+        item.update({k: checks[k] for k in ("tests", "total", "steps") if k in checks})   # only when the trailer has them
+        out.append(item)
     return out
 
 
 # ---- the report
-def build(records, unread, landed, bound, previous=(), day=""):
-    """(multi-line text, one comment line). `records` are the window's, `previous` the 24 h before (for the trend); `landed` the commits or None."""
+def build(records, unread, landed, bound, previous=(), day="", first_repo="", own=()):
+    """(multi-line text, one comment line). `records` are the window's, `previous` the 24 h before (for the trend); `landed` the commits or None.
+    Rows are per repo and lane; a lane with no land run prints nothing (one trailing line counts those pods); the repo with the most attempts comes first,
+    `first_repo` (CW_LAND_REPORT_FIRST_REPO) before it; the text stays under 20 lines, the lanes that do not fit are one `N more lanes` line."""
     lanes = {}
     for r in records:
         lanes.setdefault((r["repo"], r["lane"]), []).append(r)
-    landed_shas = [c["sha"] for c in landed or []]
+    landed_shas = [c["sha"] for c in landed or []]   # all authors: a pod landed is a pod landed
     is_landed = lambda r: bool(r["sha"]) and any(s.startswith(r["sha"]) for s in landed_shas)   # noqa: E731
     prev_by = {}
     for r in previous:
@@ -199,56 +303,92 @@ def build(records, unread, landed, bound, previous=(), day=""):
             prev_by.setdefault((r["repo"], r["lane"]), []).append(r["minutes"])
     attempts_all = sum(1 for r in records if r["land"])
     landed_all = sum(1 for r in records if r["land"] and r["land"]["exit"] == 0)
-    lines = ["Land report %s (window: last 24 h; small bound %d changed lines)" % (day, bound)]
-    for (repo, lane), rs in sorted(lanes.items()):
+    skipped = sum(1 for r in records if not r["land"])
+    repo_att = {}
+    for (repo, lane), rs in lanes.items():
+        repo_att[repo] = repo_att.get(repo, 0) + sum(1 for r in rs if r["land"])
+    shown = sorted(((k, rs) for k, rs in lanes.items() if any(r["land"] for r in rs)),
+                   key=lambda kv: (kv[0][0] != first_repo, -repo_att[kv[0][0]], kv[0][0], -sum(1 for r in kv[1] if r["land"]), kv[0][1]))
+    rows = []
+    for (repo, lane), rs in shown:
         att = [r for r in rs if r["land"]]
         ok = [r for r in att if r["land"]["exit"] == 0]
         fails = {k: 0 for k in REASONS}
         for r in att:
             if r["land"]["exit"] != 0:
                 fails[reason_of(r["land"]["exit"]) if reason_of(r["land"]["exit"]) in fails else "other"] += 1
-        lines.append("%s / %s: attempted %d, landed %d, failed: council %d, tests %d, environment %d, time limit %d, other %d; no land run %d" % (
-            repo, lane, len(att), len(ok), fails["council"], fails["tests"], fails["environment"], fails["time limit"], fails["other"], len(rs) - len(att)))
+        head = "%s / %s: attempted %d, landed %d, failed: council %d, tests %d, environment %d, time limit %d, other %d" % (
+            repo, lane, len(att), len(ok), fails["council"], fails["tests"], fails["environment"], fails["time limit"], fails["other"])
         times = [r["minutes"] for r in ok if r["minutes"] is not None]
         if len(times) < 3:
-            lines.append("  land wall time: n/a (%d landings with a time, 3 needed)" % len(times))
+            wall = "pod time: n/a (%d landings with a time, 3 needed)" % len(times)
         else:
             before = median(prev_by.get((repo, lane), []))
             trend = "no earlier day" if before is None else "%+g min vs yesterday" % round(median(times) - before, 1)
-            lines.append("  land wall time: median %s min, p90 %s min (n=%d), trend %s" % (num(median(times)), num(p90(times)), len(times), trend))
+            wall = "pod time: median %s min, p90 %s min (n=%d), trend %s" % (num(median(times)), num(p90(times)), len(times), trend)
+        parts = []
         for step in STEPS:
             vals, none = [], 0
             for r in att:
-                m = [float(s) for n, s in STEP_LINE.findall(r["land"]["tail"]) if n == step]
+                m = [float(x) for n, x in STEP_LINE.findall(r["land"]["tail"]) if n == step]
                 if m:
                     vals.append(m[-1])
                 else:
                     none += 1
-            lines.append("  %s: %s; no step data %d" % (step, "median %s s (n=%d)" % (num(median(vals)), len(vals)) if vals else "n/a", none))
+            parts.append("%s: %s; no step data %d" % (step, "median %s s (n=%d)" % (num(median(vals)), len(vals)) if vals else "n/a", none))
+        rows.append(([head, "  " + wall + "; " + "; ".join(parts)], len(att), len(ok)))
+    tail = []
+    everyone = landed
+    if landed and own:   # the figures below are the cloud workers' own landings; the others are one line
+        others = [c for c in landed if c.get("author") not in own]
+        landed = [c for c in landed if c.get("author") in own]
+    else:
+        others = []
     if landed is None:
-        lines.append("landed commits: not read (git failed or no repository directory set)")
+        tail.append("landed commits: not read (git failed or no repository directory set)")
     else:
         size = [c for c in landed if c["lines"] is not None]
         over = sum(1 for c in size if c["lines"] > bound)
         files = [c["files"] for c in landed if c["files"] is not None]
-        lines.append("landed commits: %d; change size per landing: median %s files, median %s lines (n=%d, %d unread)" % (
+        tail.append("landed commits: %d; change size per landing: median %s files (test files run), median %s lines (n=%d, %d unread)" % (
             len(landed), num(median(files)) if files else "n/a", num(median([c["lines"] for c in size])) if size else "n/a", len(size), len(landed) - len(size)))
-        lines.append("share over %d lines: %d of %d" % (bound, over, len(size)))
+        tail.append("share over %d lines: %d of %d" % (bound, over, len(size)))
         rounds = [c["rounds"] for c in landed if c["rounds"] is not None]
-        lines.append("council rounds per landing: %s (n=%d, %d unread)" % (
+        tail.append("council rounds per landing: %s (n=%d, %d unread)" % (
             "median %s, max %d, 3 or more: %d" % (num(median(rounds)), max(rounds), sum(1 for x in rounds if x >= 3)) if rounds else "n/a", len(rounds), len(landed) - len(rounds)))
+    if landed:
+        totals = [c["total"] for c in landed if "total" in c]
+        got = lambda step: [c["steps"][step] for c in landed if step in c.get("steps", {})]   # noqa: E731
+        cells = ["land time (Land-Checks total=): %s" % ("median %s s, p90 %s s (n=%d)" % (num(median(totals)), num(p90(totals)), len(totals)) if totals else "n/a (n=0)")]
+        for step in STEPS:
+            v = got(step)
+            cells.append("%s: %s" % (step, "median %s s (n=%d)" % (num(median(v)), len(v)) if v else "no step data %d" % len(landed)))
+        tail.insert(1, "; ".join(cells))
+    if others:
+        ot = [c["total"] for c in others if "total" in c]
+        tail.append("landed by others (author name as claimed, not verified): %d; land time %s" % (len(others), "median %s s (n=%d)" % (num(median(ot)), len(ot)) if ot else "n/a"))
     unlanded = [r for r in records if not is_landed(r)]
-    lines.append("pods ended unlanded: %d of %d" % (len(unlanded), len(records)))
-    for r in unlanded[:30]:
-        lines.append("  %s (%s)" % (r["worker"], r["reason"]))
+    tail.append("pods ended unlanded: %d of %d" % (len(unlanded), len(records)))
+    if skipped:
+        tail.append("%d pods with no land run skipped" % skipped)
     if unread:
-        lines.append("%d records not read" % unread)
+        tail.append("%d records not read" % unread)
+    room = MAX_LINES - 1 - len(tail)
+    fit = len(rows) if 2 * len(rows) <= room else max(0, (room - 1) // 2)
+    out = ["Land report %s (window: last 24 h; small bound %d changed lines)" % (day, bound)]
+    for row, _, _ in rows[:fit]:
+        out.extend(row)
+    rest = rows[fit:]
+    if rest:
+        out.append("%d more lanes: attempted %d, landed %d" % (len(rest), sum(x[1] for x in rest), sum(x[2] for x in rest)))
+    out.extend(tail)
+    out.extend("  %s (%s)" % (r["worker"], r["reason"]) for r in unlanded[:max(0, MAX_LINES - len(out))])
     comment = "Land report %s: attempted %d, landed %d, pods ended unlanded %d of %d%s" % (
         day, attempts_all, landed_all, len(unlanded), len(records), "; %d records not read" % unread if unread else "")
-    if not landed_all and not landed:
+    if not landed_all and not everyone:
         text = "Land report %s: no landings in the last 24 h (%d attempts, %d pods ended%s)" % (day, attempts_all, len(records), ", %d records not read" % unread if unread else "")
         return scrub(text), scrub(text)
-    return scrub("\n".join(lines))[:MESSAGE_MAX], scrub(comment)[:400]
+    return scrub("\n".join(out))[:MESSAGE_MAX], scrub(comment)[:400]
 
 
 # ---- the schedule
@@ -288,7 +428,7 @@ def write_state(path, state):
         raise
 
 
-def send_message(text, issue, run=subprocess.run):
+def send_message(text, issue, run=subprocess.run):   # item 6 of the ask: no daemon identity exists (--from is Lab only); see the PR body
     res = run(["fl" + "eet-switchboard", "send", "cos", "--issue", issue, text], capture_output=True, text=True, timeout=CALL_SECONDS)
     return res.returncode == 0
 
@@ -316,10 +456,11 @@ def daily_pass(env, now, root, state_path, git_dir=None, send=send_message, comm
             log("land report: CW_LAND_REPORT_ISSUE is not set to owner/repo#N; nothing is sent")
             return "failed"
         start = now - WINDOW
-        records, unread = load_records(root, start, now)
-        earlier, _ = load_records(root, start - WINDOW, start)
+        finder = boss_lookup(env)
+        records, unread = load_records(root, start, now, finder)
+        earlier, _ = load_records(root, start - WINDOW, start, finder)
         landed = git(git_dir or (env or {}).get("CW_LAND_REPORT_GIT_DIR"), (env or {}).get("CW_LAND_REPORT_BRANCH") or "origin/main", start)
-        text, line = build(records, unread, landed, small_bound(env), earlier, day)
+        text, line = build(records, unread, landed, small_bound(env), earlier, day, first_repo((env or {}).get("CW_LAND_REPORT_FIRST_REPO")), own_authors(env))
         for part, call, body in (("message", send, text), ("comment", comment, line)):
             if state.get(part) is True or state.get(part + "_tries", 0) >= MAX_TRIES:
                 continue
