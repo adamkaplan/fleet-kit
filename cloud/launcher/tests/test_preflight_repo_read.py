@@ -420,7 +420,7 @@ class S4Real(Base):
 
 
 
-MINT_ROLES_TESTS = 32   # the plan's count, kept as a floor: at least 32 tests of test_mint_roles pass
+MINT_ROLES_TESTS = 26   # the plan's count, kept as a floor: at least 26 (the 6 tests Renewal inherited from test_git_token_renewal are no longer collected twice) tests of test_mint_roles pass
 MINT_ROLES_HANG_GUARD_SECONDS = 900   # a bound for a hang, about six times the longest measured run; not a speed requirement
 
 
