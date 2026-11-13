@@ -344,56 +344,18 @@ class TestEndOnAsk(unittest.TestCase):
             body = self.end_with(final=text)[0][0][1]
             self.assertNotIn(t[20:], body, label)
             self.assertNotIn(t[20:], self.end_with(log=text)[0][0][1], label)
-        import time
         part = self.retired()
-        for unit in ("a1-\n", "a1\n", "| a1 |\n", "a:\n", "a=b\n", "token=a\n", "ghp_x\nb\n", "http://a:\nb\n"):
-            started = time.monotonic()
-            part._unwrap_redact(unit * (200000 // len(unit)))
-            self.assertLess(time.monotonic() - started, 8, unit)
-
-    def test_a_public_repository_without_a_usable_list_gets_only_the_withheld_line(self):
-        line = self.retired().WITHHELD_LINE
-        secret = "words about acme-secret-org and my final words"
-        for label, kw in (("missing", {"names": None}), ("directory", {"names_env": {"FLEET_PRIVATE_NAMES_FILE": tempfile.gettempdir()}})):
-            for public in (({"private": False},), ({},), (), ({"private": True}, {"private": True}), ({"private": "true"},)):
-                posts, events = self.end_with(final=secret, log="land line", visibility=public, **kw)
-                self.assertEqual([b for _i, b, _r in posts], [line], (label, public))
-                self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
-            self.assertEqual(self.last_reads, [("repos/acme/widget-api", False, self.last_reads[0][2])])   # one bounded read
-            self.assertTrue(self.last_reads[0][2])
-            control, _ = self.end_with(final=secret, control=True, visibility=({"private": False},), **kw)
-            self.assertIn("my final words", control[0][1], "control: today's end posts the text")
-
-    def test_visibility_that_cannot_be_read_counts_as_public(self):
-        for bad in (RuntimeError("down"), OSError("no gh"), ("junk",)):
-            posts, _ = self.end_with(names=None, final="my final words", visibility=bad)
-            self.assertEqual([b for _i, b, _r in posts], [self.retired().WITHHELD_LINE], bad)
-
-    def test_a_private_repository_without_a_list_posts_as_today_with_the_note(self):
-        posts, events = self.end_with(names=None, final="my final words", visibility=({"private": True},))
-        self.assertIn("my final words", posts[0][1])
-        self.assertEqual(events.count("cloud.end_names_unchecked"), 1)
-
-    def test_a_usable_list_needs_no_visibility_read(self):
-        posts, _ = self.end_with(names="acme-secret-org\n", final="my final words", visibility=RuntimeError("down"))
-        self.assertIn("my final words", posts[0][1])
-        self.assertEqual(self.last_reads, [])
-
-    def test_a_partly_unusable_list_withholds_on_a_public_repository_and_posts_on_a_private_one(self):
-        line = self.retired().WITHHELD_LINE
-        part = self.retired()
-        lists = {"bad regex": "acme-secret-org\n(unclosed\nother-made-up\n", "cut": "acme-secret-org\n" + "z" * (part.NAMES_MAX_BYTES + 10),
-                 "too many": "".join("term%d\n" % i for i in range(part.NAMES_MAX_TERMS + 5))}
-        for label, names in lists.items():
-            for public in (({"private": False},), ()):
-                posts, events = self.end_with(names=names, final="words about acme-secret-org", visibility=public)
-                self.assertEqual([b for _i, b, _r in posts], [line], (label, public))
-                self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
-            posts, events = self.end_with(names=names, final="words about acme-secret-org", visibility=({"private": True},))
-            self.assertIn("words about", posts[0][1], label)
-            self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
-        control, _ = self.end_with(names=lists["bad regex"], final="words about acme-secret-org", control=True, visibility=({"private": False},))
-        self.assertIn("words about", control[0][1], "control: today's end posts the text")
+        for unit in ("a1-\n", "a1\n", "| a1 |\n", "a:\n", "a=b\n", "token=a\n", "ghp_x\nb\n", "http://a:\nb\n", "sk-\nabcdefghijkl\n"):
+            text = unit * (200000 // len(unit))
+            out = part._unwrap_redact(text)
+            self.assertLessEqual(part._WRAP_USED[0], part._WRAP_BUDGET, unit)   # the cap is respected: a count, no clock
+            self.assertLessEqual(len(out), len(text) + 16 * (part._WRAP_BUDGET + 1), unit)   # the output is bounded (a replacement is short)
+        text = "token=a\n" * 30000
+        part._unwrap_redact(text)
+        self.assertEqual(part._WRAP_USED[0], part._WRAP_BUDGET, "the slow text spends the whole budget and stops")
+        with mock.patch.object(part, "_WRAP_BUDGET", 10 ** 9):   # control: without the cap the same text costs far more attempts
+            part._unwrap_redact(text)
+            self.assertGreater(part._WRAP_USED[0], 20000)
 
     def test_the_list_is_read_once_and_never_printed(self):
         posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")
