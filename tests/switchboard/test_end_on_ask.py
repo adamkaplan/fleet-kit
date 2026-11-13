@@ -20,7 +20,7 @@ LIMIT = sb.load_module("cloud_worker").bind(sb.__dict__)._retired().END_LOG_CHAR
 
 
 class TestEndOnAsk(unittest.TestCase):
-    def end(self, code=0, log=None, record_extra=None, post=None, mutant=False, run_json=True, final="my final words", run_logs=None, notes=None):
+    def end(self, code=0, log=None, record_extra=None, post=None, mutant=False, run_json=True, final="my final words", run_logs=None, notes=None, visibility=({"private": True},)):
         """(the posts made as [(issue, body, repo)], the audit events) of cmd_retire for a fake pod."""
         w = StopWorld(self)
         rec = w.pod(NAME, final)
@@ -34,6 +34,14 @@ class TestEndOnAsk(unittest.TestCase):
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine, posts, events, cluster = mock.Mock(), [], [], mock.MagicMock()
         engine.send = lambda sender, to, text: w.sent.append((to, text))
+        reads = engine.visibility_reads = []
+
+        def gh_api(path, paginate=True, timeout=None):   # the engine's reader: one bounded read of the repository
+            reads.append((path, paginate, timeout))
+            if isinstance(visibility, Exception):
+                raise visibility
+            return list(visibility)
+        engine.gh_api = gh_api
         record = dict({"worker": NAME, "reports_to": "boss-lane", "issue": 2393, "repo": "acme/widget-api"}, **(record_extra or {}))
         args = argparse.Namespace(name=NAME, undo=False, reason="finished")
 
@@ -61,6 +69,7 @@ class TestEndOnAsk(unittest.TestCase):
         finally:
             for p in reversed(patches):
                 p.stop()
+        self.last_reads = reads
         return posts, events
 
     def test_s4_the_final_message_and_the_last_lines_are_posted_on_the_ask_once(self):
@@ -213,7 +222,8 @@ class TestEndOnAsk(unittest.TestCase):
         part = self.retired()
         patches = [mock.patch.dict("os.environ", env)]
         if control:
-            patches += [mock.patch.object(part, "_unwrap_redact", lambda text: text), mock.patch.object(part, "_name_terms", lambda: ([], None))]
+            patches += [mock.patch.object(part, "_unwrap_redact", lambda text: text), mock.patch.object(part, "_name_terms", lambda: ([], None)),
+                        mock.patch.object(part, "_repo_is_public", lambda engine, repo: False)]
         for p in patches:
             p.start()
         try:
@@ -340,6 +350,34 @@ class TestEndOnAsk(unittest.TestCase):
             started = time.monotonic()
             part._unwrap_redact(unit * (200000 // len(unit)))
             self.assertLess(time.monotonic() - started, 8, unit)
+
+    def test_a_public_repository_without_a_usable_list_gets_only_the_withheld_line(self):
+        line = self.retired().WITHHELD_LINE
+        secret = "words about acme-secret-org and my final words"
+        for label, kw in (("missing", {"names": None}), ("directory", {"names_env": {"FLEET_PRIVATE_NAMES_FILE": tempfile.gettempdir()}})):
+            for public in (({"private": False},), ({},), ()):
+                posts, events = self.end_with(final=secret, log="land line", visibility=public, **kw)
+                self.assertEqual([b for _i, b, _r in posts], [line], (label, public))
+                self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
+            self.assertEqual(self.last_reads, [("repos/acme/widget-api", False, self.last_reads[0][2])])   # one bounded read
+            self.assertTrue(self.last_reads[0][2])
+            control, _ = self.end_with(final=secret, control=True, visibility=({"private": False},), **kw)
+            self.assertIn("my final words", control[0][1], "control: today's end posts the text")
+
+    def test_visibility_that_cannot_be_read_counts_as_public(self):
+        for bad in (RuntimeError("down"), OSError("no gh"), ("junk",)):
+            posts, _ = self.end_with(names=None, final="my final words", visibility=bad)
+            self.assertEqual([b for _i, b, _r in posts], [self.retired().WITHHELD_LINE], bad)
+
+    def test_a_private_repository_without_a_list_posts_as_today_with_the_note(self):
+        posts, events = self.end_with(names=None, final="my final words", visibility=({"private": True},))
+        self.assertIn("my final words", posts[0][1])
+        self.assertEqual(events.count("cloud.end_names_unchecked"), 1)
+
+    def test_a_usable_list_needs_no_visibility_read(self):
+        posts, _ = self.end_with(names="acme-secret-org\n", final="my final words", visibility=RuntimeError("down"))
+        self.assertIn("my final words", posts[0][1])
+        self.assertEqual(self.last_reads, [])
 
     def test_the_list_is_read_once_and_never_printed(self):
         posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")

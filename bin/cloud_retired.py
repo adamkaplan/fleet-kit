@@ -801,6 +801,20 @@ def _unwrap_redact(text):
     return "\n".join(lines)
 
 
+WITHHELD_LINE = "final message withheld: names list unreadable"
+
+
+def _repo_is_public(engine, repo):
+    """True unless GitHub says the repository is private: ONE bounded read of `repos/<owner>/<repo>` (the engine's reader, as `gh api repos/<owner>/<repo> --jq .private`).
+    A visibility that cannot be read counts as public (fail closed)."""
+    try:
+        got = engine.gh_api("repos/%s" % repo, paginate=False, timeout=20)
+        record = [v for v in got if isinstance(v, dict)] if isinstance(got, (list, tuple)) else []
+        return not (record and record[0].get("private") is True)
+    except Exception:
+        return True
+
+
 def post_end(engine, state, record, name, reason, body, post, note, audit=None):
     """Ask #2393: ONCE per end, the pod's final message and the last lines of its land log are posted on its ask issue through `post` (handoff.post_ask_comment),
     scrubbed and cut (end_comment); a pod without a log posts the message alone, a pod without an ask (`issue` and `repo` of its cloud record) posts nothing.
@@ -820,7 +834,10 @@ def post_end(engine, state, record, name, reason, body, post, note, audit=None):
                 audit and audit("private names not checked (%s)" % unchecked)
             except Exception:
                 pass
-        comment = _unwrap_redact(_hide_names(comment, terms) if terms else comment)[:END_POST_CHARS]   # then a secret folded over two lines; the cut again (a short name grows)
+        if not terms and unchecked and _repo_is_public(engine, repo):   # fail closed: no list to apply and a public (or unknown) repository: no pod text at all
+            post(engine, issue, WITHHELD_LINE, author=name, repo=repo)
+            return
+        comment = _unwrap_redact(_hide_names(comment, terms) if terms else comment)[:END_POST_CHARS]   # then a secret folded over lines; the cut again (a short name grows)
         post(engine, issue, comment, author=name, repo=repo)
     except Exception as err:
         try:
