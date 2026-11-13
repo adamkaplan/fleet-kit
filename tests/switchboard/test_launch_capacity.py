@@ -888,9 +888,25 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
 
         def pc11_run(self, script, mutate=None):
             key = (script, mutate)
+            if not PC11_RUNS:   # the first call runs every control and mutant of the class side by side (each is its own subprocess); the tests then read the table
+                self.pc11_warm()
             if key not in PC11_RUNS:   # a control is run once for the whole class: the launcher sources do not change during a run
                 PC11_RUNS[key] = self.pc11_run_uncached(script, mutate)
             return PC11_RUNS[key]
+
+        def pc11_warm(self):
+            from concurrent.futures import ThreadPoolExecutor
+            f = "cloud/launcher/cloud_worker.py"
+            jobs = [(x, None) for x in (self.PC11_U24, self.PC11_U25, self.PC11_U26, self.PC11_U26B, self.PC11_U21, self.PC11_U22, self.PC11_U23)]
+            jobs += [(self.PC11_U24, (f, "        text = done\n", "        return done\n")),
+                     (self.PC11_U25, (f, "key=lambda s: (s[0] - s[1], s[0])", "key=lambda s: (s[0], s[0] - s[1])")),
+                     (self.PC11_U26, (f, "    GLUE_PASS = True\n", "    GLUE_PASS = False\n")),
+                     (self.PC11_U26B, (f, "    GLUE_PASS = True\n", "    GLUE_PASS = False\n")),
+                     (self.PC11_U21, (f, "ipaddress.ip_address(run[i:j])", r"ipaddress.ip_address(run[i:j]) if re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}', run[i:j]) else int('x')")),
+                     (self.PC11_U23, (f, "WINDOW_OVERLAP = 64", "WINDOW_OVERLAP = 0"))]
+            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 2)) as pool:
+                for job, result in zip(jobs, pool.map(lambda j: self.pc11_run_uncached(*j), jobs)):
+                    PC11_RUNS[job] = result
 
         def pc11_run_uncached(self, script, mutate=None):
             import shutil, subprocess, tempfile
