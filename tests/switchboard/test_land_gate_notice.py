@@ -51,6 +51,14 @@ class TestLandedPushNotice(Case):
         self.run_pass(NOW)
         self.assertEqual([(r[0], r[1]) for r in self.reports], [("w-b", "done")])   # the attribution decides: the check above can see a wrong notice
 
+    def test_s10_the_pod_told_of_its_landing_was_told_at_launch_to_take_the_token_first(self):
+        text = land_module().LAND_SETUP_LINE
+        self.assertIn("`fleet-switchboard land-gate take <owner/repo>` until HELD", text)   # the launch text before this change has no token step: a landing was never gated
+        self.assertLess(text.index("land-gate take"), text.index("spire land >"))   # the token comes before the land starts
+        self.main = [self.land(SHA)]
+        self.run_pass(NOW)
+        self.assertEqual([(r[0], r[1]) for r in self.reports], [("w-a", "done")])   # and the one told of the landing is the pod that took it
+
 
 class TestLandTokenSentence(unittest.TestCase):
     def test_s7_every_land_text_carries_the_one_sentence_about_the_token(self):
