@@ -152,6 +152,7 @@ def build(mod, tmp, n_ending, n_live=0, hold=True):
 
     launcher = L(cluster, env, clock, lambda s: None)
     launcher.recorder = NoRecord()
+    launcher.recorder.root = lambda override=None: os.path.join(env["CW_CLOUD_AUDIT"] + ".records")   # #2448: the reaper's land report asks for the directory; this world holds no records
     return launcher, cluster, clock, env, events
 
 

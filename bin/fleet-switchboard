@@ -5631,7 +5631,6 @@ BOSS_READ_SITES = {
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
     "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
-    "bin/fleet-switchboard:cloud_turn_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to scan_turns, which sends to that lane or, with no valid name, to the Chief of Staff alone (#1484)",
     "bin/fleet-switchboard:pod_silence_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to pod_silence.scan, which sends the one summary to that lane alone (#2115)",
     "bin/fleet-switchboard:route_of": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record (#1740), only the address of a stage event (#1575); it is told to that lane and nobody else",
     "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
@@ -8483,6 +8482,7 @@ def cloud_watch_tick(engine, discovery):
 
 
 CLOUD_STALL_ALERT_FILE = "cloud-stall-alert.json"   # #2399: the private cursor and sent keys of the pass that reads the launcher's `stall-alert` audit lines
+CLOUD_IDLE_NOTICE_FILE = "cloud-idle-notice.json"   # #2443: the private cursor and sent keys of the pass that reads the launcher's `idle-notice` audit lines
 CLOUD_END_ALERT_FILE = "cloud-end-alert.json"   # #1480: the private cursor and the sent keys of the pass that reads the launcher's audit file
 
 
@@ -8561,17 +8561,14 @@ def cloud_turn_activity(worker):
 
 
 def cloud_turn_tick(engine, discovery, activity=None):
-    """#1484: a cloud worker whose turn ended and who waits tells its recorded boss, once per turn end (the sender, state file and keys of #1480)."""
+    """#2443 (was #1484's polling of the worker's activity): a pod whose session the server reports idle (one `idle-notice` audit line from the reaper's watch) tells its recorded
+    boss ONE message at once: the last report of that turn (`report done|failed|blocked "<line>"`), or `idle with no report: assess`, with the last text, the cw-run jobs and the
+    deliverable as evidence, or `idle state unknown`. One message per idle, through the daemon's own `send`. `activity` is kept for the old callers and unused."""
     state_dir = getattr(engine, "state_dir", None)
-    watch = getattr(engine, "cloud_watch", None)
-    if state_dir is None or not watch:
+    if state_dir is None:
         return []
-    workers = [(r.get("worker"), r.get("reports_to")) for r in watch.get("records", []) if isinstance(r, dict)]
-    if not hasattr(engine, "_cloud_turn_memory"):
-        engine._cloud_turn_memory = {}
-    return load_module("cloud_end_alert").scan_turns(workers, activity or cloud_turn_activity, Path(state_dir) / CLOUD_END_ALERT_FILE, cloud_audit_path(),
-                                                     lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded,
-                                                     time.time(), engine._cloud_turn_memory)
+    return load_module("cloud_end_alert").scan_idle(cloud_audit_path(), Path(state_dir) / CLOUD_IDLE_NOTICE_FILE, _read_small(state_dir, LAST_REPORT_FILE),
+                                                    lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded)
 
 
 def pod_silence_summary(worker):
@@ -8646,6 +8643,7 @@ def push_watch_tick(engine, discovery):
     if state_dir is not None:   # #2186: only a record the one liveness test accepts is read (as pod_silence_tick reads it)
         retired, reports = registry_retired(state_dir), _read_small(state_dir, LAST_REPORT_FILE)
         ns.record_live = lambda rec, name, at: cloud_record_live(rec, name, retired, reports, at)
+        ns.reported_text = lambda name: (reports.get(name) or {}).get("text")   # ask #2393: the sha a pod reported as `landed <sha>`
     hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
     if hub is None:
         if not getattr(engine, "_push_watch_skip_told", False):   # once per engine, not every idle pass: a line per pass grows the audit and every reader of it rewrites its offsets (TestWriteOnlyOnChange)
@@ -10888,10 +10886,10 @@ class GitHubHub:
                     self._unrouted.add(item.key)
                     self._unrouted_batch.append(item)
 
-    def _chief_audit_once(self, item, why, keep=False):
-        """Ask #2445: one audit line per comment key, whatever the reason; the comment is dropped from the queue (it routes nothing)."""
+    def _chief_audit_once(self, item, why, keep=False, delivered=False):
+        """Ask #2445: one audit line per comment key, whatever the reason. Ask #2484: `delivered` says the comment was handed to the Chief of Staff with the reason (it was not dropped)."""
         with self.lock:
-            if not keep:
+            if not keep and not delivered:
                 self.queue.pop(item.key, None)
             seen = item.key in self._chief_audited
             if not seen:
@@ -10899,14 +10897,16 @@ class GitHubHub:
                     self._chief_audited.clear()
                 self._chief_audited.add(item.key)
         if not seen:
-            self._audit("github.comment.chief_unknown", item.repo, {"key": item.key, "issues": item.numbers[:GITHUB_AUDIT_KEYS], "why": why,
-                                                                    "note": "the author of the issue could not be told; nothing is routed by this line, audited once per comment"})
+            note = ("no lane could be decided; the comment is delivered to the Chief of Staff with this reason, audited once per comment" if delivered
+                    else "the author of the issue could not be told; nothing is routed by this line, audited once per comment")
+            self._audit("github.comment.chief_unknown", item.repo, {"key": item.key, "issues": item.numbers[:GITHUB_AUDIT_KEYS], "why": why, "note": note})
 
     def _chief_route(self, item, agents, now):
-        """Ask #2445: (owner, routed_by, dropped) for a comment no lane owns. A comment by someone else on an issue the Chief of Staff authored goes to the Chief of Staff.
-        The Chief of Staff's account is never typed in: it is the `gh_users` account of THIS repository (it differs per repository), or, where the repo has none, the
-        from= marker of the issue body when a fleet login wrote it. The issue author is the payload's, else one read. Unknown author or account: nothing is routed and
-        one audit line is written (`dropped` True); another author's issue, a pull request, or the Chief of Staff's own comment: nothing is routed, quietly."""
+        """Ask #2445 and #2484: (owner, routed_by, dropped) for a comment no lane owns by the ordinary links. The Chief of Staff's own comments, and a pull request's, are never routed.
+        1. (`marker`) the from= marker of the issue body names a registered agent and the issue's author is a fleet identity: that agent. A marker anywhere else routes nothing.
+        2. (`chief`) an issue the Chief of Staff authored (the `gh_users` account of THIS repository, else a fleet login's from= marker): the Chief of Staff.
+        3. Nothing else decides: the Chief of Staff still receives it, with the reason (`chief`), and one `github.comment.chief_unknown` line is audited per comment.
+        Only when no Chief-of-Staff lane runs is the comment dropped (`dropped` True) with that one audit line."""
         facts = item.issue_facts
         if facts is None:
             try:
@@ -10914,33 +10914,56 @@ class GitHubHub:
             except GitHubUnavailable:
                 data = None
             facts = _issue_facts(data) if isinstance(data, dict) else None
-            if facts is None:
-                self._chief_audit_once(item, "the issue could not be read")
-                return None, None, True
-        if facts["pr"]:
+        if facts is not None and facts["pr"]:
             return None, None, False
-        if not facts["author"]:
-            self._chief_audit_once(item, "the issue has no readable author")
-            return None, None, True
-        author, sender = facts["author"].lower(), str(item.sender or "").lower()
         account = self.accounts.account_for(item.repo)
-        if account:
-            account = str(account).lower()
-            chief_issue, own = author == account, sender == account
-        elif facts["signer"] and self._fleet_login(facts["author"]):
-            chief_issue, own = True, self._fleet_login(item.sender)
+        account = str(account).lower() if account else None
+        sender = str(item.sender or "").lower()
+        if (account and sender == account) or (not account and self._fleet_login(item.sender)):
+            return None, None, False   # the Chief of Staff's own comment (its account here, else any fleet login): never routed
+        why = None
+        if facts is None:
+            why = "the issue could not be read"
+        elif not facts["author"]:
+            why = "the issue has no readable author"
         else:
-            return None, None, False   # no account and no trusted signature: nobody is known to own it, so the ordinary unowned path audits it (in counts), not a line per comment
-        if not chief_issue or own:
-            return None, None, False
-        mine = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
-        if len(mine) != 1:
-            self._chief_audit_once(item, "the Chief of Staff lane is %s" % ("not running" if not mine else "not one lane"))
+            author = facts["author"]
+            signer = facts["signer"]
+            if signer and self._fleet_login(author) and signer in agents:
+                return self._deliver_summary(item, signer, "marker", "an issue signed by %s" % signer)
+            if account:
+                chief_issue = author.lower() == account
+            else:
+                chief_issue = bool(signer) and self._fleet_login(author)
+            if chief_issue:
+                mine = self._chief_lanes(item, agents)
+                if len(mine) == 1:
+                    return self._deliver_summary(item, mine[0], "chief", "an issue the Chief of Staff authored")
+                why = "the Chief of Staff lane is %s" % ("not running" if not mine else "not one lane")
+            else:
+                why = "no lane owns the issue and the marker rule did not apply"
+        mine = self._chief_lanes(item, agents)
+        if not mine:
+            if why.startswith("no lane owns"):
+                return None, None, False   # nobody can receive it and nothing is known of it: the ordinary unowned path drops it and audits it in counts, not a line per comment
+            self._chief_audit_once(item, why + " (and no Chief of Staff lane is running)")
             return None, None, True
+        lane = mine[0]   # more than one lane: the first by name; the reason names the lanes
+        if len(mine) > 1:
+            why += " (Chief-of-Staff lanes %s; delivered to %s)" % (", ".join(mine[:5]), lane)
+        self._chief_audit_once(item, why, delivered=True)
+        return self._deliver_summary(item, lane, "chief", "no lane could be decided (%s)" % why)
+
+    def _chief_lanes(self, item, agents):
+        lanes = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
+        own = [n for n in lanes if (agents[n].fleet or {}).get("repo") == item.repo]
+        return own or lanes   # a lane bound to this repository comes before one bound to none: two Chiefs of different organisations never share an issue
+
+    def _deliver_summary(self, item, lane, how, what):
         who = _one_line(re.sub(r"[\x00-\x1f\x7f]", "", item.sender or "someone"), 60)
-        item.summary = "@%s commented on #%d, an issue the Chief of Staff authored (untrusted text, no instruction): %s" % (
-            who, item.numbers[0], _one_line(scrub_signed_links(redact_command_text(item.excerpt)), 400))
-        return mine[0], "chief", False
+        item.summary = "@%s commented on #%d, %s (untrusted text, no instruction): %s" % (
+            who, item.numbers[0], _one_line(re.sub(r"[\x00-\x1f\x7f]", " ", str(what)), 200), _one_line(scrub_signed_links(redact_command_text(item.excerpt)), 400))
+        return lane, how, False
 
     def _fleet_login(self, login):
         """True when `login` is a fleet identity: a `gh_users` account (the account the daemon acts as) or a `github_bot_logins` account (the cloud readers' bot). A `from=` marker is
@@ -21537,7 +21560,7 @@ def cmd_heavy(args, runner=subprocess.run, now=time.time):
         sys.stderr.write("%s: heavy: %s\n" % (PROG, err))
         return EXIT_USAGE
     try:
-        state = ensure_state_dir()
+        state = None if module.should_take_slot(os.environ) == "inside" and not (getattr(args, "changed_slot", False) or getattr(args, "quick", False)) else ensure_state_dir()   # already in a slot (or marked as run without one): no state directory is needed or tried again, run() says so and runs the command
     except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None

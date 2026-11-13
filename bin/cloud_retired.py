@@ -473,7 +473,7 @@ def pod_notes_tail(directory):
         end = _NOTES_KEY_END.search(text)
         if end and not _NOTES_KEY_BEGIN.search(text[:end.start()]):
             text = "[redacted key body]" + text[end.end():]   # a key block whose first line was cut away: all of it up to its end marker goes
-        text = D["redact_command_text"](text)
+        text = D["redact_command_text"](_unwrap_redact(text))
         lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'").replace("@", "(at)") for line in text.splitlines()]   # no mention can fire
         out = "\n".join(lines)
         if len(out) > NOTES_CHARS:
@@ -524,6 +524,8 @@ def last_message(directory, state, pod, clock=None):
                 break
         else:
             return None, "endpoint loop"
+        shown = LAST_HEAD + LAST_FILE   # only the part that can be shown is worked on
+        text = _unwrap_redact(text[:shown]) + text[shown:]   # R-SEC-2: a secret folded over lines, while the line breaks are still there
         text = D["_scrub_lib"]()(text, (), LAST_SCRUB_MAX)
         head, rest = text[:LAST_HEAD], text[LAST_HEAD:]
         lines = ["[last message of %s, untrusted text]" % pod, head]
@@ -539,3 +541,311 @@ def last_message(directory, state, pod, clock=None):
         return None, "cloud last unsafe"
     except Exception as err:
         return None, "%s" % type(err).__name__
+
+
+# ---- ask #2393: the pod's end, posted on its ask: the last text and the last lines of its land log ----
+END_LOG_CHARS = 4000     # the most characters of one run log that are posted (whole lines)
+END_LOG_ENTRIES = 8      # the most run logs posted
+END_POST_CHARS = 40000   # the whole comment
+RUN_JSON_MAX = 1 << 20
+KEY_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+SECRETISH = re.compile(r"sk-|gh[opsu]_|github_pat|AKIA|xox|eyJ|[A-Za-z0-9]{30}")   # as cloud_end_alert's: a name of this shape is not shown
+KEY_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+
+
+def _run_record_dir(directory, pod):
+    """The run record directory when it is a real child of the run record root named for THIS pod (the checks of last_message), else None."""
+    try:
+        name = os.path.basename(str(directory).rstrip("/"))
+        if not (_LAST_NAME_RE.fullmatch(name) and _name_ok(pod) and re.fullmatch(re.escape(pod) + r"-\d{8}T\d{6}Z-[0-9a-f]{6}", name, re.ASCII)):
+            return None
+        root = os.path.abspath(str(_runs_root()))
+        if os.path.dirname(os.path.abspath(str(directory))) != root or os.path.islink(str(directory)) or not stat.S_ISDIR(os.lstat(str(directory)).st_mode):
+            return None
+        return str(directory) if os.path.dirname(os.path.realpath(str(directory))) == os.path.realpath(root) else None
+    except OSError:
+        return None
+
+
+def _redact_block(block):
+    """The pod's last-text block with a key block (whole or clipped) and the switchboard's command-text redaction applied, line by line otherwise unchanged."""
+    text = str(block)
+    end = KEY_END.search(text)
+    if end and not KEY_BEGIN.search(text[:end.start()]):
+        text = "[redacted key body]" + text[end.end():]
+    return D["redact_command_text"](text)
+
+
+def _clean_tail(tail):
+    """A run log tail as it may be posted: the pod's endpoint address removed, a key block (also one whose first line was clipped) redacted whole, the
+    switchboard's redaction and the launcher's scrub by shape, printable ASCII, no backtick, whole lines only, at most END_LOG_CHARS. None when nothing is left.
+    The field is never trusted: the pod-side hook redacted it too, and this runs again."""
+    scrub = D["_scrub_lib"]()
+    text = tail[-LAST_SCRUB_MAX:] if len(tail) <= LAST_SCRUB_MAX else tail[-LAST_SCRUB_MAX:].split("\n", 1)[-1]   # our own cut drops its partial first line
+    for _ in range(21):   # the pod's own endpoint address is removed as in last_message (a rebuilt one too)
+        stripped = _remove_hosts(text)
+        done_, text = stripped == text, stripped
+        if done_:
+            break
+    else:
+        return None
+    end = KEY_END.search(text)
+    if end and not KEY_BEGIN.search(text[:end.start()]):
+        text = "[redacted key body]" + text[end.end():]   # a key block whose first line was clipped away: all of it up to its end marker goes
+    text = D["redact_command_text"](_unwrap_redact(text))   # a secret folded over two lines first; the whole text next (a key block spans lines), then the cut
+    lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()]   # per line: the scrub flattens a newline
+    out = "\n".join(lines)
+    return _cut_tail(out)
+
+
+def _cut_tail(out):
+    if len(out) > END_LOG_CHARS:
+        out = out[-END_LOG_CHARS:].split("\n", 1)[-1]   # whole lines only: a token is never cut into an unrecognisable suffix
+    return out if out.strip() else None
+
+
+def run_log_entries(directory, pod):
+    """THE ONE READER of the run record's run files (ask #2432, as merged): `run.json["end_hook"]["run_logs"]["runs"]`
+    is a list of {name: str, exit: int or null, woke: bool, log_tail: str}. Returns [(name, exit text, cleaned tail)] for the entries that have a log_tail, at
+    most END_LOG_ENTRIES; [] when the field is absent (today's pods), malformed or the record cannot be read. Never raises."""
+    try:
+        where = _run_record_dir(directory, pod)
+        if where is None:
+            return []
+        before = os.lstat(where)   # the directory is opened ONCE, by no link, and must be the one the check saw (as last_message does)
+        dfd = os.open(where, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if not os.path.samestat(before, os.fstat(dfd)):
+                return []
+            fd = os.open("run.json", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return []
+            raw = os.read(fd, RUN_JSON_MAX + 1)
+        finally:
+            os.close(fd)
+        info = D["parse_bounded"](raw[:RUN_JSON_MAX].decode("utf-8", "replace")) if len(raw) <= RUN_JSON_MAX else None
+        hook = info.get("end_hook") if isinstance(info, dict) else None
+        logs = hook.get("run_logs") if isinstance(hook, dict) else None   # ask #2432: the launcher keeps the end hook's run files here, {"runs": [...], "wake_lines": [...]}
+        logs = logs.get("runs") if isinstance(logs, dict) else None
+        out = []
+        for entry in (logs if isinstance(logs, list) else [])[:END_LOG_ENTRIES * 4]:   # entries examined are bounded too
+            try:
+                tail = entry.get("log_tail") if isinstance(entry, dict) else None
+                if not isinstance(tail, str) or not tail.strip():
+                    continue
+                cleaned = _clean_tail(tail[-4 * END_LOG_CHARS:])   # the contract says 4000; a longer field is clipped before any work
+                code = entry.get("exit")
+                code = "exit %d" % code if isinstance(code, int) and not isinstance(code, bool) and abs(code) < 10 ** 6 else "still running or no exit file"
+                label = entry["name"] if isinstance(entry.get("name"), str) else ""
+                label = D["redact_command_text"](label)   # the name is untrusted too: redacted, then reduced to one safe token
+                label = os.path.basename(label.replace("\\", "/"))
+                label = label if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", label) and not SECRETISH.search(label) else "unnamed"
+            except Exception:
+                continue   # one bad entry never drops the others
+            if cleaned:
+                out.append((label, code, cleaned))
+            if len(out) >= END_LOG_ENTRIES:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def end_comment(pod, reason, block, logs):
+    """The comment for the ask: the pod, the reason, its last text (block: already cut and scrubbed, or None) and each run log (name, exit, tail) of `logs`.
+    No mention can fire (no @) and the whole is cut at END_POST_CHARS."""
+    lines = ["cloud worker %s retired (%s)" % (pod, re.sub(r"[^A-Za-z0-9 ._:,;()-]", "?", str(reason)))]
+    if block:   # the pod's text is untrusted: no local path line, flattened, in its own fence (no backtick can end it)
+        kept = [l for l in str(block).split("\n") if " more characters in " not in l]
+        lines += ["[last text of the pod, untrusted]", "```", re.sub(r"[^\x20-\x7e\n]", "?", "\n".join(kept)).replace("`", "'"), "```"]
+    else:
+        lines.append("last text not read")
+    for name, code, tail in logs:
+        lines += ["[run log %s (%s), untrusted text]" % (name, code), "```", tail, "```"]
+    return re.sub(r"@", "(at)", "\n".join(lines))[:END_POST_CHARS]
+
+
+NAMES_MAX_BYTES = 200000   # the private-names list is read once, to this many bytes
+NAMES_MAX_TERMS = 500
+_NAMES_CHECKER = []
+
+
+def _name_terms():
+    """([compiled regexes], None) of the private-names list (the one bin/check-public-names reads: its parser, its location, `FLEET_PRIVATE_NAMES` the
+    list itself, else `FLEET_PRIVATE_NAMES_FILE` or ~/.config/fleet-switchboard/private-names.txt), or ([], why) when it is missing, unreadable or unusable.
+    Read once per call, bounded, never printed (the reason names no entry)."""
+    try:
+        if not _NAMES_CHECKER:
+            import importlib.machinery
+            import importlib.util
+            path = str(Path(__file__).resolve().with_name("check-public-names"))
+            loader = importlib.machinery.SourceFileLoader("cr_check_public_names", path)
+            mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("cr_check_public_names", loader))
+            loader.exec_module(mod)
+            _NAMES_CHECKER.append(mod)
+        mod = _NAMES_CHECKER[0]
+        text = os.environ.get("FLEET_PRIVATE_NAMES", "")
+        if not text.strip():
+            with open(os.environ.get("FLEET_PRIVATE_NAMES_FILE") or mod.DEFAULT_LIST, "rb") as handle:
+                text = handle.read(NAMES_MAX_BYTES + 1).decode("utf-8", "replace")
+        problems = []
+        if len(text) > NAMES_MAX_BYTES:
+            text = text[:NAMES_MAX_BYTES].rsplit("\n", 1)[0]   # the entry the cut fell in is dropped, not half read
+            problems.append("list cut")
+        terms, bad = [], 0
+        for line in text.splitlines():   # one entry at a time: a bad one is skipped, the others still apply
+            try:
+                found, _ignores = mod.parse_list(line)
+            except ValueError:
+                bad += 1
+                continue
+            terms += [regex for _i, regex in found]
+        if bad:
+            problems.append("%d entries unusable" % bad)
+        if len(terms) > NAMES_MAX_TERMS:
+            terms = terms[:NAMES_MAX_TERMS]
+            problems.append("list too long")
+        if not terms and not problems:
+            problems.append("no list" if not text.strip() else "no entries")
+        return terms, ("; ".join(problems) or None)
+    except Exception as err:
+        return [], type(err).__name__[:40]
+
+
+def _hide_names(text, terms):
+    """`text` with every match of a private-name regex (case rules as the checker's, per line) replaced by [private name]."""
+    out = []
+    for line in text.splitlines():   # as the checker splits
+        for regex in terms:
+            line = regex.sub(lambda m: "[private name]" if m.group(0) else m.group(0), line)
+        out.append(line)
+    return "\n".join(out)
+
+
+_WRAP_WORD = 512      # the longest word joined across a fold; a longer one is no token of ours
+_WRAP_LINES = 8       # the most lines one folded secret is followed over
+_HINT = re.compile(r"(?i)sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|eyJ|@|(?:token|secret|passw|api[_-]?key|credential|auth)[^=:]{0,40}[=:]|[A-Za-z0-9+/_-]{24}")
+_WRAP_USED = [0]      # the redaction attempts of the last _unwrap_redact call
+_WRAP_BUDGET = 20000  # the most redaction attempts of one call: a text built to be slow stops being followed, it is never slow   # what any secret shape needs: a join without one is not tried
+_WRAP_LEAD = " \t>|\"'`,;+*("   # what may stand before the continuation: an indent, a quote mark, a table bar, a string quote
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff]")
+_WRAP_PART = re.compile(r"[A-Za-z0-9_+/=.&@:-]+")
+
+
+def _looks_like_rest(word):
+    """A continuation of a token already redacted whole: random-looking (a digit and a letter, four characters or more), not prose."""
+    return _WRAP_PART.fullmatch(word) is not None and (len(word) >= 12 or (len(word) >= 4 and bool(re.search(r"\d", word)) and bool(re.search(r"[A-Za-z]", word))))
+
+
+def _unwrap_redact(text):
+    """`text` with a secret that was folded over lines redacted: at each line break the last word of the line (a trailing backslash or hyphen of the fold
+    dropped, or kept) is joined to the first word of the next line (leading blanks ignored), and of up to three more lines while each is one word, then
+    redacted by shape (the switchboard's redaction and the launcher's scrub); only when the joined word changes are the parts replaced, the rest of each line
+    kept. Where the first part is already a whole token, the next word is taken only if it looks like the rest of one. Words are capped, so a long line costs
+    nothing: work is linear in the (already cut) text."""
+    scrub, redact = D["_scrub_lib"](), D["redact_command_text"]
+
+    budget = [_WRAP_BUDGET]
+    _WRAP_USED[0] = 0
+
+    def shaped(word):
+        budget[0] -= 1
+        _WRAP_USED[0] = min(_WRAP_BUDGET, _WRAP_BUDGET - budget[0])   # the attempts made (the tests read it: the cap is a count, not a time)
+        return redact(scrub(word, (), LAST_SCRUB_MAX)) if budget[0] >= 0 else word   # past the budget nothing more is tried
+    lines = _INVISIBLE.sub("", text).splitlines()   # invisible characters cannot split a token; every kind of line break the later steps split on
+    for i in range(len(lines) - 1):
+        a = lines[i].rstrip(" \t+,;|&")   # a string concatenation or a table bar after the first part
+        tail = a[-(_WRAP_WORD + 1):]
+        if not a or not tail.split() or len(tail.split()[-1]) > _WRAP_WORD:
+            continue
+        wa = tail.split()[-1]
+        head = a[:len(a) - len(wa)]
+        for cut in dict.fromkeys((wa[:-1] if wa[-1] in "\\-" else "", wa.rstrip("\\-\"',;+"), wa)):
+            if not cut:
+                continue
+            joined, parts, found, blanks, j = cut, [], None, 0, i + 1
+            while j < len(lines) and len([1 for p_ in parts if p_[2]]) < _WRAP_LINES and blanks <= 64:
+                b = lines[j].lstrip(_WRAP_LEAD)   # an indent, a quote mark or a table bar
+                words = b[:_WRAP_WORD + 1].split()
+                if not b.strip():
+                    parts.append((j, lines[j], ""))   # a blank line in the fold
+                    blanks += 1
+                    j += 1
+                    continue
+                if not words or len(words[0]) > _WRAP_WORD:
+                    break
+                wb = words[0]
+                parts.append((j, b, wb))
+                joined += wb
+                if _HINT.search(joined) and shaped(joined) != joined and (shaped(cut) == cut or _looks_like_rest(wb) or cut != wa):
+                    found = shaped(joined)
+                    break
+                if b.rstrip(" |\"',;+") != wb:
+                    break   # a middle line is one word
+                j += 1
+            if found is None:
+                continue
+            last = parts[-1][0]
+            while last + 1 < len(lines) and len(parts) < _WRAP_LINES and lines[last].strip(_WRAP_LEAD) == parts[-1][2]:   # the rest of a token, one word to a line
+                nxt = lines[last + 1].strip(_WRAP_LEAD)
+                word = nxt[:_WRAP_WORD + 1].split()[0] if nxt else ""
+                if not word or len(word) > _WRAP_WORD or not _looks_like_rest(word) or shaped(joined + word) != found:
+                    break
+                joined += word
+                parts.append((last + 1, nxt, word))
+                last += 1
+            lines[i] = head + found
+            for j, b, wb in parts:
+                lines[j] = b[len(wb):] if wb else b
+            break
+    return "\n".join(lines)
+
+
+WITHHELD_LINE = "final message withheld: names list unreadable"
+
+
+def _repo_is_public(engine, repo):
+    """True unless GitHub says the repository is private: ONE bounded read of `repos/<owner>/<repo>` (the engine's `gh_api`, the same bare `repos/<owner>/<repo>` read as the hub's own route read: the `private` field of `gh api repos/<owner>/<repo>`; no account-specific token, so a repository the daemon's default login cannot see counts as public).
+    A visibility that cannot be read counts as public (fail closed)."""
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or ".." in repo:
+            return True
+        got = engine.gh_api("repos/%s" % repo, paginate=False, timeout=20)
+        record = [v for v in got if isinstance(v, dict)] if isinstance(got, (list, tuple)) else []
+        return not (len(record) == 1 and record[0].get("private") is True)
+    except Exception:
+        return True
+
+
+def post_end(engine, state, record, name, reason, body, post, note, audit=None):
+    """Ask #2393: ONCE per end, the pod's final message and the last lines of its land log are posted on its ask issue through `post` (handoff.post_ask_comment),
+    scrubbed and cut (end_comment); a pod without a log posts the message alone, a pod without an ask (`issue` and `repo` of its cloud record) posts nothing.
+    Never raises: a failed post is handed to `note(why)` and the retire goes on."""
+    issue, repo = record.get("issue"), record.get("repo")
+    if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1 or not isinstance(repo, str) or not repo:
+        return
+    try:
+        where = body.get("record") if isinstance(body, dict) else None
+        block, _why = last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        block = _redact_block(block) if block else block   # the last text gets the run logs' redaction too before it is posted
+        tail = run_log_entries(where, name) if isinstance(where, str) and where else []
+        comment = end_comment(name, D["_scrub_lib"]()(reason, (), 300)[:120], block, tail)
+        terms, unchecked = _name_terms()   # the post may land on a public repository: the private names are replaced, as bin/check-public-names would refuse them
+        if unchecked:
+            try:
+                audit and audit("private names not checked (%s)" % unchecked)
+            except Exception:
+                pass
+        if unchecked and _repo_is_public(engine, repo):   # fail closed: a list that is missing, unreadable or only partly usable (a bad, too long or cut line) and a public (or unknown) repository: no pod text at all
+            post(engine, issue, WITHHELD_LINE, author=name, repo=repo)
+            return
+        comment = _unwrap_redact(_hide_names(comment, terms) if terms else comment)[:END_POST_CHARS]   # then a secret folded over lines; the cut again (a short name grows)
+        post(engine, issue, comment, author=name, repo=repo)
+    except Exception as err:
+        try:
+            note(type(err).__name__[:60])
+        except Exception:
+            pass   # a failed audit line never breaks the retire
