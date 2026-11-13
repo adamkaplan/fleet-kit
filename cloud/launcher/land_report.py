@@ -8,12 +8,12 @@ small private state file, per part (message, comment), so a part that failed is 
 What the data holds (read on 12 November 2026, stated first):
   run_logs    {"runs": [{"name", "exit", "woke", "log_tail"}], "wake_lines": []}: NO time field. A per-step time of `tests:server` or `tests:pg` is therefore NOT
               recorded; the report reads one only from a line `step=<name> seconds=<n>` in a run's log tail, and a land run without it is counted as `no step data`
-              (never as zero). The follow-up is that the land tool prints that line. The land wall time is the run record's own `end` minus `start`.
+              (never as zero). The follow-up is that the land tool prints that line. The `pod time` is the run record's own `end` minus `start`.
   attempt     a record whose newest run named `land` or `land-...` exists; its exit is 0 landed, 18 council, 13 tests, 3 environment, 124 or 137 time limit, else other.
               A record with no such run is not an attempt (`no land run`).
   trailer     REAL form (checked in .spire/tool/checks.sh and the land tests): `Land-Checks: areas=<areas> tests=<n> files=<n> checks=<step:Ns,...> total=<n>s tree=<12 hex>`; its `files` is the
               number of TEST files run, NOT the files a change touched, and it has no `lines`; `Land-Council: ran: warden=approve (models fast, round <n>, diff <id>)` or
-              `none needed (...)`. So change size in lines is unread for such commits (never 0), rounds come from `round <n>`; a `lines=`/`rounds=` key is read when present.
+              `none needed (...)`. The LAND time and per-step times come from the trailer (`total=<n>s`, `checks=name(count):<n>s,...`; owner decision), the pod's life is only the `pod time` column. So change size in lines is unread for such commits (never 0), rounds come from `round <n>`; a `lines=`/`rounds=` key is read when present.
   lane        the boss the worker reports to (run record `boss`); a record without it: the worker name up to its first `-`, printed `(lane unknown)`.
 Everything read is untrusted: a corrupt record, a link, a file over RECORD_MAX bytes is skipped and counted (`N records not read`); the output goes through one scrub."""
 import datetime as dt
@@ -184,9 +184,21 @@ def reason_of(code):
 
 # ---- the landed commits
 def parse_trailer(text):
+    text = text if isinstance(text, str) else ""
     out = {}
-    for k, v in re.findall(r"\b(files|lines|rounds)=(\d{1,9})\b", text if isinstance(text, str) else ""):
+    for k, v in re.findall(r"\b(files|lines|rounds|tests)=(\d{1,9})\b", text):
         out.setdefault(k, int(v))
+    m = re.search(r"\btotal=(\d{1,7})s\b", text)   # the land wall time, seconds
+    if m:
+        out["total"] = int(m.group(1))
+    m = re.search(r"\bchecks=(\S{1,4000})", text)    # `name(count):<n>s,name:<n>s,...`; the count in brackets is optional
+    steps = {}
+    for entry in m.group(1).split(",") if m else []:
+        e = re.fullmatch(r"([A-Za-z0-9_.:-]{1,60}?)(?:\((\d{1,9})\))?:(\d{1,7})s", entry)
+        if e:
+            steps[e.group(1)] = int(e.group(3))
+    if steps:
+        out["steps"] = steps
     return out
 
 
@@ -211,7 +223,9 @@ def git_landed(git_dir, branch, since, run=subprocess.run):
         if rounds is None:   # the real Land-Council form: `ran: warden=approve (models fast, round 2, diff abc)`; `none needed (...)` has no round
             m = re.search(r"\bround (\d{1,9})\b", parts[2])
             rounds = int(m.group(1)) if m else None
-        out.append({"sha": parts[0].strip(), "files": checks.get("files"), "lines": checks.get("lines"), "rounds": rounds})
+        item = {"sha": parts[0].strip(), "files": checks.get("files"), "lines": checks.get("lines"), "rounds": rounds}
+        item.update({k: checks[k] for k in ("tests", "total", "steps") if k in checks})   # only when the trailer has them
+        out.append(item)
     return out
 
 
@@ -249,11 +263,11 @@ def build(records, unread, landed, bound, previous=(), day="", first_repo=""):
             repo, lane, len(att), len(ok), fails["council"], fails["tests"], fails["environment"], fails["time limit"], fails["other"])
         times = [r["minutes"] for r in ok if r["minutes"] is not None]
         if len(times) < 3:
-            wall = "land wall time: n/a (%d landings with a time, 3 needed)" % len(times)
+            wall = "pod time: n/a (%d landings with a time, 3 needed)" % len(times)
         else:
             before = median(prev_by.get((repo, lane), []))
             trend = "no earlier day" if before is None else "%+g min vs yesterday" % round(median(times) - before, 1)
-            wall = "land wall time: median %s min, p90 %s min (n=%d), trend %s" % (num(median(times)), num(p90(times)), len(times), trend)
+            wall = "pod time: median %s min, p90 %s min (n=%d), trend %s" % (num(median(times)), num(p90(times)), len(times), trend)
         parts = []
         for step in STEPS:
             vals, none = [], 0
@@ -278,6 +292,14 @@ def build(records, unread, landed, bound, previous=(), day="", first_repo=""):
         rounds = [c["rounds"] for c in landed if c["rounds"] is not None]
         tail.append("council rounds per landing: %s (n=%d, %d unread)" % (
             "median %s, max %d, 3 or more: %d" % (num(median(rounds)), max(rounds), sum(1 for x in rounds if x >= 3)) if rounds else "n/a", len(rounds), len(landed) - len(rounds)))
+    if landed:
+        totals = [c["total"] for c in landed if "total" in c]
+        got = lambda step: [c["steps"][step] for c in landed if step in c.get("steps", {})]   # noqa: E731
+        cells = ["land time (Land-Checks total=): %s" % ("median %s s, p90 %s s (n=%d)" % (num(median(totals)), num(p90(totals)), len(totals)) if totals else "n/a (n=0)")]
+        for step in STEPS:
+            v = got(step)
+            cells.append("%s: %s" % (step, "median %s s (n=%d)" % (num(median(v)), len(v)) if v else "no step data %d" % len(landed)))
+        tail.insert(1, "; ".join(cells))
     unlanded = [r for r in records if not is_landed(r)]
     tail.append("pods ended unlanded: %d of %d" % (len(unlanded), len(records)))
     if skipped:

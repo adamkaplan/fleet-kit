@@ -741,7 +741,7 @@ Settings (the settings file; all optional): `CW_LAND_REPORT_FIRST_REPO` (`owner/
 | run records directory, 24 h window | records of other days are not counted | `S1.test_control` | `S1.test_mutant_counts_every_record` (`S1 lane a`) |
 | a record that is corrupt, a link, or 5 MB | skipped and counted `N records not read`; the rest counted | `S7.test_control` | `S7.test_mutant_stops_at_corrupt` (`S7`) |
 | a secret-shaped value in a log tail or an outside error | one `scrub` on every output; log lines carry the class name only | `S7.test_scrub`, `S8.test_raising_sender_and_missing_issue` | none: the scrub is pinned by value |
-| the land wall times (median, p90, trend) | fewer than 3: `n/a` | `S2.test_control` | `S2.test_mutant_mean` (`S2 numbers`) |
+| the pod times (median, p90, trend; the pod's own life) and, from the Land-Checks trailer, the land time `total=` and `tests:server` / `tests:pg` seconds | fewer than 3: `n/a` | `S2.test_control` | `S2.test_mutant_mean` (`S2 numbers`) |
 | step times in the log tail | a missing time is `no step data`, not 0 | `S3.test_control` | `S3.test_mutant_missing_is_zero` (`S3 server`) |
 | `git log` of the default branch (one call, 60 s, no shell) | non-zero, a bad branch or no directory: `None`, the report says so | `S8.test_git_reads` | none: the failure is the test |
 | trailers `Land-Checks`, `Land-Council` (untrusted text) | only `files`, `lines`, `rounds` as digits are read | `S5.test_trailer_parse` | none |

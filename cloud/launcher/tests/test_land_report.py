@@ -104,7 +104,7 @@ class S2(unittest.TestCase):
         out = self.build(mod)
         self.assertIn("median 30 min, p90 100 min (n=5), trend +5 min", out, "S2 numbers")
         self.assertIn("/ small: attempted 1", out)
-        self.assertIn("land wall time: n/a", [l for l in out.splitlines() if "land wall time" in l][-1], "S2 small lane")
+        self.assertIn("pod time: n/a", [l for l in out.splitlines() if "pod time" in l][-1], "S2 small lane")
 
     def test_control(self):
         self.check(real)
@@ -566,11 +566,12 @@ class S9(unittest.TestCase):
 
     def test_real_trailer_forms(self):
         checks = "areas=docs tests=0 files=4 checks=doc-check:2s total=3s tree=0123456789ab"
-        self.assertEqual(real.parse_trailer(checks), {"files": 4})
+        self.assertEqual(real.parse_trailer(checks), {"files": 4, "tests": 0, "total": 3, "steps": {"doc-check": 2}})
         out = []
         class R: returncode = 0; stdout = "\x1e" + "a" * 40 + "\x1f" + checks + "\x1f" + "ran: warden=approve (models fast, round 2, diff abc123)" + "\x1e" + "b" * 40 + "\x1f" + checks + "\x1f" + "none needed (no path calls for a member)"
         got = real.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
         self.assertEqual([(c["files"], c["lines"], c["rounds"]) for c in got], [(4, None, 2), (4, None, None)])
+        self.assertEqual(got[0]["total"], 3)
 
     def check_cap_by_time(self, mod):
         mod.MAX_RECORDS = 3
@@ -620,6 +621,50 @@ class S9(unittest.TestCase):
         r.add(worker="p-1", code=0)
         os.mkdir(os.path.join(r.dir, "a-20261399T999999Z-abcdef"))
         return mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+
+    T1 = "areas=docs,app,server tests=20370 files=3245 checks=tests:docs(5):6s,proof-test-refs:0s,tests:app(780):688s,ssr:39s,tests:server(1539):575s,tests:pg(921):1055s,existing-startup:157s total=1056s tree=e4fee3f98d4f"
+    T2 = "areas=server tests=1600 files=40 checks=lint:3s,tests:server(40):200s,tests:pg(20):400s total=410s tree=0123456789ab"
+    C1 = "ran: architect=approve,warden=approve (models fast, round 9, diff a0cba6c30416 x)"
+    C2 = "ran: warden=approve (models fast, round 1, diff b0cba6c30416)"
+
+    def landed(self, mod):
+        raw = "".join("\x1e%s\x1f%s\x1f%s" % (c * 40, t, k) for c, t, k in (("a", self.T1, self.C1), ("b", self.T2, self.C2)))
+        class R: returncode = 0; stdout = raw
+        return mod.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
+
+    def check_trailer_times(self, mod):
+        got = self.landed(mod)
+        self.assertEqual((got[0]["total"], got[0]["tests"], got[0]["files"], got[0]["rounds"]), (1056, 20370, 3245, 9), "S12 real trailer fields")
+        self.assertEqual((got[0]["steps"]["tests:server"], got[0]["steps"]["tests:pg"], got[0]["steps"]["ssr"]), (575, 1055, 39), "S12 steps with a (count)")
+        r = Root(self)
+        r.add(worker="p-1", boss="orch-one", code=0)
+        recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        out = mod.build(recs, bad, got, 50, (), "2026-11-12")[0]
+        self.assertIn("land time (Land-Checks total=): median 733 s, p90 1056 s (n=2)", out, "S12 total")
+        self.assertIn("tests:server: median 387.5 s (n=2); tests:pg: median 727.5 s (n=2)", out, "S12 per step")
+        self.assertIn("median 5, max 9, 3 or more: 1", out, "S12 rounds")
+        self.assertIn("median 1642.5 files (test files run)", out, "S12 files label")
+        self.assertIn("pod time:", out, "S12 pod time column")
+        self.assertLess(len(out.splitlines()), 20)
+
+    def test_trailer_times(self):
+        self.check_trailer_times(real)
+
+    def test_mutant_total_is_not_read(self):
+        mod = mutant('r"\\btotal=(\\d{1,7})s\\b"', 'r"\\btotalx=(\\d{1,7})s\\b"')
+        self.check_trailer_times(real)
+        with self.assertRaises((AssertionError, KeyError)):
+            self.check_trailer_times(mod)
+
+    def test_mutant_count_in_step_name(self):
+        mod = mutant('(?:\\((\\d{1,9})\\))?:(\\d{1,7})s", entry)', ':(\\d{1,7})s", entry)')
+        with self.assertRaises((AssertionError, KeyError, IndexError)):
+            self.check_trailer_times(mod)
+
+    def test_mutant_rounds_not_from_council(self):
+        mod = mutant('m = re.search(r"\\bround (\\d{1,9})\\b", parts[2])', 'm = None')
+        with self.assertRaises(AssertionError):
+            self.check_trailer_times(mod)
 
     def test_record_without_boss_falls_back_through_load_records(self):
         r = Root(self)
