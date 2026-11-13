@@ -106,6 +106,13 @@ class Cluster:
         with self.lock:
             self.deletes.append(name)
 
+    def get_pdb(self, name):
+        return None   # no budget in this fake
+
+    def delete_pdb(self, name):
+        with self.lock:
+            self.calls.append("delete_pdb")
+
     def release_all(self):
         with self.lock:
             held, self.held = self.held, []
