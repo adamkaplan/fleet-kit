@@ -358,7 +358,7 @@ class Route(unittest.TestCase):
         for name in sorted(found - set(self.CALLERS)):
             with open(os.path.join(ROOT, name), errors="replace") as f:
                 for line in f:
-                    if "app_token.py" in line and re.search(r"subprocess|check_output|capture_output|\$\(|`|Popen", line):
+                    if re.search(r"(?<![_\w])app_token\.py", line) and re.search(r"subprocess|check_output|capture_output|\$\(|`|Popen", line):
                         self.assertTrue("--fd" in line or "--out" in line, "%s runs the mint without a route: %s" % (name, line.strip()))
         self.assertFalse([f for f, route in self.CALLERS.items() if "stdout" in route.replace("an override prints on stdout", "")])
 

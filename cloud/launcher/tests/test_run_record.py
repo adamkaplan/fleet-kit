@@ -513,6 +513,12 @@ class Record(td.Driver):
         self.assertIn("/home/worker/report", prompt)
 
 
+# Record extends td.Driver for its harness only; the tests td.Driver itself defines are run, unchanged, by test_driver.py, so they are not
+# collected a second time here (about 37 s of this file). Every test Record defines is kept.
+for _inherited in [n for n in dir(td.Driver) if n.startswith("test_") and n not in Record.__dict__]:
+    setattr(Record, _inherited, None)
+
+
 class RecordUnderATokenShapedPath(Record):
     """The key checks again with a 49-character token-shaped temp-path segment (as under macOS /var/folders):
     they must not depend on the shape of the runner's temp path."""

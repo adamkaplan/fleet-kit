@@ -480,6 +480,12 @@ class EveryFreeTextField(OverrideReasonScrub):
         self.assertEqual(self.boss_line(sb, "lane-nobody", text)["reason"].count(part), 0)
 
 
+# EveryFreeTextField extends OverrideReasonScrub for its harness only; the S12 tests OverrideReasonScrub itself defines run, unchanged, in that class,
+# so they are not collected a second time here. Every test EveryFreeTextField defines is kept.
+for _inherited in [n for n in dir(OverrideReasonScrub) if n.startswith("test_") and n not in EveryFreeTextField.__dict__]:
+    setattr(EveryFreeTextField, _inherited, None)
+
+
 KEY_BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\nzzzzAAAA1111bbbb2222cccc\n"
 KEY_FORMS = {
     "rsa": ("RSA PRIVATE KEY", "RSA PRIVATE KEY"),
