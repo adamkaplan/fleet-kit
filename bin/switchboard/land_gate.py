@@ -10,6 +10,7 @@ import copy
 import json
 import re
 import sys
+from pathlib import Path
 
 LAND_GATE_FILE = "land-gate.json"
 LAND_GATE_KEY = "land_gate"
@@ -103,7 +104,7 @@ def lg_take(entry, name, now):
 def lg_state_line(repo, entry, now):
     """One line: who holds the token and how long the queue is."""
     holder = entry["holder"]
-    return "%s: %s; queue %d" % (repo, "held by %s for %ds, last touch %ds ago" % (lg_clean(holder["name"]), now - holder["since"], now - holder["touched"]) if holder else "free", len(entry["queue"]))
+    return "%s: %s; queue %d" % (re.sub(r"[^A-Za-z0-9._/-]", "?", str(repo))[:100], "held by %s for %ds, last touch %ds ago" % (lg_clean(holder["name"]), now - holder["since"], now - holder["touched"]) if holder else "free", len(entry["queue"]))
 
 
 def lg_check(data, repo, name, now, expire, alive):
@@ -118,16 +119,24 @@ def lg_check(data, repo, name, now, expire, alive):
         len(entry["queue"]), repo)
 
 
+class land_gate_lock(impact_state_lock):
+    """The gate's own lock file (not a per-agent reattach lock): a command that cannot take it in 5 seconds says so and exits 1."""
+
+    def __init__(self, state_dir, seconds=5):
+        super().__init__(state_dir, seconds)
+        self.path = Path(state_dir) / "land-gate.lock"
+
+
 def lg_alive_reader(state_dir):
-    """alive(name): False only when the registry was read whole and neither a live row nor an endpoint row names the agent (its pod is gone). Any doubt reads as alive."""
+    """alive(name): False only when the registry was read whole, holds no live row for the name and a RETIRED record names it (its pod is gone). An agent the registry never heard of, and any doubt, reads as alive."""
     try:
         reg = load_module("registry").read(state_dir)
     except Exception:
         return lambda name: True
     if not reg.get("whole"):
         return lambda name: True
-    agents = reg.get("agents") or {}
-    return lambda name: name in agents
+    agents, retired = reg.get("agents") or {}, reg.get("retired") or {}
+    return lambda name: name in agents or name not in retired
 
 
 def _lg_caller(runner, now):
@@ -135,6 +144,8 @@ def _lg_caller(runner, now):
     kind = gates_caller_kind(runner, now)
     if kind[0] != "agent":
         return None, False, str(kind[1])
+    if lg_clean(kind[1]) != str(kind[1]):
+        return None, False, "the fleet name has characters a gate name may not (letters, digits, dot, dash, underscore)"
     return lg_clean(kind[1]), len(kind) > 2 and kind[2] == "chief-of-staff", None
 
 
@@ -158,7 +169,13 @@ def cmd_land_gate(args, runner, now):
     alive = lg_alive_reader(state)
     stamp = int(now())
     out, code = [], EXIT_OK
-    with agent_lock(state, "land-gate", seconds=5):
+    try:
+        lock = land_gate_lock(state)
+        lock.__enter__()
+    except ImpactStateBusy:
+        sys.stderr.write("%s: land-gate: the gate state is busy: try again\n" % PROG)
+        return EXIT_ERROR
+    try:
         data = {"repos": _read_small(state, LAND_GATE_FILE).get("repos", {})}
         before = json.dumps(data, sort_keys=True)
         repos = [repo] if repo is not None else sorted(r for r in data["repos"] if isinstance(r, str))
@@ -172,8 +189,14 @@ def cmd_land_gate(args, runner, now):
                     audit.append("land-gate", "land_gate." + event, each, {"name": lg_clean(who), "why": reason})
                 if entry["holder"] is not None and entry["holder"]["name"] == name:
                     got, place = "held", 0
+                elif got == "queued":
+                    names = [q["name"] for q in entry["queue"]]
+                    got, place = ("queued", names.index(name) + 1) if name in names else ("dropped", 0)
                 if got == "full":
                     out.append("refused: the queue of %s is full (%d)" % (each, LAND_GATE_QUEUE_MAX))
+                    code = EXIT_ERROR
+                elif got == "dropped":
+                    out.append("refused: %s was dropped from the queue of %s at once (its pod reads as gone); ask again" % (name, each))
                     code = EXIT_ERROR
                 elif got == "held":
                     out.append("HELD %s by %s: touch it at least every %d minutes (fleet-switchboard land-gate touch %s) and release it when done" % (each, name, expire // 60, each))
@@ -191,6 +214,7 @@ def cmd_land_gate(args, runner, now):
             elif sub == "release":
                 target = lg_clean(args.name) if getattr(args, "name", None) else name
                 if target != name and not chief:
+                    audit.append("land-gate", "land_gate.release_refused", each, {"name": target, "by": name})
                     out.append("refused: only the Chief of Staff releases another name's place")
                     code = EXIT_ERROR
                 elif entry["holder"] is not None and entry["holder"]["name"] == target:
@@ -231,6 +255,8 @@ def cmd_land_gate(args, runner, now):
         data["repos"] = {r: e for r, e in data["repos"].items() if isinstance(e, dict) and (e.get("holder") or e.get("queue"))}
         if json.dumps(data, sort_keys=True) != before:
             _write_small(state, LAND_GATE_FILE, data)
+    finally:
+        lock.__exit__(None, None, None)
     for line in out or ["no land token is held or queued"]:
         print(line)
     return code

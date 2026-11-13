@@ -79,15 +79,25 @@ class TestOrder(GateBase):
         self.assertIn("2. lane-c asked 0s ago", out)
 
     def test_s2_the_count_of_takers_served_out_of_order_is_zero(self):
-        order = ["lane-a", "lane-b", "lane-c", "lane-d"]
-        self.assertEqual(self.serve_in_order(order), order)
+        for order in (["lane-a", "lane-b", "lane-c", "lane-d"], ["lane-c", "lane-d", "lane-b", "lane-a"]):   # the second is not alphabetical
+            self.assertEqual(self.serve_in_order(order), order)
+
+    def test_the_limit_is_exact_a_holder_at_600_seconds_still_holds_and_at_601_does_not(self):
+        self.gate("take", REPO, who="lane-a")
+        self.gate("take", REPO, who="lane-b")
+        self.t += 600
+        self.gate("take", REPO, who="lane-b")
+        self.assertEqual(self.holder(), "lane-a")
+        self.t += 1
+        self.gate("take", REPO, who="lane-b")
+        self.assertEqual(self.holder(), "lane-b")
 
     def test_s2_control_a_rule_that_serves_the_newest_first_is_caught(self):
         def newest_first(entry, name, now):   # a mutant of lg_take: the newcomer jumps the queue
             entry["queue"].insert(0, {"name": name, "at": now, "seen": now})
             return "queued", 1
         with mock.patch.object(sb, "lg_take", newest_first):
-            self.assertNotEqual(self.serve_in_order(["lane-a", "lane-b", "lane-c"]), ["lane-a", "lane-b", "lane-c"])
+            self.assertEqual(self.serve_in_order(["lane-a", "lane-b", "lane-c"]), ["lane-a", "lane-c", "lane-b"])   # the mutant's exact (wrong) order
 
     def test_s2_control_the_command_is_registered_where_the_current_code_has_none(self):
         self.assertIn("land-gate", sb.build_parser().commands)   # the code before the change has no such command: nothing in it could serialise two landings
@@ -112,7 +122,10 @@ class TestOrder(GateBase):
         self.assertEqual(self.state(), {})
 
     def test_names_in_status_are_sanitised(self):
-        self.gate("take", REPO, who="lane-a\x1b[31m`x`")
+        self.gate("take", REPO, who="lane-a")
+        data = self.state()
+        data["repos"][REPO]["holder"]["name"] = "lane-a\x1b[31m`x`"   # a name written by something else into the state file
+        (self.state_dir / sb.LAND_GATE_FILE).write_text(json.dumps(data))
         code, out, _ = self.gate("status")
         self.assertEqual(code, 0)
         self.assertNotRegex(out, r"[\x00-\x09\x0b-\x1f`]")
@@ -153,6 +166,8 @@ class TestExpiry(GateBase):
         self.gone.add("lane-b")
         self.t += 5 * 60
         self.gate("take", REPO, who="lane-a")
+        self.assertNotIn("lane-b", self.queue(), "dropped for its pod, long before the request limit")
+        self.assertIn("its pod is gone", [(json.loads(l)["detail"] or {}).get("why") for l in (self.state_dir / "audit.jsonl").read_text().splitlines()])
         self.gate("take", REPO, who="lane-d")
         self.t += 6 * 60   # lane-c has not asked for 11 minutes
         self.gate("touch", REPO, who="lane-a")
@@ -204,7 +219,12 @@ class TestMove(GateBase):
         self.fill()
         code, out, _ = self.gate("move", REPO, "lane-d", "1", who="cos")
         self.assertEqual((code, self.queue()), (0, ["lane-d", "lane-b", "lane-c"]), out)
+        self.gate("move", REPO, "lane-b", "2", who="cos")
+        self.assertEqual(self.queue(), ["lane-d", "lane-b", "lane-c"])
+        self.gate("move", REPO, "lane-b", "0", who="cos")
+        self.assertEqual(self.queue(), ["lane-b", "lane-d", "lane-c"])   # a place below 1 is the front
         self.gate("move", REPO, "lane-b", "99", who="cos")
+        self.gate("move", REPO, "lane-d", "1", who="cos")
         self.assertEqual(self.queue(), ["lane-d", "lane-c", "lane-b"])   # a place past the end is the end
         self.assertEqual(self.holder(), "lane-a")
 
@@ -260,16 +280,30 @@ class TestLandList(GateBase):
                 with self.assertRaises(sb.ConfigError):
                     sb.validate_config({"land_gate": bad})
 
-    def test_the_liveness_reader_calls_a_pod_gone_only_on_a_whole_read_that_lacks_it(self):
+    def test_the_liveness_reader_calls_a_pod_gone_only_when_a_whole_read_says_it_was_retired(self):
         reg = mock.Mock()
-        for read, lane_a, lane_b in (({"whole": True, "agents": {"lane-a": {}}}, True, False), ({"whole": False, "agents": {}}, True, True)):
+        cases = (({"whole": True, "agents": {"lane-a": {}}, "retired": {"lane-b": {}}}, True, False, True),   # live, retired, never heard of
+                 ({"whole": False, "agents": {}, "retired": {"lane-b": {}}}, True, True, True))
+        for read, lane_a, lane_b, stranger in cases:
             reg.read.return_value = read
             with mock.patch.object(sb, "load_module", lambda name: reg):
                 alive = self.real_alive(self.state_dir)
-            self.assertEqual((alive("lane-a"), alive("lane-b")), (lane_a, lane_b), read)
+            self.assertEqual((alive("lane-a"), alive("lane-b"), alive("lane-x")), (lane_a, lane_b, stranger), read)
         reg.read.side_effect = OSError("unreadable")
         with mock.patch.object(sb, "load_module", lambda name: reg):
             self.assertTrue(self.real_alive(self.state_dir)("lane-a"))   # any doubt reads as alive
+
+    def test_a_busy_gate_says_so_and_exits_1(self):
+        with mock.patch.object(sb.land_gate_lock, "__enter__", side_effect=sb.ImpactStateBusy("busy")):
+            code, out, err = self.gate("take", REPO, who="lane-a")
+        self.assertEqual(code, 1)
+        self.assertIn("busy", err)
+
+    def test_a_fleet_name_a_gate_name_cannot_hold_is_refused_not_rewritten(self):
+        self.caller = ("agent", "lane a;b", "worker")
+        code, out, err = self.gate("take", REPO)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.state(), {})
 
 
 class TestCheckRule(GateBase):

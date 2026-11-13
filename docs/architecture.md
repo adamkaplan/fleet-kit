@@ -66,7 +66,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/gate_spool.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `_plain` |
 | `switchboard/merge_ready.py` | `fleet-switchboard` | namespace | 11 | one namespace: the part reads the entry's names (`read_pr_json`, `parse_pr_ref`, `build_engine`, `NoticeError`, the exit codes) |
 | `switchboard/land.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `ConfigError` |
-| `switchboard/land_gate.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part reads the entry's names (`load_config`, `config_path`, `ensure_state_dir`, `agent_lock`, `AuditLog`, `gates_caller_kind`, `uses_spire_land`, the exit codes) |
+| `switchboard/land_gate.py` | `fleet-switchboard` | namespace | 14 | one namespace: the part reads the entry's names (`load_config`, `config_path`, `ensure_state_dir`, `agent_lock`, `AuditLog`, `gates_caller_kind`, `uses_spire_land`, `impact_state_lock`, `ImpactStateBusy`, `PROG`, the exit codes) |
 | `switchboard/worktree_root.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `ConfigError` |
 | `switchboard/facts.py` | `switchboard/docker_reaper.py` | namespace | 2 | one namespace: the part reads a name another part defines; its rewiring gives it an import |
 | `switchboard/heavy_budget.py` | `cloud_worker.py` | import | 1 | a name the part reads from another unit without a declared edge |
