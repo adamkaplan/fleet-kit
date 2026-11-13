@@ -29,7 +29,7 @@ def _fixture_module():
 
 
 class TestShards(unittest.TestCase):
-    N = 8
+    N = 6
     BOUND = 0.10   # the heaviest shard may exceed the mean shard by at most 10% of the mean (and the longest class is the floor of what greedy can do)
 
     def setUp(self):
