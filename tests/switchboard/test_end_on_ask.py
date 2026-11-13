@@ -355,7 +355,7 @@ class TestEndOnAsk(unittest.TestCase):
         line = self.retired().WITHHELD_LINE
         secret = "words about acme-secret-org and my final words"
         for label, kw in (("missing", {"names": None}), ("directory", {"names_env": {"FLEET_PRIVATE_NAMES_FILE": tempfile.gettempdir()}})):
-            for public in (({"private": False},), ({},), ()):
+            for public in (({"private": False},), ({},), (), ({"private": True}, {"private": True}), ({"private": "true"},)):
                 posts, events = self.end_with(final=secret, log="land line", visibility=public, **kw)
                 self.assertEqual([b for _i, b, _r in posts], [line], (label, public))
                 self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)

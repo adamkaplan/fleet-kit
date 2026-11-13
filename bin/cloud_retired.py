@@ -808,9 +808,11 @@ def _repo_is_public(engine, repo):
     """True unless GitHub says the repository is private: ONE bounded read of `repos/<owner>/<repo>` (the engine's reader, as `gh api repos/<owner>/<repo> --jq .private`).
     A visibility that cannot be read counts as public (fail closed)."""
     try:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or ".." in repo:
+            return True
         got = engine.gh_api("repos/%s" % repo, paginate=False, timeout=20)
         record = [v for v in got if isinstance(v, dict)] if isinstance(got, (list, tuple)) else []
-        return not (record and record[0].get("private") is True)
+        return not (len(record) == 1 and record[0].get("private") is True)
     except Exception:
         return True
 
