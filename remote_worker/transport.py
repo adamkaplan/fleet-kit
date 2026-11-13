@@ -31,6 +31,7 @@ class WorkerSpec:
     idle_seconds: Optional[int] = None   # stop after this long with no activity (None: the service's default)
     hard_seconds: Optional[int] = None   # stop after this long in all (None: the service's default)
     labels: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)   # free key/value pairs the transport may record
+    env: Tuple[Tuple[str, str], ...] = field(default_factory=tuple, repr=False)   # variables for the worker's tools (a short-lived token): secret, never in a repr or a log
 
 
 @dataclass(frozen=True)

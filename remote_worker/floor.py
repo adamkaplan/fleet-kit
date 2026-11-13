@@ -204,6 +204,11 @@ class FloorTransport:
             raise TransportError("next_seq must be a whole number of 2 or more")
         self._seq[sid] = next_seq - 1
 
+    def next_seq(self, handle: WorkerHandle) -> int:
+        """The number the next command of this session will get (for a caller that keeps it between processes and gives it back to `adopt`)."""
+        sid = self._sid(handle)
+        return self._seq.get(sid, 1) + 1
+
     def start(self, spec: WorkerSpec) -> WorkerHandle:
         # the session id and the launch command id come from the worker name, so a repeated start (even from a new process) is the same launch
         sid = "ses_" + _hex16(self._caller, spec.name)
@@ -211,8 +216,10 @@ class FloorTransport:
             raise TransportError("the brief is over the service's 256 KiB limit")
         if sid not in self._seq:
             self._seq[sid] = 1
-            self._issue(sid, "launch", "c-" + _hex16("launch", sid), 1,
-                        {"repo": "%s/%s.git" % (self._git_base, spec.repo), "ref": spec.branch, "brief": spec.brief})
+            fields = {"repo": "%s/%s.git" % (self._git_base, spec.repo), "ref": spec.branch, "brief": spec.brief}
+            if spec.env:
+                fields["env"] = dict(spec.env)   # kept only in the queue message (and a payload blob when large); never logged
+            self._issue(sid, "launch", "c-" + _hex16("launch", sid), 1, fields)
         else:
             self._flush(sid)
         return WorkerHandle(name=spec.name, worker_id=sid, transport=self.name)

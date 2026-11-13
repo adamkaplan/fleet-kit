@@ -73,8 +73,20 @@ Details a caller needs:
 - The caller never deletes from the container or reads the queue (its tokens do not allow it).
 - `messagettl=86400` is set by the sender on every message; the queue's default is 7 days.
 
-## Tests
+## Command line and the switchboard wiring
 
-`tests/switchboard/test_remote_worker.py` and `tests/switchboard/test_remote_floor_carrier.py` are registered the way every file of that directory is: the
+`python3 -m remote_worker launch|status|last-message|send|retire` (`cli.py`) runs everything above from one JSON configuration file named by
+`FLEET_REMOTE_CONFIG`: the backend and its carrier settings, the land command, the repo-token command and the state directory. The token command is an
+argument list that prints a short-lived token; it is run once per launch and the token goes into the launch command's `env` only. See `WIRING.md`.
+
+| Input or call | Checked by | Test |
+|---|---|---|
+| the configuration file | `cli.load_file_config` | `TestRemoteCli.test_configuration_rules`, `test_no_configuration_or_an_unreadable_one` |
+| the token command (argument list, no shell, time limit, plain token) | `cli.mint_token` | `test_the_token_command_runs_once_without_a_shell_and_with_a_limit`, `test_a_failing_token_command_refuses...` |
+| task and message files (path or `-`, at most 100 000 bytes) | `cli._read_text` | `test_stdin_task_and_the_size_limit` |
+| the worker record (a small 0600 file, no secret) | `cli.Records` | `test_the_record_rules`, `test_the_token_is_never_stored...` |
+| `env` of a launch | `launch._check_env` | `test_env_rules`, `test_the_env_of_a_spec_is_never_in_its_repr` |
+
+`tests/switchboard/test_remote_worker.py`, `test_remote_floor_carrier.py` and `test_remote_cli.py` are registered the way every file of that directory is: the
 runner `bin/test-switchboard` finds their `Test*` classes itself, so CI runs them. Standard library only, no network (a fake HTTP layer).
 Focused: `bin/test-switchboard -k TestRemote`.

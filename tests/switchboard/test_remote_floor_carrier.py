@@ -223,6 +223,22 @@ class TestRemoteCarrier(CarrierCase):
         self.assertEqual(t.command_result(cid), "rejected:terminal")
 
 
+    def test_launch_env_goes_into_the_command_and_next_seq_follows_the_numbering(self):
+        t = self.transport()
+        h = launch_remote_worker(t, **GOOD, env=(("REPO_TOKEN", "tok_0123456789"),))
+        self.assertEqual(self.store.messages[0]["env"], {"REPO_TOKEN": "tok_0123456789"})
+        self.assertEqual(t.next_seq(h), 2)
+        t.send(h, "x")
+        self.assertEqual(t.next_seq(h), 3)
+
+    def test_large_env_moves_to_the_payload_blob_with_the_brief(self):
+        t = self.transport()
+        launch_remote_worker(t, **{**GOOD, "task": "y" * (60 * 1024)}, env=(("REPO_TOKEN", "tok_0123456789"),))
+        cmd = self.store.messages[0]
+        self.assertNotIn("env", cmd)
+        self.assertEqual(json.loads(self.store.blobs[cmd["payload"]])["env"], {"REPO_TOKEN": "tok_0123456789"})
+
+
 @only_with_package
 class TestRemotePayload(CarrierCase):
     def test_a_large_brief_goes_to_a_blob_written_first(self):

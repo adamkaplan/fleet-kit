@@ -71,7 +71,30 @@ def build_brief(repo: str, branch: str, task: str, land_command: str) -> str:
     )
 
 
-def validate_spec(name: str, repo: str, branch: str, task: str, land_command: str, idle_seconds=None, hard_seconds=None, labels=()) -> WorkerSpec:
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+MAX_ENV = 16
+MAX_ENV_VALUE = 4096
+
+
+def _check_env(env) -> tuple:
+    """The worker's extra environment: at most 16 variables, upper-case names, printable values. A value is never named in an error."""
+    items = tuple(dict(env).items()) if isinstance(env, Mapping) else tuple(env)
+    if len(items) > MAX_ENV:
+        raise SpecError("env has more than %d variables" % MAX_ENV)
+    out = []
+    for item in items:
+        name, value = item
+        if not isinstance(name, str) or not ENV_NAME_RE.match(name):
+            raise SpecError("an env name must match %s" % ENV_NAME_RE.pattern)
+        if not isinstance(value, str) or not value or len(value) > MAX_ENV_VALUE or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise SpecError("the value of env %s must be one printable line of at most %d characters" % (name, MAX_ENV_VALUE))
+        out.append((name, value))
+    if len({n for n, _ in out}) != len(out):
+        raise SpecError("env names must be distinct")
+    return tuple(out)
+
+
+def validate_spec(name: str, repo: str, branch: str, task: str, land_command: str, idle_seconds=None, hard_seconds=None, labels=(), env=()) -> WorkerSpec:
     """Check every input and return the spec. Raises SpecError naming the input (never its value for the task)."""
     if not isinstance(name, str) or not NAME_RE.match(name):
         raise SpecError("name must match %s" % NAME_RE.pattern)
@@ -87,15 +110,16 @@ def validate_spec(name: str, repo: str, branch: str, task: str, land_command: st
     _opt_seconds("idle_seconds", idle_seconds)
     _opt_seconds("hard_seconds", hard_seconds)
     pairs = tuple((str(k), str(v)) for k, v in dict(labels).items()) if isinstance(labels, Mapping) else tuple(labels)
+    env_pairs = _check_env(env)
     return WorkerSpec(name=name, repo=repo, branch=branch, task=task, brief=build_brief(repo, branch, task, land_command.strip()),
-                      land_command=land_command.strip(), idle_seconds=idle_seconds, hard_seconds=hard_seconds, labels=pairs)
+                      land_command=land_command.strip(), idle_seconds=idle_seconds, hard_seconds=hard_seconds, labels=pairs, env=env_pairs)
 
 
 def launch_remote_worker(transport: Transport, name: str, repo: str, branch: str, task: str, land_command: str,
-                         idle_seconds=None, hard_seconds=None, labels=()) -> WorkerHandle:
+                         idle_seconds=None, hard_seconds=None, labels=(), env=()) -> WorkerHandle:
     """Validate, then start. Raises SpecError before any call; a TransportError from `start` passes through unchanged.
     A handle whose name does not match the request is a transport bug: the worker is stopped and the launch fails."""
-    spec = validate_spec(name, repo, branch, task, land_command, idle_seconds, hard_seconds, labels)
+    spec = validate_spec(name, repo, branch, task, land_command, idle_seconds, hard_seconds, labels, env)
     handle = transport.start(spec)
     if not isinstance(handle, WorkerHandle) or handle.name != spec.name:
         if isinstance(handle, WorkerHandle):
