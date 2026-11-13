@@ -331,7 +331,6 @@ class Route(unittest.TestCase):
         "cloud/launcher/tests/test_issues_read.py": "in process and fd",
         "cloud/launcher/tests/test_mint_retry.py": "in process",
         "cloud/launcher/tests/test_mint_roles.py": "argv (a fake mint records it)",
-        "cloud/launcher/tests/test_no_open_files.py": "text (a file list)",
         "cloud/launcher/tests/test_preflight.py": "in process",
         "cloud/launcher/tests/test_token_at_limit.py": "text (reads the mint source)",
         "docs/agent-credentials.md": "text",
