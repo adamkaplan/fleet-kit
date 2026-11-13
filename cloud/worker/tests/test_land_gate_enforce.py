@@ -115,6 +115,7 @@ class TestHook(Gate):
         self.fake(3, REFUSAL)
         for url in (URL + "/", URL[:-4] + "/", URL[:-4], "git@example.invalid:acme-org/widget-service.git"):
             self.assertEqual(self.hook(url).returncode, 3, url)
+            self.assertEqual(self.asked()[-1], "acme-org/widget-service --name lane-a", url)   # the repository was read right from each form
 
     def test_s6_a_url_that_names_no_owner_and_repository_is_unchecked_audited_and_refused_under_the_word(self):
         self.fake(3, REFUSAL)
@@ -127,11 +128,12 @@ class TestHook(Gate):
         self.assertEqual(self.hook(url, env={"CW_LAND_GATE": "enforce"}).returncode, 3)
 
     def test_the_existing_land_record_rule_still_comes_first(self):
-        self.fake(0, "ok")
+        self.fake(3, REFUSAL)
         line = "refs/heads/x %s refs/heads/main %s\n" % (self.base, self.base)   # no Land trailers
         r = subprocess.run(["sh", HOOK, "origin", URL], input=line, cwd=self.repo, env=self.env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 3)
         self.assertIn("without a land record", r.stderr)
+        self.assertEqual(self.asked(), [])   # the old rule refused first: the gate was not even asked
 
 
 class TestWrapper(Gate):
@@ -146,17 +148,27 @@ class TestWrapper(Gate):
 
     def test_s9_a_start_and_a_restart_without_the_token_are_refused_saying_why_and_with_it_the_land_runs(self):
         self.fake(3, REFUSAL)
-        for attempt in ("start", "restart"):   # a restart is another start of the same name
-            r = self.cw(*self.LAND)
-            self.assertEqual(r.returncode, 3, (attempt, r.stderr))
-            self.assertIn(REFUSAL, r.stderr)
-            self.assertIn("the land was not started", r.stderr)
+        r = self.cw(*self.LAND)   # a start
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn(REFUSAL, r.stderr)
+        self.assertIn("the land was not started", r.stderr)
         self.assertFalse(self.ran())
         self.assertFalse(os.path.exists(os.path.join(self.d, "runs", "land.pid")))
+        self.assertEqual(self.asked(), ["acme-org/widget-service --name lane-a"])
         self.fake(0, "lane-a holds the land token of acme-org/widget-service")
-        r = self.cw(*self.LAND)
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.cw(*self.LAND).returncode, 0)   # with the token it runs
         self.assertTrue(self.ran())
+        self.cw("wait", "land", "20")
+        runs = os.path.join(self.d, "runs")
+        before = sorted((n, open(os.path.join(runs, n)).read()) for n in os.listdir(runs) if n.startswith("land.") and n.endswith((".pid", ".exit")))
+        os.unlink(os.path.join(self.repo, "ran.txt"))
+        self.fake(3, REFUSAL)   # the token is gone (expired, or taken by another): a RESTART of the same name
+        r = self.cw(*self.LAND)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn(REFUSAL, r.stderr)
+        self.assertFalse(self.ran())   # it did not run again
+        after = sorted((n, open(os.path.join(runs, n)).read()) for n in os.listdir(runs) if n.startswith("land.") and n.endswith((".pid", ".exit")))
+        self.assertEqual(before, after, "the earlier run's record is untouched by the refused restart")
 
     def test_s9_control_a_wrapper_without_the_gate_starts_the_land(self):
         text = open(TOOL).read().replace("    land_gate(cmd)\n", "")
@@ -192,7 +204,7 @@ class TestWrapper(Gate):
 
     def test_s6_a_command_that_is_not_a_land_is_not_asked(self):
         self.fake(3, REFUSAL)
-        for cmd in (["echo", "hello"], ["sh", "-c", "echo spirit lander"]):
+        for cmd in (["echo", "hello"], ["sh", "-c", "echo spirit lander"], ["sh", "-c", "spire lander"], ["sh", "-c", "spire land-x"]):
             r = self.cw("start", "--name", "other", "--", *cmd)
             self.assertEqual(r.returncode, 0, (cmd, r.stderr))
             self.cw("wait", "other", "5")
