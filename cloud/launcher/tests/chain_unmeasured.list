@@ -105,6 +105,7 @@ cloud/worker/tests/test_dockerfile_tini.py
 cloud/worker/tests/test_entrypoint.py
 cloud/worker/tests/test_entrypoint_import.py
 cloud/worker/tests/test_entrypoint_long_run.py
+cloud/worker/tests/test_land_gate_enforce.py
 cloud/worker/tests/test_plan_check_in_pod.py
 cloud/worker/tests/test_pod_notes_log.py
 cloud/worker/tests/test_pr_label.py
