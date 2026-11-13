@@ -237,6 +237,7 @@ def cmd_land_gate(args, runner, now):
 
 
 cmd_land_gate.direct = True   # state file only: no daemon start, no error mapping
+cmd_land_gate.guard_records = True   # its name says `gate`: it writes the token state, so on a tree the installed-tree guard cannot read it refuses
 
 
 def add_land_gate_parsers(sub):
@@ -245,8 +246,10 @@ def add_land_gate_parsers(sub):
                                       "the holder runs `touch <repo>` while it lands and `release <repo>` when done; a holder that stops touching or whose pod is gone loses the token at once. "
                                       "`status [repo]` shows holder, queue and times. `move <repo> <name> <place>` is the Chief of Staff's.")
     actions = gate.add_subparsers(dest="gate_action", required=True)
-    for word in ("take", "touch"):
-        actions.add_parser(word, help="%s the land token of the repository" % word.capitalize()).add_argument("repo", help="owner/repo on the land list")
+    take = actions.add_parser("take", help="Take the land token of the repository (or ask again for a queued place)")
+    take.add_argument("repo", help="owner/repo on the land list")
+    touch = actions.add_parser("touch", help="Show the holder is alive: keeps the token")
+    touch.add_argument("repo", help="owner/repo on the land list")
     rel = actions.add_parser("release", help="Give the token up (or leave the queue); the Chief of Staff may name another")
     rel.add_argument("repo", help="owner/repo on the land list")
     rel.add_argument("name", nargs="?", help="Another name's place (the Chief of Staff only)")
