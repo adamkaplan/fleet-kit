@@ -275,6 +275,12 @@ class Renewal(gtr.RealMint):
         self.assertNotEqual(self.renew("orchestrator", mut), ORCH_SET)
 
 
+# Renewal reuses the harness of gtr.RealMint only; the tests RealMint itself defines (the renewal timing, the failure and mutant runs) are run, unchanged, by
+# test_git_token_renewal.py, so they are not collected a second time here (about 70 s of this file). Renewal's own tests above are all kept.
+for _inherited in [n for n in dir(gtr.RealMint) if n.startswith("test") and n not in Renewal.__dict__]:
+    setattr(Renewal, _inherited, None)
+
+
 class Mutants(unittest.TestCase):
     def test_s6_the_real_table_has_no_failure(self):
         self.assertEqual(table_failures(app_token), [])
