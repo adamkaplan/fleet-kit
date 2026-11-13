@@ -337,10 +337,19 @@ def daily_pass(env, now, root, state_path, git_dir=None, send=send_message, comm
         return "sent" if state["message"] and state["comment"] else "partial"
     except Exception as err:
         try:
-            log("land report: the pass failed (%s)" % type(err).__name__)
+            log("land report: the pass failed (%s)" % failure_summary(err))
         except Exception:
             pass
         return "failed"
+
+
+def failure_summary(err):
+    """The type and the function names of the traceback's last frame, never a value: scrubbed."""
+    tb = err.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    where = "%s:%s" % (os.path.basename(tb.tb_frame.f_code.co_filename), tb.tb_frame.f_code.co_name) if tb is not None else "unknown"
+    return scrub("%s in %s" % (type(err).__name__, where))
 
 
 def run(launcher, now):   # #2448: the reaper's one call; loaded by name (the token service's image does not ship this module); never raises
@@ -348,4 +357,4 @@ def run(launcher, now):   # #2448: the reaper's one call; loaded by name (the to
         root = launcher.recorder.root()
         daily_pass(launcher.env, now, root, os.path.join(root, ".land-report.json"), log=lambda t: print("cloud-worker: " + t, file=sys.stderr))
     except Exception as err:
-        print("cloud-worker: the land report failed: %s" % type(err).__name__, file=sys.stderr)
+        print("cloud-worker: the land report failed: %s" % failure_summary(err), file=sys.stderr)

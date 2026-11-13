@@ -5,6 +5,7 @@ S5 unset is today's and the command settings win; S6 a missing, empty, wrong-mod
 S7 a mutant that calls az fails with the anchored text."""
 import io, os, subprocess, sys, tempfile, types, unittest
 from contextlib import redirect_stderr
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
@@ -157,11 +158,10 @@ class Reads(Base):
 
     def test_s4_no_program_is_run_and_no_value_reaches_an_argument_a_log_or_stderr(self):
         ran = []
-        real_run, real_popen = subprocess.run, subprocess.Popen
-        subprocess.run = lambda *a, **k: ran.append(a) or real_run(*a, **k)
-        subprocess.Popen = lambda *a, **k: ran.append(a) or real_popen(*a, **k)
-        self.addCleanup(setattr, subprocess, "run", real_run)
-        self.addCleanup(setattr, subprocess, "Popen", real_popen)
+        for target in ("subprocess.run", "subprocess.Popen"):   # named by string: the real call is never made and nothing is left patched
+            patcher = mock.patch(target, side_effect=lambda *a, **k: ran.append(a))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         err = io.StringIO()
         with redirect_stderr(err):
             self.check_all()

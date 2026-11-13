@@ -4276,7 +4276,7 @@ class Launcher:
         """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
         (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
         `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
-        if not NAME_RE.match(a.worker or ""):
+        if not NAME_RE.fullmatch(a.worker or ""):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         name = pod_name(a.worker)
         if not self.kube.get_pod(name):
@@ -4954,7 +4954,7 @@ class Launcher:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 raw = ann(pod, "pr-labels")
-                if not raw or (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if not raw or (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 labels = [x for x in raw.split(",") if PR_LABEL_RE.fullmatch(x)]
                 if not labels:
@@ -5010,7 +5010,7 @@ class Launcher:
         for pod in pods:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
-                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 raw_end = ann(pod, "hard-deadline")
                 if not raw_end or ann(pod, "final-note"):
@@ -5071,7 +5071,7 @@ class Launcher:
         for pod in pods:
             worker = ann(pod, "worker")
             try:
-                if ann(pod, "persistent") is not None and (pod.get("status") or {}).get("phase") == "Running" and NAME_RE.match(worker or "") \
+                if ann(pod, "persistent") is not None and (pod.get("status") or {}).get("phase") == "Running" and NAME_RE.fullmatch(worker or "") \
                         and not self.kube.get_run_secret(pod_name(worker)):   # a persistent pod's Secret is the worker's: its absence is ONE report line
                     raise _NotRenewed("the per-run Secret of the persistent orchestrator was not found")
                 try:
@@ -5140,7 +5140,7 @@ class Launcher:
             return False
         # a persistent pod is NAME-0 but its per-run Secrets are named after the worker: found by the worker's name. Any annotation the renewal needs
         # (such as the token role) is read from the pod's own annotations, which are the pod template's.
-        persistent = ann(pod, "persistent") is not None and bool(NAME_RE.match(worker or ""))
+        persistent = ann(pod, "persistent") is not None and bool(NAME_RE.fullmatch(worker or ""))
         if persistent:
             name = pod_name(worker)
         secret = self.kube.get_run_secret(name)
