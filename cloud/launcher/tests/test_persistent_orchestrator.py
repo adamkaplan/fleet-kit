@@ -779,7 +779,8 @@ class S10Manifest(unittest.TestCase):
                  (("",), ("pods/portforward",), ("create",)), (("",), ("secrets",), ("get", "list", "create", "patch", "delete"))]
 
     # Documented additions relative to OLD_RULES: the StatefulSet rule (the persistent workload) and the PodDisruptionBudget rule (one budget per worker pod).
-    EXPECTED_ADDED = [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete")),
+    EXPECTED_ADDED = [(("",), ("events",), ("get", "list")),
+                      (("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete")),
                       (("policy",), ("poddisruptionbudgets",), ("get", "list", "create", "delete"))]
 
     def check_rules(self, role):
