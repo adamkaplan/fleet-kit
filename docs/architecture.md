@@ -217,6 +217,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_cluster.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_cluster.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_cluster.py` | `unknown_report_to:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_retired.py` | `_name_terms:exec_module` | 1 | uses an identifier of the import machinery (exec_module): `bin/check-public-names` is a script without a `.py` name, loaded by path, read-only; only its parser is used and it does nothing at import time beyond defining it |
+| `cloud_retired.py` | `_name_terms:import(importlib)` | 2 | imports a module that can load code by name, or one of its identifiers (`importlib.machinery`, `importlib.util`), for the same path load |
+| `cloud_retired.py` | `_name_terms:importlib` | 3 | uses the module object (a call, an attribute, an argument) for the same path load |
 | `cloud_way_back_check.py` | `check:imp` | 3 | uses the module object (a call, an attribute, an argument) |
 | `cloud_way_back_check.py` | `check_fixture_shape:imp` | 4 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_load_part:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
