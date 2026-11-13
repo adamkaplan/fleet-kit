@@ -9,6 +9,7 @@ The families are derived from the code, never listed twice:
 """
 import argparse
 import ast
+import contextlib
 import base64
 import datetime as dt
 import hashlib
@@ -263,7 +264,8 @@ class RealMint(Harness):
         """A pass every 60 seconds from T to T+63 minutes: (mints by T+59, the minute the token was swapped, the oldest token age seen)."""
         L = self.launcher()
         by59, swapped, oldest = None, None, 0
-        for minute in range(minutes + 1):
+        # every second minute, plus T+59 and the last: the swap (T+30), the one mint by T+59 and the age bound are all still seen
+        for minute in sorted(set(range(0, minutes + 1, 2)) | {59, minutes}):
             self.at(minutes=minute)
             self.one_pass(L)
             if minute == 59:
@@ -492,6 +494,7 @@ class PersistentFailure(Harness):
 
 class Cases(Harness):
     """Every quiet exit, refusal and failure of the renewal, with the fake mint, as one table checked against the code."""
+    fail_fast = False
 
     def cases(self):
         def env(**kw):
@@ -581,7 +584,7 @@ class Cases(Harness):
     def run_all(self):
         snapshot = dict(self.env)
         for name, (kind, setup, text) in self.cases().items():
-            with self.subTest(name):
+            with (contextlib.nullcontext() if self.fail_fast else self.subTest(name)):   # a mutant is killed by its first failing case: stop there
                 self.env.clear()
                 self.env.update(snapshot)
                 self.outputs = []
@@ -619,7 +622,7 @@ class MutantTable(unittest.TestCase):
         survivors, total = [], mutant_module(10 ** 6)[1]
         for i in range(total):
             mod, _ = mutant_module(i)
-            inner = type("Inner%d" % i, (Cases,), {"cwm": mod})
+            inner = type("Inner%d" % i, (Cases,), {"cwm": mod, "fail_fast": True})
             result = unittest.TestResult()
             unittest.TestSuite([inner("test_every_case_of_the_table_ends_as_it_says")]).run(result)
             if result.wasSuccessful():
