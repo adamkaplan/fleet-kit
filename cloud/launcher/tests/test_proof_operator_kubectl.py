@@ -18,19 +18,27 @@ echo "$@" >> "$FAKE_DIR/kubectl.log"
 tr '\\0' ' ' < /proc/$$/cmdline >> "$FAKE_DIR/argv.log"; echo >> "$FAKE_DIR/argv.log"
 tr '\\0' '\\n' < /proc/$$/environ | grep -v '^PATH=' >> "$FAKE_DIR/env.log"
 case "$*" in
-  *"create token cw-operator --duration=30m"*) [ -f "$FAKE_DIR/refuse" ] && exit 1; printf '%s\\n' TOKMARK-9f3a1c77; exit 0;;
+  *"create token cw-operator --duration="*) echo "$*" >> "$FAKE_DIR/mint.log"; [ -f "$FAKE_DIR/refuse" ] && exit 1
+    n=$(cat "$FAKE_DIR/mints" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/mints"
+    [ -f "$FAKE_DIR/limit" ] && [ $n -gt $(cat "$FAKE_DIR/limit") ] && exit 1
+    printf 'TOKMARK-9f3a1c77-%s\\n' $n; exit 0;;
   *"config view"*) echo '{"clusters":[{"name":"c","cluster":{"server":"https://example.invalid:6443","certificate-authority-data":"QQ=="}}]}'; exit 0;;
 esac
 [ -f "$FAKE_DIR/hang" ] && { echo "To sign in, use a web browser to open the page https://example.invalid/devicelogin and enter the code ABCD1234"; sleep 20; exit 0; }
 case "$1" in --token) echo "old form" >> "$FAKE_DIR/oldform.log";; esac
 cfg=$(cat "$KUBECONFIG" 2>/dev/null)
 case "$cfg" in *TOKMARK-9f3a1c77*) ;; *) case "$1 $2" in "--token TOKMARK-9f3a1c77") ;; *) echo "no token" >&2; exit 1;; esac;; esac
-case "$*" in *proof-results*) cat "$FAKE_DIR/results"; exit 0;; esac
+ser=$(printf '%s' "$cfg" | sed -n 's/.*TOKMARK-9f3a1c77-\\([0-9]*\\).*/\\1/p')
+if [ -f "$FAKE_DIR/life" ]; then u=$(cat "$FAKE_DIR/use.$ser" 2>/dev/null || echo 0); u=$((u+1)); echo $u > "$FAKE_DIR/use.$ser"
+  [ $u -gt $(cat "$FAKE_DIR/life") ] && { echo "Unauthorized" >&2; exit 1; }; fi
+case "$*" in *proof-results*) if [ -f "$FAKE_DIR/ready" ]; then p=$(cat "$FAKE_DIR/polls" 2>/dev/null || echo 0); p=$((p+1)); echo $p > "$FAKE_DIR/polls"; [ $p -lt $(cat "$FAKE_DIR/ready") ] && exit 0; fi; cat "$FAKE_DIR/results"; exit 0;; esac
 cat > /dev/null 2>&1 || true
 exit 0
 """
 CHILD = ("import sys,types\nm=types.ModuleType('p')\nm.__dict__['__file__']=sys.argv[1]\nexec(compile(sys.argv[2],'p','exec'),m.__dict__)\n"
-         "sys.exit(m.main([sys.argv[3],'--repo','acme/widget','--wait','0']))\n")
+         "import time\nclock=[0.0]\ntime.monotonic=lambda:clock[0]\n"
+         "def nap(s): clock[0]+=s\n"
+         "sys.exit(m.main([sys.argv[3],'--repo','acme/widget','--wait',sys.argv[4]],sleep=nap))\n")
 
 
 class ProofOperatorKubectl(G.Base):
@@ -51,8 +59,8 @@ class ProofOperatorKubectl(G.Base):
         Path(p).write_text("apiVersion: v1\nkind: Config\n")
         os.chmod(p, 0o600)
 
-    def child(self, source=None, bound=25):
-        return subprocess.run([sys.executable, "-c", CHILD, str(G.ROOT / "bin" / "cloud_image_proof.py"), source or G.PROOF, G.SRC],
+    def child(self, source=None, bound=25, wait="0"):
+        return subprocess.run([sys.executable, "-c", CHILD, str(G.ROOT / "bin" / "cloud_image_proof.py"), source or G.PROOF, G.SRC, wait],
                               env=self.env, capture_output=True, text=True, timeout=bound)
 
     def everything(self):
@@ -99,9 +107,9 @@ class ProofOperatorKubectl(G.Base):
 
     def test_control_the_old_token_on_argv_form_is_seen_by_the_same_check(self):
         self.minter()
-        old = 'kubectl, cfg = ([env["CW_KUBECTL"]], None) if env.get("CW_KUBECTL") else (["kubectl"], mint_token(env))'
+        old = 'return kube_run(["kubectl"] + rest, env, config=cfg, **kw)'
         self.assertEqual(G.PROOF.count(old), 1)
-        argv_form = G.PROOF.replace(old, 'kubectl, cfg = ["kubectl", "--token", json.loads(mint_token(env))["users"][0]["user"]["token"]], None')
+        argv_form = G.PROOF.replace(old, 'return kube_run(["kubectl", "--token", json.loads(cfg)["users"][0]["user"]["token"]] + rest, env, **kw)')
         self.child(argv_form)
         self.assertIn(MARK, self.argv_env_text())   # the mutant puts the token back on argv and the check sees it
 
@@ -149,6 +157,45 @@ class ProofOperatorKubectl(G.Base):
         except subprocess.TimeoutExpired:
             return   # the mutant waited past the bound, as the mutant must
         self.fail("the waiting mutant ended in time with exit %s" % done.returncode)
+
+    def long_wait(self, source=None, life="3", ready="6"):
+        self.minter()
+        Path(self.fake, "life").write_text(life)   # a token is good for this many kubectl calls, then kubectl answers Unauthorized
+        Path(self.fake, "ready").write_text(ready)   # the results show up on this poll
+        Path(self.fake, "results").write_text("".join("%s pass\n" % i for i in G.ITEMS) if hasattr(G, "ITEMS") else "")
+        return self.child(source, wait="3000")   # fake clock: 3000 s is longer than any token lifetime
+
+    def test_a_wait_longer_than_a_token_lifetime_still_reads_the_results(self):
+        done = self.long_wait()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(int(Path(self.fake, "polls").read_text()), 6)
+        self.assertGreater(int(Path(self.fake, "mints").read_text()), 6)   # a fresh token per call
+        for line in Path(self.fake, "mint.log").read_text().splitlines():
+            self.assertIn("--duration=10m", line)   # short, and the same whatever --wait is
+        self.assertNotIn(MARK, done.stdout + done.stderr + self.everything())
+
+    def test_control_a_proof_that_mints_once_is_caught(self):
+        old = "            cfg = mint_token(env)\n"
+        self.assertEqual(G.PROOF.count(old), 1)
+        once = G.PROOF.replace(old, "            cfg = kc.__dict__.setdefault('c', mint_token(env))\n")
+        self.assertEqual(self.long_wait().returncode, 0)   # the control: the real source passes the same setup
+        for n in ("mints", "polls", "mint.log") + tuple("use.%d" % i for i in range(1, 40)):
+            Path(self.fake, n).unlink(missing_ok=True)
+        done = self.long_wait(once)
+        self.assertNotEqual(done.returncode, 0, "the mint-once mutant read the results with an expired token")
+
+    def test_a_mint_that_fails_on_a_later_poll_ends_at_once_with_one_line(self):
+        self.minter()
+        Path(self.fake, "limit").write_text("4")   # the first calls mint, a later one is refused
+        Path(self.fake, "ready").write_text("99")
+        Path(self.fake, "results").write_text("")
+        done = self.child(wait="3000")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+        self.assertIn("refused", done.stderr)
+        self.assertEqual(len([l for l in self.log("launcher") if l.startswith("retire ")]), 1)
+        self.assertEqual(os.listdir(self.rdir), [])
+        self.assertNotIn(MARK, done.stdout + done.stderr + self.argv_env_text() + self.everything())
 
 
 if __name__ == "__main__":

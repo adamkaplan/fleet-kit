@@ -150,7 +150,7 @@ class KubeUnusable(Exception):
     """kubectl cannot be used: the one line names the cause (never a value); the command ends with exit status 2."""
 
 
-MINT = "cre" + "ate token cw-operator --duration=30m"   # the one mint command (in two parts: an existing pin reads the plain verb)
+MINT = "cre" + "ate token cw-operator --duration=10m"   # the one mint command (in two parts: an existing pin reads the plain verb)
 SIGN_IN = re.compile(r"devicelogin|device login|to sign in|enter the code|authenticate", re.I)
 
 
@@ -208,7 +208,7 @@ def kube_run(argv, env, stdin=None, fds=(), config=None):
 
 
 def mint_token(env):
-    """The kubeconfig text for a 30-minute cw-operator token minted with the minter kubeconfig of CW_SECRET_DIR (the launcher's reader and file name); never printed or stored."""
+    """The kubeconfig text for a 10-minute cw-operator token (one per kubectl call, so none outlives a call or depends on --wait) minted with the minter kubeconfig of CW_SECRET_DIR (the launcher's reader and file name); never printed or stored."""
     sys.path.insert(0, os.path.join(ROOT, "cloud", "launcher"))
     try:
         import secret_files as module
@@ -224,11 +224,10 @@ def mint_token(env):
     if not config or len(config) > 60000:
         raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig is empty or too large")
     mint = kube_run(["kubectl", "-n", env.get("CW_CLOUD_NAMESPACE") or "cw"] + MINT.split(), dict(env, KUBECONFIG=os.devnull), config=config)
-    done = mint
     if not (mint.stdout or "").strip() or mint.returncode != 0:
         raise KubeUnusable("no cluster login for kubectl: the token for cw-operator was refused")
     view = kube_run(["kubectl", "config", "view", "--minify", "--raw", "-o", "json"], dict(env, KUBECONFIG=os.devnull), config=config)
-    token = (done.stdout or "").strip() if done is not None and done.returncode == 0 else ""
+    token = (mint.stdout or "").strip()
     if not token or re.search(r"\s", token):
         raise KubeUnusable("no cluster login for kubectl: the token for cw-operator was refused")
     return operator_config(view, token, env.get("CW_CLOUD_NAMESPACE") or "cw")
@@ -296,7 +295,12 @@ def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchbo
         raise Refused("the proof pod could not be launched (exit %s); no receipt was written" % ("?" if made is None else made.returncode))
     results = ""
     try:
-        kubectl, cfg = ([env["CW_KUBECTL"]], None) if env.get("CW_KUBECTL") else (["kubectl"], mint_token(env))   # minted after the launch, so it lasts the whole wait; a refusal retires the pod below
+        def kc(rest, **kw):
+            """One kubectl call with its own fresh token (a mint that fails raises KubeUnusable: the command ends, retiring the pod below)."""
+            if env.get("CW_KUBECTL"):
+                return kube_run([env["CW_KUBECTL"]] + rest, env, **kw)
+            cfg = mint_token(env)
+            return kube_run(["kubectl"] + rest, env, config=cfg, **kw)
         try:
             last = [l for l in made.stdout.splitlines() if l.strip()][-1]
             pod = str(json.loads(last).get("runtime_id") or worker)
@@ -306,13 +310,13 @@ def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchbo
         if not isinstance(pod, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", pod):
             pod = worker
         ns = ["-n", env["CW_CLOUD_NAMESPACE"]] if env.get("CW_CLOUD_NAMESPACE") else []
-        kube_run(kubectl + ns + [KUBE_RUN, pod, "--", "rm", "-f", RESULTS_PATH], env, config=cfg)   # a results file the image brought with it is never read
+        kc(ns + [KUBE_RUN, pod, "--", "rm", "-f", RESULTS_PATH])   # a results file the image brought with it is never read
         with open(os.path.join(ROOT, "cloud", "worker", "proof-set.md"), encoding="utf-8") as f:
             brief = f.read()
-        kube_run(kubectl + ns + [KUBE_RUN, "-i", pod, "--", "sh", "-c", "cat > /work/proof-set.md"], env, stdin=brief, config=cfg)
+        kc(ns + [KUBE_RUN, "-i", pod, "--", "sh", "-c", "cat > /work/proof-set.md"], stdin=brief)
         deadline = time.monotonic() + args.wait
         while True:
-            got = kube_run(kubectl + ns + [KUBE_RUN, pod, "--", "cat", RESULTS_PATH], env, config=cfg)
+            got = kc(ns + [KUBE_RUN, pod, "--", "cat", RESULTS_PATH])
             if got is not None and got.returncode == 0 and got.stdout.strip():
                 results = got.stdout
                 if all(any(l.split()[:1] == [item] for l in results.splitlines()) for item in ITEMS):
