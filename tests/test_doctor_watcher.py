@@ -40,9 +40,10 @@ EXTRACT = r'''awk '/^cleanup\(\) /{print} /^run_to\(\) \{/{p=1} p{print} p&&/^}/
 
 HARNESS = EXTRACT + r'''
 n="$2"; stop="$3"
+# n=0 with stop=1: no count of starts is assumed; run until the first early removal is seen (the event).
 . "$HDIR/fn.sh"
 bad=0; i=0
-while [ "$i" -lt "$n" ]; do
+while [ "$n" -eq 0 ] || [ "$i" -lt "$n" ]; do
   TMPDIR_FD=$(mktemp -d "$HDIR/d.XXXXXX"); OUT="$TMPDIR_FD/out"
   trap cleanup EXIT INT TERM
   run_to "$CAP" true
@@ -84,6 +85,9 @@ def run_scratch(shell, script, doctor_text, *args):
 
 
 def early_removals(doctor_text, n, stop=0):
+    """Count early removals over n starts; n=0 with stop=1 waits for the first one (the event), however many
+    starts that takes: the chance of the race window depends on how the scheduler places the new process."""
+    assert n > 0 or stop == 1, "an unbounded run needs stop=1"
     return int(run_scratch(["bash"], HARNESS, doctor_text, n, stop)[-2])
 
 
@@ -110,7 +114,7 @@ class TestWatcher(unittest.TestCase):
                          "on macOS the old watcher showed 0 early removals in 20000 starts (run 41585441923), so this half is measured on Linux only")
     def test_s1_old_watcher_shows_the_cause(self):
         old = mutate(self.text, NEW, OLD)
-        self.assertGreaterEqual(early_removals(old, 5000, stop=1), 1, "the cause is not established")
+        self.assertGreaterEqual(early_removals(old, 0, stop=1), 1, "the cause is not established")
 
     def test_s2_no_early_removal(self):
         self.assertEqual(early_removals(self.text, RUNS), 0)
@@ -135,7 +139,7 @@ class TestWatcher(unittest.TestCase):
         check_harness(self.text, RUNS)                       # the control first: passes
         old = mutate(self.text, NEW, OLD)
         with self.assertRaises(AssertionError) as cm:
-            check_harness(old, 5000)
+            check_harness(old, 0)
         self.assertIn("the doctor removed its own temporary directory:", str(cm.exception))
 
     def test_noop_mutation_fails_the_computation(self):
