@@ -101,7 +101,7 @@ CI columns: seconds of the step in runs 43355343111 / 43324682615 / 43190655884 
 | bin/fleet-scenario validate | test | 2 / 2 / 1 | 1 | 0 | switchboard (bin/) |
 | bin/fleet-scenario coverage | test | 1 / 1 / 2 | 1 | 0 | switchboard (bin/) |
 | bin/test-cloud-worker | test-cloud | 149 / 141 / 150 | 141 | 1 | cloud lane |
-| bin/test-cloud-launcher (the chain) | test-cloud | 1213 / 1213 / 490 | n/a | - | cloud lane |
+| bin/test-cloud-launcher (the chain) | test-cloud | 1213 / 1213 / 490 | 2002 | 1 | cloud lane |
 | bin/test-cloud-hub | test-cloud | 116 / 116 / 117 | 116 | 0 | cloud lane |
 | bin/test-cloud-channel | test-cloud | 0 / 0 / 0 | 0 | 0 | cloud lane |
 | bin/test-cloud-channel-server | test-cloud | 39 / 40 / 39 | 39 | 0 | cloud lane |
@@ -258,37 +258,65 @@ Chain TIME lines (whole seconds, measured in the pod by `bin/test-cloud-launcher
 | entry | pod s | CI s (run 43355343111) | owner |
 |---|---:|---:|---|
 | cloud/launcher/tests/test_no_open_files.py | 308 | 384 | cloud lane |
+| cloud/launcher/tests/test_git_token_renewal.py | 198 | - | cloud lane |
+| cloud/launcher/tests/test_run_record.py | 161 | - | cloud lane |
 | cloud/launcher/tests/test_preflight_repo_read.py | 116 | 120 | cloud lane |
+| cloud/launcher/tests/test_mint_roles.py | 110 | - | cloud lane |
 | cloud/launcher/tests/test_scrub_linear.py | 96 | - | cloud lane |
+| cloud/launcher/tests/test_driver.py | 95 | - | cloud lane |
+| cloud/worker/tests/test_cloud_prepush_background.py | 92 | - | cloud lane |
 | cloud/launcher/tests/test_registry_endpoint.py | 89 | - | cloud lane |
 | cloud/launcher/tests/test_refusal_label.py | 88 | - | cloud lane |
 | cloud/launcher/tests/test_persistent_orchestrator.py | 86 | 86 | cloud lane |
 | cloud/launcher/tests/test_pdb.py | 82 | - | cloud lane |
+| cloud/launcher/tests/test_cloud_stack_wait.py | 63 | - | cloud lane |
 | cloud/launcher/tests/test_brief_header.py | 58 | 66 | cloud lane |
+| cloud/launcher/tests/test_cloud_quick_scans_run.py | 54 | - | cloud lane |
+| cloud/launcher/tests/test_stub_cleanup.py | 50 | - | cloud lane |
+| cloud/launcher/tests/test_cloud_k1.py | 45 | - | cloud lane |
 | cloud/launcher/tests/test_scratch_clean.py | 43 | - | cloud lane |
+| cloud/launcher/tests/test_cloud_stack.py | 43 | - | cloud lane |
 | cloud/launcher/tests/test_kept_expiry.py | 42 | 41 | cloud lane |
+| cloud/launcher/tests/test_cloud_worker.py | 41 | - | cloud lane |
 | cloud/launcher/tests/test_failed_pod_record.py | 38 | 36 | cloud lane |
 | cloud/launcher/tests/test_stall_structural.py | 38 | - | cloud lane |
+| cloud/launcher/tests/test_app_token.py | 38 | - | cloud lane |
 | cloud/launcher/tests/test_reaper_managed.py | 35 | - | cloud lane |
+| cloud/worker/tests/test_plan_check_in_pod.py | 35 | - | cloud lane |
+| cloud/launcher/tests/test_stop_no_checkout.py | 32 | - | cloud lane |
 | cloud/launcher/tests/test_persistent_merge_fix.py | 29 | 32 | cloud lane |
 | cloud/launcher/tests/test_stop_cause.py | 29 | - | cloud lane |
+| cloud/launcher/tests/test_preflight.py | 28 | - | cloud lane |
+| cloud/launcher/tests/test_cloud_prestop.py | 27 | - | cloud lane |
 | bin/test-cloud-retired | 26 | 33 | cloud lane |
+| cloud/launcher/tests/test_vault_block.py | 25 | - | cloud lane |
+| cloud/launcher/tests/test_worker_copies.py | 25 | - | cloud lane |
+| cloud/worker/tests/test_cloud_prepush_hardening.py | 25 | - | cloud lane |
+| cloud/launcher/tests/test_cloud_quick_bounds.py | 24 | - | cloud lane |
 | cloud/launcher/tests/test_reap_concurrent.py | 23 | - | cloud lane |
+| cloud/launcher/tests/test_m_cap.py | 23 | - | cloud lane |
 | cloud/launcher/tests/test_fixture_root.py | 22 | 36 | cloud lane |
 | cloud/launcher/tests/test_orchestrator_agent.py | 22 | 21 | cloud lane |
 | cloud/launcher/tests/test_retire_gone_exact.py | 21 | - | cloud lane |
 | cloud/launcher/tests/test_cloud_settings.py | 20 | 34 | cloud lane |
 | cloud/launcher/tests/test_cloud_status_summary.py | 19 | 22 | cloud lane |
 | cloud/launcher/tests/test_proof_operator_kubectl.py | 19 | - | cloud lane |
+| cloud/worker/tests/test_cw_run.py | 19 | - | cloud lane |
 | cloud/launcher/tests/test_cloud_model_served.py | 18 | 23 | cloud lane |
+| cloud/launcher/tests/test_untracked_report.py | 15 | - | cloud lane |
+| cloud/worker/tests/test_cloud_prepush_preflight.py | 15 | - | cloud lane |
 | cloud/launcher/tests/test_cluster_token_refresh.py | 14 | 15 | cloud lane |
+| cloud/worker/tests/test_cloud_prepush.py | 14 | - | cloud lane |
 | cloud/launcher/tests/test_app_token_route.py | 13 | 17 | cloud lane |
 | cloud/launcher/tests/test_idle_default_note.py | 13 | 13 | cloud lane |
 | cloud/launcher/tests/test_known_forms.py | 13 | 16 | cloud lane |
 | cloud/launcher/tests/test_cloud_tests_write_tmp.py | 12 | 20 | cloud lane |
 | cloud/launcher/tests/test_launch_idempotent.py | 12 | 14 | cloud lane |
 | cloud/launcher/tests/test_preflight_step.py | 12 | 12 | cloud lane |
+| cloud/launcher/tests/test_token_at_limit.py | 12 | - | cloud lane |
 | cloud/launcher/tests/test_kept_failed_once.py | 11 | 11 | cloud lane |
+| cloud/worker/tests/test_cw_run_wake.py | 11 | - | cloud lane |
+| cloud/launcher/tests/test_issues_read.py | 11 | - | cloud lane |
 | cloud/launcher/tests/test_results_own_run.py | 10 | - | cloud lane |
 | cloud/launcher/tests/test_cloud_shapes.py | 9 | 12 | cloud lane |
 | cloud/launcher/tests/test_hub_entry_keys.py | 9 | 9 | cloud lane |
@@ -296,8 +324,13 @@ Chain TIME lines (whole seconds, measured in the pod by `bin/test-cloud-launcher
 | cloud/launcher/tests/test_cloud_pr_preflight.py | 8 | 12 | cloud lane |
 | cloud/launcher/tests/test_image_proof_launch.py | 8 | 9 | cloud lane |
 | cloud/launcher/tests/test_repo_min_shape.py | 8 | - | cloud lane |
+| cloud/worker/tests/test_cw_gh.py | 8 | - | cloud lane |
+| cloud/launcher/tests/test_orchestrator_hub_session.py | 8 | - | cloud lane |
+| cloud/launcher/tests/test_cloud_split.py | 8 | - | cloud lane |
 | cloud/launcher/tests/test_m_cap_stopped.py | 7 | 8 | cloud lane |
 | cloud/launcher/tests/test_retire_gone_pod.py | 7 | - | cloud lane |
+| cloud/worker/tests/test_activity.py | 7 | - | cloud lane |
+| cloud/launcher/tests/test_token_service.py | 6 | - | cloud lane |
 | cloud/launcher/tests/test_cloud_default_model.py | 5 | 4 | cloud lane |
 | cloud/launcher/tests/test_cloud_preflight_quick.py | 5 | 7 | cloud lane |
 | cloud/launcher/tests/test_cloud_preflight_wired.py | 5 | 6 | cloud lane |
@@ -306,6 +339,7 @@ Chain TIME lines (whole seconds, measured in the pod by `bin/test-cloud-launcher
 | cloud/launcher/tests/test_results_own_run_wiring.py | 5 | - | cloud lane |
 | cloud/launcher/tests/test_stack_model_key.py | 5 | - | cloud lane |
 | cloud/launcher/tests/test_stop_failed_pod.py | 5 | - | cloud lane |
+| cloud/launcher/tests/test_wip_save.py | 5 | - | cloud lane |
 | cloud/launcher/tests/test_app_token_service.py | 4 | 6 | cloud lane |
 | cloud/launcher/tests/test_create_says_why.py | 4 | 3 | cloud lane |
 | cloud/launcher/tests/test_cw_names.py | 4 | 2 | cloud lane |
@@ -313,8 +347,12 @@ Chain TIME lines (whole seconds, measured in the pod by `bin/test-cloud-launcher
 | cloud/launcher/tests/test_kept_running_once.py | 4 | 5 | cloud lane |
 | cloud/launcher/tests/test_nudge_reused.py | 4 | 4 | cloud lane |
 | cloud/launcher/tests/test_reaper_audit_tail.py | 4 | - | cloud lane |
+| cloud/worker/tests/test_activity_message.py | 4 | - | cloud lane |
 | cloud/launcher/tests/test_cloud_inspect.py | 3 | 4 | cloud lane |
 | cloud/launcher/tests/test_end_hook_run_files.py | 3 | 4 | cloud lane |
+| cloud/worker/tests/test_pod_notes_log.py | 3 | - | cloud lane |
+| cloud/worker/tests/test_scan_dpkg_skip.py | 3 | - | cloud lane |
+| cloud/launcher/tests/test_git_token_retry.py | 3 | - | cloud lane |
 | cloud/launcher/tests/test_cloud_pod_replaced.py | 2 | 2 | cloud lane |
 | cloud/launcher/tests/test_end_hook_nothing_to_push.py | 2 | 2 | cloud lane |
 | cloud/launcher/tests/test_idle_default_60.py | 2 | 3 | cloud lane |
@@ -361,7 +399,7 @@ Chain TIME lines (whole seconds, measured in the pod by `bin/test-cloud-launcher
 | cloud/launcher/tests/test_pod_requests.py | 0 | 0 | cloud lane |
 | cloud/launcher/tests/test_readonly_root.py | 0 | 0 | cloud lane |
 
-14 further entries took under 3 s each in the pod (sum 13 s); all 117 entries are in the JSON (`launcher_files_pod`). Pod total of the TIME lines: 1654 s (27.6 min); entries measured: 117 of 193.
+51 further entries took under 3 s each in the pod (sum 33 s); all 192 entries are in the JSON (`launcher_files_pod`). Sum of the TIME lines: 3060 s (51.0 min of work; the chain's wall time with its 3 parallel lanes was 2,002 s = 33.4 min); entries with a TIME line: 192 of 193.
 
 ### Cloud worker suite (`bin/test-cloud-worker`: 152 tests, 140 s in the pod, 141-150 s in CI)
 
@@ -391,7 +429,7 @@ The other python suites have per-class times in the JSON (`other_suites`).
 
 ## 4. The slowest 50 (classes, chain files and whole suites that cannot be split)
 
-Seconds are pod seconds. Tag vocabulary: `sleeps/real waits`, `real subprocess/server`, `serial chain`, `big fixture/setup`, `parse-once candidate`, `mutant runs`. Cause lines for rows 1-30 come from reading the class's code and its slowest tests (the slowest tests are listed in the second table); rows 31-50 are tagged from the code too, a shorter read.
+Seconds are pod seconds. Tag vocabulary: `sleeps/real waits`, `real subprocess/server`, `serial chain`, `big fixture/setup`, `parse-once candidate`, `mutant runs`. Cause lines for rows 1-30 come from reading the class's code and its slowest tests (the slowest tests are listed in the second table); rows 31-50 are tagged from the code too, a shorter read. Launcher chain files (names ending `.py`) have no per-test times, so their cause lines come from the file's header and counts of sleep, subprocess and mutant mentions, not from a test-by-test read: treat those as leads for the cloud lane.
 
 | # | name | file | seconds | tags | cause | owner |
 |---:|---|---|---:|---|---|---|
@@ -399,52 +437,52 @@ Seconds are pod seconds. Tag vocabulary: `sleeps/real waits`, `real subprocess/s
 | 2 | test_no_open_files.py | cloud/launcher/tests/test_no_open_files.py | 308.0 | real subprocess/server; serial chain | re-runs every launcher test file in its own subprocess under `-W error::ResourceWarning` (4 at a time), so the chain's work is paid twice; it also runs serially in the chain (a parallel-list candidate). | cloud lane |
 | 3 | TestLaunchCapacity | tests/switchboard/test_launch_capacity.py | 299.1 | mutant runs; real subprocess/server | test_u23 mutant cases copy the cloud_worker source and run the 400-line PC-11 battery as a child process per case (160 s + 79 s in two tests). | switchboard (bin/) |
 | 4 | TestImpactHold924 | tests/switchboard/test_924.py | 203.1 | parse-once candidate; mutant runs | 61 tests, each loops over 100+ daemon/helper functions, patching one function at a time and re-driving the whole clear (`reassign_registrar` per function). | switchboard (bin/) |
-| 5 | TestBlockedMutants | bin/test-switchboard | 146.9 | mutant runs | negates every guard of the blocked report in a source copy and runs the named killer test for each (103 s + 41 s in two tests). | switchboard (bin/) |
-| 6 | TestGhShimEffectRule | tests/switchboard/test_gh_shim_sign_input.py | 119.2 | mutant runs; real subprocess/server | each `mutant4` test rewrites the gh shim source and runs the whole R4 spelling battery through a real subprocess; about 17 s each, 5 mutants + control. | switchboard (bin/) |
-| 7 | test_preflight_repo_read.py | cloud/launcher/tests/test_preflight_repo_read.py | 116.0 | real subprocess/server | starts its own loopback fake GitHub and runs the real preflight.py as a subprocess for every case; no sleeps. | cloud lane |
-| 8 | TestRegistrarFloor | bin/test-switchboard | 106.8 | parse-once candidate; mutant runs | re-derives the daemon closure and registrar lists, then runs the lint on every mutant (29 s in one test) over a 1,330-line class; many cases re-parse the entry. | switchboard (bin/) |
-| 9 | TestHostDisk | tests/switchboard/test_host_disk.py | 105.7 | real subprocess/server; big fixture/setup | one test re-runs a named group of classes in one process with the disk faked at 5 GB (100 s): a second full execution of other classes. | switchboard (bin/) |
-| 10 | TestFactsReadAtRunTime | bin/test-switchboard | 97.5 | mutant runs; big fixture/setup | 2 tests: every fact name x every spelling re-drives the gate path with a recording proxy (96 s in one test). | switchboard (bin/) |
-| 11 | test_scrub_linear.py | cloud/launcher/tests/test_scrub_linear.py | 96.0 | (not read) |  | cloud lane |
-| 12 | TestOfflineScenarios | bin/test-switchboard | 91.1 | big fixture/setup | one test per scenario file; q1 (two fake hours, 26 s) and g3 (14 s) drive thousands of fake-clock passes; no real waits. | switchboard (bin/) |
-| 13 | test_registry_endpoint.py | cloud/launcher/tests/test_registry_endpoint.py | 89.0 | mutant runs; big fixture/setup | mutants copy the source tree to a scratch directory and run the behaviour tests in it; the launch runs on the fake cluster. | cloud lane |
-| 14 | TestNewTestChecksMutants | tests/switchboard/test_new_test_checks.py | 88.4 | mutant runs; real subprocess/server | six mutants, each on a source copy, each run as a real check subprocess (about 14-17 s each). | switchboard (bin/) |
-| 15 | test_refusal_label.py | cloud/launcher/tests/test_refusal_label.py | 88.0 | real subprocess/server | loopback stub of GitHub plus 8 refusal labels each through the launcher (subprocess per launch). | cloud lane |
-| 16 | test_persistent_orchestrator.py | cloud/launcher/tests/test_persistent_orchestrator.py | 86.0 | mutant runs; big fixture/setup | 1,200 lines, 37 mutant mentions: scratch-copy mutants and the fake-kubectl cluster per scenario. | cloud lane |
-| 17 | TestGhShimSignInput | tests/switchboard/test_gh_shim_sign_input.py | 85.3 | real subprocess/server; big fixture/setup | 38 tests run the real shim as a subprocess through a rig (each spelling a process). | switchboard (bin/) |
-| 18 | test_pdb.py | cloud/launcher/tests/test_pdb.py | 82.0 | mutant runs; real subprocess/server | 22 mutant mentions: scratch copies of the launcher, each run through the fake kubectl. | cloud lane |
-| 19 | Mutants | bin/test-decisions-pull | 81.0 | mutant runs | 82 mutants of the decisions-pull source, each `load()` re-executes the module (about 1 s each). | cloud lane |
-| 20 | TestRefusals | bin/test-cloud-cli | 67.5 | sleeps/real waits | a local HTTP server with a stalled or cut body: tests wait out real socket timeouts (`error_body_cut_mid_read` 31.7 s). | cloud lane |
-| 21 | TestStopFinalMessageBareMutant | tests/switchboard/test_stop_final_message.py | 65.8 | mutant runs; real subprocess/server | copies the check file and tests to a scratch tree and runs it as a child (58.6 s in one test). | switchboard (bin/) |
-| 22 | TestImpactHold | bin/test-switchboard | 65.8 | parse-once candidate; big fixture/setup | 120 tests on one 2,358-line class, each building a repository fixture world; 29 parse/read uses. | switchboard (bin/) |
-| 23 | TestPlanHashMarkerLaunch | tests/switchboard/test_plan_hash_marker.py | 65.6 | mutant runs; real subprocess/server | control and mutant each run the real `launch` on a copy of the entry (33 s each). | switchboard (bin/) |
-| 24 | TestStopFinalMessageBare | tests/switchboard/test_stop_final_message.py | 65.2 | real subprocess/server | U20 runs the whole check file again as a nested subprocess (54 s). | switchboard (bin/) |
-| 25 | TestArchitectureSafetyNet | tests/switchboard/test_cases_10.py | 62.9 | real subprocess/server; big fixture/setup | records every verb of the entry with a process pool and again to prove it deterministic (60 s in one test). | switchboard (bin/) |
-| 26 | TestPlanReviewCommands | bin/test-switchboard | 59.8 | big fixture/setup | 53 tests at 0.5-3.6 s: each builds the plan-review world with the real engine. | switchboard (bin/) |
-| 27 | test_brief_header.py | cloud/launcher/tests/test_brief_header.py | 58.0 | mutant runs; real subprocess/server | 1,012 lines, 38 mutant mentions, 6 subprocess uses: scratch-copy mutants of the launcher. | cloud lane |
-| 28 | TestQueuedBehindTurn | tests/switchboard/test_queued_behind_turn.py | 55.2 | mutant runs; real subprocess/server | s5 copies the tree twice and runs two tests in each (35 s); the light-switch test is 17 s. | switchboard (bin/) |
-| 29 | TestResume | bin/test-switchboard | 45.1 | mutant runs | one test applies every mutant in memory and runs its named test (25 s). | switchboard (bin/) |
-| 30 | TestOneTableOfTheBinSetClasses | bin/test-path-suites | 44.0 | real subprocess/server; big fixture/setup | each test builds a fixture repository and runs `preflight-pr` as a subprocess (up to 20 s). | switchboard (bin/) |
-| 31 | test_scratch_clean.py | cloud/launcher/tests/test_scratch_clean.py | 43.0 | sleeps/real waits; real subprocess/server | leaves children running and checks they are ended and a stubborn one killed: real process waits. | cloud lane |
-| 32 | TestHeavyProgress | tests/switchboard/test_heavy_progress.py | 42.4 | sleeps/real waits; real subprocess/server | s14 starts a child that blocks on a lock and waits for the outer bound (24 s); s10 and s11 wait for threads to time out (5 s each). | switchboard (bin/) |
-| 33 | test_kept_expiry.py | cloud/launcher/tests/test_kept_expiry.py | 42.0 | big fixture/setup | fake kubectl and fake clock; no sleeps: setup per case (41 s over the file). | cloud lane |
-| 34 | TestShimTopSpender | bin/test-switchboard | 41.6 | real subprocess/server | s3 runs the shim with every environment name it reads, one process each (20 s). | switchboard (bin/) |
-| 35 | TestCloudChannelServer | bin/test-cloud-channel-server | 39.1 | real subprocess/server; sleeps/real waits | 62 tests that start a real channel server and talk to it. | cloud lane |
-| 36 | test_failed_pod_record.py | cloud/launcher/tests/test_failed_pod_record.py | 38.0 | big fixture/setup | 800 lines of fake-cluster scenarios, 28 mutant mentions. | cloud lane |
-| 37 | test_stall_structural.py | cloud/launcher/tests/test_stall_structural.py | 38.0 | (not read) |  | cloud lane |
-| 38 | TestIdentityCheck | bin/test-switchboard | 37.5 | real subprocess/server | 41 tests of the identity check through the real shim; one test is 11.7 s (every write refused after a failed lookup). | switchboard (bin/) |
-| 39 | TestLaunchedReviewerMutants | tests/switchboard/test_launched_reviewers.py | 36.6 | mutant runs | one test applies all mutants and runs the named guard for each (36.6 s). | switchboard (bin/) |
-| 40 | test_reaper_managed.py | cloud/launcher/tests/test_reaper_managed.py | 35.0 | sleeps/real waits | 4 `sleep` calls: the reaper process is run for real and waited on. | cloud lane |
-| 41 | Plain | bin/test-cloud-cli | 34.0 | sleeps/real waits | `bin/test-cloud-cli`: real server with timeouts. | cloud lane |
-| 42 | TestGhShimRawPath | tests/switchboard/test_gh_shim_sign_input.py | 33.1 | mutant runs; real subprocess/server | mutant of the shim run in a subprocess per spelling. | switchboard (bin/) |
-| 43 | Wire | bin/test-cloud-cli | 32.2 | sleeps/real waits; real subprocess/server | a stalled server is cut by the client timeout: `test_stalled_server_is_cut_by_the_timeout` waits 30 s for real. | cloud lane |
-| 44 | TestGhShimMergeGate | bin/test-switchboard | 31.8 | real subprocess/server; mutant runs | 46 tests through the real shim; mutant of the route matching 7.5 s. | switchboard (bin/) |
-| 45 | TestHeavySlots | tests/switchboard/test_cases_07.py | 30.1 | real subprocess/server; sleeps/real waits | real slot wrapper processes and waits (up to 3.9 s per test). | switchboard (bin/) |
-| 46 | TestRecordingCommands | bin/test-switchboard | 29.9 | sleeps/real waits | a lock held past the bound: the tests wait the real bound (6.3 s x 3). | switchboard (bin/) |
-| 47 | TestMadeUpPids | bin/test-switchboard | 29.5 | mutant runs; big fixture/setup | one test re-runs every pid-standin class with the real parent and grandparent numbers (23 s). | switchboard (bin/) |
-| 48 | test_persistent_merge_fix.py | cloud/launcher/tests/test_persistent_merge_fix.py | 29.0 | mutant runs; big fixture/setup | 8 mutant mentions; fake cluster. | cloud lane |
-| 49 | test_stop_cause.py | cloud/launcher/tests/test_stop_cause.py | 29.0 | (not read) |  | cloud lane |
-| 50 | TestDerivedClosure | tests/switchboard/test_closure.py | 27.7 | parse-once candidate | derives the closure of the daemon from the source (27.7 s over 8 tests). | switchboard (bin/) |
+| 5 | test_git_token_renewal.py | cloud/launcher/tests/test_git_token_renewal.py | 198.0 | mutant runs; big fixture/setup | 27 mutant mentions: scratch-copy mutants of the reaper, each run through the fake kubectl (198 s in the pod; parallel list). | cloud lane |
+| 6 | test_run_record.py | cloud/launcher/tests/test_run_record.py | 161.0 | real subprocess/server; big fixture/setup | 4 subprocess uses plus the stub server and fake kubectl (161 s; parallel list). | cloud lane |
+| 7 | TestBlockedMutants | bin/test-switchboard | 146.9 | mutant runs | negates every guard of the blocked report in a source copy and runs the named killer test for each (103 s + 41 s in two tests). | switchboard (bin/) |
+| 8 | TestGhShimEffectRule | tests/switchboard/test_gh_shim_sign_input.py | 119.2 | mutant runs; real subprocess/server | each `mutant4` test rewrites the gh shim source and runs the whole R4 spelling battery through a real subprocess; about 17 s each, 5 mutants + control. | switchboard (bin/) |
+| 9 | test_preflight_repo_read.py | cloud/launcher/tests/test_preflight_repo_read.py | 116.0 | real subprocess/server | starts its own loopback fake GitHub and runs the real preflight.py as a subprocess for every case; no sleeps. | cloud lane |
+| 10 | test_mint_roles.py | cloud/launcher/tests/test_mint_roles.py | 110.0 | mutant runs; real subprocess/server | 9 mutant mentions; the real mint runs as a subprocess per role (110 s). | cloud lane |
+| 11 | TestRegistrarFloor | bin/test-switchboard | 106.8 | parse-once candidate; mutant runs | re-derives the daemon closure and registrar lists, then runs the lint on every mutant (29 s in one test) over a 1,330-line class; many cases re-parse the entry. | switchboard (bin/) |
+| 12 | TestHostDisk | tests/switchboard/test_host_disk.py | 105.7 | real subprocess/server; big fixture/setup | one test re-runs a named group of classes in one process with the disk faked at 5 GB (100 s): a second full execution of other classes. | switchboard (bin/) |
+| 13 | TestFactsReadAtRunTime | bin/test-switchboard | 97.5 | mutant runs; big fixture/setup | 2 tests: every fact name x every spelling re-drives the gate path with a recording proxy (96 s in one test). | switchboard (bin/) |
+| 14 | test_scrub_linear.py | cloud/launcher/tests/test_scrub_linear.py | 96.0 | mutant runs | 43 mutant mentions: each check against the frozen old scrub, many generated inputs (96 s). | cloud lane |
+| 15 | test_driver.py | cloud/launcher/tests/test_driver.py | 95.0 | sleeps/real waits; real subprocess/server | 8 sleep calls and 7 subprocess uses: the operator driver run_task.py is started and waited on. | cloud lane |
+| 16 | test_cloud_prepush_background.py | cloud/worker/tests/test_cloud_prepush_background.py | 92.0 | sleeps/real waits; real subprocess/server | the background prepush runs real child processes and is polled. | cloud lane |
+| 17 | TestOfflineScenarios | bin/test-switchboard | 91.1 | big fixture/setup | one test per scenario file; q1 (two fake hours, 26 s) and g3 (14 s) drive thousands of fake-clock passes; no real waits. | switchboard (bin/) |
+| 18 | test_registry_endpoint.py | cloud/launcher/tests/test_registry_endpoint.py | 89.0 | mutant runs; big fixture/setup | mutants copy the source tree to a scratch directory and run the behaviour tests in it; the launch runs on the fake cluster. | cloud lane |
+| 19 | TestNewTestChecksMutants | tests/switchboard/test_new_test_checks.py | 88.4 | mutant runs; real subprocess/server | six mutants, each on a source copy, each run as a real check subprocess (about 14-17 s each). | switchboard (bin/) |
+| 20 | test_refusal_label.py | cloud/launcher/tests/test_refusal_label.py | 88.0 | real subprocess/server | loopback stub of GitHub plus 8 refusal labels each through the launcher (subprocess per launch). | cloud lane |
+| 21 | test_persistent_orchestrator.py | cloud/launcher/tests/test_persistent_orchestrator.py | 86.0 | mutant runs; big fixture/setup | 1,200 lines, 37 mutant mentions: scratch-copy mutants and the fake-kubectl cluster per scenario. | cloud lane |
+| 22 | TestGhShimSignInput | tests/switchboard/test_gh_shim_sign_input.py | 85.3 | real subprocess/server; big fixture/setup | 38 tests run the real shim as a subprocess through a rig (each spelling a process). | switchboard (bin/) |
+| 23 | test_pdb.py | cloud/launcher/tests/test_pdb.py | 82.0 | mutant runs; real subprocess/server | 22 mutant mentions: scratch copies of the launcher, each run through the fake kubectl. | cloud lane |
+| 24 | Mutants | bin/test-decisions-pull | 81.0 | mutant runs | 82 mutants of the decisions-pull source, each `load()` re-executes the module (about 1 s each). | cloud lane |
+| 25 | TestRefusals | bin/test-cloud-cli | 67.5 | sleeps/real waits | a local HTTP server with a stalled or cut body: tests wait out real socket timeouts (`error_body_cut_mid_read` 31.7 s). | cloud lane |
+| 26 | TestStopFinalMessageBareMutant | tests/switchboard/test_stop_final_message.py | 65.8 | mutant runs; real subprocess/server | copies the check file and tests to a scratch tree and runs it as a child (58.6 s in one test). | switchboard (bin/) |
+| 27 | TestImpactHold | bin/test-switchboard | 65.8 | parse-once candidate; big fixture/setup | 120 tests on one 2,358-line class, each building a repository fixture world; 29 parse/read uses. | switchboard (bin/) |
+| 28 | TestPlanHashMarkerLaunch | tests/switchboard/test_plan_hash_marker.py | 65.6 | mutant runs; real subprocess/server | control and mutant each run the real `launch` on a copy of the entry (33 s each). | switchboard (bin/) |
+| 29 | TestStopFinalMessageBare | tests/switchboard/test_stop_final_message.py | 65.2 | real subprocess/server | U20 runs the whole check file again as a nested subprocess (54 s). | switchboard (bin/) |
+| 30 | test_cloud_stack_wait.py | cloud/launcher/tests/test_cloud_stack_wait.py | 63.0 | sleeps/real waits | 23 sleep mentions; the file names a fake clock, so most are the fake pause; its time is in the retry-attempt loops (63 s). | cloud lane |
+| 31 | TestArchitectureSafetyNet | tests/switchboard/test_cases_10.py | 62.9 | real subprocess/server; big fixture/setup | records every verb of the entry with a process pool and again to prove it deterministic (60 s in one test). | switchboard (bin/) |
+| 32 | TestPlanReviewCommands | bin/test-switchboard | 59.8 | big fixture/setup | 53 tests at 0.5-3.6 s: each builds the plan-review world with the real engine. | switchboard (bin/) |
+| 33 | test_brief_header.py | cloud/launcher/tests/test_brief_header.py | 58.0 | mutant runs; real subprocess/server | 1,012 lines, 38 mutant mentions, 6 subprocess uses: scratch-copy mutants of the launcher. | cloud lane |
+| 34 | TestQueuedBehindTurn | tests/switchboard/test_queued_behind_turn.py | 55.2 | mutant runs; real subprocess/server | s5 copies the tree twice and runs two tests in each (35 s); the light-switch test is 17 s. | switchboard (bin/) |
+| 35 | test_cloud_quick_scans_run.py | cloud/launcher/tests/test_cloud_quick_scans_run.py | 54.0 | real subprocess/server | runs every named quick scan for real on a clean tree, 8 subprocess uses (54 s). | cloud lane |
+| 36 | test_stub_cleanup.py | cloud/launcher/tests/test_stub_cleanup.py | 50.0 | sleeps/real waits; real subprocess/server | 89 subprocess uses and 21 sleeps: starts child processes and checks none is left behind (50 s). | cloud lane |
+| 37 | TestResume | bin/test-switchboard | 45.1 | mutant runs | one test applies every mutant in memory and runs its named test (25 s). | switchboard (bin/) |
+| 38 | test_cloud_k1.py | cloud/launcher/tests/test_cloud_k1.py | 45.0 | big fixture/setup | fake cluster per scenario (45 s). | cloud lane |
+| 39 | TestOneTableOfTheBinSetClasses | bin/test-path-suites | 44.0 | real subprocess/server; big fixture/setup | each test builds a fixture repository and runs `preflight-pr` as a subprocess (up to 20 s). | switchboard (bin/) |
+| 40 | test_scratch_clean.py | cloud/launcher/tests/test_scratch_clean.py | 43.0 | sleeps/real waits; real subprocess/server | leaves children running and checks they are ended and a stubborn one killed: real process waits. | cloud lane |
+| 41 | test_cloud_stack.py | cloud/launcher/tests/test_cloud_stack.py | 43.0 | big fixture/setup | fake kubectl stack-pod shapes, 7 mutant mentions (43 s). | cloud lane |
+| 42 | TestHeavyProgress | tests/switchboard/test_heavy_progress.py | 42.4 | sleeps/real waits; real subprocess/server | s14 starts a child that blocks on a lock and waits for the outer bound (24 s); s10 and s11 wait for threads to time out (5 s each). | switchboard (bin/) |
+| 43 | test_kept_expiry.py | cloud/launcher/tests/test_kept_expiry.py | 42.0 | big fixture/setup | fake kubectl and fake clock; no sleeps: setup per case (41 s over the file). | cloud lane |
+| 44 | TestShimTopSpender | bin/test-switchboard | 41.6 | real subprocess/server | s3 runs the shim with every environment name it reads, one process each (20 s). | switchboard (bin/) |
+| 45 | test_cloud_worker.py | cloud/launcher/tests/test_cloud_worker.py | 41.0 | real subprocess/server; big fixture/setup | 13 subprocess uses: launcher, reaper, end hook through the fake kubectl (41 s). | cloud lane |
+| 46 | TestCloudChannelServer | bin/test-cloud-channel-server | 39.1 | real subprocess/server; sleeps/real waits | 62 tests that start a real channel server and talk to it. | cloud lane |
+| 47 | test_failed_pod_record.py | cloud/launcher/tests/test_failed_pod_record.py | 38.0 | big fixture/setup | 800 lines of fake-cluster scenarios, 28 mutant mentions. | cloud lane |
+| 48 | test_stall_structural.py | cloud/launcher/tests/test_stall_structural.py | 38.0 | mutant runs; real subprocess/server | 6 mutant mentions, 4 subprocess uses (38 s). | cloud lane |
+| 49 | test_app_token.py | cloud/launcher/tests/test_app_token.py | 38.0 | real subprocess/server; mutant runs | real openssl and a loopback stub of the GitHub API; 24 mutant mentions (38 s). | cloud lane |
+| 50 | TestIdentityCheck | bin/test-switchboard | 37.5 | real subprocess/server | 41 tests of the identity check through the real shim; one test is 11.7 s (every write refused after a failed lookup). | switchboard (bin/) |
 
 ### The slowest 50 individual tests of `bin/test-switchboard` (pod seconds)
 
@@ -569,7 +607,7 @@ What changed, plainly: (a) the file no longer runs in one process in CI: the 8 s
 - **The switchboard shards ran 3 at a time** in the pod (6 CPU limit), not one at a time, so each shard has some contention; the other suites ran strictly one at a time. Because of that, the per-test seconds of the switchboard are an upper bound for a quiet machine, not a precise value.
 - **The pod has failures that CI does not:** `TestCloudReaperInstallOnMacOS` and the service-file-mode tests (115 failing/erroring lines in shards 3, 6 and 8; the pod's checkout directory is group-writable), `bin/test-app-mint` (1 test: this pod's `gh` client has no `auth git-credential`), `bin/test-cloud-worker` (1 test: `test_the_kits_own_launcher_link_is_accepted`), `cloud/tests/test-cloud` (skip list differs: no `kubectl`). Their timings are kept; their pass/fail is not claimed.
 - **`bin/check-public-names`** needs the repository secret: in the pod it printed its skip note (0.03 s), so its real cost (6-8 s in CI) was not measured here, and its CI failure is not examined beyond the fact of the failure.
-- **Launcher entries on the parallel list** print their TIME only when their lane output is replayed at the end; in a timed-out CI run none of them were replayed, so their CI times are unknown; the pod times are from the full run.
+- **Launcher entries on the parallel list** print their TIME only when their lane output is replayed at the end; in a timed-out CI run none of them were replayed, so their CI times are unknown; the pod times are from the full run (193 entries, 2,002 s = 33.4 minutes of wall with 3 parallel lanes; 192 TIME lines; `test_launcher_shards.py` failed in the pod and prints no TIME line: it takes about 2 s in CI).
 - **macOS legs** were not measured in the pod (no macOS here); CI times of the macOS jobs are in section 1 only as job minutes.
 - **The nightly legs** (`nightly <ref> (...)` jobs that run the whole `bin/test-switchboard` unsharded on ubuntu) are not in the last three runs (all three were dispatches); not measured.
 - **Per-test times inside the launcher files** (one process per file, no common runner) were not collected; only per-file times from the chain's TIME lines.
