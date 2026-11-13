@@ -20,6 +20,9 @@ SYSTEM_SENDERS = {
 }
 
 
+PLAIN_OPTIONS = ("-B", "-u", "-E", "-s", "-S", "-I", "-O", "-OO", "-b", "-bb", "-q")
+
+
 def registered(name):
     return isinstance(name, str) and name in SYSTEM_SENDERS
 
@@ -42,7 +45,8 @@ def read_process(pid):
         fields = done.stdout.split()
         if done.returncode != 0 or len(fields) < 2:
             return None
-        return int(fields[0]), None, fields[1:]
+        comm = subprocess.run(["ps", "-ww", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+        return int(fields[0]), comm or None, fields[1:]   # the executable as the system names it, not the first word of the argument list
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -59,10 +63,10 @@ def parent_is(name, kit_root, parent=None, reader=read_process, uid=None):
     owner, exe, argv = info
     if owner != (os.getuid() if uid is None else uid):
         return False
-    if not os.path.basename(exe or argv[0]).startswith("python"):
+    if not exe or not os.path.basename(exe).startswith("python"):   # no readable executable, no proof
         return False
     options = 1
-    while options < len(argv) and argv[options].startswith("-"):
+    while options < len(argv) and argv[options] in PLAIN_OPTIONS:   # only options that take no value and run no code: `-c`, `-m`, `-W x` and the like are never skipped
         options += 1
     if options + 1 >= len(argv) or argv[options + 1] != row["verb"]:
         return False

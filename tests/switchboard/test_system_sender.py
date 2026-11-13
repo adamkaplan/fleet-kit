@@ -45,6 +45,7 @@ class Kit:
     def start(self, *argv, program=None, script=None):
         proc = subprocess.Popen([program or sys.executable] + list(argv or ("-B", str(script or self.script), "reap", "--loop", "60")),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.procs = getattr(self, "procs", []) + [proc]   # kept: a dropped handle of a running child is a ResourceWarning line
         self.case.addCleanup(proc.wait)
         self.case.addCleanup(proc.terminate)
         mine = Path("/proc/%d/cmdline" % os.getpid()).read_bytes() if sys.platform.startswith("linux") else None
@@ -148,6 +149,24 @@ class TestSystemSenderSend(SendRig):
         self.assertEqual(self.world.admissions("coder"), [])
         self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
 
+    def test_s3_from_naming_the_sender_is_refused_even_from_the_reaper_process_with_the_claim_set(self):
+        reaper = self.kit.start()
+        before = len(self.delivered())
+        for lab in (False, True):
+            code, out, err = self.send("send", "--from", NAME, "cos", "--issue", "2", "x", parent=reaper, lab=lab, **{ENV: NAME})
+            self.assertEqual(code, 1, err)
+            self.assertIn("never named with --from", err)
+            self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertEqual(len(self.delivered()), before)
+
+    def test_s7_a_registry_without_the_sender_refuses_with_one_line_and_delivers_nothing(self):
+        reaper = self.kit.start()
+        with mock.patch.dict(SYSTEM.SYSTEM_SENDERS, clear=True):
+            code, out, err = self.send(parent=reaper, **{ENV: NAME})
+        self.assertEqual(code, 1, err)
+        self.assertEqual(err.strip(), "fleet-switchboard: not sent: this is not a registered system sender")
+        self.assertEqual(self.delivered(), [])
+
     def test_s6_a_persons_pane_and_the_lab_from_are_delivered_with_the_labels_they_had(self):
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
         code, _, err = self.send(lab=True)
@@ -192,6 +211,8 @@ class TestParentProof(Base):
             "another verb": self.kit.start("-B", str(self.kit.script), "create"),
             "no verb": self.kit.start("-B", str(self.kit.script)),
             "python -c": self.kit.start("-c", "import time; time.sleep(120)", str(self.kit.script), "reap"),
+            "python -c with a code text that starts with a dash": self.kit.start("-c", "-0 or __import__('time').sleep(120)", str(self.kit.script), "reap"),
+            "python -W with a value": self.kit.start("-W", "ignore", str(self.kit.script), "reap"),
             "a relative path": self.kit.start("-B", "cloud/launcher/cloud_worker.py", "reap"),
         }
         for label, pid in cases.items():
@@ -204,6 +225,12 @@ class TestParentProof(Base):
         self.assertFalse(self.proof(pid, uid=os.getuid() + 1))
         os.chmod(str(self.kit.script), 0o666)
         self.assertFalse(self.proof(pid))
+
+    def test_a_parent_that_is_not_a_python_interpreter_is_not_the_sender(self):
+        real = (os.getuid(), "/bin/sh", [sys.executable, "-B", str(self.kit.script), "reap"])
+        self.assertTrue(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: (real[0], sys.executable, real[2])))
+        self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: real))                              # a shell with the same argument list
+        self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: (real[0], None, real[2])))          # an executable that cannot be read
 
     def test_a_reader_that_fails_is_no_proof(self):
         self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: None))
