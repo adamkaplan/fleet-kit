@@ -323,6 +323,21 @@ class TestEndOnAsk(unittest.TestCase):
         posts, _ = self.end_with(names="acme-secret-org\n", final="about acme-\nsecret-org and well-\nknown 2nd things")
         self.assertIn("well-?known 2nd things", posts[0][1])
 
+    def test_quoted_and_invisible_folds_many_blank_lines_and_the_cost_of_a_long_text(self):
+        t = self.SPLIT
+        cases = {"string literal": 'k = "%s" +\n"%s",' % (t[:20], t[20:]), "zero width": "x %s\u200b\n%s y" % (t[:20], t[20:]),
+                 "nine blanks": "x %s%s%s y" % (t[:20], "\n" * 10, t[20:])}
+        for label, text in cases.items():
+            body = self.end_with(final=text)[0][0][1]
+            self.assertNotIn(t[20:], body, label)
+            self.assertNotIn(t[20:], self.end_with(log=text)[0][0][1], label)
+        import time
+        part = self.retired()
+        for unit in ("a1-\n", "a1\n", "| a1 |\n"):
+            started = time.monotonic()
+            part._unwrap_redact(unit * (200000 // len(unit)))
+            self.assertLess(time.monotonic() - started, 4, unit)
+
     def test_the_list_is_read_once_and_never_printed(self):
         posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")
         self.assertNotIn("unclosed-acme-secret", repr((posts, events)))

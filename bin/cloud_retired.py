@@ -727,6 +727,9 @@ def _hide_names(text, terms):
 
 _WRAP_WORD = 512      # the longest word joined across a fold; a longer one is no token of ours
 _WRAP_LINES = 8       # the most lines one folded secret is followed over
+_HINT = re.compile(r"sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|eyJ|://|[=:]|[A-Za-z0-9+/_-]{24}")   # what any secret shape needs: a join without one is not tried
+_WRAP_LEAD = " \t>|\"'`,;+*("   # what may stand before the continuation: an indent, a quote mark, a table bar, a string quote
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff]")
 _WRAP_PART = re.compile(r"[A-Za-z0-9_+/=.-]+")
 
 
@@ -745,40 +748,42 @@ def _unwrap_redact(text):
 
     def shaped(word):
         return redact(scrub(word, (), LAST_SCRUB_MAX))
-    lines = text.splitlines()   # every kind of line break the later steps split on
+    lines = _INVISIBLE.sub("", text).splitlines()   # invisible characters cannot split a token; every kind of line break the later steps split on
     for i in range(len(lines) - 1):
-        a = lines[i].rstrip()
+        a = lines[i].rstrip(" \t+,;|&")   # a string concatenation or a table bar after the first part
         tail = a[-(_WRAP_WORD + 1):]
         if not a or not tail.split() or len(tail.split()[-1]) > _WRAP_WORD:
             continue
         wa = tail.split()[-1]
         head = a[:len(a) - len(wa)]
-        for cut in ((wa[:-1] if wa[-1] in "\\-" else ""), wa):
+        for cut in dict.fromkeys((wa[:-1] if wa[-1] in "\\-" else "", wa.rstrip("\\-\"',;+"), wa)):
             if not cut:
                 continue
-            alone = shaped(cut) != cut
-            joined, parts, found = cut, [], None
-            for j in range(i + 1, min(i + 1 + _WRAP_LINES, len(lines))):
-                b = lines[j].lstrip(" \t>|")   # an indent, a quote mark or a table bar
+            joined, parts, found, blanks, j = cut, [], None, 0, i + 1
+            while j < len(lines) and len([1 for p_ in parts if p_[2]]) < _WRAP_LINES and blanks <= 64:
+                b = lines[j].lstrip(_WRAP_LEAD)   # an indent, a quote mark or a table bar
                 words = b[:_WRAP_WORD + 1].split()
                 if not b.strip():
                     parts.append((j, lines[j], ""))   # a blank line in the fold
+                    blanks += 1
+                    j += 1
                     continue
                 if not words or len(words[0]) > _WRAP_WORD:
                     break
                 wb = words[0]
                 parts.append((j, b, wb))
                 joined += wb
-                if shaped(joined) != joined and (not alone or _looks_like_rest(wb) or cut != wa):
+                if _HINT.search(joined) and shaped(joined) != joined and (shaped(cut) == cut or _looks_like_rest(wb) or cut != wa):
                     found = shaped(joined)
                     break
-                if b.rstrip(" |") != wb:
+                if b.rstrip(" |\"',;+") != wb:
                     break   # a middle line is one word
+                j += 1
             if found is None:
                 continue
             last = parts[-1][0]
-            while last + 1 < len(lines) and len(parts) < _WRAP_LINES and lines[last].strip(" \t>|") == parts[-1][2]:   # the rest of a token, one word to a line
-                nxt = lines[last + 1].strip(" \t>|")
+            while last + 1 < len(lines) and len(parts) < _WRAP_LINES and lines[last].strip(_WRAP_LEAD) == parts[-1][2]:   # the rest of a token, one word to a line
+                nxt = lines[last + 1].strip(_WRAP_LEAD)
                 word = nxt[:_WRAP_WORD + 1].split()[0] if nxt else ""
                 if not word or len(word) > _WRAP_WORD or not _looks_like_rest(word) or shaped(joined + word) != found:
                     break
