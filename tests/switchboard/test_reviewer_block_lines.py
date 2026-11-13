@@ -73,6 +73,20 @@ def count_problems(texts):
     return out
 
 
+def sentence_problems(text, names):
+    """[problem]: a line name that a text does not name once, in one sentence of its own (one line, no other line name in that sentence)."""
+    out = []
+    for name in names:
+        lines = [l for l in text.splitlines() if "`%s: " % name in l]
+        if len(lines) != 1 or len(re.findall(r"`%s: " % re.escape(name), lines[0])) != 1:
+            out.append("%s is named %d times" % (name, len(lines)))
+            continue
+        sentences = [s for s in re.split(r"(?<=\.)\s+(?=[A-Z])", lines[0]) if "`%s: " % name in s]
+        if len(sentences) != 1 or [n for n in names if "`%s: " % n in sentences[0]] != [name]:
+            out.append("%s shares its sentence" % name)
+    return out
+
+
 def read_all():
     return {role: path.read_text() for role, path in ROLE_FILES.items()}
 
@@ -83,17 +97,10 @@ class TestReviewerBlockLines(unittest.TestCase):
 
     def test_the_names_of_the_agent_files_are_the_names_of_the_skill_and_the_laws_each_said_once(self):
         names = sorted(n for ns in derived_names(read_all()).values() for n in ns)
-        self.assertEqual(len(names), 3, names)
-        for path in (SKILL, LAWS):
-            text = path.read_text()
-            for name in names:
-                with self.subTest(file=path.name, name=name):
-                    self.assertEqual(len(re.findall(r"`%s: " % re.escape(name), text)), 1)
-                    lines = [l for l in text.splitlines() if "`%s: " % name in l]
-                    self.assertEqual(len(lines), 1)
-                    sentences = [s for s in re.split(r"(?<=\.)\s+(?=[A-Z])", lines[0]) if "`%s: " % name in s]
-                    self.assertEqual(len(sentences), 1)
-                    self.assertEqual([n for n in names if "`%s: " % n in sentences[0]], [name], "one sentence per line name")
+        self.assertEqual(len(names), len(set(names)), names)
+        for path in (SKILL, LAWS, REPO / "REVIEW_LAWS.md"):
+            with self.subTest(file=str(path.relative_to(REPO))):
+                self.assertEqual(sentence_problems(path.read_text(), names), [])
 
     def test_the_agent_paragraph_names_each_line_inline_too_so_the_instruction_is_there(self):
         for role, name in (("test", "mutants-run"), ("test", "mutants-survived"), ("impact", "blast-radius")):
@@ -127,9 +134,16 @@ class TestReviewerBlockLinesControl(unittest.TestCase):
         wide = dict(texts, impact=re.sub(r"\nblast-radius: .*", "\nblast-radius: " + "x" * 81, texts["impact"], count=1))
         self.assertEqual(len(count_problems(wide)), 1)
 
-    def test_a_skill_that_names_a_line_twice_is_seen(self):
-        text = SKILL.read_text().replace("`blast-radius: <one line>`", "`blast-radius: <one line>` `blast-radius: x`", 1)
-        self.assertEqual(len(re.findall(r"`blast-radius: ", text)), 2, "the planted drift is there; the count the check reads is not 1")
+    def test_a_skill_that_names_a_line_twice_or_in_a_shared_sentence_is_seen(self):
+        names = sorted(n for ns in derived_names(read_all()).values() for n in ns)
+        text = SKILL.read_text()
+        self.assertEqual(sentence_problems(text, names), [])
+        twice = text.replace("`blast-radius: <one line>`", "`blast-radius: <one line>` and `blast-radius: x`", 1)
+        self.assertEqual(len(sentence_problems(twice, names)), 1)
+        dropped = text.replace("`mutants-run: N`", "the first line", 1)
+        self.assertEqual(sentence_problems(dropped, names), ["mutants-run is named 0 times"])
+        shared = text.replace("`mutants-survived: M`", "`mutants-survived: M` and `mutants-run: N`", 1)
+        self.assertEqual(len(sentence_problems(shared, names)), 2)
 
 
 if __name__ == "__main__":
