@@ -413,11 +413,13 @@ class Recorder:
             return None
         return "\n".join(text.splitlines()[-NOTES_LINES:]) or None
 
-    def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
+    def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False, boss=None):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""
         run_id = "%s-%s-%s" % (worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
         info = {"worker": worker, "repository": repo, "run_id": run_id, "start": started, "end": None,
                 "exit_reason": "", "head_sha": None, "transcript": "unavailable", "reason": "the record was not finished"}
+        if isinstance(boss, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", boss):   # the lane of the land report (#2448)
+            info["boss"] = boss
         if persistent:   # only a persistent orchestrator's record has the key
             info["persistent"] = True
         directory = ""

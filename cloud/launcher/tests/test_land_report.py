@@ -40,14 +40,15 @@ class Root:
         case.addCleanup(self.tmp.cleanup)
         self.dir, self.n = self.tmp.name, 0
 
-    def add(self, worker="bob-1", repo="o/r", end=None, minutes=10, code=0, tail="", sha=None, reason="stop", land=True, raw=None):
+    def add(self, worker="bob-1", repo="o/r", end=None, minutes=10, code=0, tail="", sha=None, reason="stop", land=True, raw=None, boss=None):
         self.n += 1
         end = end or NOW - dt.timedelta(hours=2)
         rid = "%s-20261112T0%05dZ-%06x" % (worker, self.n, self.n)
         d = os.path.join(self.dir, rid)
         os.mkdir(d)
         runs = [{"name": "land", "exit": code, "woke": False, "log_tail": tail}] if land else []
-        rec = {"worker": worker, "repository": repo, "start": iso(end - dt.timedelta(minutes=minutes)), "end": iso(end), "exit_reason": reason,
+        boss = boss or __import__("re").sub(r"-\d+$", "", worker)   # the lane: the boss the record carries
+        rec = {"worker": worker, "boss": boss, "repository": repo, "start": iso(end - dt.timedelta(minutes=minutes)), "end": iso(end), "exit_reason": reason,
                "head_sha": sha, "end_hook": {"pushed": True, "run_logs": {"runs": runs, "wake_lines": []}}}
         with open(os.path.join(d, "run.json"), "w") as f:
             f.write(raw if raw is not None else json.dumps(rec))
@@ -451,6 +452,93 @@ class RunCall(unittest.TestCase):
         with self.assertRaises(OSError) as cm:
             self.check_raise(m)
         self.assertEqual(str(cm.exception), "no root", "RUN exception escaped")
+
+
+class S9(unittest.TestCase):
+    """Lanes by boss, rows without a land run skipped, the first-repo setting, the line cap (ask #2448, the first report was unreadable)."""
+    def build(self, mod, first=""):
+        r = Root(self)
+        for i in range(3):   # one boss, three pods: ONE lane (the pod names differ)
+            r.add(worker="pod%d-%d" % (i, i), boss="orch-one", repo="acme-org/widget-service", code=0)
+        for i in range(2):
+            r.add(worker="idle%d-1" % i, boss="orch-one", repo="acme-org/widget-service", land=False)
+        r.add(worker="idle9-1", boss="orch-three", repo="acme-org/widget-service", land=False)
+        r.add(worker="other-1", boss="orch-two", repo="acme-org/gadget-api", code=18)
+        r.add(worker="solo-3", repo="acme-org/gadget-api", code=13, boss="x")
+        recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        for rec in recs:
+            if rec["worker"] == "solo-3":
+                rec["lane"] = mod.lane_of("solo-3")
+        return mod.build(recs, bad, [commit("1", 5)], 50, (), "2026-11-12", first)[0]
+
+    def check(self, mod):
+        out = self.build(mod)
+        self.assertIn("acme-org/widget-service / orch-one: attempted 3, landed 3", out, "S9 by boss")
+        self.assertEqual(out.count("acme-org/widget-service /"), 1, "S9 one lane per boss")
+        self.assertNotIn("idle0", out.split("pods ended unlanded")[0], "S9 no row for a pod without a land run")
+        self.assertIn("3 pods with no land run skipped", out, "S9 skipped line")
+        self.assertNotIn("orch-three", out, "S9 no row for a lane with attempted 0")
+        self.assertIn("solo (lane unknown)", out, "S9 fallback names the prefix")
+        self.assertLess(out.index("widget-service"), out.index("gadget-api"), "S9 most attempts first")
+        first = self.build(mod, "acme-org/gadget-api")
+        self.assertLess(first.index("gadget-api"), first.index("widget-service"), "S9 first repo")
+
+    def many(self, mod):
+        r = Root(self)
+        for i in range(40):
+            r.add(worker="p-%d" % i, boss="orch%02d" % i, repo="acme-org/widget-service", code=0, tail="x" * 50)
+        return report(mod, r, landed=[commit("1", 5)])
+
+    def check_cap(self, mod):
+        out = self.many(mod)
+        self.assertLess(len(out.splitlines()), 20, "S9 line cap")
+        self.assertLessEqual(len(out), 3500, "S9 char cap")
+        self.assertRegex(out, r"\d+ more lanes: attempted \d+, landed \d+", "S9 more lanes")
+        self.assertIn("pods ended unlanded", out)
+
+    def test_control(self):
+        self.check(real)
+        self.check_cap(real)
+
+    def test_mutant_group_by_pod(self):
+        mod = mutant('"lane": lane_of(rec.get("worker"), rec.get("boss"))', '"lane": name_text(rec.get("worker"), 64)')
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9 by boss", str(cm.exception))
+
+    def test_mutant_prints_rows_without_land_run(self):
+        mod = mutant("for k, rs in lanes.items() if any(r[\"land\"] for r in rs))", "for k, rs in lanes.items())")
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9", str(cm.exception))
+
+    def test_mutant_first_repo_ignored(self):
+        mod = mutant("(kv[0][0] != first_repo, ", "(False, ")
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9 first repo", str(cm.exception))
+
+    def test_mutant_no_cap(self):
+        mod = mutant("fit = len(rows) if 2 * len(rows) <= room else max(0, (room - 1) // 2)", "fit = len(rows)")
+        self.check_cap(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_cap(mod)
+        self.assertIn("S9 line cap", str(cm.exception))
+
+    def test_mutant_fallback_not_marked(self):
+        mod = mutant('+ " (lane unknown)"', '+ ""')
+        self.check(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check(mod)
+        self.assertIn("S9 fallback", str(cm.exception))
+
+    def test_setting_validated(self):
+        self.assertEqual(real.first_repo("acme-org/widget-service"), "acme-org/widget-service")
+        self.assertEqual(real.first_repo("bad name"), "")
+        self.assertEqual(real.first_repo(None), "")
 
 
 def reaper_module_name(src):
