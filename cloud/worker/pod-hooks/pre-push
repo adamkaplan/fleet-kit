@@ -89,8 +89,8 @@ note() {   # $1 kind, $2 ref, $3 sha
   ) >/dev/null 2>&1 || :
 }
 
-# Ask #2517: the land gate. A push of the default branch of a repository on the land list needs the pod's live land token (`fleet-switchboard land-gate take`).
-# The question goes to the switchboard (CW_LAND_GATE_CMD, default `fleet-switchboard land-gate check`, called with `<owner/repo> --name <FLEET_AGENT_NAME>`): exit 0 = allowed
+# Ask #2517: the land gate. A push of the default branch of a repository on the land list needs the pod's live land token (`switchboard land-gate take`).
+# The question goes to the switchboard (CW_LAND_GATE_CMD, default `switchboard land-gate check`, called with `<owner/repo> --name <FLEET_AGENT_NAME>`): exit 0 = allowed
 # (holds the token, or the repository is not on the land list), exit 3 = refused, its one line says why, who holds it and the queue length. Anything else (no command, a
 # timeout, another status) is UNREACHABLE: the push is ALLOWED and ONE line "<UTC time> land-gate-unchecked <owner/repo> <ref>" goes to CW_LAND_GATE_AUDIT
 # (default /work/.land-gate-audit.log); CW_LAND_GATE=enforce turns the refusal on for that case (the one configuration word). A URL that names no owner/repo is not asked.
@@ -123,7 +123,7 @@ land_gate() {   # $1 remote ref: refuse (exit 3) when the pod does not hold the 
   [ -n "$gr" ] || { gate_unchecked "-" "$1"; return 0; }   # no owner/repo to ask about: the gate was not checked (one audit line; refused under enforce)
   gname=${FLEET_AGENT_NAME:-}
   case "$gname" in ""|*[!A-Za-z0-9._-]*) gate_unchecked "$gr" "$1"; return 0 ;; esac
-  gcmd=${CW_LAND_GATE_CMD:-fleet-switchboard land-gate check}
+  gcmd=${CW_LAND_GATE_CMD:-switchboard land-gate check}
   set -f
   gout=$(timeout 20 $gcmd "$gr" --name "$gname" 2>/dev/null </dev/null); gs=$?
   set +f

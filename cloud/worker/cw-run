@@ -238,7 +238,7 @@ def supervise(name, cmd):
 
 
 # Ask #2517: the land gate. A START (and so a RESTART: every start of a name runs again) of a land (`spire land`) in a repository on the land list is refused unless the pod
-# holds the live land token. The question is the hook's: CW_LAND_GATE_CMD (default `fleet-switchboard land-gate check`) with `<owner/repo> --name <FLEET_AGENT_NAME>`:
+# holds the live land token. The question is the hook's: CW_LAND_GATE_CMD (default `switchboard land-gate check`) with `<owner/repo> --name <FLEET_AGENT_NAME>`:
 # exit 0 allowed, exit 3 refused (its line says why, who holds it and the queue length); anything else is UNREACHABLE: the land starts and ONE audit line goes to
 # CW_LAND_GATE_AUDIT (default /work/.land-gate-audit.log); CW_LAND_GATE=enforce refuses it instead. A command that is not a land is not asked.
 LAND_WORDS = re.compile(r"(?:^|[\s/'\";&|(`{])spire\s+land(?=$|[\s'\";&|)])")
@@ -266,7 +266,7 @@ def land_gate(cmd):
     code, out = None, ""
     if repo is not None and NAME_OK.fullmatch(name):   # no repository or no name: the gate cannot be asked: unreachable below (audited, refused under enforce)
         try:
-            r = subprocess.run(shlex.split(os.environ.get("CW_LAND_GATE_CMD") or "fleet-switchboard land-gate check") + [repo, "--name", name],
+            r = subprocess.run(shlex.split(os.environ.get("CW_LAND_GATE_CMD") or "switchboard land-gate check") + [repo, "--name", name],
                                capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
             code, out = r.returncode, r.stdout
         except (OSError, subprocess.SubprocessError, ValueError):

@@ -13,7 +13,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(HERE, "..", "pod-hooks", "pre-push")
 TOOL = os.path.join(HERE, "..", "cw-run")
-REFUSAL = "refused: lane-a does not hold the land token of acme-org/widget-service; it is held by lane-b (last touch 12s ago); queue length 2. Run: fleet-switchboard land-gate take acme-org/widget-service"
+REFUSAL = "refused: lane-a does not hold the land token of acme-org/widget-service; it is held by lane-b (last touch 12s ago); queue length 2. Run: switchboard land-gate take acme-org/widget-service"
 URL = "https://example.invalid/acme-org/widget-service.git"
 ZERO = "0" * 40
 
