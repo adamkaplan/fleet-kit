@@ -47,10 +47,10 @@ class TestEndOnAsk(unittest.TestCase):
                    mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record")]
         if mutant:   # today's end: nothing is posted on the ask
             real = (Path(__file__).resolve().parents[2] / "bin" / "cloud_retired.py").read_text()
-            old = "        post(engine, issue, end_comment("
+            old = "        post(engine, issue, comment,"
             assert real.count(old) == 1
             module = types.ModuleType("cloud_retired_today")
-            exec(compile(real.replace(old, "        (lambda *a, **k: None)(engine, issue, end_comment(", 1), "cloud_retired.py", "exec"), module.__dict__)
+            exec(compile(real.replace(old, "        (lambda *a, **k: None)(engine, issue, comment,", 1), "cloud_retired.py", "exec"), module.__dict__)
             module.D = cloud._retired().D   # today's end: the comment is built and never posted
             patches.append(mock.patch.object(cloud._retired(), "post_end", module.post_end))
         call = cloud.cmd_retire.__wrapped__ if hasattr(cloud.cmd_retire, "__wrapped__") else cloud.cmd_retire
@@ -194,6 +194,85 @@ class TestEndOnAsk(unittest.TestCase):
     def test_a_kept_pod_posts_nothing_and_a_pod_without_an_ask_posts_nothing(self):
         self.assertEqual(self.end(code=1, log="exit 0")[0], [])
         self.assertEqual(self.end(record_extra={"issue": None}, log="exit 0")[0], [])
+
+    # ask #2393 (R-SEC-2 and private names): the post can land on a public repository's issue
+    SPLIT = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
+
+    def retired(self):
+        return sb.load_module("cloud_worker").bind(sb.__dict__)._retired()
+
+    def end_with(self, names=None, names_env=None, control=False, **kwargs):
+        """(posts, events) with the names list in a temp file (`names`: its text, None: no file at all) and, for the control, today's end without both new steps."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        env = {"FLEET_PRIVATE_NAMES": "", "FLEET_PRIVATE_NAMES_FILE": str(Path(tmp) / "none.txt")}
+        if names is not None:
+            (Path(tmp) / "names.txt").write_text(names)
+            env["FLEET_PRIVATE_NAMES_FILE"] = str(Path(tmp) / "names.txt")
+        env.update(names_env or {})
+        part = self.retired()
+        patches = [mock.patch.dict("os.environ", env)]
+        if control:
+            patches += [mock.patch.object(part, "_unwrap_redact", lambda text: text), mock.patch.object(part, "_name_terms", lambda: ([], None))]
+        for p in patches:
+            p.start()
+        try:
+            return self.end(**kwargs)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_a_token_split_across_a_newline_or_a_backslash_newline_is_redacted(self):
+        t = self.SPLIT
+        for cut, glue in ((20, "\n"), (12, "\\\n"), (18, "-\n")):
+            text = "before\npush with %s%s%s now\nafter" % (t[:cut], glue, t[cut:])
+            for where in ({"final": text}, {"log": text}):
+                posts, _ = self.end_with(**where)
+                body = posts[0][1]
+                self.assertNotIn(t[:cut], body, (cut, where))
+                self.assertNotIn(t[cut:], body, (cut, where))
+                self.assertIn("[redacted]", body)
+                self.assertIn("push with", body)
+                self.assertIn("now", body)
+                self.assertIn("after", body)
+            control, _ = self.end_with(final=text, control=True)
+            self.assertIn(t[cut:], control[0][1], "control: today's end leaves the split token in")
+
+    def test_a_normal_two_line_text_is_not_mangled(self):
+        text = "The build finished.\nAll 12 checks passed, see the notes\nfor details-\nand a long-hyphenated-word\nnext line."
+        for where in ({"final": text}, {"log": text}, {"notes": text}):
+            posts, _ = self.end_with(**where)
+            control, _ = self.end_with(control=True, **where)
+            self.assertEqual(posts[0][1], control[0][1], where)   # the same post as today's, word for word
+            self.assertIn("long-hyphenated-word", posts[0][1])
+
+    def test_a_private_term_in_the_message_or_log_is_replaced_case_insensitively(self):
+        names = "# made-up terms\nacme-secret-org\ncase:ExactOnly\n"
+        posts, events = self.end_with(names=names, final="see ACME-Secret-Org/repo and ExactOnly and exactonly", log="log of acme-secret-org")
+        body = posts[0][1]
+        self.assertNotIn("secret-org", body.lower())
+        self.assertNotIn("ExactOnly", body)
+        self.assertIn("exactonly", body)
+        self.assertGreaterEqual(body.count("[private name]"), 3)
+        self.assertNotIn("cloud.end_names_unchecked", events)
+        control, _ = self.end_with(names=names, final="see acme-secret-org", control=True)
+        self.assertIn("acme-secret-org", control[0][1], "control: today's end posts the term")
+
+    def test_a_list_given_as_text_is_used_and_a_zero_width_entry_does_nothing(self):
+        posts, _ = self.end_with(names_env={"FLEET_PRIVATE_NAMES": "x*\nacme-secret-org"}, final="abc acme-secret-org")
+        self.assertIn("abc [private name]", posts[0][1])
+
+    def test_a_missing_or_unreadable_or_bad_list_posts_and_the_audit_says_so_once(self):
+        for label, kw in (("missing", {"names": None}), ("directory", {"names_env": {"FLEET_PRIVATE_NAMES_FILE": tempfile.gettempdir()}}),
+                          ("bad", {"names": "(unclosed\n"}), ("empty", {"names": "# nothing\n"})):
+            posts, events = self.end_with(final="words about acme-secret-org", **kw)
+            self.assertEqual(len(posts), 1, label)
+            self.assertIn("acme-secret-org", posts[0][1], label)
+            self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
+
+    def test_the_list_is_read_once_and_never_printed(self):
+        posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")
+        self.assertNotIn("unclosed-acme-secret", repr((posts, events)))
 
     def test_a_failed_post_is_audited_and_the_retire_goes_on(self):
         posts, events = self.end(log="exit 0", post=RuntimeError("down"))

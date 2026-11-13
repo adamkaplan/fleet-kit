@@ -473,7 +473,7 @@ def pod_notes_tail(directory):
         end = _NOTES_KEY_END.search(text)
         if end and not _NOTES_KEY_BEGIN.search(text[:end.start()]):
             text = "[redacted key body]" + text[end.end():]   # a key block whose first line was cut away: all of it up to its end marker goes
-        text = D["redact_command_text"](text)
+        text = D["redact_command_text"](_unwrap_redact(text))
         lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'").replace("@", "(at)") for line in text.splitlines()]   # no mention can fire
         out = "\n".join(lines)
         if len(out) > NOTES_CHARS:
@@ -524,6 +524,7 @@ def last_message(directory, state, pod, clock=None):
                 break
         else:
             return None, "endpoint loop"
+        text = _unwrap_redact(text)   # R-SEC-2: a secret folded over two lines, while the line breaks are still there
         text = D["_scrub_lib"]()(text, (), LAST_SCRUB_MAX)
         head, rest = text[:LAST_HEAD], text[LAST_HEAD:]
         lines = ["[last message of %s, untrusted text]" % pod, head]
@@ -590,7 +591,7 @@ def _clean_tail(tail):
     end = KEY_END.search(text)
     if end and not KEY_BEGIN.search(text[:end.start()]):
         text = "[redacted key body]" + text[end.end():]   # a key block whose first line was clipped away: all of it up to its end marker goes
-    text = D["redact_command_text"](text)   # the whole text first (a key block spans lines), then the cut
+    text = D["redact_command_text"](_unwrap_redact(text))   # a secret folded over two lines first; the whole text next (a key block spans lines), then the cut
     lines = [re.sub(r"[^\x20-\x7e]", "?", scrub(line, (), LAST_SCRUB_MAX)).replace("`", "'") for line in text.splitlines()]   # per line: the scrub flattens a newline
     out = "\n".join(lines)
     return _cut_tail(out)
@@ -666,7 +667,73 @@ def end_comment(pod, reason, block, logs):
     return re.sub(r"@", "(at)", "\n".join(lines))[:END_POST_CHARS]
 
 
-def post_end(engine, state, record, name, reason, body, post, note):
+NAMES_MAX_BYTES = 200000   # the private-names list is read once, to this many bytes
+NAMES_MAX_TERMS = 500
+_NAMES_CHECKER = []
+
+
+def _name_terms():
+    """([compiled regexes], None) of the private-names list (the one bin/check-public-names reads: its parser, its location, `FLEET_PRIVATE_NAMES` the
+    list itself, else `FLEET_PRIVATE_NAMES_FILE` or ~/.config/fleet-switchboard/private-names.txt), or ([], why) when it is missing, unreadable or unusable.
+    Read once per call, bounded, never printed (the reason names no entry)."""
+    try:
+        if not _NAMES_CHECKER:
+            import importlib.machinery
+            import importlib.util
+            path = str(Path(__file__).resolve().with_name("check-public-names"))
+            loader = importlib.machinery.SourceFileLoader("cr_check_public_names", path)
+            mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("cr_check_public_names", loader))
+            loader.exec_module(mod)
+            _NAMES_CHECKER.append(mod)
+        mod = _NAMES_CHECKER[0]
+        text = os.environ.get("FLEET_PRIVATE_NAMES", "")[:NAMES_MAX_BYTES]
+        if not text.strip():
+            with open(os.environ.get("FLEET_PRIVATE_NAMES_FILE") or mod.DEFAULT_LIST, "rb") as handle:
+                text = handle.read(NAMES_MAX_BYTES).decode("utf-8", "replace")
+        if not text.strip():
+            return [], "no list"
+        terms, _ignores = mod.parse_list(text)
+        return [regex for _i, regex in terms[:NAMES_MAX_TERMS]], (None if terms else "no entries")
+    except Exception as err:
+        return [], type(err).__name__[:40]
+
+
+def _hide_names(text, terms):
+    """`text` with every match of a private-name regex (case rules as the checker's, per line) replaced by [private name]."""
+    out = []
+    for line in text.split("\n"):
+        for regex in terms:
+            line = regex.sub(lambda m: "[private name]" if m.group(0) else m.group(0), line)
+        out.append(line)
+    return "\n".join(out)
+
+
+_WRAP_MAX_LINE = 4000
+
+
+def _unwrap_redact(text):
+    """`text` with a secret that was folded over two lines redacted: for each pair of adjacent lines the last word of the first (a trailing backslash or
+    hyphen of the fold dropped, or kept) is joined to the first word of the next and redacted by shape (the switchboard's redaction and the launcher's
+    scrub); only when that changes the joined word are the two parts replaced, the rest of both lines kept. Linear in the text, which is already cut."""
+    scrub, redact = D["_scrub_lib"](), D["redact_command_text"]
+
+    def shaped(word):
+        return redact(scrub(word, (), LAST_SCRUB_MAX))
+    lines = text.split("\n")
+    for i in range(len(lines) - 1):
+        a, b = lines[i].rstrip("\r"), lines[i + 1].rstrip("\r")
+        if not a or not b or len(a) > _WRAP_MAX_LINE or len(b) > _WRAP_MAX_LINE or a[-1].isspace() or b[0].isspace():
+            continue
+        wa, wb = a.split()[-1], b.split()[0]
+        head, rest = a[:len(a) - len(wa)], b[len(wb):]
+        for cut in ((wa[:-1] if wa[-1] in "\\-" else ""), wa):
+            if cut and shaped(cut + wb) != cut + wb:
+                lines[i], lines[i + 1] = head + shaped(cut + wb), rest
+                break
+    return "\n".join(lines)
+
+
+def post_end(engine, state, record, name, reason, body, post, note, audit=None):
     """Ask #2393: ONCE per end, the pod's final message and the last lines of its land log are posted on its ask issue through `post` (handoff.post_ask_comment),
     scrubbed and cut (end_comment); a pod without a log posts the message alone, a pod without an ask (`issue` and `repo` of its cloud record) posts nothing.
     Never raises: a failed post is handed to `note(why)` and the retire goes on."""
@@ -678,7 +745,15 @@ def post_end(engine, state, record, name, reason, body, post, note):
         block, _why = last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
         block = _redact_block(block) if block else block   # the last text gets the run logs' redaction too before it is posted
         tail = run_log_entries(where, name) if isinstance(where, str) and where else []
-        post(engine, issue, end_comment(name, D["_scrub_lib"]()(reason, (), 300)[:120], block, tail), author=name, repo=repo)
+        comment = end_comment(name, D["_scrub_lib"]()(reason, (), 300)[:120], block, tail)
+        terms, unchecked = _name_terms()   # the post may land on a public repository: the private names are replaced, as bin/check-public-names would refuse them
+        if unchecked:
+            try:
+                audit and audit("private names not checked (%s)" % unchecked)
+            except Exception:
+                pass
+        comment = _unwrap_redact(_hide_names(comment, terms) if terms else comment)   # then a secret folded over two lines
+        post(engine, issue, comment, author=name, repo=repo)
     except Exception as err:
         try:
             note(type(err).__name__[:60])

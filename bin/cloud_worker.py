@@ -1436,7 +1436,7 @@ def _final_message(engine, state, record, name, reason, body=None):
     try:
         where = body.get("record") if isinstance(body, dict) else None   # THIS stop's record, as the launcher's answer names it (PC-7); never a lookup by name
         block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
-        _retired().post_end(engine, state, record, name, reason, body, H["post_ask_comment"], lambda why_: _audit(engine, "cloud.end_post_failed", name, {"why": why_}))   # ask #2393: once, on the pod's ask
+        _retired().post_end(engine, state, record, name, reason, body, H["post_ask_comment"], lambda why_: _audit(engine, "cloud.end_post_failed", name, {"why": why_}), lambda why_: _audit(engine, "cloud.end_names_unchecked", name, {"why": why_}))   # ask #2393: once, on the pod's ask
         text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
         boss and engine.send("switchboard", boss, text)
     except Exception as err:
