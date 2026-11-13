@@ -2026,8 +2026,12 @@ class TestCloudWatchBounds(unittest.TestCase):
         # a tick that writes or never audits fails the recording test above: prove the audit one by a source mutant
         src = (REPO / "bin" / "fleet-switchboard").read_text()
         self.assertIn('engine.audit.append(engine.actor, "cloud-watch.capped"', src)
-        self.assertNotIn("os.unlink", src[src.index("def cloud_watch_tick"):src.index("def finish_pass")])
-        self.assertNotIn("subprocess", src[src.index("def cloud_watch_tick"):src.index("def finish_pass")])
+        # the body of cloud_watch_tick alone (to its blank-line gap): the functions after it (the end notice's one bounded branch read, #2470, runs `gh`) are not this tick
+        start = src.index("def cloud_watch_tick")
+        body = src[start:src.index("\n\n\n", start)]
+        self.assertIn("return result", body)
+        self.assertNotIn("os.unlink", body)
+        self.assertNotIn("subprocess", body)
 
 
 class TestArchTools(unittest.TestCase):
