@@ -1,7 +1,9 @@
 """Ask #2448: the daily land report (cloud/launcher/land_report.py), scenarios S1 to S8. Offline: fake run records in a temporary directory, a fake clock,
 recording senders, a fake git. Each mutant is a scratch copy of the module with one text replaced (asserted to occur once); its control (the real module
 through the same check) runs first and must pass, and the mutant must fail with the anchored text."""
+import contextlib
 import datetime as dt
+import io
 import importlib.util
 import json
 import os
@@ -31,6 +33,16 @@ def mutant(old, new):
     spec = importlib.util.spec_from_loader("land_report_mutant", loader=None)
     mod = importlib.util.module_from_spec(spec)
     exec(compile(src.replace(old, new), "land_report_mutant", "exec"), mod.__dict__)
+    return mod
+
+
+def load_copy():
+    """A fresh copy of the real module (no change), loaded the way the mutants are."""
+    with open(SOURCE) as f:
+        src = f.read()
+    spec = importlib.util.spec_from_loader("land_report_copy", loader=None)
+    mod = importlib.util.module_from_spec(spec)
+    exec(compile(src, "land_report_copy", "exec"), mod.__dict__)
     return mod
 
 
@@ -593,12 +605,11 @@ class S9(unittest.TestCase):
         self.assertNotIn("zz-old", names, "S11 late name outside the window is not read")
 
     def test_cap_is_by_time(self):
-        self.check_cap_by_time(mutant("MAX_RECORDS = 5000 ", "MAX_RECORDS = 5000 "))
+        self.check_cap_by_time(load_copy())
 
     def test_mutant_cap_by_name(self):
         mod = mutant("names = [n for _, n in sorted(stamped)[-MAX_RECORDS:]]", "names = sorted(n for _, n in stamped)[-MAX_RECORDS:]")
-        mod2 = mutant("MAX_RECORDS = 5000 ", "MAX_RECORDS = 5000 ")
-        self.check_cap_by_time(mod2)
+        self.check_cap_by_time(load_copy())
         with self.assertRaises(AssertionError) as cm:
             self.check_cap_by_time(mod)
         self.assertIn("S11 early name", str(cm.exception))
@@ -634,8 +645,8 @@ class S9(unittest.TestCase):
 
     def check_trailer_times(self, mod):
         got = self.landed(mod)
-        self.assertEqual((got[0]["total"], got[0]["tests"], got[0]["files"], got[0]["rounds"]), (1056, 20370, 3245, 9), "S12 real trailer fields")
-        self.assertEqual((got[0]["steps"]["tests:server"], got[0]["steps"]["tests:pg"], got[0]["steps"]["ssr"]), (575, 1055, 39), "S12 steps with a (count)")
+        self.assertEqual((got[0].get("total"), got[0].get("tests"), got[0].get("files"), got[0].get("rounds")), (1056, 20370, 3245, 9), "S12 real trailer fields")
+        self.assertEqual(tuple(got[0].get("steps", {}).get(k) for k in ("tests:server", "tests:pg", "ssr")), (575, 1055, 39), "S12 steps with a (count)")
         r = Root(self)
         r.add(worker="p-1", boss="orch-one", code=0)
         recs, bad = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
@@ -652,17 +663,23 @@ class S9(unittest.TestCase):
 
     def test_mutant_total_is_not_read(self):
         mod = mutant('r"\\btotal=(\\d{1,7})s\\b"', 'r"\\btotalx=(\\d{1,7})s\\b"')
-        self.check_trailer_times(real)
-        with self.assertRaises((AssertionError, KeyError)):
+        self.check_trailer_times(real)   # control first
+        self.assertEqual(real.parse_trailer(self.T2)["total"], 410)
+        self.assertNotIn("total", mod.parse_trailer(self.T2), "S12 the mutant does not read total")
+        with self.assertRaises(AssertionError):
             self.check_trailer_times(mod)
 
     def test_mutant_count_in_step_name(self):
-        mod = mutant('(?:\\((\\d{1,9})\\))?:(\\d{1,7})s", entry)', ':(\\d{1,7})s", entry)')
-        with self.assertRaises((AssertionError, KeyError, IndexError)):
+        mod = mutant('(?:\\((\\d{1,9})\\))?:', '(?:(\\d{1,9}))?:')
+        self.check_trailer_times(real)   # control first
+        self.assertEqual(real.parse_trailer(self.T2)["steps"]["tests:server"], 200)
+        self.assertNotIn("tests:server", mod.parse_trailer(self.T2).get("steps", {}), "S12 the mutant cannot read name(count)")
+        with self.assertRaises(AssertionError):
             self.check_trailer_times(mod)
 
     def test_mutant_rounds_not_from_council(self):
         mod = mutant('m = re.search(r"\\bround (\\d{1,9})\\b", parts[2])', 'm = None')
+        self.check_trailer_times(real)   # control first
         with self.assertRaises(AssertionError):
             self.check_trailer_times(mod)
 
@@ -768,6 +785,109 @@ class S9(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.check_boss_rule(real, re.compile(r"[a-z][a-z0-9_-]{0,15}"))
         self.assertIn("S15 writer and reader disagree", str(cm.exception))
+
+    def lookup_case(self, mod, make):
+        """boss_lookup on a worker record `bad-1.json` made by make(path); returns the lane of a pod 'bad-1'."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cloud = os.path.join(tmp.name, "cloud")
+        os.makedirs(cloud)
+        make(os.path.join(cloud, "bad-1.json"), tmp.name)
+        return mod.lane_of("bad-1", None, lambda: mod.boss_lookup({"CW_CLOUD_RECORD_DIR": cloud})("bad-1"))
+
+    @staticmethod
+    def good(path, _):
+        with open(path, "w") as f:
+            json.dump({"reports_to": "orch-one"}, f)
+
+    @staticmethod
+    def a_link(path, tmpdir):
+        target = os.path.join(tmpdir, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"reports_to": "orch-one"}, f)
+        os.symlink(target, path)
+
+    @staticmethod
+    def a_dir(path, _):
+        os.mkdir(path)
+
+    @staticmethod
+    def too_big(path, _):
+        with open(path, "w") as f:
+            f.write(json.dumps({"reports_to": "orch-one"}) + " " * 70000)   # valid JSON in its first 64 KiB: only the size check refuses it
+
+    def check_untrusted_files(self, mod):
+        self.assertEqual(self.lookup_case(mod, self.good), "orch-one", "S16 control: a good record is read")
+        self.assertEqual(self.lookup_case(mod, self.a_link), "bad (lane unknown)", "S16 symlink refused")
+        self.assertEqual(self.lookup_case(mod, self.a_dir), "bad (lane unknown)", "S16 non-regular file refused")
+        self.assertEqual(self.lookup_case(mod, self.too_big), "bad (lane unknown)", "S16 file over 64 KiB refused")
+
+    def test_untrusted_files(self):
+        self.check_untrusted_files(real)
+
+    def test_mutant_follows_links(self):
+        mod = mutant("fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)", "fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)")
+        self.check_untrusted_files(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_untrusted_files(mod)
+        self.assertIn("S16 symlink", str(cm.exception))
+
+    def test_mutant_no_size_check(self):
+        mod = mutant("info.st_size > 65536", "False")
+        self.check_untrusted_files(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_untrusted_files(mod)
+        self.assertIn("S16 file over", str(cm.exception))
+
+    def test_record_with_its_own_invalid_boss_falls_to_the_launch_record(self):
+        cloud = self.launch_dirs()
+        r = Root(self)
+        for w, b in (("live-1", "Not A Name; x"), ("none-4", "Not A Name; x")):
+            r.add(worker=w, code=0, boss=b)
+        recs, _ = real.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW, real.boss_lookup({"CW_CLOUD_RECORD_DIR": cloud}))
+        lanes = {x["worker"]: x["lane"] for x in recs}
+        self.assertEqual(lanes, {"live-1": "orch-one", "none-4": "none (lane unknown)"})
+
+    def test_own_authors_file_and_limit(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ident = os.path.join(tmp.name, "ident")
+        with open(ident, "w") as f:
+            f.write("acme-bot[bot]\nbot@example.invalid\n")
+        self.assertEqual(real.own_authors({}, ident), ("acme-bot[bot]",))
+        self.assertEqual(real.own_authors({"CW_LAND_REPORT_OWN_AUTHORS": "x-bot"}, ident), ("x-bot",), "the setting wins")
+        self.assertEqual(real.own_authors({"CW_LAND_REPORT_OWN_AUTHORS": "ok," + "a" * 101}, ident), ("ok",), "a name over 100 characters is dropped")
+        with open(ident, "w") as f:
+            f.write("b" * 101 + "\n")
+        self.assertEqual(real.own_authors({}, ident), (), "an identity line over 100 characters is not used")
+
+    def check_slack(self, mod):
+        start, end = NOW - dt.timedelta(hours=24), NOW
+        r = Root(self)
+        for name, when in (("in-lo", start - dt.timedelta(days=1)), ("out-lo", start - dt.timedelta(days=1, seconds=1)),
+                           ("in-hi", end + dt.timedelta(days=1)), ("out-hi", end + dt.timedelta(days=1, seconds=1))):
+            os.mkdir(os.path.join(r.dir, "%s-%s-%06x" % (name, when.strftime("%Y%m%dT%H%M%SZ"), 1)))   # no run.json: a directory that is read counts as unread
+        recs, unread = mod.load_records(r.dir, start, end)
+        self.assertEqual((recs, unread), ([], 2), "S17 both boundary ids read, both ids beyond not read")
+
+    def test_slack_boundary(self):
+        self.check_slack(real)
+
+    def test_mutant_slack_boundary_exclusive(self):
+        mod = mutant("if start - slack <= when <= end + slack:", "if start - slack < when < end + slack:")
+        self.check_slack(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_slack(mod)
+        self.assertIn("S17", str(cm.exception))
+
+    def test_stop_path_boss_lookup_never_raises(self):
+        import cloud_worker
+        class Bad:
+            @property
+            def env(self):
+                raise RuntimeError("boom")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(cloud_worker._stall("boss_of", Bad(), "w-1"), "the stop path gets boss=None, not an exception")
 
     def test_record_without_boss_falls_back_through_load_records(self):
         r = Root(self)
