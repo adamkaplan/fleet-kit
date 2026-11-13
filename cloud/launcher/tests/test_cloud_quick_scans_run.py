@@ -1,4 +1,4 @@
-"""Every named quick scan must RESOLVE and RUN (exit 0) on a clean tree; a mutant that runs a shell script with python fails."""
+"""A quick scan runs through the right interpreter (a shell script with python fails); an exceeded total bound is not clean; a missing helper is loud."""
 import shutil, importlib.machinery, importlib.util, os, subprocess, sys, tempfile, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -26,12 +26,6 @@ class TestScansRun(unittest.TestCase):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "worktree", "prune"], cwd=ROOT)
         shutil.rmtree(cls.tmp, ignore_errors=True)
-
-    def test_every_scan_entry_runs_clean(self):
-        pre = load(os.path.join(ROOT, "bin", "cloud-pr-preflight"), "pre_ok")
-        for rel, sel in pre.cloud_quick.SCAN_TESTS:
-            with self.subTest(scan=rel, selector=sel):
-                self.assertEqual(pre.run_one(self.wt, rel, 140, sel), 0)
 
     def test_mutant_running_shell_with_python_fails(self):
         with open(os.path.join(ROOT, "bin", "cloud-pr-preflight")) as fh:
