@@ -17078,6 +17078,21 @@ def impact_rating_entries(state_dir, pr, head):
     return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
 
 
+def brief_pieces(state_dir, pr, head):
+    """{"rating", "mutants", "blast"} for the impact brief (#2509), read from the recorded reviews at EXACTLY `head` (`impact_brief.recorded_pieces` decides which record counts). A state that is missing, a ledger that cannot be
+    read or whose chain is broken, or a rule file that cannot be read gives all three None: each prints `not shown` and the owner decides. Never read from the text of the pull request or of a pod."""
+    none = {"rating": None, "mutants": None, "blast": None}
+    if state_dir is None or not isinstance(head, str):
+        return none
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+        module = load_module("delegated_clear")
+        block = module.score_block()
+        return none if problem or not block else load_module("impact_brief").recorded_pieces(entries, pr, head, block["rating_roles"], module.counts_by_block)
+    except Exception:
+        return none
+
+
 def gate_impact_rating(state_dir, pr, head):
     """What the `gates` impact-rating line says (#892), from the engine's own records and rule and nothing computed here: `impact_rating_entries` (the one filter of the independent
     reviewer's records at EXACTLY this head) and `delegated_clear.judge` (the level of the highest record whose recorded role counts, from the matrix cell: the SAME function the delegated
@@ -17260,7 +17275,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     brief_module = load_module("impact_brief")   # slice A hook (#1215): the brief is built from the same diff read; display only, no decision reads it yet
     report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "owner_paths": ((matrix.get("owner_hold") or {}).get("substance_decider") or {}).get("owner_only_paths") or {},
                    "ci": pr_ci_of(raw.get("statusCheckRollup")), "unknown": unknown, "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete,
-                   "reads": [{"by": e.get("by"), "verdict": e.get("verdict"), "head": e.get("head")} for e in rating_entries], "rating": ({"class": record[1]} if record and record[1] else None)}
+                   "reads": [{"by": e.get("by"), "verdict": e.get("verdict"), "head": e.get("head")} for e in rating_entries], **brief_pieces(engine.state_dir, "%s#%d" % (repo, number), head)}
     brief = brief_module.build_brief(brief_module.facts_from_report(files, report_base))
     return {"brief": brief, "pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "list_problem": list_problem,
@@ -17412,6 +17427,7 @@ def cmd_impact_floor(args, runner, now):
             print("  rename: the source path of %s was not seen, and it may have been a top tier path; this is not a verdict of \"not held\"" % ", ".join(blind[:3]))
         if isinstance(report.get("brief"), dict):
             print(report["brief"]["text"], end="")   # #1215: the one-screen brief; advice only, no decision changes
+            print("  brief digest: %s\n  to clear as the Chief of Staff pass exactly: --brief-digest %s --brief-text %s" % (report["brief"]["digest"], report["brief"]["digest"], shlex.quote(report["brief"]["text"])))   # #2509: the whole digest and the exact text, so the clear needs no --json
         print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
@@ -20659,6 +20675,7 @@ def cmd_review(args, runner, now):
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
         block_digest, block_fields, block_rows, block_problem = None, {}, None, None
+        piece_fields = {}   # (#2509) the mutant counts and the blast radius a block states: the impact brief reads them back at the exact head
         from_file = given.get("block_file") is not None
         block_path = given.get("block") if given.get("block") is not None else given.get("block_file")
         if given.get("block_file") is not None:   # #1126: the verbatim block, and nothing restated: the rating comes from the block alone
@@ -20682,6 +20699,9 @@ def cmd_review(args, runner, now):
             block_fields["impact_action"], block_fields["impact_class"] = fields["impact_action"], fields["impact_class"]   # #1126: kept so the floor can print what the block itself said
             verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
             block_rows, block_problem = fields["files_read"], fields["files_problem"]
+            piece_fields = {name: fields[name] for name in PIECE_FIELD_REVIEWER if fields[name] is not None}
+            if any(reviewer != PIECE_FIELD_REVIEWER[name] for name in piece_fields):
+                raise ReviewError("refused: `mutants-run:` and `mutants-survived:` belong to the test reviewer's block and `blast-radius:` to the impact reviewer's (nothing was recorded)")
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
                 if rating_in[name] is None:
@@ -20768,7 +20788,7 @@ def cmd_review(args, runner, now):
             entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if action:
             entry["impact_action"] = action
-        if reviewer == "impact" or confirms:   # (#815) a carry confirmation is read by the same recorded role as a rating
+        if reviewer == "impact" or confirms or piece_fields:   # (#815) a carry confirmation is read by the same recorded role as a rating
             entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
@@ -20781,6 +20801,9 @@ def cmd_review(args, runner, now):
                 for name, value in block_fields.items():
                     if value:
                         entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
+        entry.update({name: int(value) if name != "blast_radius" else value for name, value in piece_fields.items()})   # (#2509) numbers and one short ASCII line, checked by `parse_review_block`; the brief reads them only from a record at the exact head
+        if reviewer == "test" and block_digest:
+            entry["block_sha256"] = block_digest[0]   # (#2509) the mutant counts count only from a block that was given
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         (stored, already), = plan_ledger.append_once(state, [entry], now())   # the same record again writes nothing (#1049)
