@@ -283,3 +283,38 @@ class TestCheckRule(GateBase):
         self.assertEqual(sb.lg_check(data, REPO, "lane-a", 150, 600, lambda name: True)[0], True)
         self.assertEqual(sb.lg_check(data, REPO, "lane-a", 800, 600, lambda name: True)[0], False)   # past its limit
         self.assertEqual(json.dumps(data, sort_keys=True), before)
+
+
+class TestCheckCommand(GateBase):
+    """`land-gate check` (second slice): the one question the land wrapper and the pod's pre-push hook ask. Exit 0 allowed, 3 refused with the words; it reads and writes nothing."""
+
+    def check(self, repo, name):
+        return self.gate("check", repo, "--name", name)
+
+    def test_s5_the_holder_is_allowed_and_another_name_is_refused_naming_the_holder_and_the_queue(self):
+        self.gate("take", REPO, who="lane-a")
+        self.gate("take", REPO, who="lane-b")
+        self.assertEqual(self.check(REPO, "lane-a")[0], 0)
+        code, out, _ = self.check(REPO, "lane-b")
+        self.assertEqual(code, 3)
+        self.assertIn("lane-b does not hold the land token of %s" % REPO, out)
+        self.assertIn("held by lane-a", out)
+        self.assertIn("queue length 1", out)
+        code, out, _ = self.check(REPO, "lane-z")   # nobody asked at all
+        self.assertEqual(code, 3)
+
+    def test_s5_a_holder_past_the_limit_is_refused_and_a_free_gate_refuses_everyone(self):
+        self.gate("take", REPO, who="lane-a")
+        self.t += 601
+        self.assertEqual(self.check(REPO, "lane-a")[0], 3)
+        self.assertEqual(self.holder(), "lane-a", "a check changes nothing")
+        self.assertIn("nobody holds it", self.check(REPO, "lane-b")[1])   # the dead holder is gone at once and nobody is next
+
+    def test_s6_a_repository_off_the_land_list_is_untouched(self):
+        code, out, _ = self.check(OTHER, "lane-a")
+        self.assertEqual(code, 0)
+        self.assertIn("not on the land list", out)
+        self.assertEqual(self.state(), {})
+
+    def test_the_name_is_a_fleet_name(self):
+        self.assertEqual(self.check(REPO, "a b;c")[0], 2)

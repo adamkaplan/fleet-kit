@@ -237,6 +237,55 @@ def supervise(name, cmd):
             pass
 
 
+# Ask #2517: the land gate. A START (and so a RESTART: every start of a name runs again) of a land (`spire land`) in a repository on the land list is refused unless the pod
+# holds the live land token. The question is the hook's: CW_LAND_GATE_CMD (default `fleet-switchboard land-gate check`) with `<owner/repo> --name <FLEET_AGENT_NAME>`:
+# exit 0 allowed, exit 3 refused (its line says why, who holds it and the queue length); anything else is UNREACHABLE: the land starts and ONE audit line goes to
+# CW_LAND_GATE_AUDIT (default /work/.land-gate-audit.log); CW_LAND_GATE=enforce refuses it instead. A command that is not a land is not asked.
+LAND_WORDS = re.compile(r"(?:^|[\s/'\";&|(])spire\s+land(?=$|[\s'\";&|)])")
+GATE_AUDIT = os.environ.get("CW_LAND_GATE_AUDIT") or "/work/.land-gate-audit.log"
+
+
+def is_land(cmd):
+    return bool(LAND_WORDS.search(" ".join(cmd))) and "--dry-run" not in cmd and "--help" not in cmd
+
+
+def origin_repo():
+    try:
+        url = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.match(r"^(?:[a-z+]+://(?:[^/@]*@)?[^/]+/|[^/@:]*@?[^/:]+:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", url)
+    return m.group(1) if m else None
+
+
+def land_gate(cmd):
+    if not is_land(cmd):
+        return
+    repo = origin_repo()
+    name = os.environ.get("FLEET_AGENT_NAME") or ""
+    if repo is None:
+        return   # no repository to ask about: untouched
+    code, out = None, ""
+    if NAME_OK.fullmatch(name):
+        try:
+            r = subprocess.run(shlex.split(os.environ.get("CW_LAND_GATE_CMD") or "fleet-switchboard land-gate check") + [repo, "--name", name],
+                               capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+            code, out = r.returncode, r.stdout
+        except (OSError, subprocess.SubprocessError, ValueError):
+            code = None
+    if code == 0:
+        return
+    if code == 3:
+        die(redact(re.sub(r"[^\x20-\x7e]", "?", (out.splitlines() or ["refused: the land gate"])[0]))[:300] + " (the land was not started)", 3)
+    if os.environ.get("CW_LAND_GATE") == "enforce":
+        die("refused: the land gate could not be checked (the switchboard is unreachable) and CW_LAND_GATE=enforce; the land was not started", 3)
+    try:
+        with open(GATE_AUDIT, "a") as f:
+            f.write("%s land-gate-unchecked %s start\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), re.sub(r"[^A-Za-z0-9._/-]", "?", repo)[:100]))
+    except OSError:
+        pass
+
+
 def cmd_start(args):
     name = None
     if args[:1] == ["--name"]:
@@ -258,6 +307,7 @@ def cmd_start(args):
         r = subprocess.run([sys.executable, checker, "--list", rules, shlex.join(cmd)], capture_output=True, text=True)
         if r.returncode == 1:
             die("the pod's shell rules refuse that command; it was not started")
+    land_gate(cmd)
     ensure_dir()
     if state(name)[0] == "running":
         die("a run named %s is still running" % name)

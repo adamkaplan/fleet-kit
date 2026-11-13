@@ -146,9 +146,21 @@ def cmd_land_gate(args, runner, now):
     repo = getattr(args, "repo", None)
     if repo is not None:
         repo = repo.lower() if isinstance(repo, str) else repo
+        if sub == "check" and isinstance(repo, str) and not uses_spire_land(config, repo):
+            print("%s is not on the land list: no gate" % lg_clean(repo))
+            return EXIT_OK   # untouched: a repository off the land list is never refused
         if not isinstance(repo, str) or not uses_spire_land(config, repo):
             sys.stderr.write("%s: land-gate: %s is not on the land list (`land_repos`): it has no gate\n" % (PROG, lg_clean(repo)))
             return EXIT_USAGE
+    if sub == "check":   # the question of the enforcement (the land wrapper and the pod's pre-push hook): exit 0 allowed, 3 refused with the words; reads, writes nothing
+        who = lg_clean(args.name)
+        if not _LG_NAME.fullmatch(args.name or ""):
+            sys.stderr.write("%s: land-gate check: --name is a fleet name\n" % PROG)
+            return EXIT_USAGE
+        state = ensure_state_dir()
+        ok, line = lg_check(_read_small(state, LAND_GATE_FILE), repo, who, int(now()), expire, lg_alive_reader(state))
+        print(line)
+        return EXIT_OK if ok else EXIT_HELD
     name, chief, why = _lg_caller(runner, now) if sub != "status" else (None, False, None)
     if sub != "status" and name is None:
         sys.stderr.write("%s: land-gate %s: the caller is not a fleet agent (%s)\n" % (PROG, sub, _one_line(why, 160)))
@@ -255,6 +267,9 @@ def add_land_gate_parsers(sub):
     rel.add_argument("name", nargs="?", help="Another name's place (the Chief of Staff only)")
     status = actions.add_parser("status", help="The holder, the queue and the times, one line each")
     status.add_argument("repo", nargs="?", help="owner/repo (default: every repository with a holder or a queue)")
+    check = actions.add_parser("check", help="Does NAME hold the live token of the repository? Exit 0 yes (or not a land repository), 3 no, with the words; reads only")
+    check.add_argument("repo", help="owner/repo")
+    check.add_argument("--name", required=True, help="The fleet name asking")
     move = actions.add_parser("move", help="Put a queued name at a place (1 = next); the Chief of Staff only")
     move.add_argument("repo", help="owner/repo on the land list")
     move.add_argument("name", help="The queued name")
