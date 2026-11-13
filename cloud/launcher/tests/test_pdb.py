@@ -211,7 +211,7 @@ only = os.environ.get("CW_TEST_PDB_ONLY")
 if only:
     t = unittest.TestSuite(x for x in t if x.id().rsplit(".", 1)[1].startswith(only))
     assert t.countTestCases() >= 1
-r = unittest.TextTestRunner(stream=io.StringIO()).run(t)
+r = unittest.TextTestRunner(stream=io.StringIO(), failfast=True).run(t)
 if r.wasSuccessful():
     print("PDB-PROBE-OK")
 else:
@@ -238,15 +238,15 @@ else:
         self.assertEqual((code, out.strip()), (0, OK_LINE), out)
 
     def test_mutant_selector_on_the_shared_label_fails_s2(self):
-        self.assertEqual(self.probe()[0], 0)   # control first
-        code, out = self.probe('"selector": {"matchLabels": {"app": LABEL, "cw/worker": worker}}}}\n', '"selector": {"matchLabels": {"app": LABEL}}}}\n')
+        self.assertEqual(self.probe(only="test_s2_three_launches")[0], 0)   # control first, on the same test
+        code, out = self.probe('"selector": {"matchLabels": {"app": LABEL, "cw/worker": worker}}}}\n', '"selector": {"matchLabels": {"app": LABEL}}}}\n', only="test_s2_three_launches")
         self.assertEqual(code, 1)
         self.assertRegex(out, r"PDB-PROBE-FAIL: test_s2_three_launches")
 
     def test_mutant_budget_not_deleted_by_stop_fails_s3(self):
-        self.assertEqual(self.probe()[0], 0)
-        code, out = self.probe('''("pdb", "poddisruptionbudget/%s-pdb" % name, self.kube.delete_pdb),
-                                ("secret", "secret/%s-pw" % name, self.kube.delete_secret),''', '''("secret", "secret/%s-pw" % name, self.kube.delete_secret),''')
+        self.assertEqual(self.probe(only="test_s3_stop_removes_own_budget_only")[0], 0)
+        code, out = self.probe(only="test_s3_stop_removes_own_budget_only", old='''("pdb", "poddisruptionbudget/%s-pdb" % name, self.kube.delete_pdb),
+                                ("secret", "secret/%s-pw" % name, self.kube.delete_secret),''', new='''("secret", "secret/%s-pw" % name, self.kube.delete_secret),''')
         self.assertEqual(code, 1)
         self.assertRegex(out, r"PDB-PROBE-FAIL: test_s3_stop_removes_own_budget_only")
 
