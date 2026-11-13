@@ -26,6 +26,8 @@ import subprocess
 import sys
 import tempfile
 
+import run_record
+
 RECORD_MAX = 1 << 20          # a run.json over this is not read (the real one is a few KB)
 MAX_RECORDS = 5000            # directories looked at in one pass
 SMALL_LINES_DEFAULT = 50      # the small bound, a setting (CW_LAND_REPORT_SMALL_LINES)
@@ -56,16 +58,17 @@ def name_text(value, limit=40, extra=""):
     return (re.sub(r"[^A-Za-z0-9._%s-]" % re.escape(extra), "", value) if isinstance(value, str) else "")[:limit] or "unknown"
 
 
-BOSS_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+BOSS_NAME = run_record.BOSS_NAME   # the one definition (run_record.py is shipped everywhere; this module is loaded by name beside it)
 MAX_LINES = 19                # the whole message stays under 20 lines
 FIRST_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
 
-def lane_of(worker, boss=None):
+def lane_of(worker, boss=None, fallback=None):
     """The lane is the boss the worker reports to (the run record's `boss`); a record without it falls back to the worker name's prefix up to the first
     `-` (its trailing letters-digits suffix goes with the rest) and says `lane unknown`."""
-    if isinstance(boss, str) and BOSS_NAME.fullmatch(boss):
-        return boss
+    for candidate in (boss, fallback() if callable(fallback) else None):   # the run record's, then the launch records' (looked up only when needed)
+        if isinstance(candidate, str) and BOSS_NAME.fullmatch(candidate):
+            return candidate
     return name_text(worker, 64).split("-")[0] + " (lane unknown)"
 
 
@@ -165,7 +168,7 @@ def read_small_json(path):
         finally:
             os.close(fd)
         return got if isinstance(got, dict) else None
-    except Exception:
+    except (OSError, ValueError, UnicodeDecodeError):   # json.JSONDecodeError is a ValueError
         return None
 
 
@@ -223,7 +226,7 @@ def load_records(root, start, end, boss_of=None):
             continue
         began = parse_time(rec.get("start"))
         hook = rec.get("end_hook") if isinstance(rec.get("end_hook"), dict) else {}
-        out.append({"worker": name_text(rec.get("worker"), 64), "repo": name_text(rec.get("repository"), 100, "/"), "lane": lane_of(rec.get("worker"), rec.get("boss") if isinstance(rec.get("boss"), str) and BOSS_NAME.fullmatch(rec["boss"]) else (boss_of(rec.get("worker")) if boss_of else None)),
+        out.append({"worker": name_text(rec.get("worker"), 64), "repo": name_text(rec.get("repository"), 100, "/"), "lane": lane_of(rec.get("worker"), rec.get("boss"), (lambda w=rec.get("worker"): boss_of(w)) if boss_of else None),
                     "minutes": (ended - began).total_seconds() / 60 if began and ended >= began else None, "land": land_run(rec),
                     "sha": rec.get("head_sha") if isinstance(rec.get("head_sha"), str) and re.fullmatch(r"[0-9a-f]{7,40}", rec["head_sha"]) else None,
                     "reason": name_text(rec.get("exit_reason"), 30) if isinstance(rec.get("exit_reason"), str) else "unknown",
@@ -363,7 +366,7 @@ def build(records, unread, landed, bound, previous=(), day="", first_repo="", ow
         tail.insert(1, "; ".join(cells))
     if others:
         ot = [c["total"] for c in others if "total" in c]
-        tail.append("landed by others: %d; land time %s" % (len(others), "median %s s (n=%d)" % (num(median(ot)), len(ot)) if ot else "n/a"))
+        tail.append("landed by others (author name as claimed, not verified): %d; land time %s" % (len(others), "median %s s (n=%d)" % (num(median(ot)), len(ot)) if ot else "n/a"))
     unlanded = [r for r in records if not is_landed(r)]
     tail.append("pods ended unlanded: %d of %d" % (len(unlanded), len(records)))
     if skipped:

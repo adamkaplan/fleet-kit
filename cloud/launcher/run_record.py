@@ -36,6 +36,8 @@ import tempfile
 import threading
 import time
 
+BOSS_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")   # the ONE rule for a boss name: this writer, the land report (reader) and its test use it
+
 MAX_BODY = 8 * 1024 * 1024      # a larger answer is not read (a cut JSON text cannot be parsed anyway)
 MAX_DEPTH = 100                  # real messages nest a few dozen levels; deeper is refused before json.loads
 TRANSCRIPT_CAP = 5 * 1024 * 1024
@@ -418,7 +420,7 @@ class Recorder:
         run_id = "%s-%s-%s" % (worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
         info = {"worker": worker, "repository": repo, "run_id": run_id, "start": started, "end": None,
                 "exit_reason": "", "head_sha": None, "transcript": "unavailable", "reason": "the record was not finished"}
-        if isinstance(boss, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", boss):   # the lane of the land report (#2448)
+        if isinstance(boss, str) and BOSS_NAME.fullmatch(boss):   # the lane of the land report (#2448)
             info["boss"] = boss
         if persistent:   # only a persistent orchestrator's record has the key
             info["persistent"] = True

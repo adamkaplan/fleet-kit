@@ -744,7 +744,7 @@ Settings (the settings file; all optional): `CW_LAND_REPORT_OWN_AUTHORS` (comma 
 | the pod times (median, p90, trend; the pod's own life) and, from the Land-Checks trailer, the land time `total=` and `tests:server` / `tests:pg` seconds | fewer than 3: `n/a` | `S2.test_control` | `S2.test_mutant_mean` (`S2 numbers`) |
 | step times in the log tail | a missing time is `no step data`, not 0 | `S3.test_control` | `S3.test_mutant_missing_is_zero` (`S3 server`) |
 | `git log` of the default branch (one call, 60 s, no shell) | non-zero, a bad branch or no directory: `None`, the report says so | `S8.test_git_reads` | none: the failure is the test |
-| trailers `Land-Checks`, `Land-Council` (untrusted text) | only `files`, `lines`, `rounds` as digits are read | `S5.test_trailer_parse` | none |
+| trailers `Land-Checks`, `Land-Council` (untrusted text) | only `files`, `tests`, `lines`, `rounds` as digits, `total=<n>s`, the `checks=` entries `name(count):<n>s`, and `round <n>` in `Land-Council` are read; the author split is by the CLAIMED author name, not a verified identity | `S5.test_trailer_parse` | none |
 | the small bound setting | not a whole number 1 to 999999: 50 | `S4.test_small_bound_setting`, `S4.test_control` | `S4.test_mutant_at_least` (`S4 bound`) |
 | council rounds per landing | median and max, not a sum | `S5.test_control` | `S5.test_mutant_sum` (`S5 rounds`) |
 | pods ended unlanded | only pods with no landed head | `S6.test_control` | `S6.test_mutant_every_pod` (`S6 count`) |
