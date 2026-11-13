@@ -524,7 +524,8 @@ def last_message(directory, state, pod, clock=None):
                 break
         else:
             return None, "endpoint loop"
-        text = _unwrap_redact(text)   # R-SEC-2: a secret folded over two lines, while the line breaks are still there
+        shown = LAST_HEAD + LAST_FILE   # only the part that can be shown is worked on
+        text = _unwrap_redact(text[:shown]) + text[shown:]   # R-SEC-2: a secret folded over lines, while the line breaks are still there
         text = D["_scrub_lib"]()(text, (), LAST_SCRUB_MAX)
         head, rest = text[:LAST_HEAD], text[LAST_HEAD:]
         lines = ["[last message of %s, untrusted text]" % pod, head]
@@ -717,7 +718,7 @@ def _name_terms():
 def _hide_names(text, terms):
     """`text` with every match of a private-name regex (case rules as the checker's, per line) replaced by [private name]."""
     out = []
-    for line in text.split("\n"):
+    for line in text.splitlines():   # as the checker splits
         for regex in terms:
             line = regex.sub(lambda m: "[private name]" if m.group(0) else m.group(0), line)
         out.append(line)
@@ -725,7 +726,7 @@ def _hide_names(text, terms):
 
 
 _WRAP_WORD = 512      # the longest word joined across a fold; a longer one is no token of ours
-_WRAP_LINES = 4       # the most lines one folded secret is followed over
+_WRAP_LINES = 8       # the most lines one folded secret is followed over
 _WRAP_PART = re.compile(r"[A-Za-z0-9_+/=.-]+")
 
 
@@ -744,11 +745,11 @@ def _unwrap_redact(text):
 
     def shaped(word):
         return redact(scrub(word, (), LAST_SCRUB_MAX))
-    lines = text.split("\n")
+    lines = text.splitlines()   # every kind of line break the later steps split on
     for i in range(len(lines) - 1):
-        a = lines[i].rstrip("\r")
+        a = lines[i].rstrip()
         tail = a[-(_WRAP_WORD + 1):]
-        if not a or tail[-1:].isspace() or not tail.split() or len(tail.split()[-1]) > _WRAP_WORD:
+        if not a or not tail.split() or len(tail.split()[-1]) > _WRAP_WORD:
             continue
         wa = tail.split()[-1]
         head = a[:len(a) - len(wa)]
@@ -758,8 +759,11 @@ def _unwrap_redact(text):
             alone = shaped(cut) != cut
             joined, parts, found = cut, [], None
             for j in range(i + 1, min(i + 1 + _WRAP_LINES, len(lines))):
-                b = lines[j].rstrip("\r").lstrip()
+                b = lines[j].lstrip(" \t>|")   # an indent, a quote mark or a table bar
                 words = b[:_WRAP_WORD + 1].split()
+                if not b.strip():
+                    parts.append((j, lines[j], ""))   # a blank line in the fold
+                    continue
                 if not words or len(words[0]) > _WRAP_WORD:
                     break
                 wb = words[0]
@@ -768,13 +772,13 @@ def _unwrap_redact(text):
                 if shaped(joined) != joined and (not alone or _looks_like_rest(wb) or cut != wa):
                     found = shaped(joined)
                     break
-                if b != wb:
+                if b.rstrip(" |") != wb:
                     break   # a middle line is one word
             if found is None:
                 continue
             last = parts[-1][0]
-            while last + 1 < len(lines) and len(parts) < _WRAP_LINES and lines[last].strip() == parts[-1][2]:   # the rest of a token, one word to a line
-                nxt = lines[last + 1].strip()
+            while last + 1 < len(lines) and len(parts) < _WRAP_LINES and lines[last].strip(" \t>|") == parts[-1][2]:   # the rest of a token, one word to a line
+                nxt = lines[last + 1].strip(" \t>|")
                 word = nxt[:_WRAP_WORD + 1].split()[0] if nxt else ""
                 if not word or len(word) > _WRAP_WORD or not _looks_like_rest(word) or shaped(joined + word) != found:
                     break
@@ -783,7 +787,7 @@ def _unwrap_redact(text):
                 last += 1
             lines[i] = head + found
             for j, b, wb in parts:
-                lines[j] = b[len(wb):]
+                lines[j] = b[len(wb):] if wb else b
             break
     return "\n".join(lines)
 

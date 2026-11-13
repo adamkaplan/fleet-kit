@@ -302,6 +302,27 @@ class TestEndOnAsk(unittest.TestCase):
         posts, _ = self.end_with(names="x\n", final="x" * (LIMIT * 20))
         self.assertLessEqual(len(posts[0][1]), self.retired().END_POST_CHARS)
 
+    def test_more_fold_shapes_are_redacted_and_the_names_list_is_read_once(self):
+        t = self.SPLIT
+        cases = {"bare cr": "x %s\r%s y" % (t[:20], t[20:]), "form feed": "x %s\x0c%s y" % (t[:20], t[20:]), "blank line": "x %s\n\n%s y" % (t[:20], t[20:]),
+                 "trailing space": "x %s  \n%s y" % (t[:20], t[20:]), "quote mark": "x %s\n> %s y" % (t[:20], t[20:]), "table bar": "x %s\n| %s |" % (t[:20], t[20:]),
+                 "seven lines": "x " + "\n".join(t[k:k + 6] for k in range(0, 42, 6))}
+        for label, text in cases.items():
+            for where in ({"final": text}, {"log": text}, {"notes": text}):
+                body = self.end_with(**where)[0][0][1]
+                self.assertNotIn(t[20:], body, (label, where))
+                self.assertNotIn(t[6:12], body, (label, where))
+        part = self.retired()
+        reads = []
+        real = part._name_terms
+        with mock.patch.object(part, "_name_terms", lambda: reads.append(1) or real()):
+            self.end_with(names="acme-secret-org\n", final="x", log="y")
+        self.assertEqual(len(reads), 1)
+
+    def test_a_name_folded_over_a_line_break_and_a_trailing_hyphen_before_prose_are_left_as_they_are(self):
+        posts, _ = self.end_with(names="acme-secret-org\n", final="about acme-\nsecret-org and well-\nknown 2nd things")
+        self.assertIn("well-?known 2nd things", posts[0][1])
+
     def test_the_list_is_read_once_and_never_printed(self):
         posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")
         self.assertNotIn("unclosed-acme-secret", repr((posts, events)))
