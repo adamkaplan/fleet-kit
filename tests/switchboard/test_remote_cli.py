@@ -44,7 +44,7 @@ class TestRemoteCli(Base):
         self.cfg = {"backend": "floor", "land_command": LAND,
                     "floor": {"account": "examplestore", "floor_id": "f1", "caller_id": "fleet", "git_base": "https://git.example",
                               "queue_sas_file": sas_file(d, "q", QSAS), "container_sas_file": sas_file(d, "c", CSAS)},
-                    "repo_token_command": ["mint-token", "--repo", "acme/widget-api"], "repo_token_env": "REPO_TOKEN", "state_dir": self.state_dir}
+                    "repo_token_command": ["mint-token", "acme/widget-api", "--fd", "{fd}"], "repo_token_env": "REPO_TOKEN", "state_dir": self.state_dir}
         self.calls = []
         self.token_result = Done()
 
@@ -52,6 +52,8 @@ class TestRemoteCli(Base):
         self.calls.append((argv, kw))
         if isinstance(self.token_result, Exception):
             raise self.token_result
+        if self.token_result.returncode == 0:
+            os.write(int(argv[argv.index("--fd") + 1]), self.token_result.stdout.encode())
         return self.token_result
 
     def backends(self):
@@ -103,7 +105,7 @@ class TestRemoteCli(Base):
     def test_the_token_command_runs_once_without_a_shell_and_with_a_limit(self):
         self.launch()
         (argv, kw), = self.calls
-        self.assertEqual(argv, ["mint-token", "--repo", "acme/widget-api"])
+        self.assertEqual(argv, ["mint-token", "acme/widget-api", "--fd", "{fd}"])
         self.assertIs(kw["shell"], False)
         self.assertEqual(kw["stdin"], subprocess.DEVNULL)
         self.assertGreater(kw["timeout"], 0)
@@ -127,6 +129,14 @@ class TestRemoteCli(Base):
                 self.assertEqual(len(err.strip().splitlines()), 1)
                 self.assertNotIn(TOKEN, err)
                 self.assertEqual(self.store.requests, [])
+
+    def test_a_token_command_without_the_placeholder_is_refused_before_it_runs(self):
+        cfg = {**self.cfg, "repo_token_command": ["mint-token", "acme/widget-api"]}
+        task = os.path.join(self.dir.name, "t.txt")
+        open(task, "w").write(TASK)
+        code, out, err = self.call("launch", "widget-1", "--repo", "acme/widget-api", "--branch", "b", "--task-file", task, cfg=cfg)
+        self.assertEqual((code, out, self.calls, self.store.requests), (1, "", [], []))
+        self.assertEqual(len(err.strip().splitlines()), 1)
 
     def test_stdin_task_and_the_size_limit(self):
         code, _, _ = self.call("launch", "widget-1", "--repo", "acme/widget-api", "--branch", "b", "--task-file", "-", stdin=TASK)

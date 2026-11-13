@@ -6,11 +6,12 @@ configuration file whose path is in `FLEET_REMOTE_CONFIG` (or `--config`):
     {"backend": "floor", "land_command": "<the command a finished worker runs>",
      "floor": {"account": "examplestore", "floor_id": "f1", "caller_id": "fleet", "queue_sas_file": "/path/q", "container_sas_file": "/path/c",
                "git_base": "https://git.example"},
-     "repo_token_command": ["mint-token", "--repo", "acme/widget-api"], "repo_token_env": "REPO_TOKEN", "state_dir": "/home/user/.remote-workers"}
+     "repo_token_command": ["mint-token", "acme/widget-api", "--fd", "{fd}"], "repo_token_env": "REPO_TOKEN", "state_dir": "/home/user/.remote-workers"}
 
 Inputs and outside calls (each has a test in tests/switchboard/test_remote_cli.py):
 - the config file (a small regular file; keys and types checked; no default for the land command);
-- the token command: an argument list run with no shell, once per launch, stdin closed, a time limit; its first output line must be plain token
+- the token command: an argument list run with no shell, once per launch, stdin closed, a time limit. One argument carries the placeholder `{fd}`,
+  replaced by the number of a pipe the command writes the token to (its standard output and error are discarded); the token must be plain token
   characters. It goes only into the launch command's `env`; it is never stored, printed, logged or put in an error;
 - the task and message text files (a path or `-` for standard input, at most 100 000 bytes);
 - the worker record: one small file per worker in `state_dir` (name, session id, next command number: no secret), written 0600 by rename;
@@ -36,6 +37,7 @@ MAX_TEXT_FILE = 100_000
 MAX_RECORD = 4096
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_.~+/=:-]{8,4096}$")
 TOKEN_SECONDS = 30
+FD_PLACEHOLDER = "{fd}"
 DEFAULT_TOKEN_ENV = "REPO_TOKEN"
 FLOOR_KEYS = ("account", "floor_id", "caller_id", "queue_sas_file", "container_sas_file", "git_base")
 
@@ -94,19 +96,39 @@ def load_file_config(path: str) -> dict:
 
 
 def mint_token(argv, run: Callable = subprocess.run, seconds: int = TOKEN_SECONDS) -> str:
-    """Run the configured token command once and return its token. Nothing of its output is ever put in an error."""
+    """Run the configured token command once and return its token, read from a pipe the command writes to. Nothing of its output is ever put in an error.
+
+    The command names the pipe with the placeholder `{fd}` in one of its arguments (for example `--fd {fd}`): it is replaced by the number of the
+    write end, which the child inherits. The command prints nothing on standard output; its standard output and error are discarded."""
+    if not any(FD_PLACEHOLDER in a for a in argv):
+        raise CliError("the token command has no %s placeholder" % FD_PLACEHOLDER)
+    r, w = os.pipe()
     try:
-        done = run(list(argv), shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=seconds)
-    except subprocess.TimeoutExpired:
-        raise CliError("the token command ran over %d seconds" % seconds) from None
-    except OSError:
-        raise CliError("the token command could not be run") from None
-    if done.returncode != 0:
-        raise CliError("the token command failed (exit %d)" % done.returncode)
-    out = done.stdout if isinstance(done.stdout, str) else done.stdout.decode("utf-8", "replace")
-    token = out.strip()
+        os.set_inheritable(w, True)
+        cmd = [a.replace(FD_PLACEHOLDER, str(w)) for a in argv]
+        try:
+            done = run(cmd, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=seconds,
+                       pass_fds=(w,), close_fds=True)
+        except subprocess.TimeoutExpired:
+            raise CliError("the token command ran over %d seconds" % seconds) from None
+        except OSError:
+            raise CliError("the token command could not be run") from None
+        if done.returncode != 0:
+            raise CliError("the token command failed (exit %d)" % done.returncode)
+        os.close(w)
+        w = -1
+        os.set_blocking(r, False)
+        try:
+            data = os.read(r, 8192)
+        except BlockingIOError:
+            data = b""
+    finally:
+        os.close(r)
+        if w >= 0:
+            os.close(w)
+    token = data.decode("utf-8", "replace").strip()
     if not TOKEN_RE.match(token):
-        raise CliError("the token command did not print a plain token")
+        raise CliError("the token command did not deliver a plain token")
     return token
 
 

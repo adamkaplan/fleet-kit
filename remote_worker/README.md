@@ -82,7 +82,7 @@ argument list that prints a short-lived token; it is run once per launch and the
 | Input or call | Checked by | Test |
 |---|---|---|
 | the configuration file | `cli.load_file_config` | `TestRemoteCli.test_configuration_rules`, `test_no_configuration_or_an_unreadable_one` |
-| the token command (argument list, no shell, time limit, plain token) | `cli.mint_token` | `test_the_token_command_runs_once_without_a_shell_and_with_a_limit`, `test_a_failing_token_command_refuses...` |
+| the token command (argument list, `{fd}` pipe, no shell, time limit, plain token) | `cli.mint_token` | `test_the_token_command_runs_once_without_a_shell_and_with_a_limit`, `test_a_failing_token_command_refuses...` |
 | task and message files (path or `-`, at most 100 000 bytes) | `cli._read_text` | `test_stdin_task_and_the_size_limit` |
 | the worker record (a small 0600 file, no secret) | `cli.Records` | `test_the_record_rules`, `test_the_token_is_never_stored...` |
 | `env` of a launch | `launch._check_env` | `test_env_rules`, `test_the_env_of_a_spec_is_never_in_its_repr` |
