@@ -40,7 +40,6 @@ cloud/launcher/tests/test_idle_nudge.py: rewritten in #2185
 cloud/launcher/tests/test_issues_read.py: none (read)
 cloud/launcher/tests/test_kept_failed_once.py: none (read)
 cloud/launcher/tests/test_m_cap.py: none (read)
-cloud/launcher/tests/test_no_open_files.py: none (read)
 cloud/launcher/tests/test_orchestrator_agent.py: rewritten in #2185
 cloud/launcher/tests/test_orchestrator_hub_session.py: none (read)
 cloud/launcher/tests/test_persistent_merge_fix.py: none (read)
