@@ -207,7 +207,7 @@ def recorded_pieces(entries, pr, head, roles, counts_by_block):
         return out
     mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("pr") == pr and e.get("head") == head and e.get("by_role") in roles]
     impact = [e for e in mine if e.get("reviewer") == "impact"]
-    tests = [e for e in mine if e.get("reviewer") == "test"]
+    tests = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("pr") == pr and e.get("head") == head and e.get("reviewer") == "test"]   # of EVERY role: a later record of the test reviewer takes the counts away, whoever wrote it
     # an uncounted record (no block, an incomplete or non-approving verdict, a score that disagrees) or two counted records that rate differently is never silently dropped: nothing is shown (as `judge` refuses a higher uncounted rating)
     if impact and all(counts_by_block(e) and e.get("verdict") == "approve" for e in impact) and len({(e.get("impact_severity"), e.get("impact_probability")) for e in impact}) == 1:
         last = impact[-1]
@@ -217,7 +217,7 @@ def recorded_pieces(entries, pr, head, roles, counts_by_block):
             blast = last.get("blast_radius")
             if isinstance(blast, str) and blast.strip():
                 out["blast"] = blast.strip()
-    if tests and tests[-1].get("verdict") == "approve" and isinstance(tests[-1].get("block_sha256"), str) and len(tests[-1]["block_sha256"]) == 64:   # the newest test record decides, whatever it carries
+    if tests and tests[-1].get("by_role") in roles and tests[-1].get("verdict") == "approve" and isinstance(tests[-1].get("block_sha256"), str) and len(tests[-1]["block_sha256"]) == 64:   # the newest test record decides, whatever it carries
         ran, survived = _count(tests[-1].get("mutants_run")), _count(tests[-1].get("mutants_survived"))
         if ran and survived is not None and survived <= ran:   # a run of no mutants is no run
             out["mutants"] = "%d run, %d survived" % (ran, survived)

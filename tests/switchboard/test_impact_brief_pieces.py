@@ -47,8 +47,8 @@ def pieces(entries, module=IB, roles=ROLES, counts=DC.counts_by_block):
     return module.recorded_pieces(entries, PR, HEAD, roles, counts)
 
 
-def load_mutant(old, new):
-    assert SOURCE.count(old) == 1, old
+def load_mutant(old, new, count=1):
+    assert SOURCE.count(old) == count, old
     module = types.ModuleType("impact_brief_mutant")
     exec(compile(SOURCE.replace(old, new), "impact_brief.py", "exec"), module.__dict__)
     return module
@@ -92,6 +92,7 @@ class TestBriefPiecesPure(unittest.TestCase):
             "a newer incomplete rating beside a good one": ([impact_entry(), impact_entry(verdict="incomplete", impact_severity="High", block_impact_severity="High")], {"rating": None, "mutants": None, "blast": None}),
             "two counted ratings that differ": ([impact_entry(), impact_entry(impact_severity="Major", block_impact_severity="Major")], none),
             "a request for changes": ([impact_entry(verdict="request-changes"), test_entry(verdict="request-changes")], none),
+            "a newer test record of another role": ([test_entry(), test_entry(by_role=None, mutants_run=None, mutants_survived=None)], none),
             "a newer test record without a block": ([test_entry(), test_entry(block_sha256="none")], none),
             "no entries": ([], none),
             "not a list": (None, none),
@@ -100,6 +101,12 @@ class TestBriefPiecesPure(unittest.TestCase):
         for label, (entries, expect) in cases.items():
             self.assertEqual(pieces(entries), expect, label)
         self.assertEqual(pieces([impact_entry(), test_entry()], roles=[]), none, "no rating role readable: nothing counts")
+
+    def test_the_newest_of_two_agreeing_impact_records_decides(self):
+        first, later = impact_entry(), impact_entry(impact_class="data", blast_radius="two modules")
+        self.assertEqual(pieces([first, later])["rating"]["class"], "data")
+        self.assertEqual(pieces([first, later])["blast"], "two modules")
+        self.assertIsNone(pieces([first, impact_entry(blast_radius=None)])["blast"], "a later record without the field takes it away")
 
     def test_s3_the_newest_record_of_a_reviewer_decides(self):
         later_without = [test_entry(), test_entry(mutants_run=None, mutants_survived=None, verdict="comment")]
@@ -161,7 +168,7 @@ class TestBriefPiecesPure(unittest.TestCase):
     def test_s7_mutants_of_the_reader_fail_the_scenarios(self):
         records = [impact_entry(), test_entry()]
         none = {"rating": None, "mutants": None, "blast": None}
-        ignore_head = load_mutant('== pr and e.get("head") == head and', "== pr and")
+        ignore_head = load_mutant('== pr and e.get("head") == head and', "== pr and", 2)
         self.assertNotEqual(pieces([impact_entry(head=OTHER), test_entry(head=OTHER)], ignore_head), none)
         ignore_role = load_mutant('and e.get("by_role") in roles]', "]")
         self.assertNotEqual(pieces([impact_entry(by_role="coder"), test_entry(by_role="coder")], ignore_role), none)
@@ -278,6 +285,12 @@ def build(TestBlockTable):
             (got,) = self.entries("test")
             self.assertEqual((got["mutants_run"], got["mutants_survived"]), (12, 1))
             self.assertIn("by_role", got)
+            # end to end: the real record is read back at its head by the brief's reader (the role of the recorder stands in for the matrix's rating role)
+            read = IB.recorded_pieces(self.ledger(), got["pr"], got["head"], [got["by_role"]], DC.counts_by_block)
+            self.assertEqual(read["mutants"], "12 run, 1 survived")
+            self.assertEqual(IB.recorded_pieces(self.ledger(), self.PR, "f" * 40, [got["by_role"]], DC.counts_by_block)["mutants"], None)
+            self.assertEqual(self.record(reviewer="test")[0], 0)   # a later record without the lines takes the counts away
+            self.assertIsNone(IB.recorded_pieces(self.ledger(), got["pr"], got["head"], [got["by_role"]], DC.counts_by_block)["mutants"])
 
         def test_the_impact_reviewers_blast_radius_is_recorded_as_one_line(self):
             code, out, err = self.record(extra="blast-radius: one module, no data\n")

@@ -20802,6 +20802,8 @@ def cmd_review(args, runner, now):
                     if value:
                         entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
         entry.update({name: int(value) if name != "blast_radius" else value for name, value in piece_fields.items()})   # (#2509) numbers and one short ASCII line, checked by `parse_review_block`; the brief reads them only from a record at the exact head
+        if reviewer == "test" and block_digest:
+            entry["block_sha256"] = block_digest[0]   # (#2509) the mutant counts count only from a block that was given
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         (stored, already), = plan_ledger.append_once(state, [entry], now())   # the same record again writes nothing (#1049)
