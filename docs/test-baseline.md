@@ -76,7 +76,7 @@ Ubuntu wall (first job start to last ubuntu job end): **23.0 min**; with the mac
 
 Why the runs are red (read from the logs): `bin/check-public-names` failed in runs 43324682615 and 43190655884 (a hit count; the names are not printed and are not quoted here); in run 43355343111 the launcher step hit its 20-minute timeout (`##[error]... has timed out after 20 minutes`) after 86 chain entries and the parallel entries never replayed; run 43324682615 shows the same step time (1,213 s) but its log is cut by the 5 MB log limit, so only the step time is evidence; in 43190655884 a launcher test failed and the step ended after 8.2 minutes; one shard failed in two runs (`TestArchitectureDocument` in 43355343111, `TestPrExplainer` skill size in 43190655884). The step time of a job that failed is the time to the failure.
 
-Runner queue: in run 43324682615 `shards (2/8)`, `(7/8)` and `(8/8)` started 8 to 12 minutes after the run began (no runner free), so its 40.7 min wall includes up to 12 minutes of waiting that no test change can remove.
+Runner queue: in run 43324682615 the ubuntu jobs started late (no runner free): `test (ubuntu-latest)` 4.5 min, `test-cloud (ubuntu-latest)` 8.0 min, `shards (1/8)` 6.3 min, `(3/8)` 10.9, `(6/8)` 14.2, `(4/8)` 14.4, `(5/8)` 14.6, `(2/8)` 19.6, `(7/8)` 22.3 and `(8/8)` 25.0 minutes after the plan job began. Its 40.6 min wall (critical path `test-cloud (ubuntu-latest)`: 8.0 + 32.7) therefore includes 8.0 minutes of waiting that no test change can remove; the last shard to finish ended at 32.8 min. In run 43190655884 the starts were 2.2 to 6.0 minutes after the plan job.
 
 ## 2. Every suite CI runs: CI time and pod time
 
@@ -130,7 +130,7 @@ Steps that failed in CI keep the time to the failure (`check-public-names` faile
 | 8/8 | 432 / 434 / 453 | 7.3 | 456 | 1089 | 447 | 1 |
 | all 8 | | 69.4 | 4224 | 10903 | 4176 | |
 
-The pod shard failures (rc 1) are the pod, not the product: shard 3 has 20 failures all in `TestCloudReaperInstallOnMacOS` (the checkout directory `/work/repo` has a group-writable parent, which the reaper install refuses); shards 6 and 8 have 37 and 58 failing or erroring test lines, the first named `test_the_service_file_is_private_in_every_case` (file-mode and ownership checks of the service install code, which this pod's filesystem fails: the same family); timings of a failing test are still real. The shard split is today's `tests/switchboard/class_times.json` (stale: it is the 4 November table, 713 classes, 3,673 s; today there are 1018 classes), which is why the shards are unbalanced: shard 3 holds 2,449 tests and shard 4 takes 982 s of pod wall against a median of 470 s.
+The pod shard failures (rc 1) are the pod, not the product: shard 3 has 20 failures all in `TestCloudReaperInstallOnMacOS` (the checkout directory `/work/repo` has a group-writable parent, which the reaper install refuses); shards 6 and 8 have 37 and 58 failing or erroring test lines, the first named `test_the_service_file_is_private_in_every_case` (file-mode and ownership checks of the service install code, which this pod's filesystem fails: the same family); timings of a failing test are still real. The shard split is today's `tests/switchboard/class_times.json` (stale: it is the 4 November table, 713 classes, 3,673 s; today there are 1018 classes), which is why the shards are unbalanced: shard 3 holds 2,430 tests and shard 4 takes 982 s of pod wall against a median of 470 s.
 ## 3. Time of each class and each file
 
 All 1018 classes and 172 files of `bin/test-switchboard` (including the classes loaded from `tests/switchboard/`) are in `tests/baseline-times.json` (`switchboard_classes`, `switchboard_files`, seconds measured in the pod with the sum of per-test times from a `unittest` result subclass; CI does not print per-test times, so per-class CI times cannot be read from a run: only the step total per shard is in section 2). Here: the files and classes of at least 5 s, then the slowest 40 classes.
@@ -206,7 +206,7 @@ All 1018 classes and 172 files of `bin/test-switchboard` (including the classes 
 
 Total of all 172 files: 4176.5 s (69.6 minutes), 10903 tests. Files under 5 s: 106, together 133.2 s.
 
-`bin/test-switchboard` itself holds 6192 of the 10903 tests (file `bin/test-switchboard`, 80,493 lines) and `tests/switchboard/` the rest; `builtins`-module classes are classes built inside a function (`TestImpactHold924`, `TestLaunchCapacity` and others) and are placed by the file that defines them.
+`bin/test-switchboard` itself holds 6192 of the 10903 tests (file `bin/test-switchboard`, 80,493 lines) and `tests/switchboard/` the rest; the `shard` of a class is the shard of the last of its tests seen (a class name defined in more than one file can span shards, so per-class shard counts differ slightly from the shard table); `builtins`-module classes are classes built inside a function (`TestImpactHold924`, `TestLaunchCapacity` and others) and are placed by the file that defines them.
 
 | class | file | tests | seconds | shard | owner |
 |---|---|---:|---:|---:|---|
@@ -542,7 +542,7 @@ Per-test times of the other suites are in the JSON (`other_suites[...].top_tests
 | 50 | 11.7 | __main__.TestIdentityCheck.test_a_failed_account_lookup_refuses_every_write_and_lets_every_read_through | real subprocess/server/big fixture/setup |
 ## 5. What the 4 November analysis (ask #2108) changed
 
-Then: run 41793485239 (4 November 2026, green, `test (ubuntu-latest)` ~70 minutes, one process): `bin/test-switchboard` 61.2 minutes, 8,696 tests, 712 classes; top 20 classes 38.6 minutes (63%); minutes per class from log timestamps (time between consecutive test lines). Today: pod seconds per class, summed per-test times from this baseline; 10,903 tests, 1,018 classes; the 8 shards (slices F-A..F-D and the shard option landed). Then-minutes and today-seconds come from different machines and different methods (log timestamps vs per-test timers), so differences under about a third mean nothing.
+Then: run 41793485239 (4 November 2026, green, `test (ubuntu-latest)` ~70 minutes, one process): `bin/test-switchboard` 61.2 minutes, 8,696 tests, 712 classes; top 20 classes 38.6 minutes (63%; the 20 rows the plan lists sum to 37.6, 61%, the table below uses those rows); minutes per class from log timestamps (time between consecutive test lines). Today: pod seconds per class, summed per-test times from this baseline; 10,903 tests, 1,018 classes; the 8 shards (slices F-A..F-D and the shard option landed). Then-minutes and today-seconds come from different machines and different methods (log timestamps vs per-test timers), so differences under about a third mean nothing.
 
 ### The 20 classes of then, today
 
@@ -569,7 +569,7 @@ Then: run 41793485239 (4 November 2026, green, `test (ubuntu-latest)` ~70 minute
 | TestImpactReleaseEveryPass | 0.8 | 70 | 13.3 | 0.2 | 70 | faster 3.6x |
 | TestOfflineScenariosPR4 | 0.7 | 10 | 3.7 | 0.1 | 10 | faster 11.4x |
 
-The 20 then-classes: 37.6 minutes then (as listed, 38.6 with rounding of the source) and 15.0 minutes today.
+The 20 then-classes: 37.6 minutes then (the sum of the 20 rows as listed in the plan; the plan itself states 38.6, a 1.0 minute difference I cannot explain) and 15.0 minutes today. A change of under a third in either direction is called `about the same` (ratio between 0.67 and 1.5).
 
 ### The top 20 today
 
@@ -596,9 +596,9 @@ The 20 then-classes: 37.6 minutes then (as listed, 38.6 with rounding of the sou
 | 19 | TestHeavyProgress | tests/switchboard/test_heavy_progress.py | 25 | 42.4 | 0.7 | yes |
 | 20 | TestShimTopSpender | bin/test-switchboard | 15 | 41.6 | 0.7 | yes |
 
-Today the top 20 classes take 31.9 of 69.6 minutes (46%); then 38.6 of 61.2 (63%). In the top 20 today 9 classes were in the then top 20; 11 are new (mostly mutant runners of later asks: `TestLaunchCapacity`, `TestImpactHold924`, `TestGhShimEffectRule`, `TestNewTestChecksMutants`, `TestGhShimSignInput`).
+Today the top 20 classes take 31.9 of 69.6 minutes (46%); then 38.6 of 61.2 as stated (63%; the listed rows sum to 37.6, 61%). In the top 20 today 9 classes were in the then top 20; 11 are new (mostly mutant runners of later asks: `TestLaunchCapacity`, `TestImpactHold924`, `TestGhShimEffectRule`, `TestNewTestChecksMutants`, `TestGhShimSignInput`).
 
-What changed, plainly: (a) the file no longer runs in one process in CI: the 8 shards cut the longest single job from about 70 minutes to 11-19 minutes (shard 4 of today's three runs). (b) Total test work did not fall: it rose from 61.2 to 69.6 minutes (tests 8,696 to 10,903). (c) The slices fixed what they named in part: `TestRegistrarFloor` 5.9 to 1.8 minutes, `TestWiredCheckPlanted` 3.4 to 0.2, `TestNoPaneToJudge` 3.2 to 0.1, `TestWholeRead` 1.4 to 0.05, `TestMutantIsCaught` 2.4 to 0.4, `TestTheEntryGuard` 2.1 to 0.3. (d) Others did not improve or got worse: `TestBlockedMutants` 1.1 to 2.4, `TestFactsReadAtRunTime` 0.9 to 1.6, `TestOfflineScenarios` 1.7 to 1.5, `TestShimTopSpender` 0.8 to 0.7 and the `TestHostDisk` 2.6 to 1.8 minutes remain; `TestHostDisk`'s one 100-second test still re-runs other classes. (e) New slow classes appeared after 4 November (mutant runners of the later asks), and the class-time table `tests/switchboard/class_times.json` was not refreshed, so the shards are unbalanced (shard 3: 2,449 tests; shard 4: 982 s).
+What changed, plainly: (a) the file no longer runs in one process in CI: the 8 shards cut the longest single job from about 70 minutes to 11-19 minutes (shard 4 of today's three runs). (b) Total test work did not fall: it rose from 61.2 to 69.6 minutes (tests 8,696 to 10,903). (c) The slices fixed what they named in part: `TestRegistrarFloor` 5.9 to 1.8 minutes, `TestWiredCheckPlanted` 3.4 to 0.2, `TestNoPaneToJudge` 3.2 to 0.1, `TestWholeRead` 1.4 to 0.05, `TestMutantIsCaught` 2.4 to 0.4, `TestTheEntryGuard` 2.1 to 0.3. (d) Others did not improve or got worse: `TestBlockedMutants` 1.1 to 2.4, `TestFactsReadAtRunTime` 0.9 to 1.6, `TestOfflineScenarios` 1.7 to 1.5, `TestShimTopSpender` 0.8 to 0.7 and the `TestHostDisk` 2.6 to 1.8 minutes remain; `TestHostDisk`'s one 100-second test still re-runs other classes. (e) New slow classes appeared after 4 November (mutant runners of the later asks), and the class-time table `tests/switchboard/class_times.json` was not refreshed, so the shards are unbalanced (shard 3: 2,430 tests; shard 4: 982 s).
 
 ## 6. What could not be measured
 
