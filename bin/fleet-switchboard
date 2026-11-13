@@ -8536,6 +8536,34 @@ def cloud_branch_tip(engine, repo, branch):
         return None
 
 
+HEADS_MAX = 5000   # the most branch lines one read keeps (ask #2470); more is a partial read, never a proof of anything
+
+
+def cloud_branch_heads(engine, repo):
+    """Ask #2470: ONE bounded read of the repository's own branch heads at the end of a pod: [(branch, full sha)], or None on any failure (an unreadable remote, a partial list).
+    One `gh api --paginate` call under the account of the repository, a 30 s timeout; an answer of more than HEADS_MAX lines is a partial read (None); the answer is a pair of fixed-shape fields, nothing else is kept."""
+    try:
+        if not (isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,99}/[A-Za-z0-9_-][A-Za-z0-9._-]{0,99}", repo)):
+            return None
+        intents = engine.intents
+        env = intents.env_for(repo)
+        argv = [intents.gh, "api", "--paginate", "repos/%s/git/matching-refs/heads?per_page=100" % repo, "--jq", '.[] | .ref + " " + .object.sha']
+        done = intents.runner(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
+        if done.returncode != 0:
+            return None
+        lines = (done.stdout or "").splitlines()
+        if len(lines) > HEADS_MAX:
+            return None
+        found = []
+        for line in lines:
+            ref, _, sha = line.partition(" ")
+            if ref.startswith("refs/heads/") and re.fullmatch(r"[0-9a-f]{40}", sha):
+                found.append((ref[len("refs/heads/"):], sha))
+        return found
+    except Exception:
+        return None
+
+
 def cloud_end_tick(engine, discovery):
     """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
     and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
@@ -8549,6 +8577,7 @@ def cloud_end_tick(engine, discovery):
                                                      lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker),
                                                      head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha),
                                                      branch_tip=lambda repo, branch: cloud_branch_tip(engine, repo, branch),
+                                                     branch_heads=lambda repo: cloud_branch_heads(engine, repo),
                                                      last_push=load_module("cloud_end_alert").push_reader(getattr(getattr(engine, "audit", None), "path", None), load_module("record_json").parse_bounded))
 
 

@@ -288,11 +288,49 @@ def ref_shape(branch):
     return ".." not in branch and all(p and not p.startswith(".") and not p.endswith((".lock", ".")) for p in parts)
 
 
-def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None, record=None, branch_tip=None):
+NOT_WIRED = "not wired"   # `heads` of a caller that hands no reader in (a test of the older notice): the older answer stands; a wired reader that fails gives None
+NAMED_MAX = 3      # the most pushed branches the notice names; the rest are counted (ask #2470)
+NAME_CLIP = 60     # a branch name longer than this is cut
+
+
+def shown_name(name):
+    """A remote branch name as it may stand in a notice: printable ASCII of the safe set, cut to NAME_CLIP; a name with a secret shape or nothing left is `(unprintable name)`."""
+    text = plain(name, NAME_CLIP)
+    return text if text and not SECRETISH.search(str(name)[:200]) and not SECRETISH.search(text) else "(unprintable name)"   # the secret shapes are looked for in the raw name too (plain drops `_`)
+
+
+def moved_branches(hook, heads, worker):
+    """Ask #2470: [(branch, full sha)] of the remote branches whose tip is a commit the pod made (the end hook's `made`, from the pod's own reflogs: its commits, never a fetched one),
+    the `<pod>/wip` save left out. `heads` is the one read of the remote's refs, [(branch, sha)], or None when it failed. Returns None when this cannot be told (no read, no `made`):
+    that is never `nothing pushed`."""
+    made = hook.get("made") if isinstance(hook, dict) else None
+    if not isinstance(heads, list) or not isinstance(made, list):
+        return None
+    mine = {m for m in made if isinstance(m, str) and FULL_SHA.fullmatch(m)}
+    found = [(b, h) for b, h in heads if isinstance(b, str) and isinstance(h, str) and h in mine and b != "%s/wip" % worker]
+    return found if found or not mine else None   # commits the pod made, yet no tip holds one (pushed over, merged, rebased): where they went is not shown, so never `nothing pushed`
+
+
+def many_heads(repo, moved, head_checks):
+    """The head line for one or more moved branches: the first as listed with its check state, then up to NAMED_MAX - 1 more by name and sha, then the count of the rest."""
+    first = finish_head(repo, shown_name(moved[0][0]), moved[0][1], head_checks)
+    if len(moved) == 1:
+        return first
+    named = ["%s@%s" % (shown_name(b), h[:8]) for b, h in moved[1:NAMED_MAX]]
+    rest = len(moved) - 1 - len(named)
+    return "%s Also pushed: %s%s." % (first, ", ".join(named), " and %d more" % rest if rest > 0 else "")
+
+
+def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None, record=None, branch_tip=None, heads=NOT_WIRED):
     """#2267: the last head the pod pushed (branch, short sha) and its check state; `head_checks(repo, sha)` is handed in (this module reads no network).
-    `pushed` is the pod's newest own push (branch, sha) from the switchboard audit: used when the end hook found nothing or no head."""
+    `pushed` is the pod's newest own push (branch, sha) from the switchboard audit: used when the end hook found nothing or no head.
+    `heads` (ask #2470) is the ONE read of the repository's branch heads made at the end, [(branch, sha)], or None when it failed or was not made."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if isinstance(run, dict) else None
+    moved = moved_branches(hook, heads, worker) if heads is not NOT_WIRED else None
+    if moved:   # the repository's own refs: every branch whose tip is a commit the pod made (the pod's own task branch, a pull request's existing branch, a second branch)
+        return many_heads(repo, moved, head_checks)
+    proven = moved is not None or heads is NOT_WIRED   # the read succeeded and `made` says what the pod made: only then may the notice say `nothing pushed`
     if not (pushed and pushed != UNPROVEN and pushed[0] != "%s/wip" % worker):   # no audited real push: the task branch standing at the pod's own head is one
         own = own_branch_head(record_dir, repo, record, parse, branch_tip)
         if own:
@@ -301,7 +339,9 @@ def head_line(record_dir, repo, head_checks, parse, pushed=None, worker=None, re
         if not pushed:
             # a PR marked ready proves a push the push watch may not see (a branch of the pod's own choosing): not "nothing pushed"
             note = valid_pr_note(hook)
-            return "Last head: head unknown." if note and note.startswith("PR #") else "Last head: nothing pushed."
+            if note and note.startswith("PR #"):
+                return "Last head: head unknown."
+            return "Last head: nothing pushed." if proven else "Last head: pushes unknown."   # #2470: no proof, no `nothing pushed`
         return "Last head: head unknown." if pushed == UNPROVEN else finish_head(repo, pushed[0], pushed[1], head_checks)
     branch = hook.get("head_on") if isinstance(hook, dict) else None
     sha = run.get("head_sha") if isinstance(run, dict) else None
@@ -327,7 +367,7 @@ def finish_head(repo, branch, sha, head_checks):
     return "Last head: %s@%s, checks %s." % (branch, sha[:8], re.sub(r"[^A-Za-z0-9 :,._/#()-]", "?", state)[:200])
 
 
-def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None, last_push=None, branch_tip=None):
+def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None, last_text=None, head_checks=None, last_push=None, branch_tip=None, branch_heads=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it. `last_text(directory, worker)` (ask #1788)
     gives (block, None) or (None, why): the boss's copy, not the Chief of Staff's, ends with the pod's last text, framed as untrusted.
     `last_push(worker)` gives (branch, full sha) of the pod's newest own push or None (see push_reader)."""
@@ -388,7 +428,11 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
                 own = last_push(worker) if last_push is not None else None
             except Exception:
                 own = None   # fail mode: no own push is known, the line says what the end hook shows (as before this reader)
-            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own, worker, record, branch_tip)
+            try:   # ask #2470: ONE read of the repository's branch heads per ended pod; any failure is None (never `nothing pushed`)
+                heads = branch_heads((record or {}).get("repo")) if branch_heads is not None and name else (NOT_WIRED if branch_heads is None else None)
+            except Exception:
+                heads = None
+            text += " " + head_line(raw_dir(reason) if name else "", (record or {}).get("repo"), head_checks, parse, own, worker, record, branch_tip, heads)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         boss_text = text
