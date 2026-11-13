@@ -1896,12 +1896,12 @@ class TestHeavySlots(Base):
         self.assertIn("running without one", err)
         self.assertEqual(out.read_text().strip(), "none")
 
-    def test_a_marked_heavy_still_refuses_a_quick_run_in_a_state_directory_that_is_not_private(self):   # the quick/changed-slot exception of cmd_heavy keeps its state check
-        self.state().chmod(0o755)
-        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy", "--quick", "--", "true"], env=self.env(FLEET_HEAVY_SLOT="none"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    def test_a_marked_heavy_still_opens_the_state_directory_for_a_quick_run(self):   # the quick/changed-slot exception of cmd_heavy: without it the quick run would be refused for "no state directory"
+        self.state()
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy", "--quick", "--", "true", "-k", "x"], env=self.env(FLEET_HEAVY_SLOT="none"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         _, err = proc.communicate(timeout=60)
-        self.assertNotEqual(proc.returncode, 0, err)
-        self.assertIn("refused", err)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("no state directory", err)
 
     def test_heavy_off_runs_the_command_directly_with_no_slot_and_no_line(self):
         out = self.home / "off-out"
