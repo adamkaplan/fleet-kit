@@ -535,6 +535,43 @@ class S9(unittest.TestCase):
             self.check(mod)
         self.assertIn("S9 fallback", str(cm.exception))
 
+    def lands(self, mod, names):
+        r = Root(self)
+        d = r.add(worker="p-1", boss="orch-one", repo="acme-org/widget-service")
+        path = os.path.join(d, "run.json")
+        rec = json.load(open(path))
+        rec["end_hook"]["run_logs"]["runs"] = [{"name": n, "exit": c, "woke": False, "log_tail": ""} for n, c in names]   # newest first
+        json.dump(rec, open(path, "w"))
+        recs, _ = mod.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        return recs[0]["land"]
+
+    def check_names(self, mod):
+        self.assertEqual(self.lands(mod, [("land1", 0)]), {"exit": 0, "tail": ""}, "S10 land1")
+        self.assertEqual(self.lands(mod, [("land12", 18)])["exit"], 18, "S10 land12")
+        self.assertEqual(self.lands(mod, [("land-x", 13)])["exit"], 13, "S10 land-suffix")
+        self.assertEqual(self.lands(mod, [("dry3", 0), ("land1", 13)])["exit"], 13, "S10 dry3 ignored, the newest land-named run decides")
+        self.assertEqual(self.lands(mod, [("land2", 0), ("land1", 13)])["exit"], 0, "S10 newest land wins")
+        for n in ("dry1", "retest", "chk", "t10", "wbase", "mise"):
+            self.assertIsNone(self.lands(mod, [(n, 0)]), "S10 not a landing: " + n)
+
+    def test_land_names(self):
+        self.check_names(real)
+
+    def test_mutant_old_land_pattern(self):
+        mod = mutant('(?:\\d{1,9}|-[A-Za-z0-9._-]{0,60})?', '(?:-[A-Za-z0-9._-]{0,60})?')
+        self.check_names(real)
+        with self.assertRaises(AssertionError) as cm:
+            self.check_names(mod)
+        self.assertIn("S10 land1", str(cm.exception))
+
+    def test_real_trailer_forms(self):
+        checks = "areas=docs tests=0 files=4 checks=doc-check:2s total=3s tree=0123456789ab"
+        self.assertEqual(real.parse_trailer(checks), {"files": 4})
+        out = []
+        class R: returncode = 0; stdout = "\x1e" + "a" * 40 + "\x1f" + checks + "\x1f" + "ran: warden=approve (models fast, round 2, diff abc123)" + "\x1e" + "b" * 40 + "\x1f" + checks + "\x1f" + "none needed (no path calls for a member)"
+        got = real.git_landed("/x", "origin/main", NOW, run=lambda *a, **k: R())
+        self.assertEqual([(c["files"], c["lines"], c["rounds"]) for c in got], [(4, None, 2), (4, None, None)])
+
     def test_record_without_boss_falls_back_through_load_records(self):
         r = Root(self)
         d = r.add(worker="solo-3", code=0)

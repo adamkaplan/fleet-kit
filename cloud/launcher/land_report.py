@@ -11,7 +11,9 @@ What the data holds (read on 12 November 2026, stated first):
               (never as zero). The follow-up is that the land tool prints that line. The land wall time is the run record's own `end` minus `start`.
   attempt     a record whose newest run named `land` or `land-...` exists; its exit is 0 landed, 18 council, 13 tests, 3 environment, 124 or 137 time limit, else other.
               A record with no such run is not an attempt (`no land run`).
-  trailer     `Land-Checks: files=<n> lines=<n> rounds=<n>` (key=value pairs; `rounds` may be in `Land-Council` instead); a missing key is counted as unread, not 0.
+  trailer     REAL form (checked in .spire/tool/checks.sh and the land tests): `Land-Checks: areas=<areas> tests=<n> files=<n> checks=<step:Ns,...> total=<n>s tree=<12 hex>`; its `files` is the
+              number of TEST files run, NOT the files a change touched, and it has no `lines`; `Land-Council: ran: warden=approve (models fast, round <n>, diff <id>)` or
+              `none needed (...)`. So change size in lines is unread for such commits (never 0), rounds come from `round <n>`; a `lines=`/`rounds=` key is read when present.
   lane        the boss the worker reports to (run record `boss`); a record without it: the worker name up to its first `-`, printed `(lane unknown)`.
 Everything read is untrusted: a corrupt record, a link, a file over RECORD_MAX bytes is skipped and counted (`N records not read`); the output goes through one scrub."""
 import datetime as dt
@@ -36,7 +38,7 @@ EXIT_REASON = {0: "landed", 18: "council", 13: "tests", 3: "environment", 124: "
 REASONS = ("council", "tests", "environment", "time limit", "other")
 STEPS = ("tests:server", "tests:pg")
 STEP_LINE = re.compile(r"\bstep=(tests:server|tests:pg) seconds=(\d{1,7}(?:\.\d{1,3})?)\b")
-LAND_NAME = re.compile(r"land(?:-[A-Za-z0-9._-]{0,60})?")
+LAND_NAME = re.compile(r"land(?:\d{1,9}|-[A-Za-z0-9._-]{0,60})?")   # land, land<N> (cw-run names), land-<suffix>; never dry<N>, retest, chk
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}-\d{8}T\d{6}Z-[0-9a-f]{6}")
 ISSUE_REF = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99})#([1-9][0-9]{0,8})")
 BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,100}")
@@ -195,6 +197,9 @@ def git_landed(git_dir, branch, since, run=subprocess.run):
             continue
         checks = parse_trailer(parts[1])
         rounds = checks.get("rounds", parse_trailer(parts[2]).get("rounds"))
+        if rounds is None:   # the real Land-Council form: `ran: warden=approve (models fast, round 2, diff abc)`; `none needed (...)` has no round
+            m = re.search(r"\bround (\d{1,9})\b", parts[2])
+            rounds = int(m.group(1)) if m else None
         out.append({"sha": parts[0].strip(), "files": checks.get("files"), "lines": checks.get("lines"), "rounds": rounds})
     return out
 
@@ -256,7 +261,7 @@ def build(records, unread, landed, bound, previous=(), day="", first_repo=""):
         size = [c for c in landed if c["lines"] is not None]
         over = sum(1 for c in size if c["lines"] > bound)
         files = [c["files"] for c in landed if c["files"] is not None]
-        tail.append("landed commits: %d; change size per landing: median %s files, median %s lines (n=%d, %d unread)" % (
+        tail.append("landed commits: %d; change size per landing: median %s files (test files run), median %s lines (n=%d, %d unread)" % (
             len(landed), num(median(files)) if files else "n/a", num(median([c["lines"] for c in size])) if size else "n/a", len(size), len(landed) - len(size)))
         tail.append("share over %d lines: %d of %d" % (bound, over, len(size)))
         rounds = [c["rounds"] for c in landed if c["rounds"] is not None]
