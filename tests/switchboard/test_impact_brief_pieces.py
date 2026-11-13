@@ -245,7 +245,7 @@ class TestBriefPiecesFloor(unittest.TestCase):
         self.assertEqual(argv[:2], ["--brief-digest", brief["digest"]])
         self.assertEqual(argv[2], "--brief-text")
         self.assertEqual(argv[3], brief["text"], "the text passes through the shell byte for byte")
-        self.assertEqual(DC.brief_refusals(brief, argv[1], argv[3], []), [], flags)
+        self.assertEqual(DC.brief_refusals(brief, argv[1], argv[3], ["the reviewed change is within the order"]), [], flags)
 
     def test_s4_the_print_without_a_digest_in_the_report_is_not_made_up(self):
         report = dict(self.report(), brief=None)
