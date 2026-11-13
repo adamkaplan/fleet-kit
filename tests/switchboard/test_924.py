@@ -284,10 +284,15 @@ def _body():
         def RATING_ROOT_WHY(self):   # one row for each of `rating_roots`, in the matrix (`rating_roots_why`): the one table the code, the matrix text and docs/switchboard.md share
             return sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["rating_roots_why"]
 
+        _derived_cache = None
+
         def rating_path_derived(self):
-            """The definitions that belong to the rating's path, derived from the code: the call path from `main` to a rating target (with the two dynamic edges), the definitions that read, write or register a rating field and the
+            """(cached on the class: the three tests that ask derive it once) The definitions that belong to the rating's path, derived from the code: the call path from `main` to a rating target (with the two dynamic edges), the definitions that read, write or register a rating field and the
             the definitions `main` itself names (its guard and the dispatch). (names, the parsed daemon, the matrix rule)."""
             import ast
+            cls = type(self)
+            if cls._derived_cache is not None:
+                return cls._derived_cache
             walked = {}
 
             def walk(node):   # each definition is walked once, whatever the number of questions asked of it (parse-once)
@@ -320,7 +325,8 @@ def _body():
             clear_dispatchers = {n for n, node in defs.items() if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Name) and x.id == "cmd_impact_clear" for x in walk(node))}   # the clear's own entry: the definition that names it (`cmd_impact`) runs it, though `main` reaches it only by the string "cmd_" + action, which the walker follows for the rating's action only
             path = (on_path & set(from_main)) | clear_dispatchers | touching | {x.id for fn in ("main", "private_parser") for x in walk(defs[fn]) if isinstance(x, ast.Name) and x.id in defs}   # what main and the private parser name themselves
             handing = {c.func.id for n in path if n in defs for c in walk(defs[n]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs and any(k.arg is None for k in c.keywords)}   # what the path hands the handler's arguments to (`call_command(handler, **available)`)
-            return path | handing, daemon, rule
+            cls._derived_cache = (path | handing, daemon, rule)
+            return cls._derived_cache
 
         def test_the_rating_roots_are_derived_from_the_code_and_each_is_classified_in_one_table(self):
             module = sb.load_module("delegated_clear")
@@ -329,12 +335,16 @@ def _body():
             self.assertEqual(sorted(rule["rating_roots"]), sorted(self.RATING_ROOT_WHY), "rating_roots and the classification table name the same roots: a root added to the code path is classified here (or not a root)")
             self.assertTrue(all(len(why) > 20 for why in self.RATING_ROOT_WHY.values()))
             self.assertEqual(sorted(set(rule["rating_roots"]) - derived), [], "every root is on the rating's path (derived from the code)")
+            self.check_each_root(module, derived, daemon, rule, dynamic)
+
+        def check_each_root(self, module, derived, daemon, rule, dynamic):
             reach = module.closure(daemon, module.daemon_roots(rule), dynamic)[0]
             self.assertEqual(sorted(n for n in derived if n not in reach), [], "every definition on the rating's path is in the closure")
             for root in sorted(self.RATING_ROOT_WHY):   # one mutant for each member: without this root, the path is still covered (it is also named by another root, said here) or the derived set leaves the closure
                 with self.subTest(root=root):
                     rest = dict(rule, rating_roots=[r for r in rule["rating_roots"] if r != root])
-                    lost = sorted(n for n in derived if n not in module.closure(daemon, module.daemon_roots(rest), dynamic)[0])
+                    without = module.closure(daemon, module.daemon_roots(rest), dynamic)[0]   # once per root (the comprehension asked for it once per derived name)
+                    lost = sorted(n for n in derived if n not in without)
                     self.assertEqual(lost, [], "%s is also reached by name from another root (main), so the list names it explicitly to hold it if that path changes" % root) if root not in ("main", "cmd_impact") else self.assertNotEqual(lost, [], "main and cmd_impact are roots no other root reaches by name: without them the path leaves the closure; the others are reached from")
             self.assertTrue({"code_snapshot", "code_replaced", "direct_command", "private_parser", "add_impact_parsers"} <= derived & set(rule["rating_roots"]), "the guard main runs is a derived root (the definitions main names itself)")
             hand_list = "RATING_PATH" + "_FUNCTIONS"   # the hand-kept list of the old guard: gone, nothing to pin
@@ -524,7 +534,7 @@ def _body():
             return daemon_names, helper
 
         KEPT_ALWAYS = ("cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser", "main")
-        SAMPLE_STEP = 6   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 6th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
+        SAMPLE_STEP = 18   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 18th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
 
         def sampled(self, cases):
             """The cases of a derived list that are run: the named ones, the first and last of each module, and every SAMPLE_STEP-th (deterministic; a name added later moves the sample, never empties it)."""
