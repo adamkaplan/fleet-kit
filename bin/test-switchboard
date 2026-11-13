@@ -30264,7 +30264,7 @@ class TestRecordingCommands(LedgerBase):
     """#1049: every recording command (the set is read from the code: the functions marked `@recording`) ends with ONE line, `recorded #<id>`, `already recorded #<id>` or
     `not recorded: <reason>`, within ONE bound (`RECORD_WAIT_SECONDS`), and the same record again writes nothing. One row per member; one mutant per member."""
 
-    WAIT, PROGRESS = 2, 1   # the bound and the first word, shortened for the tests (the real values are the module's constants)
+    WAIT, PROGRESS = 1, 0.4   # the bound and the first word, shortened for the tests (the real values are the module's constants)
     EXEMPT = {   # commands that reach a ledger append and are NOT recording commands of this contract (the plan's out-of-scope list); a new one is a failure until it is placed
         "gates": "reads; its `ci-record` form is the daemon's recorder", "gates_ci_record": "the built-in `ci` recorder",
         "item_prove": "a work item, not a pull request", "item_verdict": "a work item, not a pull request", "item_ci_record": "a work item, not a pull request",
@@ -73878,6 +73878,8 @@ class TestGhShimMergeGate(Base):
             want = "gh: review rule unreadable: review_rule.py: %s: merge refused" % cause
             if (done.returncode, seen) != (10, None) or want not in done.stderr.splitlines():
                 failed.append((kind, done.returncode, done.stderr.strip()[-200:]))
+                if mutate:
+                    break   # a mutant is seen by its first failing row
         return failed
 
     def test_every_bad_review_rule_refuses_the_merge_with_its_own_cause_line(self):
