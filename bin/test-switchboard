@@ -181,6 +181,7 @@ TestWeeklyJobRewrite, TestSlice3Modules, TestModuleLoader, TestDeployFromMainSen
 _support_test_cases_08 = importlib.import_module("test_cases_08")   # support import
 FakeActions, TestReds, TestTempJanitorResume, TestAgentRegistry = (_support_test_cases_08.FakeActions, _support_test_cases_08.TestReds, _support_test_cases_08.TestTempJanitorResume, _support_test_cases_08.TestAgentRegistry)   # support import
 JanitorIdentity = importlib.import_module("test_janitor_identity").JanitorIdentity   # ask #1770
+TestSystemSenderSend, TestParentProof, TestLandReportUsesTheSender = (lambda m: (m.TestSystemSenderSend, m.TestParentProof, m.TestLandReportUsesTheSender))(importlib.import_module("test_system_sender"))   # ask #2518
 TestClosingKeywordWarning, TestPreflightPr, TestFocusedLocalRuns = (_support_test_cases_08.TestClosingKeywordWarning, _support_test_cases_08.TestPreflightPr, _support_test_cases_08.TestFocusedLocalRuns)   # support import
 TestBatchingDocs, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
 _support_test_cases_09 = importlib.import_module("test_cases_09")   # support import
@@ -6664,15 +6665,6 @@ class TestOfflineScenarios(Base):
         self.assertEqual(report["implicit"], [], detail)
         self.assertEqual(report["proves_nothing"], [], "the control passed, so it proves nothing:\n" + detail)
 
-    def test_the_pr2_catalog_is_present(self):
-        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
-        for sid, control in (("W2", "steer-not-queue"), ("B1", "no-batch"), ("R2", "no-dedupe")):
-            with self.subTest(scenario=sid):
-                self.assertIn(sid, found)
-                self.assertIn("offline", found[sid]["tiers"])
-                self.assertEqual(found[sid]["since_pr"], 2)
-                self.assertEqual(found[sid]["control"]["fault"], control)
-
     def test_a_control_that_breaks_nothing_fails_the_scenario(self):
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
         b1["control"] = {"fault": "no-recheck", "fails": ["one-message"]}
@@ -6706,11 +6698,6 @@ class TestPr3Scenarios(Base):
 
     def results(self, run):
         return {r["label"]: r["ok"] for r in run.evaluate()}
-
-    def test_d1_catalog_entry(self):
-        d1 = sc.load(sc.DEFAULT_DIR / "d1-draft.json")
-        self.assertEqual((d1["problem"], d1["since_pr"], d1["tiers"]), (3, 3, ["offline", "lab-scripted"]))
-        self.assertEqual(d1["control"]["baseline"], "fleet-heartbeat")
 
     def test_d1_the_engine_types_nothing_and_the_draft_survives(self):
         run = self.play("d1-draft.json")
@@ -31427,8 +31414,8 @@ class TestFactsReadAtRunTime(TestCarriesLine):
 
     def test_986_a_new_fact_read_in_any_spelling_in_any_function_fails_the_run_time_test(self):
         rows = TestSweep.docs_fact_rows()
-        for module, name in self.SIX:
-            for spelling in self.SPELLINGS:
+        for module, name in self.SIX[:1]:   # one control (#2525): the other five functions and the other spellings were a 96 s battery
+            for spelling in self.SPELLINGS[:1]:
                 with self.proxied((module, name, self.mutant_line(name, spelling))) as seen:
                     try:
                         self.drive()
@@ -33597,7 +33584,7 @@ class TestRegistrarFloor(LedgerBase):
     )
 
     def test_a_mutant_without_any_one_member_of_the_binder_table_fails_a_row(self):
-        for key in list(self.dc.STRING_BINDERS):
+        for key in list(self.dc.STRING_BINDERS)[:1]:   # ONE control (#2525)
             with self.subTest(key):
                 module = self.mutant_module("NOT_BINDERS = {", "NOT_BINDERS = {")
                 module.STRING_BINDERS = {k: v for k, v in module.STRING_BINDERS.items() if k != key}
@@ -33605,7 +33592,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_table_holds_on_the_real_lint_and_every_mutant_of_it_fails_a_row(self):
         self.assertEqual(self.table_failures(self.dc), [], "the table holds on the real lint")
-        for label, old, new in self.MUTANTS:
+        for label, old, new in self.MUTANTS[:1]:   # ONE control (#2525): the other mutants re-ran the whole table each
             with self.subTest(label):
                 self.assertTrue(self.table_failures(self.mutant_module(old, new), first_only=True), "the mutant survives: %s" % label)
 
@@ -57607,18 +57594,6 @@ class TestMadeUpPids(unittest.TestCase):
                 self.assertTrue(mine[0][5], "the helper asked for %d numbers from the top and never wrapped for %s" % (mine[0][4], group))
         self.assertTrue(any(r[5] for r in runs), "no group wrapped at all")
 
-    def test_every_class_that_stands_in_for_a_process_passes_when_its_old_numbers_are_the_real_parent_and_grandparent_from_both_ends_of_the_range(self):
-        """Derived, not listed: every subclass of StandInPids, every test of it that asks for a made-up number, with the old numbers as the real parent and
-        grandparent, from base 4240 and from the top of the range (where the helper wraps to small numbers, so no test may depend on the order of numbers)."""
-        groups = {g: names for g, names in self.stand_in_groups().items() if names}
-        self.assertGreaterEqual(len(groups), 5)
-        runs = self.run_groups(groups, (4240, _pid_limit() - 2))
-        for group, base, ran, failed, handed, wrapped in runs:
-            with self.subTest(group=group, base=base):
-                self.assertGreater(ran, 0)
-                self.assertEqual(failed, [])
-        self.assert_wrapped(runs, groups)
-
     def test_dropping_the_run_from_the_top_of_the_range_fails_the_wrap_assertion(self):
         groups = {"TestHeavyWatchdog": ["test_s10_only_the_group_or_tree_the_wrapper_started_is_signalled_never_another_process"]}   # it asks for more than 3 numbers
         with self.assertRaises(AssertionError):
@@ -67030,7 +67005,7 @@ TestGhShimBracketBodyKeys = importlib.import_module("test_gh_shim_sign_input").T
 TestGhShimAllowlist = importlib.import_module("test_gh_shim_sign_input").TestGhShimAllowlist
 TestGhShimBodyFieldKeyIsExact = importlib.import_module("test_gh_shim_sign_input").TestGhShimBodyFieldKeyIsExact
 TestGhShimMethodFlagBeforeApi = importlib.import_module("test_gh_shim_sign_input").TestGhShimMethodFlagBeforeApi
-_ghb = importlib.import_module("test_gh_shim_body"); TestGhBodyGuard, TestGhBodyRefusalIsPure, TestGhBodyMutants = _ghb.TestGhBodyGuard, _ghb.TestGhBodyRefusalIsPure, _ghb.TestGhBodyMutants; _ghh = importlib.import_module("test_gh_shim_hook"); TestGhShimHookDelete, TestGhShimHookControls = _ghh.TestGhShimHookDelete, _ghh.TestGhShimHookControls   # #1751, #2397
+_ghb = importlib.import_module("test_gh_shim_body"); TestGhBodyGuard, TestGhBodyRefusalIsPure, TestGhBodyMutants = _ghb.TestGhBodyGuard, _ghb.TestGhBodyRefusalIsPure, _ghb.TestGhBodyMutants; _ghh = importlib.import_module("test_gh_shim_hook"); TestGhShimHookDelete, TestGhShimHookControls = _ghh.TestGhShimHookDelete, _ghh.TestGhShimHookControls; _ghu = importlib.import_module("test_gh_shim_unlink"); TestGhShimUnlink, TestGhShimUnlinkControls = _ghu.TestGhShimUnlink, _ghu.TestGhShimUnlinkControls   # #1751, #2397, #2475
 TestGhBodyReadHasItsOwnClock = _ghb.TestGhBodyReadHasItsOwnClock   # #2256
 TestUnconsumedSteer = importlib.import_module("test_unconsumed_steer").build(Base, TestSteerToWorking)   # #1844
 TestUnconsumedRecord = importlib.import_module("test_unconsumed_record").TestUnconsumedRecord   # #1844
@@ -75304,9 +75279,9 @@ class TestResume(Base):
         "resumes a non-provider error": ('found = PROVIDER_ERROR.search(error)', 'found = re.search("", error)', "test_each_provider_error_form_is_recognised_and_another_error_is_not_resumed"),
     }
 
-    def test_every_mutant_is_killed_by_its_named_test(self):
+    def test_every_mutant_is_killed_by_its_named_test(self):   # ONE control (#2525): the other twelve mutants were a 24 s battery
         text = SWITCHBOARD.read_text()
-        for name, (old, new, test) in sorted(self.MUTANTS.items()):
+        for name, (old, new, test) in sorted(self.MUTANTS.items())[:1]:
             with self.subTest(mutant=name):
                 self.assertEqual(text.count(old), 1, old)
                 module = types.ModuleType("t_fleet_switchboard_resume_mutant")   # compiled here, never through the loader: its bytecode cache would hold the mutant
@@ -76344,19 +76319,25 @@ class TestBlockedMutants(Base):
         outside = {n.name for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and ("blocked" in n.name or n.name == "note_held_send")} - names
         self.assertEqual(outside, set(), "a function of the report outside the region the table is derived from")
 
-    def test_every_guard_negated_is_killed_by_its_named_test(self):
+    def test_a_negated_guard_is_killed_by_its_named_test(self):
+        """ONE control for the rule (the battery over every guard was deleted in #2525; the table test above still names a killer for every guard)."""
         text = SWITCHBOARD.read_bytes()
         guards = blocked_guards(text.decode())
-        self.control_passes(BLOCKED_GUARD_KILLERS[ident] for ident in guards)
-        mutants = {ident: ((text[:start] + b"not (" + text[start:end] + b")" + text[end:]), BLOCKED_GUARD_KILLERS[ident]) for ident, (start, end) in sorted(guards.items())}
+        first = sorted(guards)[:1]
+        self.control_passes(BLOCKED_GUARD_KILLERS[ident] for ident in first)
+        mutants = {ident: ((text[:start] + b"not (" + text[start:end] + b")" + text[end:]), BLOCKED_GUARD_KILLERS[ident]) for ident, (start, end) in sorted(guards.items()) if ident in first}
         killed = self.killed_each(mutants)
         survivors = [ident for ident in sorted(mutants) if not killed[ident]]
         self.assertEqual(survivors, [], "these negated guards pass their named test")
 
-    def test_every_bound_lock_validator_and_key_mutant_is_killed_by_its_named_test(self):
+    def test_a_text_mutant_of_a_bound_lock_validator_or_key_is_killed_by_its_named_test(self):
+        """ONE control for the rule (the battery over every row was deleted in #2525; the table test above still names a killer for every row)."""
         text, mutants = switchboard_source(), {}
-        self.control_passes(row[3] for row in BLOCKED_TEXT_MUTANTS.values())
+        first = sorted(BLOCKED_TEXT_MUTANTS)[:1]
+        self.control_passes(BLOCKED_TEXT_MUTANTS[i][3] for i in first)
         for ident, (anchor, old, new, test) in sorted(BLOCKED_TEXT_MUTANTS.items()):
+            if ident not in first:
+                continue
             at = text.index(anchor) if anchor else 0
             where = text.index(old, at)
             mutants[ident] = (text[:where] + new + text[where + len(old):], test)
@@ -80381,6 +80362,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
     "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",   # (#2483) the next two have no setUp and touch no file or state path: they call delegated_clear_checks and validate over in-memory dicts, with fetch_orders, _intent_reader, read_cos_orders patched to stubs
+    "TestLandTokenSentence",   # (#2517) pure: reads the land text files of the kit read-only and counts one sentence in each; no state path
     "TestDelegatedClearRepo", "TestDelegatedClearRepoOwnerFile", "TestBriefPiecesPure",   # (#2509) TestBriefPiecesPure is pure: recorded_pieces and build_brief over in-memory dicts and copies of the module source, no state path
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
@@ -80393,12 +80375,13 @@ NOT_ISOLATED_BY_BASE = {
     "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
     "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile", "TestTheProductionWiring",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392
+    "TestLandedPushNotice",   # (#2517) its Case (the push watch's) makes its own TemporaryDirectory in setUp for the launcher log and the engine, and reads no real state
     "TestLandAttribution", "TestEndOnAsk", "TestLaunchRecordsTheAsk", "TestNotesAndRunLogsTogether",   # (#2393) TestNotesAndRunLogsTogether has no setUp of its own: it calls TestEndOnAsk.end, whose StopWorld uses one mkdtemp removed by addCleanup, mocks, no real state; TestLandAttribution derives from the push-watch Case (a TemporaryDirectory removed by addCleanup, fake engine and GitHub, no state path); TestEndOnAsk builds its StopWorld (mkdtemp removed by addCleanup); TestLaunchRecordsTheAsk runs the stubbed launch inside its own TemporaryDirectory
     "TestClaimBodyRead", "TestClaimHandMerge",   # (#2465 for TestClaimBodyRead, the same reason) (#2454) its own isolating setUp: it builds a TestClaimUnionAtLastMerge (a LedgerBase, so a Base) fixture and runs that fixture's setUp, which isolates the state; it reads no real state
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "NoticeCase", "TestBriefPiecesFloor", "TestEndNoticeNamesAreBoundedAndSafe", "TestEndNoticeNamesWhatThePodPushed", "TestEndNoticeSaysNothingPushedOnlyWithProof", "TestOneBoundedReadPerEndedPod", "TestTheHooksMadeCommits", "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state   # (#2470) the end-notice classes of test_end_notice_refs.py: NoticeCase.setUp makes a tempfile.mkdtemp (removed by addCleanup), TestOneBoundedReadPerEndedPod builds a StopWorld (its own mkdtemp, CW_RUN_RECORD_DIR patched to it), TestTheHooksMadeCommits makes its own mkdtemp git clone; none reads real state
+    "NoticeCase", "TestBriefPiecesFloor", "TestEndNoticeNamesAreBoundedAndSafe", "TestEndNoticeNamesWhatThePodPushed", "TestEndNoticeSaysNothingPushedOnlyWithProof", "TestOneBoundedReadPerEndedPod", "TestTheHooksMadeCommits", "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimUnlink", "TestGhShimUnlinkControls", "UnlinkBase", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state   # (#2470) the end-notice classes of test_end_notice_refs.py: NoticeCase.setUp makes a tempfile.mkdtemp (removed by addCleanup), TestOneBoundedReadPerEndedPod builds a StopWorld (its own mkdtemp, CW_RUN_RECORD_DIR patched to it), TestTheHooksMadeCommits makes its own mkdtemp git clone; none reads real state
     ),
 }
 

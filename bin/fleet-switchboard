@@ -13427,7 +13427,7 @@ def _send_by_registry(args, runner, now):
         sys.stderr.write("%s: --interrupt is not supported on an endpoint route: nothing sent\n" % PROG)
         return EXIT_USAGE
     if args.sender is not None:
-        if os.environ.get(LAB_ENV) != "1":
+        if os.environ.get(LAB_ENV) != "1" and not getattr(args, "system_proven", False):
             sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n" % (PROG, LAB_ENV))
             return EXIT_USAGE
         sender = args.sender
@@ -13502,6 +13502,14 @@ def _cmd_send(args, runner, now):
 
 
 def _send_one(args, runner, now):
+    system = load_module("system_sender")   # #2518: a registered system sender is proved by the calling process; the claim variable and --from only NAME one
+    claim = os.environ.get(system.SYSTEM_SENDER_ENV) or None
+    if claim or system.registered(args.sender):
+        line = system.refusal(claim or args.sender, args.name, KIT_ROOT, from_name=args.sender)
+        if line:
+            sys.stderr.write("%s: %s\n" % (PROG, line))
+            return EXIT_ERROR
+        args.sender, args.system_proven = claim, True
     routed = _send_by_registry(args, runner, now)
     if routed is not None:
         return routed
@@ -13514,7 +13522,7 @@ def _send_one(args, runner, now):
         sys.stderr.write("%s: %s\n" % (PROG, refusal))
         return EXIT_USAGE
     if args.sender is not None:
-        if os.environ.get(LAB_ENV) != "1":
+        if os.environ.get(LAB_ENV) != "1" and not getattr(args, "system_proven", False):
             sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
                              % (PROG, LAB_ENV))
             return EXIT_USAGE

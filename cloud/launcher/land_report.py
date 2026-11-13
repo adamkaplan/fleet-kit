@@ -428,8 +428,13 @@ def write_state(path, state):
         raise
 
 
-def send_message(text, issue, run=subprocess.run):   # item 6 of the ask: no daemon identity exists (--from is Lab only); see the PR body
-    res = run(["fl" + "eet-switchboard", "send", "cos", "--issue", issue, text], capture_output=True, text=True, timeout=CALL_SECONDS)
+SYSTEM_SENDER = "cloud-reaper"   # the name registered in bin/system_sender.py
+
+
+def send_message(text, issue, run=subprocess.run):
+    # #2518: the reaper has no pane and no session; it names the registered system sender (a name, no secret) and the switchboard checks that this process IS the reaper
+    env = dict(os.environ, SWITCHBOARD_SYSTEM_SENDER=SYSTEM_SENDER)
+    res = run(["fl" + "eet-switchboard", "send", "cos", "--issue", issue, text], capture_output=True, text=True, timeout=CALL_SECONDS, env=env)
     return res.returncode == 0
 
 
