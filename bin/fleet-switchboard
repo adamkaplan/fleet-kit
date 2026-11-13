@@ -8643,6 +8643,7 @@ def push_watch_tick(engine, discovery):
     if state_dir is not None:   # #2186: only a record the one liveness test accepts is read (as pod_silence_tick reads it)
         retired, reports = registry_retired(state_dir), _read_small(state_dir, LAST_REPORT_FILE)
         ns.record_live = lambda rec, name, at: cloud_record_live(rec, name, retired, reports, at)
+        ns.reported_text = lambda name: (reports.get(name) or {}).get("text")   # ask #2393: the sha a pod reported as `landed <sha>`
     hub = getattr(engine, "hub", None)   # the GitHub reader is the hub (Switchboard has no gh_api); with none, skip the pass
     if hub is None:
         if not getattr(engine, "_push_watch_skip_told", False):   # once per engine, not every idle pass: a line per pass grows the audit and every reader of it rewrites its offsets (TestWriteOnlyOnChange)
