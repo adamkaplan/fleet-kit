@@ -145,10 +145,12 @@ class StartupTaint(unittest.TestCase):
         open(r3.cfg + ".sysbox-fix.failed", "w").write("count=2\n")
         r3.run()
         self.assertEqual(r3.rc, 4)
+        self.assertNotIn("label", r3.calls)   # the label command was not run
         self.assertEqual(r3.removals(), [])
         r4 = Run(config=RIGHT)               # already right but containerd not answering: not verified
         self.addCleanup(r4.close)
         r4.run(CTR_DOWN="1")
+        self.assertNotEqual(r4.rc, 0)
         self.assertEqual(r4.removals(), [])
 
     def test_absent_taint_is_not_an_error(self):
@@ -205,6 +207,22 @@ class StartupTaint(unittest.TestCase):
 
     def test_s5_control_a_manifest_without_it_is_caught(self):
         self.assertEqual(tolerations(FIX_YAML.replace("tolerations:", "other:")), [])
+
+    def test_mutant_without_the_absent_branch_is_caught(self):
+        def absent_says(script):
+            r = Run(script, config=RIGHT)
+            try:
+                open(os.path.join(r.tmp, "taint"), "w").write('#!/bin/sh\necho \'taint "%s:NoSchedule" not found\' >&2\nexit 1\n' % KEY)
+                r.run()
+                assert "startup taint already absent" in r.out, "absent text missing"
+            finally:
+                r.close()
+        absent_says(SCRIPT)                       # the control first
+        mutant = SCRIPT.replace('echo "startup taint already absent"; return 0', 'true')
+        self.assertNotEqual(mutant, SCRIPT)
+        with self.assertRaises(AssertionError) as cm:
+            absent_says(mutant)
+        self.assertEqual(str(cm.exception), "absent text missing")
 
     def test_s6_mutant_that_never_removes_is_caught(self):
         check_s2(SCRIPT)                       # the control first
