@@ -535,6 +535,16 @@ class S9(unittest.TestCase):
             self.check(mod)
         self.assertIn("S9 fallback", str(cm.exception))
 
+    def test_record_without_boss_falls_back_through_load_records(self):
+        r = Root(self)
+        d = r.add(worker="solo-3", code=0)
+        path = os.path.join(d, "run.json")
+        rec = json.load(open(path))
+        del rec["boss"]
+        json.dump(rec, open(path, "w"))
+        recs, _ = real.load_records(r.dir, NOW - dt.timedelta(hours=24), NOW)
+        self.assertEqual(recs[0]["lane"], "solo (lane unknown)")
+
     def test_setting_validated(self):
         self.assertEqual(real.first_repo("acme-org/widget-service"), "acme-org/widget-service")
         self.assertEqual(real.first_repo("bad name"), "")
