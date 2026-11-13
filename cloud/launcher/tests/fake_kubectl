@@ -240,7 +240,11 @@ elif cmd == "get" and args[1] == "poddisruptionbudget":
     if obj is None: missing('poddisruptionbudgets.policy "%s"' % args[2])
     print(json.dumps(obj))
 elif cmd == "get" and args[1] == "poddisruptionbudgets":
-    for o in st.get("pdbs", {}).values():   # the launcher's jsonpath: name, cw/pod label, creation time
+    pdbs = list(st.get("pdbs", {}).values())
+    if "-l" in args:  # honour a label selector `key=value`
+        k, v = args[args.index("-l") + 1].split("=", 1)
+        pdbs = [o for o in pdbs if o["metadata"].get("labels", {}).get(k) == v]
+    for o in pdbs:   # the launcher's jsonpath: name, cw/pod label, creation time
         m = o["metadata"]
         print("\t".join([m["name"], m.get("labels", {}).get("cw/pod", ""), m.get("creationTimestamp", "2026-01-01T00:00:00Z")]))
 elif cmd == "get" and args[1] == "nodes":
