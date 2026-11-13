@@ -1,4 +1,0 @@
-{
- "command": "ensure",
- "help": "usage: fleet-switchboard ensure [-h] options: -h, --help show this help message and exit"
-}

@@ -1,9 +1,0 @@
-# RuntimeClass for Sysbox. The handler name must match the runtime stanza that
-# containerd-fix.yaml puts under the plugin key containerd 2.x reads.
-# No scheduling block: an autoscaler's template node cannot carry a label that is set only after install.
-# A worker pod that wants Sysbox selects the pool label sysbox-install=yes itself.
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: sysbox-runc
-handler: sysbox-runc

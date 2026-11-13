@@ -1,4 +1,0 @@
-{
- "command": "poke",
- "help": "usage: fleet-switchboard poke [-h] options: -h, --help show this help message and exit"
-}

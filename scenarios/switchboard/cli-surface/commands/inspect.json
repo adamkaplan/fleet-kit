@@ -1,4 +1,0 @@
-{
- "command": "inspect",
- "help": "usage: fleet-switchboard inspect [-h] [--short] name positional arguments: name The cloud worker's fleet name options: -h, --help show this help message and exit --short One line, for a notice"
-}

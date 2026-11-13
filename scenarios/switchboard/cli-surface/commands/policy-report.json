@@ -1,4 +1,0 @@
-{
- "command": "policy-report",
- "help": "usage: fleet-switchboard policy-report [-h] [--minutes MINUTES] [--json] [--check] options: -h, --help show this help message and exit --minutes MINUTES The window to sample (default 60) --json --check Liveness: exit 1 when agents are working and nothing was judged for 30 minutes"
-}

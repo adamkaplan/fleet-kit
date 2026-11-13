@@ -1,4 +1,0 @@
-{
- "command": "triage",
- "help": "usage: fleet-switchboard triage [-h] {seen-leave,unmute,muted} ... `triage seen-leave OWNER/REPO#N` keeps the item out of the Chief of Staff's stale digest until it changes (a comment, a label, a state or a push). `triage unmute OWNER/REPO#N` undoes it; `triage muted` lists them. positional arguments: {seen-leave,unmute,muted} options: -h, --help show this help message and exit"
-}

@@ -1,4 +1,0 @@
-{
- "command": "pr-explain",
- "help": "usage: fleet-switchboard pr-explain [-h] [--before BEFORE] [--after AFTER] [--body-file BODY_FILE] [--check] pr Reads the PR once and PRINTS the block for its description; it writes nothing. Paste it, or use --body-file to get the whole new body with the block in once, then `gh pr edit --body-file`. --check judges the description the PR has. positional arguments: pr The pull request: owner/repo#N or its URL options: -h, --help show this help message and exit --before BEFORE The behaviour before, one or two lines --after AFTER The behaviour after, one or two lines --body-file BODY_FILE A file with a PR body (or - for the PR's own): print it with the block in once --check Judge the PR description: one block, a real why part, no generated summary flowchart"
-}

@@ -1,4 +1,0 @@
-{
- "command": "reds",
- "help": "usage: fleet-switchboard reds [-h] pr `reds OWNER/REPO#N` reads the `failing-tests` artifact (failing-tests.json v1) of the pull request's run and of main's last runs and prints which failing names also fail on main's latest run, which are flaky there (2 or more of its last 5 usable runs) and which are new. Main's runs are the runs of the repo's reference events on the default branch (config reds.reference_events, default push; a merge_group reference is read by its gh-readonly-queue ref). Main is judged ONLY by main's own runs: the pull request's list and its `complete` flag are its own claim. A run with no artifact, an expired one or complete=false is UNKNOWN, never passing. Names match in full, else by a UNIQUE leaf (marked 'matched by name only'). Bounded calls, cached by run id; it writes nothing to GitHub. positional arguments: pr OWNER/REPO#N options: -h, --help show this help message and exit"
-}

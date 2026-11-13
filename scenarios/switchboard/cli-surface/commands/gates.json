@@ -1,4 +1,0 @@
-{
- "command": "gates",
- "help": "usage: fleet-switchboard gates [-h] [--plan PLAN] [--ask ASK] [--head HEAD] [--json] [--limit LIMIT] [--all] pr [rest ...] positional arguments: pr The pull request: owner/repo#N or its URL rest With `mode`: <owner/repo> <shadow|enforce|off> options: -h, --help show this help message and exit --plan PLAN The plan: owner/repo#N or an issue URL (default: the one the PR's ledger entries name, else the `PLAN:` line of the PR body) --ask ASK The ask whose Done-when the plan must cover (as `plan check --ask`) --head HEAD The PR head sha (default: read from GitHub) --json --limit LIMIT With `stats`: how many merged PRs to show (default 10) --all Exit by the whole board, not only the gates the repo enforces"
-}

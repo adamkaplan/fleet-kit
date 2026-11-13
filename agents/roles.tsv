@@ -1,2 +1,0 @@
-# agents/roles.tsv: the roles each agent may be launched with: name, a TAB, roles separated by commas (read by fleet-switchboard launch --role tester, #1963)
-coder	coder,tester

@@ -1,4 +1,0 @@
-{
- "command": "move",
- "help": "usage: fleet-switchboard move [-h] --to TO_CHARTER [--from SENDER] ask positional arguments: ask The ask: N or OWNER/REPO#N options: -h, --help show this help message and exit --to TO_CHARTER The charter it moves to: N or OWNER/REPO#N, in the ask's repo --from SENDER Lab only: the caller's fleet name"
-}

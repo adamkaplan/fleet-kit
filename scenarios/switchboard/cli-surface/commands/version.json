@@ -1,4 +1,0 @@
-{
- "command": "version",
- "help": "usage: fleet-switchboard version [-h] options: -h, --help show this help message and exit"
-}

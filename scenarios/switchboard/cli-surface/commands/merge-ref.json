@@ -1,4 +1,0 @@
-{
- "command": "merge-ref",
- "help": "usage: fleet-switchboard merge-ref [-h] [--repo REPO] [--refresh] pr Reads the first parent of refs/pull/N/merge and the head of the base branch and says fresh or STALE. Reads only: it never closes, reopens or edits a pull request. Exit 3: the pull request conflicts and has no merge ref. positional arguments: pr The pull request: owner/repo#N, its URL, or a number with --repo options: -h, --help show this help message and exit --repo REPO The repository for a bare number --refresh Make the mergeability query that recomputes the ref (a read), read the ref again, say fresh or still STALE"
-}
