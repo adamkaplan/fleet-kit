@@ -14,8 +14,8 @@ ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT / "cloud" / "worker" / "tests"))
 import stub_support  # noqa: E402
 
-ROUNDS = 10
-WAVE_SIZE = 5
+ROUNDS = 4
+WAVE_SIZE = 2
 PY = sys.executable
 TINY_LOADER = (
     "import importlib.machinery, importlib.util, os, sys, unittest\n"

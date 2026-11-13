@@ -48,7 +48,7 @@ class Hub:
         self.relay = relay_mod.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=wait, **relay_kw)
         self.server = hub_mod.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json"), "fleet-agents"),
                                          cloud_hub.Inbox(agents_path), self.lines.append, str(t / "decisions.json"), relay=self.relay, daemon="daemon", max_handlers=max_handlers, namespace="fleet-agents")
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.port = self.server.server_address[1]
 
     def __enter__(self):

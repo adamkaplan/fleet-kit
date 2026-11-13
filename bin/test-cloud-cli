@@ -56,7 +56,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         self.srv.seen, self.srv.code = [], 200
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(self.srv.server_close)
         self.addCleanup(self.srv.shutdown)
         self.tmp = tempfile.TemporaryDirectory()
@@ -142,7 +142,7 @@ class TestRefusals(Base):
     def test_redirect_is_refused(self):
         other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         other.seen, other.code = [], 200
-        threading.Thread(target=other.serve_forever, daemon=True).start()
+        threading.Thread(target=other.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(other.server_close)
         self.addCleanup(other.shutdown)
         self.srv.code = 302
@@ -228,7 +228,7 @@ class TestMutants(Base):
     def test_mutant_follows_redirects(self):
         other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         other.seen, other.code = [], 200
-        threading.Thread(target=other.serve_forever, daemon=True).start()
+        threading.Thread(target=other.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(other.server_close)
         self.addCleanup(other.shutdown)
         self.srv.code = 302
@@ -250,7 +250,7 @@ class TestMutants(Base):
     def test_mutant_ignores_environment_url(self):
         other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         other.seen, other.code = [], 200
-        threading.Thread(target=other.serve_forever, daemon=True).start()
+        threading.Thread(target=other.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(other.server_close)
         self.addCleanup(other.shutdown)
         src = self.mutate('post or make_post(url)', 'post or make_post("http://127.0.0.1:%d/send")' % other.server_address[1])
@@ -370,7 +370,7 @@ class Wire(unittest.TestCase):
     def serve(self, handler):
         srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
         srv.seen = []
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
         return srv, "http://127.0.0.1:%d/send" % srv.server_address[1]
