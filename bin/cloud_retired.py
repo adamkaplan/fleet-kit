@@ -686,14 +686,30 @@ def _name_terms():
             loader.exec_module(mod)
             _NAMES_CHECKER.append(mod)
         mod = _NAMES_CHECKER[0]
-        text = os.environ.get("FLEET_PRIVATE_NAMES", "")[:NAMES_MAX_BYTES]
+        text = os.environ.get("FLEET_PRIVATE_NAMES", "")
         if not text.strip():
             with open(os.environ.get("FLEET_PRIVATE_NAMES_FILE") or mod.DEFAULT_LIST, "rb") as handle:
-                text = handle.read(NAMES_MAX_BYTES).decode("utf-8", "replace")
-        if not text.strip():
-            return [], "no list"
-        terms, _ignores = mod.parse_list(text)
-        return [regex for _i, regex in terms[:NAMES_MAX_TERMS]], (None if terms else "no entries")
+                text = handle.read(NAMES_MAX_BYTES + 1).decode("utf-8", "replace")
+        problems = []
+        if len(text) > NAMES_MAX_BYTES:
+            text = text[:NAMES_MAX_BYTES].rsplit("\n", 1)[0]   # the entry the cut fell in is dropped, not half read
+            problems.append("list cut")
+        terms, bad = [], 0
+        for line in text.splitlines():   # one entry at a time: a bad one is skipped, the others still apply
+            try:
+                found, _ignores = mod.parse_list(line)
+            except ValueError:
+                bad += 1
+                continue
+            terms += [regex for _i, regex in found]
+        if bad:
+            problems.append("%d entries unusable" % bad)
+        if len(terms) > NAMES_MAX_TERMS:
+            terms = terms[:NAMES_MAX_TERMS]
+            problems.append("list too long")
+        if not terms and not problems:
+            problems.append("no list" if not text.strip() else "no entries")
+        return terms, ("; ".join(problems) or None)
     except Exception as err:
         return [], type(err).__name__[:40]
 
@@ -708,28 +724,67 @@ def _hide_names(text, terms):
     return "\n".join(out)
 
 
-_WRAP_MAX_LINE = 4000
+_WRAP_WORD = 512      # the longest word joined across a fold; a longer one is no token of ours
+_WRAP_LINES = 4       # the most lines one folded secret is followed over
+_WRAP_PART = re.compile(r"[A-Za-z0-9_+/=.-]+")
+
+
+def _looks_like_rest(word):
+    """A continuation of a token already redacted whole: random-looking (a digit and a letter, four characters or more), not prose."""
+    return len(word) >= 4 and bool(re.search(r"\d", word)) and bool(re.search(r"[A-Za-z]", word)) and _WRAP_PART.fullmatch(word) is not None
 
 
 def _unwrap_redact(text):
-    """`text` with a secret that was folded over two lines redacted: for each pair of adjacent lines the last word of the first (a trailing backslash or
-    hyphen of the fold dropped, or kept) is joined to the first word of the next and redacted by shape (the switchboard's redaction and the launcher's
-    scrub); only when that changes the joined word are the two parts replaced, the rest of both lines kept. Linear in the text, which is already cut."""
+    """`text` with a secret that was folded over lines redacted: at each line break the last word of the line (a trailing backslash or hyphen of the fold
+    dropped, or kept) is joined to the first word of the next line (leading blanks ignored), and of up to three more lines while each is one word, then
+    redacted by shape (the switchboard's redaction and the launcher's scrub); only when the joined word changes are the parts replaced, the rest of each line
+    kept. Where the first part is already a whole token, the next word is taken only if it looks like the rest of one. Words are capped, so a long line costs
+    nothing: work is linear in the (already cut) text."""
     scrub, redact = D["_scrub_lib"](), D["redact_command_text"]
 
     def shaped(word):
         return redact(scrub(word, (), LAST_SCRUB_MAX))
     lines = text.split("\n")
     for i in range(len(lines) - 1):
-        a, b = lines[i].rstrip("\r"), lines[i + 1].rstrip("\r")
-        if not a or not b or len(a) > _WRAP_MAX_LINE or len(b) > _WRAP_MAX_LINE or a[-1].isspace() or b[0].isspace():
+        a = lines[i].rstrip("\r")
+        tail = a[-(_WRAP_WORD + 1):]
+        if not a or tail[-1:].isspace() or not tail.split() or len(tail.split()[-1]) > _WRAP_WORD:
             continue
-        wa, wb = a.split()[-1], b.split()[0]
-        head, rest = a[:len(a) - len(wa)], b[len(wb):]
+        wa = tail.split()[-1]
+        head = a[:len(a) - len(wa)]
         for cut in ((wa[:-1] if wa[-1] in "\\-" else ""), wa):
-            if cut and shaped(cut + wb) != cut + wb:
-                lines[i], lines[i + 1] = head + shaped(cut + wb), rest
-                break
+            if not cut:
+                continue
+            alone = shaped(cut) != cut
+            joined, parts, found = cut, [], None
+            for j in range(i + 1, min(i + 1 + _WRAP_LINES, len(lines))):
+                b = lines[j].rstrip("\r").lstrip()
+                words = b[:_WRAP_WORD + 1].split()
+                if not words or len(words[0]) > _WRAP_WORD:
+                    break
+                wb = words[0]
+                parts.append((j, b, wb))
+                joined += wb
+                if shaped(joined) != joined and (not alone or _looks_like_rest(wb) or cut != wa):
+                    found = shaped(joined)
+                    break
+                if b != wb:
+                    break   # a middle line is one word
+            if found is None:
+                continue
+            last = parts[-1][0]
+            while last + 1 < len(lines) and len(parts) < _WRAP_LINES and lines[last].strip() == parts[-1][2]:   # the rest of a token, one word to a line
+                nxt = lines[last + 1].strip()
+                word = nxt[:_WRAP_WORD + 1].split()[0] if nxt else ""
+                if not word or len(word) > _WRAP_WORD or not _looks_like_rest(word) or shaped(joined + word) != found:
+                    break
+                joined += word
+                parts.append((last + 1, nxt, word))
+                last += 1
+            lines[i] = head + found
+            for j, b, wb in parts:
+                lines[j] = b[len(wb):]
+            break
     return "\n".join(lines)
 
 
@@ -752,7 +807,7 @@ def post_end(engine, state, record, name, reason, body, post, note, audit=None):
                 audit and audit("private names not checked (%s)" % unchecked)
             except Exception:
                 pass
-        comment = _unwrap_redact(_hide_names(comment, terms) if terms else comment)   # then a secret folded over two lines
+        comment = _unwrap_redact(_hide_names(comment, terms) if terms else comment)[:END_POST_CHARS]   # then a secret folded over two lines; the cut again (a short name grows)
         post(engine, issue, comment, author=name, repo=repo)
     except Exception as err:
         try:

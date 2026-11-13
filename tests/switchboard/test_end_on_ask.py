@@ -270,6 +270,38 @@ class TestEndOnAsk(unittest.TestCase):
             self.assertIn("acme-secret-org", posts[0][1], label)
             self.assertEqual(events.count("cloud.end_names_unchecked"), 1, label)
 
+    def test_a_fold_with_an_indent_over_three_lines_or_after_a_very_long_line_is_redacted(self):
+        t = self.SPLIT
+        cases = {"indent": "x %s\n   %s y" % (t[:20], t[20:]), "three lines": "x %s\n%s\n%s y" % (t[:15], t[15:30], t[30:]),
+                 "long line": "p" * 5000 + " %s\n%s" % (t[:20], t[20:]), "four lines": "x %s\n%s\n%s\n%s" % (t[:8], t[8:16], t[16:30], t[30:])}
+        for label, text in cases.items():
+            for where in ({"final": text}, {"log": text}):
+                body = self.end_with(**where)[0][0][1]
+                for piece in (t[8:16], t[15:30], t[20:], t[30:]):
+                    self.assertNotIn(piece, body, (label, piece))
+                self.assertIn("[redacted]", body, label)
+            self.assertIn(t[30:], self.end_with(final=text, control=True)[0][0][1], label)
+
+    def test_a_whole_token_followed_by_a_word_on_the_next_line_keeps_the_word(self):
+        for text in ("key %s\nafter that\nmore" % self.SPLIT, "key %s\n  later words" % self.SPLIT):
+            body = self.end_with(final=text)[0][0][1]
+            self.assertNotIn(self.SPLIT[20:], body)
+            self.assertIn("after that" if "after" in text else "later words", body)
+
+    def test_one_bad_entry_or_a_cut_entry_does_not_disable_the_others(self):
+        posts, events = self.end_with(names="(unclosed\nacme-secret-org\n", final="about acme-secret-org")
+        self.assertIn("about [private name]", posts[0][1])
+        self.assertEqual(events.count("cloud.end_names_unchecked"), 1)
+        part = self.retired()
+        text = "acme-secret-org\n" + "z" * (part.NAMES_MAX_BYTES + 10)
+        posts, events = self.end_with(names=text, final="about acme-secret-org")
+        self.assertIn("about [private name]", posts[0][1])
+        self.assertEqual(events.count("cloud.end_names_unchecked"), 1)
+
+    def test_a_short_name_that_grows_the_text_is_cut_again(self):
+        posts, _ = self.end_with(names="x\n", final="x" * (LIMIT * 20))
+        self.assertLessEqual(len(posts[0][1]), self.retired().END_POST_CHARS)
+
     def test_the_list_is_read_once_and_never_printed(self):
         posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")
         self.assertNotIn("unclosed-acme-secret", repr((posts, events)))
