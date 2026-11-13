@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# push: the landing step. Land the LOCAL commits DIRECT ON origin/main: no branch pushed, no pull request, no lock (the remote's refusal of a push that is not a fast-forward is the arbiter).
+#
+#   push [--dry-run] [<rev>]       lands the commits origin/main..<rev> (default HEAD) of the worktree it is run in, each as itself (linear history)
+#   push --hold REASON | --release              stop / allow landing in this clone
+#   push --freeze REASON --owner NAME --for 6h  freeze landing but for fixes and reverts | --thaw
+#   push --status
+#
+# What it does: hold? -> fetch -> frozen? -> rebase the commits onto origin/main in this run's own scratch worktree (<git common dir>/spire-land/run.<pid>.<random>/wt, removed at exit)
+#   -> the gate (the tool's checks.sh of THAT tree, which is origin/main's own: a commit cannot loosen what judges it) on that exact combination -> fetch again: main moved during the gate = rebase and
+#   check again -> `git push origin <sha>:main`, a plain fast-forward (no force anywhere). A lost race rebases and retries; a refusal that is not a lost race is final.
+# There is NO flag that skips the gate, overrides a result or lands past a red check: land fixes the code and lands again.
+#
+# Exit: 0 landed | 1 stopped with a plain message | 2 bad input | 11 rebase conflict (files named) | 13 the gate fails (nothing lands) | 14 held or frozen.
+# The LAST line of stdout is JSON: {"sha","commits","gate_seconds","result","exit"} (result: landed, would-land, conflict, gate, held, error).
+# Where it lives: this file is .spire/tool/push; TOOL is its folder, nothing is resolved against the current directory (LAYOUT.md).
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib/freeze.sh"
+remote=origin; base=main
+
+usage() { echo "usage: push [--dry-run] [<rev>] | --hold REASON | --release | --freeze REASON --owner NAME --for DURATION | --thaw | --status | --version" >&2; exit 2; }
+dry=0; op=; opreason=; owner=; dur=; args=()
+while [ $# -gt 0 ]; do case $1 in
+  --dry-run) dry=1;;
+  --hold|--freeze) op=${1#--}; opreason=${2:?$1 needs a reason}; shift;;
+  --release|--thaw|--status) op=${1#--};;
+  --owner) owner=${2:?--owner needs a name}; shift;; --for) dur=${2:?--for needs a duration}; shift;;
+  --version) echo "push $(cat "$here/VERSION" 2>/dev/null || echo unknown)"; exit 0;;
+  -*) usage;; *) args+=("$1");; esac; shift; done
+[ ${#args[@]} -le 1 ] || usage
+rev=${args[0]:-HEAD}
+
+wt=; sha=; ncommits=; gate_s=; result=error; t0=$(date +%s); run=; attempt=0; already=0
+json_num() { [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$1" || printf null; }
+json_str() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]] && printf '"%s"' "$1" || printf null; }
+onexit() {
+  local c=$?
+  if [ -z "$op" ]; then
+    [ -z "${state:-}" ] || [ ! -d "${state:-}" ] || printf '{"ts":%s,"result":"%s","commits":%s,"commit":%s,"attempts":%s,"gate_s":%s,"total_s":%s}\n' "$(date +%s)" "$result" "$(json_num "$ncommits")" "$(json_str "${tip0:-}")" "$(json_num "$([ "$attempt" = 0 ] || echo "$attempt")")" "$(json_num "$gate_s")" "$(( $(date +%s) - t0 ))" >> "$state/metrics.jsonl" 2>/dev/null || true
+    printf '{"sha":%s,"commits":%s,"gate_seconds":%s,"result":"%s","exit":%s}\n' "$(json_str "$sha")" "$(json_num "$ncommits")" "$(json_num "$gate_s")" "$result" "$c"
+  fi
+  # this run's scratch worktree always goes (through git, never `worktree prune`: the clone is shared); the run directory with it
+  if [ -n "$run" ] && [ -d "$run" ]; then
+    [ ! -e "$run/wt/.git" ] || git -C "$top" worktree remove -f "$run/wt" >/dev/null 2>&1 || true
+    if [ "$c" = 0 ]; then rm -rf "$run"; else find "$run" -mindepth 1 -maxdepth 1 ! -name '*.log' -exec rm -rf {} + 2>/dev/null || true; fi
+  fi
+}
+trap onexit EXIT
+stop() { local code=$1; result=$2; shift 2; echo "push: $*" >&2; exit "$code"; }
+die() { stop 1 error "$*"; }
+badinput() { echo "push: $*" >&2; exit 2; }
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || badinput "not inside a git worktree"
+common=$(git -C "$top" rev-parse --path-format=absolute --git-common-dir); state=$common/spire-land; mkdir -p "$state"
+holdf=$state/hold; freezef=$state/freeze
+holdcheck() { [ ! -e "$holdf" ] || stop 14 held "HOLD in force: $(sed -n 1p "$holdf" 2>/dev/null); not landing. push --release lifts it."; }
+
+case $op in
+  hold) printf '%s (set %s)\n' "$opreason" "$(date -u +%FT%TZ)" > "$holdf"; echo "push: HOLD set: $opreason"; exit 0;;
+  release) rm -f "$holdf"; echo "push: hold released"; exit 0;;
+  freeze) [ -n "$owner" ] && [ -n "$dur" ] || badinput "--freeze needs --owner NAME and --for DURATION (a freeze has a named owner and an expiry)"
+    [[ "$dur" =~ ^([0-9]+)([smhd])$ ]] || badinput "--for takes N followed by s, m, h or d (e.g. 6h)"
+    case ${BASH_REMATCH[2]} in s) unit=1;; m) unit=60;; h) unit=3600;; *) unit=86400;; esac; secs=$(( BASH_REMATCH[1] * unit ))
+    [[ "$owner" =~ ^[A-Za-z0-9._@-]+$ ]] || badinput "--owner: letters, digits and ._@- only"
+    now=$(date +%s); printf 'owner=%s\nreason=%s\nsince=%s\nexpires=%s\n' "$owner" "$(echo "$opreason" | tr '\n' ' ')" "$now" "$((now + secs))" > "$freezef"
+    echo "push: FROZEN until $(date -u -d "@$((now + secs))" +%FT%TZ) by $owner: only a fix or a revert lands. push --thaw lifts it."; exit 0;;
+  thaw) rm -f "$freezef"; echo "push: freeze lifted"; exit 0;;
+  status) if [ -e "$holdf" ]; then echo "hold: $(sed -n 1p "$holdf")"; else echo "hold: none"; fi
+    if freeze_active "$freezef"; then echo "freeze: $(freeze_describe "$freezef")"; else echo "freeze: none"; fi
+    exit 0;;
+esac
+
+# the run's own directory: <git common dir>/spire-land/run.<pid>.<random> holds everything this run writes, so no two runs share a file.
+# Leftovers of runs that died (their pid is gone and the directory is over a day old) are swept here; a symlink or a live pid's directory is never touched.
+for d in "$state"/run.*; do
+  p=${d##*/run.}; p=${p%%.*}; [ -d "$d" ] && [ ! -L "$d" ] && [[ "$p" =~ ^[0-9]+$ ]] && [ ! -d "/proc/$p" ] && [ -n "$(find "$d" -maxdepth 0 -mmin +1440 2>/dev/null)" ] || continue
+  [ ! -e "$d/wt/.git" ] || git -C "$top" worktree remove -f "$d/wt" >/dev/null 2>&1 || true
+  rm -rf "$d"
+done
+run=$(mktemp -d "$state/run.$$.XXXXXX") || badinput "cannot create a run directory under $state"
+# fetch_main DIR: fetch main. Landers of one clone fetch into the same remote-tracking ref and git refuses the loser ("cannot lock ref"): that one transient refusal is retried, anything else is a failure.
+fetch_main() { local i rc=0
+  for i in 1 2 3 4 5 6 7 8; do
+    rc=0; git -C "$1" -c core.filesRefLockTimeout=2000 fetch -q "$remote" "$base" 2>"$run/fetch.err" || rc=$?
+    [ "$rc" != 0 ] || return 0
+    grep -q 'cannot lock ref\|\.lock' "$run/fetch.err" || break
+    sleep "0.$((RANDOM % 9 + 1))"
+  done
+  cat "$run/fetch.err" >&2; return "$rc"
+}
+
+holdcheck
+git -C "$top" remote get-url "$remote" >/dev/null 2>&1 || badinput "no remote named $remote"
+fetch_main "$top" || die "cannot fetch $remote $base"
+export LAND_TOP=$top LAND_BASE_REF=$remote/$base LAND_STATE_DIR=$state LAND_RUN_DIR=$run
+
+tip0=$(git -C "$top" rev-parse --verify -q "$rev^{commit}") || badinput "no such revision: $rev"
+commits=$(git -C "$top" rev-list --reverse --topo-order "$remote/$base..$tip0")
+[ -n "$commits" ] || badinput "nothing to land: $rev is already in $remote/$base"
+[ -z "$(git -C "$top" rev-list --merges "$remote/$base..$tip0")" ] || badinput "$rev has merge commits: history lands linear; rebase onto $remote/$base first"
+ncommits=$(wc -l <<<"$commits")
+[ "$rev" != HEAD ] || [ -z "$(git -C "$top" status --porcelain --untracked-files=no)" ] || echo "push: note: uncommitted changes in $top are not landed (only the $ncommits commit(s))" >&2
+
+# a freeze (a person's: a named owner and an expiry) stops landing but for a fix or a revert (by the subject)
+isfix=1; for c in $commits; do [[ "$(git -C "$top" log -1 --format=%s "$c")" =~ ^(fix\((ci|tests)\):|[Rr]evert) ]] || isfix=0; done
+freezecheck() { freeze_active "$freezef" || return 0
+  [ "$isfix" = 1 ] && echo "push: $base is frozen; this change is a fix or a revert: landing" || stop 14 held "$base is frozen ($(freeze_describe "$freezef")): only a fix or a revert lands"; }
+freezecheck
+
+# the scratch worktree: ours, by path. Never `git worktree prune`: the clone is shared with other lanes' worktrees.
+wt=$run/wt; git -C "$top" worktree add -q -f --detach "$wt" "$remote/$base"
+g() { git -C "$wt" "$@"; }
+while :; do
+  attempt=$((attempt + 1))
+  fetch_main "$wt" || die "cannot fetch $remote $base"
+  bsha=$(g rev-parse --verify "$remote/$base^{commit}")   # the base of THIS attempt, pinned: other landers of the clone move the shared ref under us
+  g reset -q --hard; g clean -fdq; g checkout -q --detach "$tip0"
+  if ! g rebase -q "$bsha" >/dev/null 2>&1; then
+    conflicted=$(g diff --name-only --diff-filter=U); g rebase --abort
+    stop 11 conflict "your commit(s) conflict with $base in: $(echo $conflicted | tr ' ' '\n' | LC_ALL=C sort -u | paste -sd' '). Resolve it in your worktree: git fetch $remote && git rebase $remote/$base, then land again."
+  fi
+  if [ "$(g rev-parse HEAD)" = "$bsha" ]; then already=1; sha=$bsha; break; fi   # every commit is already in main (a crash after an accepted push, a rerun): nothing to rebuild or test
+  # the gate on the exact combination, with the tool of THAT tree (main's own, plus the change when it edits the tool)
+  gate=$wt/.spire/tool/checks.sh; [ -x "$gate" ] || stop 13 gate "$wt has no .spire/tool/checks.sh: nothing could gate this landing"
+  ts=$(date +%s)
+  (cd "$wt" && "$gate" "$remote/$base") >"$run/gate.log" 2>&1 || { tail -15 "$run/gate.log" >&2; stop 13 gate "the gate fails on the rebased commits (log: $run/gate.log); nothing lands."; }
+  gate_s=$(( $(date +%s) - ts ))
+  sha=$(g rev-parse HEAD)
+  fetch_main "$wt" || die "cannot fetch $remote $base"
+  if ! g merge-base --is-ancestor "$remote/$base" HEAD; then echo "push: $base moved during the gate: rebasing and checking again (attempt $attempt)"; continue; fi
+  holdcheck; freezecheck   # the verdict is only good while nobody has held or frozen landing
+  [ "$dry" = 0 ] || break
+  if git -C "$wt" push -q "$remote" "$sha:refs/heads/$base" 2>"$run/push.log"; then break; fi   # a plain push: the remote refuses what is not a fast-forward, and that refusal is the arbiter between landers
+  # refused: ask the remote. Our commit in it = accepted after all; main moved on = lost the race, again; neither = a real refusal, not retried
+  fetch_main "$wt" || die "cannot fetch $remote $base"
+  if g merge-base --is-ancestor "$sha" "$remote/$base"; then echo "push: the push reported a failure but ${sha:0:12} is in $base: landed"; break; fi
+  sed 's/^/push: push: /' "$run/push.log" >&2
+  ! g merge-base --is-ancestor "$remote/$base" "$sha" || die "the push of ${sha:0:12} to $base was refused and $base has not moved: not retrying (the remote's reason is above)"
+  echo "push: lost the race for $base: rebasing and checking again (attempt $attempt)" >&2
+  sleep "$(awk -v n="$attempt" -v r="$RANDOM" 'BEGIN { m = n / 2; if (m > 10) m = 10; printf "%.2f", m * r / 32768 }')"   # jitter, so losers do not collide again
+done
+if [ "$already" = 1 ]; then result=landed; echo "push: already landed: every commit of $rev is in $base (${sha:0:12}); nothing to do"; exit 0; fi
+if [ "$dry" = 1 ]; then result=would-land; echo "push: dry run: would land ${sha:0:12} (gate ${gate_s}s); nothing pushed"; exit 0; fi
+result=landed
+echo "push: ${sha:0:12} is $base: $ncommits commit(s), gate ${gate_s}s"
+echo "push: your branch still holds the pre-rebase commits ($base has them rebased): start the next task from a fresh worktree off $remote/$base"

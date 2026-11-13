@@ -837,7 +837,7 @@ def _launch(args, runner, now, reserve):
             record = _record_from_create(name, body)
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
-            record["repo"], record["branch"] = repo, branch
+            record["repo"], record["branch"], record["issue"] = repo, branch, None if args.issue is None else int(args.issue)   # ask #2393: the issue names the ask the pod's end is posted on
             if stack_model:
                 record["stack_model_secret"], record["stack_model_key"] = stack_model[0], "delivered"   # the name and that it was delivered; nothing else
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
@@ -983,7 +983,7 @@ def _limits_note(args, record):
         return "%dh" % (seconds // 3600) if seconds % 3600 == 0 else "%dm" % (seconds // 60) if seconds % 60 == 0 else "%ds" % seconds
     def limit(label, value, key):
         text = str(value)[:20] if value else applied(record.get(key))
-        return "%s limit %s%s" % (label, text, "" if value else " (default)" if text != "not reported" else "")
+        return "%s limit %s%s" % (label, text, "" if value else (" (default for shape L)" if getattr(args, "shape", None) == "L" and label == "hard" else " (default)") if text != "not reported" else "")
     stops = []
     for key in ("idle_deadline", "hard_deadline"):
         try:
@@ -1430,16 +1430,15 @@ _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
 def _final_message(engine, state, record, name, reason, body=None):
-    """Ask #1788: after a successful retire, ONE message to the recorded boss: the pod, the reason, and its last text (cut, scrubbed, framed as
-    untrusted: cloud_retired.last_message). Never raises: a failed send is said in the audit and the retire goes on."""
+    """Ask #1788: after a successful retire, ONE message to the boss with the pod's last text (cloud_retired.last_message); never raises."""
     boss = record.get("reports_to")
-    if not isinstance(boss, str) or not _BOSS_NAME_RE.fullmatch(boss):
-        return
+    boss = boss if isinstance(boss, str) and _BOSS_NAME_RE.fullmatch(boss) else None   # ask #2393: a pod without a boss still has its end posted on its ask
     try:
         where = body.get("record") if isinstance(body, dict) else None   # THIS stop's record, as the launcher's answer names it (PC-7); never a lookup by name
         block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        _retired().post_end(engine, state, record, name, reason, body, H["post_ask_comment"], lambda why_: _audit(engine, "cloud.end_post_failed", name, {"why": why_}), lambda why_: _audit(engine, "cloud.end_names_unchecked", name, {"why": why_}))   # ask #2393: once, on the pod's ask
         text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
-        engine.send("switchboard", boss, text)
+        boss and engine.send("switchboard", boss, text)
     except Exception as err:
         _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
 

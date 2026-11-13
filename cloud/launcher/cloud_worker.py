@@ -412,6 +412,8 @@ def forbidden_pod_fields(pod):
 DEFAULT_IDLE = "60m"               # a create with no --idle (ask #2305: a coder pod outlives a long model wait)
 DEFAULT_ORCHESTRATOR_IDLE = "30m"  # an orchestrator keeps the older default
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
+DEFAULT_HARD = "2h"
+SHAPE_DEFAULT_HARD = {"L": DEFAULT_MAX_HARD}   # the one table of a per-shape default hard limit (a land runs 1 to 3.5 h); a shape with no row takes DEFAULT_HARD
 # The cluster-side floor: every pod carries spec.activeDeadlineSeconds = the --max-hard cap + this grace, so the kubelet
 # ends a pod even when no reaper runs. The cap, not the current hard deadline: Kubernetes lets that field be lowered on
 # a running pod but never raised, so a value at the initial hard limit would make `extend` (within the cap) a lie. The
@@ -3288,6 +3290,10 @@ class Launcher:
             if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
             check_shape(a, self.env)   # resolves an unnamed shape; before any cluster, vault or token call
+            if not a.hard:   # only a default is lowered to a smaller --max-hard; an explicit --hard is kept as given
+                a.hard = SHAPE_DEFAULT_HARD.get(a.shape, DEFAULT_HARD)
+                if parse_duration(a.hard) > parse_duration(a.max_hard) and a.shape in SHAPE_DEFAULT_HARD:
+                    a.hard = a.max_hard
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
@@ -4234,7 +4240,7 @@ class Launcher:
         """What the pod is doing NOW, read-only: ONE `kubectl exec` of the pod's `cw-pod-inspect` (one JSON line). A pod whose image has no such command
         (or whose answer is not that line) is read by the fallback: git in /work/repo and `cw-worker-activity` through exec; every other field is listed in
         `missing`. EVERY text is scrubbed here (Kube.scrub) before it is returned: nothing the pod printed leaves raw."""
-        if not NAME_RE.match(a.worker or ""):
+        if not NAME_RE.fullmatch(a.worker or ""):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         name = pod_name(a.worker)
         if not self.kube.get_pod(name):
@@ -4885,7 +4891,7 @@ class Launcher:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 raw = ann(pod, "pr-labels")
-                if not raw or (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if not raw or (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 labels = [x for x in raw.split(",") if PR_LABEL_RE.fullmatch(x)]
                 if not labels:
@@ -4941,7 +4947,7 @@ class Launcher:
         for pod in pods:
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
-                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.fullmatch(worker or ""):
                     continue
                 raw_end = ann(pod, "hard-deadline")
                 if not raw_end or ann(pod, "final-note"):
@@ -5002,7 +5008,7 @@ class Launcher:
         for pod in pods:
             worker = ann(pod, "worker")
             try:
-                if ann(pod, "persistent") is not None and (pod.get("status") or {}).get("phase") == "Running" and NAME_RE.match(worker or "") \
+                if ann(pod, "persistent") is not None and (pod.get("status") or {}).get("phase") == "Running" and NAME_RE.fullmatch(worker or "") \
                         and not self.kube.get_run_secret(pod_name(worker)):   # a persistent pod's Secret is the worker's: its absence is ONE report line
                     raise _NotRenewed("the per-run Secret of the persistent orchestrator was not found")
                 try:
@@ -5071,7 +5077,7 @@ class Launcher:
             return False
         # a persistent pod is NAME-0 but its per-run Secrets are named after the worker: found by the worker's name. Any annotation the renewal needs
         # (such as the token role) is read from the pod's own annotations, which are the pod template's.
-        persistent = ann(pod, "persistent") is not None and bool(NAME_RE.match(worker or ""))
+        persistent = ann(pod, "persistent") is not None and bool(NAME_RE.fullmatch(worker or ""))
         if persistent:
             name = pod_name(worker)
         secret = self.kube.get_run_secret(name)
@@ -5764,7 +5770,7 @@ def build_parser():
     c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
     c.add_argument("--idle", default=None, help="the idle limit; unset: %s (%s with --agent orchestrator)" % (DEFAULT_IDLE, DEFAULT_ORCHESTRATOR_IDLE))
-    c.add_argument("--hard", default="2h")
+    c.add_argument("--hard", default=None)
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))
     c.add_argument("--image")

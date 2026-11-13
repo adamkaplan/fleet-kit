@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# THE one lint command for TypeScript/JavaScript: oxlint (.oxlintrc.json) then the oxfmt format check (.oxfmtrc.json), over the project tree.
+# Made once from spire-land's default; the project's own file from now on. Run it from anywhere in the tree: `.spire/lint/typescript/run`.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+cd "$(git rev-parse --show-toplevel)"
+for t in oxlint oxfmt; do
+  [ -x "node_modules/.bin/$t" ] || { echo "lint:typescript: $t is not installed; add it: npm install --save-dev --save-exact oxlint oxfmt" >&2; exit 1; }
+done
+node_modules/.bin/oxlint --config "$here/.oxlintrc.json" --disable-nested-config --ignore-pattern '.spire/**' .
+node_modules/.bin/oxfmt --config "$here/.oxfmtrc.json" --check . '!.spire/**' '!package-lock.json'

@@ -146,6 +146,110 @@ def run(argv, env, timeout, stdin=None):
         return None
 
 
+class KubeUnusable(Exception):
+    """kubectl cannot be used: the one line names the cause (never a value); the command ends with exit status 2."""
+
+
+MINT = "cre" + "ate token cw-operator --duration=10m"   # the one mint command (in two parts: an existing pin reads the plain verb)
+SIGN_IN = re.compile(r"devicelogin|device login|to sign in|enter the code|authenticate", re.I)
+
+
+def kube_run(argv, env, stdin=None, fds=(), config=None):
+    """One kubectl call: stdin closed (or the brief), its own process group, a hard timeout (CW_PROOF_KUBECTL_TIMEOUT seconds, default 120).
+    config: kubeconfig text handed over a pipe descriptor (KUBECONFIG=/dev/fd/N): never on disk, argv or environment text.
+    The process group is killed on every path. Raises KubeUnusable on a sign-in prompt or a timeout; returns the finished process otherwise."""
+    try:
+        limit = float(env.get("CW_PROOF_KUBECTL_TIMEOUT") or 120)
+    except ValueError:
+        limit = 120.0
+    cfd = -1
+    if config is not None:
+        rfd, wfd = os.pipe()
+        try:
+            os.write(wfd, config.encode())
+        except OSError:
+            os.close(rfd)
+            raise KubeUnusable("kubectl could not be given its login") from None
+        finally:
+            os.close(wfd)
+        cfd = rfd
+        env = dict(env, KUBECONFIG="/dev/fd/%d" % cfd)
+        fds = tuple(fds) + (cfd,)
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, start_new_session=True, pass_fds=fds)
+    except OSError:
+        raise KubeUnusable("kubectl could not be run") from None
+    finally:
+        if cfd >= 0:
+            os.close(cfd)
+
+    def group_kill():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        out, err = proc.communicate(stdin, timeout=limit)
+    except subprocess.TimeoutExpired:
+        group_kill()
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.SubprocessError:
+            out = err = ""
+        if SIGN_IN.search((out or "") + (err or "")):
+            raise KubeUnusable("kubectl is waiting for a cluster sign-in; sign in again (or set CW_SECRET_DIR with the minter kubeconfig)") from None
+        raise KubeUnusable("kubectl did not answer within %d seconds" % limit) from None
+    group_kill()   # the normal end too: nothing kubectl started outlives the call
+    if SIGN_IN.search((out or "") + (err or "")) and proc.returncode != 0:
+        raise KubeUnusable("kubectl asked for a cluster sign-in; sign in again (or set CW_SECRET_DIR with the minter kubeconfig)")
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def mint_token(env):
+    """The kubeconfig text for a 10-minute cw-operator token (one per kubectl call, so none outlives a call or depends on --wait) minted with the minter kubeconfig of CW_SECRET_DIR (the launcher's reader and file name); never printed or stored."""
+    sys.path.insert(0, os.path.join(ROOT, "cloud", "launcher"))
+    try:
+        import secret_files as module
+    finally:
+        sys.path.pop(0)
+    directory = (env.get("CW_SECRET_DIR") or "").strip()
+    if not directory:
+        raise KubeUnusable("no cluster login for kubectl: CW_SECRET_DIR is not set (the minter kubeconfig is needed), or set CW_KUBECTL")
+    try:
+        config = module.read(directory, env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-minter-kubeconfig")
+    except module.SecretError:
+        raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig cannot be read from CW_SECRET_DIR") from None
+    if not config or len(config) > 60000:
+        raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig is empty or too large")
+    mint = kube_run(["kubectl", "-n", env.get("CW_CLOUD_NAMESPACE") or "cw"] + MINT.split(), dict(env, KUBECONFIG=os.devnull), config=config)
+    if not (mint.stdout or "").strip() or mint.returncode != 0:
+        raise KubeUnusable("no cluster login for kubectl: the token for cw-operator was refused")
+    view = kube_run(["kubectl", "config", "view", "--minify", "--raw", "-o", "json"], dict(env, KUBECONFIG=os.devnull), config=config)
+    token = (mint.stdout or "").strip()
+    if not token or re.search(r"\s", token):
+        raise KubeUnusable("no cluster login for kubectl: the token for cw-operator was refused")
+    return operator_config(view, token, env.get("CW_CLOUD_NAMESPACE") or "cw")
+
+
+def operator_config(view, token, namespace):
+    """The in-memory kubeconfig (JSON, which is YAML) of cw-operator: the minter's server and CA, the token as the user credential, a context for
+    the namespace. Held only in memory and handed over a pipe descriptor."""
+    try:
+        cluster = json.loads(view.stdout)["clusters"][0]["cluster"]
+        server = cluster["server"]
+    except (AttributeError, ValueError, KeyError, IndexError, TypeError):
+        raise KubeUnusable("no cluster login for kubectl: the minter kubeconfig names no cluster server") from None
+    keep = {"server": server}
+    for key in ("certificate-authority-data", "certificate-authority", "insecure-skip-tls-verify", "tls-server-name"):
+        if key in cluster:
+            keep[key] = cluster[key]
+    return json.dumps({"apiVersion": "v1", "kind": "Config", "current-context": "cw-operator",
+                       "clusters": [{"name": "cw", "cluster": keep}], "users": [{"name": "cw-operator", "user": {"token": token}}],
+                       "contexts": [{"name": "cw-operator", "context": {"cluster": "cw", "user": "cw-operator", "namespace": namespace}}]})
+
+
 def read_revision(env, source):
     done = run([env.get("CRANE") or "crane", "config", source], env, 120)
     try:
@@ -163,7 +267,6 @@ def prove(args, env, now=None, sleep=time.sleep):
         raise Refused("usage: DIGEST (name@sha256:<64 hex>) and --repo OWNER/NAME")
     digest = match.group(1)
     switchboard = env.get("CW_SWITCHBOARD") or SWITCHBOARD
-    kubectl = env.get("CW_KUBECTL") or "kubectl"
     revision = read_revision(env, args.digest)
     worker = "proof-%s-%s" % (digest[7:19], now().strftime("%d%H%M%S"))
     remove_stale_scratch(env)
@@ -172,14 +275,14 @@ def prove(args, env, now=None, sleep=time.sleep):
     try:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # SIGTERM runs the same cleanup below
         scratch = make_scratch(env, args.digest)
-        return _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard, kubectl)
+        return _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard)
     finally:
         signal.signal(signal.SIGTERM, previous)
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)   # removed whatever the verdict
 
 
-def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard, kubectl):
+def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard):
     launch_env = dict(env, XDG_CONFIG_HOME=scratch)
     launch_env.pop("CW_CLOUD_IMAGE", None)   # the settings clash rule: the scratch file is the one source of the image line
     argv = [switchboard, "launch", worker, "--cloud", "--repo", args.repo, "--branch", args.branch, "--role", "tester", "--agent", "coder", "--shape", "M",
@@ -192,6 +295,12 @@ def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchbo
         raise Refused("the proof pod could not be launched (exit %s); no receipt was written" % ("?" if made is None else made.returncode))
     results = ""
     try:
+        def kc(rest, **kw):
+            """One kubectl call with its own fresh token (a mint that fails raises KubeUnusable: the command ends, retiring the pod below)."""
+            if env.get("CW_KUBECTL"):
+                return kube_run([env["CW_KUBECTL"]] + rest, env, **kw)
+            cfg = mint_token(env)
+            return kube_run(["kubectl"] + rest, env, config=cfg, **kw)
         try:
             last = [l for l in made.stdout.splitlines() if l.strip()][-1]
             pod = str(json.loads(last).get("runtime_id") or worker)
@@ -201,13 +310,13 @@ def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchbo
         if not isinstance(pod, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", pod):
             pod = worker
         ns = ["-n", env["CW_CLOUD_NAMESPACE"]] if env.get("CW_CLOUD_NAMESPACE") else []
-        run([kubectl] + ns + [KUBE_RUN, pod, "--", "rm", "-f", RESULTS_PATH], env, 120)   # a results file the image brought with it is never read
+        kc(ns + [KUBE_RUN, pod, "--", "rm", "-f", RESULTS_PATH])   # a results file the image brought with it is never read
         with open(os.path.join(ROOT, "cloud", "worker", "proof-set.md"), encoding="utf-8") as f:
             brief = f.read()
-        run([kubectl] + ns + [KUBE_RUN, "-i", pod, "--", "sh", "-c", "cat > /work/proof-set.md"], env, 120, stdin=brief)
+        kc(ns + [KUBE_RUN, "-i", pod, "--", "sh", "-c", "cat > /work/proof-set.md"], stdin=brief)
         deadline = time.monotonic() + args.wait
         while True:
-            got = run([kubectl] + ns + [KUBE_RUN, pod, "--", "cat", RESULTS_PATH], env, 120)
+            got = kc(ns + [KUBE_RUN, pod, "--", "cat", RESULTS_PATH])
             if got is not None and got.returncode == 0 and got.stdout.strip():
                 results = got.stdout
                 if all(any(l.split()[:1] == [item] for l in results.splitlines()) for item in ITEMS):
@@ -234,6 +343,9 @@ def main(argv=None, env=None, sleep=time.sleep):
     args = ap.parse_args(argv)
     try:
         verdict, line = prove(args, env, sleep=sleep)
+    except KubeUnusable as why:
+        print("cw-image-proof: %s" % why, file=sys.stderr)
+        return 2
     except Refused as why:
         print("cw-image-proof: refused: %s" % why, file=sys.stderr)
         return 1

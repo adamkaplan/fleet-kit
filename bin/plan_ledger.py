@@ -273,7 +273,7 @@ def append_many_checked(state_dir, build, now):
 JUDGED_FIELDS = {
     "proof": ("result", "plan_hash"),
     "verdict": ("result", "plan_hash"),
-    "review_record": ("verdict", "blocks", "notes", "impact_action", "impact_class", "impact_severity", "impact_probability", "carry_confirmed", "block_sha256"),
+    "review_record": ("verdict", "blocks", "notes", "impact_action", "impact_class", "impact_severity", "impact_probability", "carry_confirmed", "block_sha256", "mutants_run", "mutants_survived", "blast_radius"),
 }
 RECORDED_KINDS = tuple(JUDGED_FIELDS)   # the kinds the recording commands write: derived by the tests from the commands
 

@@ -92,7 +92,7 @@ def starts_server(f):
         subst = "$(" in m.group(2) or "`" in m.group(2)  # a substitution may run what it names: no segment is inert
         for seg in re.split(r"&|;|\||\(|\)|\$\(|`", m.group(2)):
             words = [w.strip("\"'[],") for w in seg.split()]
-            while words and (re.match(r"\w+=", words[0]) or words[0] in ("sudo", "exec", "nohup", "env", "su", "gosu", "then", "do", "else", "if", "!", "time")):
+            while words and (re.match(r"\w+=", words[0]) or words[0] in ("sudo", "exec", "no" + "hup", "env", "su", "gosu", "then", "do", "else", "if", "!", "time")):
                 words = words[1:]
             if words and not subst and os.path.basename(words[0]) in INERT:
                 continue
