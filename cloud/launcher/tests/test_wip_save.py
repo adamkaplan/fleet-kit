@@ -438,8 +438,8 @@ class FakeKube:
 
     def exec(self, name, *args, **kw):
         self.execs.append((name,) + args)
-        self.stdins.append(kw.get("stdin"))
         if args[:4] == ("python3", "-I", "-", "--snapshot"):
+            self.stdins.append(kw.get("stdin"))   # only the save's own exec: the stall watch's read-only probe (#2444) is not a save
             if self.answer is not None:
                 return self.answer
             r = self.pod_by_name[name].snapshot()
