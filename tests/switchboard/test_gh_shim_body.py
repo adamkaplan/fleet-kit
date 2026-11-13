@@ -99,9 +99,31 @@ def forms(rig, text):
             ("api --input -", ["api", issue, "-X", "PATCH", "--input", "-"], json_text)]
 
 
-def battery(rig):
+class _Found(Exception):
+    pass
+
+
+class _Bad(list):
+    """The failures of a battery; with `until` set, the battery stops at the first failure whose text holds it (a mutant needs no more than its anchored text)."""
+    until = None
+
+    def append(self, text):
+        list.append(self, text)
+        if self.until and self.until in text:
+            raise _Found()
+
+
+def battery(rig, until=None):
     """The failures the plan's scenarios S7 and S8 find in this rig (empty for the real shim)."""
-    bad = []
+    bad = _Bad()
+    bad.until = until
+    try:
+        return _battery(rig, bad)
+    except _Found:
+        return list(bad)
+
+
+def _battery(rig, bad):
     for text in (NO_DONE, NO_INTENT, ONLY_LINE):
         for label, argv, stdin in forms(rig, text):
             done, calls, _ = rig.go(argv, stdin=stdin)
@@ -203,18 +225,18 @@ class TestGhBodyMutants(unittest.TestCase):
                ("gh_body.py", "a failed read is read as a body with no parts", "    if data is None:\n        return UNREAD_WHY % (probe.why or \"no reason given\")\n",
                 "    if data is None:\n        return None\n", "an unreadable current body passed"))
 
-    def run_with(self, name, source):
+    def run_with(self, name, source, until=None):
         rig = BodyRig(shim_source=source if name == "gh" else None, gh_body_source=source if name != "gh" else None)
         self.addCleanup(rig.close)
-        return battery(rig)
+        return battery(rig, until)
 
     def test_the_control_passes_and_each_mutant_fails_with_its_anchored_text(self):
         for name, label, old, new, text in self.MUTANTS:
             with self.subTest(mutant=label):
                 source = (SHIM_DIR / name).read_text()
-                self.assertEqual(self.run_with(name, source), [])   # the control
+                # the control (the unmutated shim passes the whole battery) is TestGhBodyGuard's first test: it is not run again for each mutant
                 self.assertEqual(source.count(old), 1, label)
-                failures = self.run_with(name, source.replace(old, new, 1))
+                failures = self.run_with(name, source.replace(old, new, 1), until=text)   # stops at the anchored text
                 self.assertTrue(any(text in f for f in failures), (label, failures))
 
 
