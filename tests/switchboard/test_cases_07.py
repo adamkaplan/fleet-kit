@@ -1877,6 +1877,15 @@ class TestHeavySlots(Base):
         self.assertEqual(err.count("already inside a slot"), 3)
         self.assertNotIn("no slot after", err)
 
+    def test_a_heavy_that_ran_without_a_slot_still_marks_its_command_so_a_nested_heavy_runs_directly(self):   # #2387: bin/test-switchboard re-wraps itself under heavy; without the marker each level wrapped the next, forever
+        self.state().chmod(0o755)   # a state directory that is not private: no slot, the command still runs
+        inner = " ".join(['"%s"' % sys.executable, '"%s"' % SWITCHBOARD, "heavy", "--", "sh", "-c", "'echo level-2'"])
+        proc = self.start("sh", "-c", inner)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual((proc.returncode, out.strip()), (0, "level-2"), err)
+        self.assertEqual(err.count("running without one"), 1, "the outer heavy found no slot; the inner one did not try again")
+        self.assertEqual(err.count("already inside a slot"), 1, err)
+
     def test_heavy_off_runs_the_command_directly_with_no_slot_and_no_line(self):
         out = self.home / "off-out"
         proc = self.start("sh", "-c", 'echo "$FLEET_HEAVY_SLOT" > "%s"' % out, env=self.env(FLEET_HEAVY="off"))
