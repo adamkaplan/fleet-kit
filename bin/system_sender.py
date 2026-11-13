@@ -12,7 +12,7 @@ or `--from` cannot make the parent process the reaper. Standard library only. No
 import os
 import subprocess
 
-SYSTEM_SENDER_ENV = "FLEET_SWITCHBOARD_SYSTEM_SENDER"   # names the claimed sender; it is not a credential and proves nothing
+SYSTEM_SENDER_ENV = "SWITCHBOARD_SYSTEM_SENDER"   # names the claimed sender; it is not a credential and proves nothing
 
 # name -> the one program that is that sender, the one word that program must be run with, and who it may write to
 SYSTEM_SENDERS = {

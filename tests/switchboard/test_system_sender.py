@@ -19,7 +19,7 @@ from support.loader import captured, sb
 from support.paths import REPO
 from support.wire_fakes import FAKE_HERDR, FAKE_OPENCODE
 
-ENV = "FLEET_SWITCHBOARD_SYSTEM_SENDER"
+ENV = "SWITCHBOARD_SYSTEM_SENDER"
 NAME = "cloud-reaper"
 SYSTEM = sb.load_module("system_sender")
 
