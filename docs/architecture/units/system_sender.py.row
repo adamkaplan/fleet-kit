@@ -1,0 +1,1 @@
+| `system_sender.py` | 2 | the registry of system senders (the cloud reaper) and the proof that the calling process IS one: the parent process read from the operating system, never a variable (#2518) | |

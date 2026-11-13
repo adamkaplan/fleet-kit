@@ -383,6 +383,7 @@ class TestPlatformPaths(unittest.TestCase):
         "bin/switchboard/job_runs.py": "a part cut out of bin/fleet-switchboard; portable ps -o ... -p PID call, which also exists on Linux",
         "bin/cloud_cluster.py": "portable ps -o ... -p PID call, which also exists on Linux",
         "bin/guard_record_head_move.py": "portable ps -o ... -p PID call, which also exists on Linux",
+        "bin/system_sender.py": "portable ps -ww -o ... -p PID fallback when /proc is absent, which also exists on Linux",
     }
 
     @staticmethod
