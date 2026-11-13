@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,9 +46,8 @@ def write(root, rel, text, mode=None):
         path.chmod(mode)
 
 
-def fixture():
+def _build_fixture(root):
     """A repository with one module `lib/calc.py` that two suites run: one by import, one by its command name `calc-cli`."""
-    root = tempfile.mkdtemp(prefix="ps-fixture-")
     git(root, "init", "-q", "-b", "main")
     write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return a + b\n")
     write(root, "bin/calc-cli", "#!/usr/bin/env python3\nimport sys; sys.path.insert(0, 'lib')\nimport calc\nprint(calc.add(1, 2))\n", 0o755)
@@ -56,6 +56,20 @@ def fixture():
     write(root, "docs/notes.md", "nothing\n")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "base")
+
+
+_FIXTURE_TEMPLATE = []
+
+
+def fixture():
+    """A fresh copy of the base repository, built once for this process (a git init and commit each time cost most of a fixture)."""
+    if not _FIXTURE_TEMPLATE:
+        template = tempfile.mkdtemp(prefix="ps-template-")
+        _build_fixture(template)
+        _FIXTURE_TEMPLATE.append(template)
+    root = tempfile.mkdtemp(prefix="ps-fixture-")
+    shutil.rmtree(root)
+    shutil.copytree(_FIXTURE_TEMPLATE[0], root, symlinks=True)
     return root
 
 

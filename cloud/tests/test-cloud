@@ -234,12 +234,11 @@ cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
 TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=1 POLL=0.2 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
 [ $rc = 1 ] && [ "$(restarts)" = 2 ] && [ "$(grep -c 'rolling back' "$tmp/err")" = 1 ] && [ ! -e "$ip" ] && cmp -s "$tmp/orig" "$tmp/config.toml" \
   && ok "fix: normal rollback is not repeated by the trap (2 restarts, 1 rollback)" || bad "fix: double rollback (rc=$rc restarts=$(restarts))"
-# (a, b) SIGTERM / SIGINT during the first wait: the trap restores byte for byte, restarts, checks, exits non-zero, no label
-for sig in TERM INT; do
+# (a) SIGTERM during the first wait (SIGINT is not sent: a background job of a non-interactive shell ignores it, and a shell cannot re-enable a signal ignored on entry): the trap restores byte for byte, restarts, checks, exits non-zero, no label
+for sig in TERM; do
   cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
-  # a non-interactive shell starts background jobs with INT ignored: re-enable it, as a pod's PID 1 has it
   TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=30 POLL=1 \
-    sh -c 'trap - INT; exec sh "$0"' "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err" &
+    sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err" &
   pid=$!; i=0
   while ! grep -q 'ctr version' "$tmp/log" && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
   [ $i -lt 200 ] || { bad "fix: SIG$sig test: the first probe never started"; kill -9 $pid; }
