@@ -49,62 +49,11 @@ class Alert(tea.World):
 
     def test_a_fresh_finished_results_file_gets_no_note(self):
         text = self.deliver({"done": True, "state": "done", "text": "STATUS: done"}, tea.real)
-        self.assertIn("its results file says STATUS: done", text)
         self.assertNotIn("Results:", text)
 
 
 class Watch(unittest.TestCase):
-    def pass_for(self, results, mtime="unset", age=60, module=sw, patch=None):
-        w = tsw.World()
-        w.add(progress_age=60)   # quiet for an hour: progress-stale fires unless the pod is finished
-        inner = w.pods["w1-pod"]["probe"]
-
-        def probe(now):
-            d = dict(inner(now), results=results)
-            started = w.now.timestamp() - age * 60
-            if mtime != "unset" and mtime is not None:
-                d["results_mtime"] = started + mtime
-            return d
-        w.pods["w1-pod"]["probe"] = probe
-        return [c for _, c in w.run(module)]
-
-    def cases(self, module=sw):
-        stale = self.pass_for("STATUS: done", -60, module=module)
-        self.assertEqual(stale, ["progress-stale"], "a stale results file kept the pod from being called stalled")
-        self.assertEqual(self.pass_for("STATUS: done", 60, module=module), [], "a fresh results file did not finish the pod")
-        self.assertEqual(self.pass_for("STATUS: done", 0, module=module), ["progress-stale"], "mtime equal to the start counted as fresh")
-        self.assertEqual(self.pass_for("STATUS: done", None, module=module), [], "an absent mtime was held against the file")
-
-    def test_watch_pass_end_to_end(self):
-        self.cases()
-
-    def test_started_not_set_in_watch_pass_is_caught(self):
-        mod = mutate_module(sw.__file__, '            data["started"] = started.timestamp()', "            pass", "sw_nostart")
-        with self.assertRaisesRegex(AssertionError, "a stale results file kept the pod"):
-            self.cases(mod)
-
-    def test_decide_ignoring_the_probes_mtime_is_caught(self):
-        mod = mutate_module(sw.__file__, '_num(data.get("results_mtime"))', "None", "sw_nomtime")
-        with self.assertRaisesRegex(AssertionError, "a stale results file kept the pod"):
-            self.cases(mod)
-
-    def test_the_boundary_flipped_is_caught(self):
-        real = rr.results_verdict
-        mod = mutate_module(rr.__file__, "not mtime > start", "mtime < start", "rr_flip")
-        rr.results_verdict = mod.results_verdict
-        try:
-            with self.assertRaisesRegex(AssertionError, "mtime equal to the start counted as fresh"):
-                self.cases()
-        finally:
-            rr.results_verdict = real
-
-    def test_unknown_start_is_not_held_against_the_file(self):
-        data = {"now": 9000, "results": "STATUS: done", "results_mtime": 10, "progress": {"mtime": 0, "tail": ["x"]}}
-        self.assertEqual(sw.decide(data), {})
-        self.assertEqual(list(sw.decide(dict(data, started=500))), ["progress-stale"])
-        self.assertEqual(sw.decide(dict(data, started=5)), {})
-        self.assertEqual(list(sw.decide(dict(data, started=10))), ["progress-stale"])
-
+    # ask #2443: the stall watch no longer decides "finished" from results.txt text (the structural turn state does), so the pass-level finish cases of ask #2472 are gone.
     def test_the_probe_reports_the_results_mtime_and_a_missing_file_has_none(self):
         d = tempfile.mkdtemp(prefix="probe-")
         path = os.path.join(d, "results.txt")

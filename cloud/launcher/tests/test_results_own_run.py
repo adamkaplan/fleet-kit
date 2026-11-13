@@ -45,7 +45,6 @@ class Own(trr.Record):
     def test_s3_a_file_written_by_this_run_says_done(self):
         found = self.results(DONE_LAST, NEW)
         self.assertEqual((found["state"], found["done"]), ("done", True))
-        self.assertIn("its results file says STATUS: done", self.notice(found))
 
     def test_s4_a_marker_that_is_not_the_last_line_is_unfinished(self):
         found = self.results(DONE_FIRST, NEW)
@@ -73,11 +72,6 @@ class Own(trr.Record):
                 check()
         finally:
             rr.results_verdict = real
-
-    def test_the_stall_watch_shares_the_rule(self):
-        data = {"now": 9000, "results": "status: DONE", "results_mtime": OLD, "started": 5000}
-        self.assertFalse(sw._results_done(data))
-        self.assertTrue(sw._results_done(dict(data, results_mtime=6000)))
 
 
 for _n in dir(trr.Record):   # the inherited tests are that file's own, not run again here

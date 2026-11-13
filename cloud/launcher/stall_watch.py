@@ -11,13 +11,14 @@ the send, as the minute-40 note does; when the send reached nobody the mark is m
                     line occurs 3 times in the progress file's last 10 lines
   failed-run-idle   a run's exit file holds a non-zero number and neither the progress file nor the agent session changed for 10 minutes after the exit file's time
 
-A pod that has finished (the progress file's last line is `done` or `STATUS: done`, or /work/results.txt's last line is `STATUS: done`; any case) is not stalled for progress-stale and failed-run-idle (refusal still fires).
+A pod whose server reports the session idle (ask #2443; see `classify`) is not stalled for progress-stale and failed-run-idle: its boss got the idle notice (refusal still fires). The text lines `done` and `STATUS: done` decide nothing.
 A pod younger than 10 minutes or a pod whose exec fails is skipped; the pass line names it (pod and reason, no pod content). The message holds the pod
 name, the condition, one evidence line (secret-looking text and the pod's token replaced by [redacted], at most 300 characters; untrusted data, never a
 command) and the time. Pod text is never run.
 """
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 CHIEF = "cos"                      # the Chief of Staff's switchboard name when the config names none (`remind cos`)
 CONFIG_KEY = "cos_name"            # the switchboard config's key (config.json) that names the Chief of Staff's agent, when it has one
 STALL_ASK = "adamkaplan/fl" "eet-kit#2399"   # the stall watch's own ask: the switchboard's `send` needs --issue (every message names its ask)
+IDLE_NOTICE_MIN_SECONDS = 120      # ask #2443: a pod's idle notices are at least this far apart (the key comes from the pod's own server: a looping pod cannot flood its boss)
 RETRY_SECONDS = 10 * 60            # an alert that reached nobody is tried again at the next pass at least this long after
 MIN_POD_AGE_SECONDS = 600          # a younger pod is not read
 PASS_BUDGET_SECONDS = 90           # the pass reads no more pods once its reads have taken this long (the rest wait for the next pass)
@@ -39,6 +41,7 @@ REPEAT_WINDOW = 10                 # ... in this many last lines
 REALERT_SECONDS = 60 * 60          # once per condition per pod per this long
 EVIDENCE_MAX = 300
 CONDITIONS = ("progress-stale", "refusal", "failed-run-idle")
+IDLE_ACTION = "idle-notice"        # ask #2443: the audit action of one idle notice (the daemon sends it to the boss, bin/cloud_end_alert.py scan_idle)
 ALERT_ACTION = "stall-alert"       # the audit action of one alert; the switchboard daemon reads it and sends the messages (bin/cloud_end_alert.py scan_stall)
 REFUSAL_WORDS = re.compile(r"Permission denied: shell|permission\.rejected|^\s*(?:refused:|Blocked:|Blocked at)")
 ERROR_LINE = re.compile(r"error|fail|exception|denied|refused|cannot|unable|not found", re.I)
@@ -46,7 +49,7 @@ ERROR_LINE = re.compile(r"error|fail|exception|denied|refused|cannot|unable|not 
 # Run INSIDE the pod by `kubectl exec python3 -c <this>`. Reads only: the progress file (mtime, last 10 lines), /work/runs (per file name, mtime and the last
 # line of a log, the number of an exit file) and the agent session's last non-user message (at most 400 characters) from the pod's own server. Prints ONE JSON line.
 PROBE_CODE = r'''
-import base64, json, os, sys, time, urllib.parse, urllib.request
+import base64, json, os, re, sys, time, urllib.parse, urllib.request
 def tail(p, n):
     try:
         with open(p, "rb") as f:
@@ -54,13 +57,15 @@ def tail(p, n):
             return [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()][-n:]
     except OSError:
         return None
-out = {"now": time.time(), "results": "", "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None, "updated": None, "activity": None, "running": None}
+out = {"now": time.time(), "results": "", "results_exists": False, "progress": None, "runs": [], "exits": [], "msg": "", "msg_time": None, "turn": {"turn": "unknown", "outcome": None, "finish": None},
+       "idle": None, "active_read": False, "session_updated": None, "turn_start": None, "ahead": None, "updated": None, "activity": None, "running": None}
 try:
     p = "/work/progress.txt"
     out["progress"] = {"mtime": os.path.getmtime(p), "tail": [l[:400] for l in (tail(p, 10) or [])]}
 except OSError:
     pass
-out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]
+out["results"] = ((tail("/work/results.txt", 1) or [""])[0])[:200]   # text for humans: decides nothing
+out["results_exists"] = os.path.isfile("/work/results.txt") and not os.path.islink("/work/results.txt")   # the deliverable as structure
 try:
     out["results_mtime"] = os.path.getmtime("/work/results.txt")
 except OSError:
@@ -114,6 +119,8 @@ try:
                 if m.get("type") == "user" or info.get("role") == "user":
                     continue
                 text = m.get("text") or info.get("text") or ""
+                if not text and isinstance(m.get("content"), list):   # the v2 assistant message: its text blocks are in `content`
+                    text = " ".join(str(x.get("text") or "") for x in m["content"] if isinstance(x, dict) and x.get("type") == "text")
                 if not text and isinstance(m.get("parts"), list):
                     text = " ".join(str(x.get("text") or "") for x in m["parts"] if isinstance(x, dict))
                 t = (info.get("time") or {}).get("created")
@@ -131,6 +138,39 @@ try:
                 break
             q = "?cursor=" + urllib.parse.quote(str(nxt))
         out["msg"] = best[-400:]
+        # ask #2443: the structural turn state, as cloud/worker/activity.py turn_state reads it (the same three answers; anything odd stays unknown)
+        def newest(kind):
+            it = get("/api/session/%s/message?limit=1&order=desc&type=%s" % (ss[-1]["id"], kind)).get("data")
+            if not it:
+                return None
+            if not isinstance(it, list) or not isinstance(it[0], dict) or it[0].get("type") != kind or not isinstance((it[0].get("time") or {}).get("created"), (int, float)):
+                raise ValueError("odd")
+            return it[0]
+        act = get("/api/session/active").get("data")
+        if isinstance(act, (dict, list)) and re.fullmatch(r"[A-Za-z0-9_]{1,80}", str(ss[-1]["id"])):
+            if (act if isinstance(act, list) else [v for v in act.values() if not isinstance(v, dict) or v.get("type") in (None, "running")]):
+                out["turn"] = {"turn": "running", "outcome": None, "finish": None}
+            else:
+                out["active_read"] = True   # the server says: not running (an unreadable turn below is then "idle state unknown", not silence)
+                out["session_updated"] = ss[-1].get("time", {}).get("updated") if isinstance(ss[-1].get("time"), dict) else None
+                idle, asst = newest("idle"), newest("assistant")
+                fin = asst.get("finish") if asst else None
+                if idle and idle.get("outcome") in ("succeeded", "failed", "interrupted") and (fin is None or fin in ("stop", "length", "tool-calls", "content-filter", "error", "unknown")) and not (asst and asst["time"]["created"] > idle["time"]["created"]):
+                    out["turn"] = {"turn": "idle", "outcome": idle["outcome"], "finish": fin}
+                    if isinstance(idle.get("id"), str) and re.fullmatch(r"msg_[A-Za-z0-9_]{1,80}", idle["id"]):
+                        out["idle"] = {"id": idle["id"], "created": idle["time"]["created"]}
+                    usr = newest("user")   # the turn began with the newest user message: a report made after it belongs to this turn
+                    out["turn_start"] = usr["time"]["created"] if usr else None
+except Exception:
+    pass
+try:   # commits ahead of the default branch, a local read (no network): evidence of a deliverable, never a gate
+    import subprocess
+    for d in (os.environ.get("CW_WORKDIR"), "/home/worker", "/work/repo"):
+        if d and os.path.isdir(os.path.join(d, ".git")):
+            r = subprocess.run(["git", "-C", d, "rev-list", "--count", "origin/HEAD..HEAD"], capture_output=True, text=True, timeout=1)
+            if r.returncode == 0 and r.stdout.strip().isdigit():
+                out["ahead"] = int(r.stdout.strip())
+                break
 except Exception:
     pass
 print(json.dumps(out))
@@ -169,7 +209,21 @@ def _ann(pod, key, default=None):
 
 
 def _num(v):
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    """A finite number or None (a pod's answer is untrusted: NaN and infinity read as no number)."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+TURN_VALUES = {"turn": ("running", "idle", "unknown"), "outcome": ("succeeded", "failed", "interrupted", None), "finish": ("stop", "length", "tool-calls", "content-filter", "error", "unknown", None)}
+
+
+def classify(data):
+    """The pod's state from what its server reported (ask #2443): "running" (the session is active), "idle" (not active, the last idle message and assistant finish are
+    readable) or "unknown" (anything unreadable or off the schema's values: never idle by guess). Text lines decide nothing. An idle pod is told to its boss at once by
+    the idle notice (`idle_notice`); the stall conditions below are only the backstop for a session that never goes idle (running, or unreadable)."""
+    turn = data.get("turn")
+    if not isinstance(turn, dict) or any(turn.get(k) not in TURN_VALUES[k] for k in TURN_VALUES):
+        return "unknown"
+    return turn["turn"] if turn["turn"] in ("running", "idle") else "unknown"
 
 
 RUNNING_QUIET_SECONDS = 30 * 60    # a running turn with no new message or tool call for this long no longer silences a condition (a turn hung inside one tool call)
@@ -196,12 +250,6 @@ def session_state(data, now, threshold):
     return False, ""
 
 
-def _results_done(data):
-    """Ask #2472: the run record's one rule (last non-empty line, and newer than the pod's start when both times are known)."""
-    from run_record import results_verdict
-    return results_verdict(str(data.get("results") or ""), _num(data.get("results_mtime")), _num(data.get("started")), nocase=True) == "done"
-
-
 def decide(data):
     """{condition: evidence text} for the three conditions, from the probe's answer. Pure: times are the pod's own clock (`now` in the answer)."""
     now = _num(data.get("now"))
@@ -217,13 +265,12 @@ def decide(data):
     stime = _num(data.get("msg_time"))
     if stime is not None and not (stime <= now + 60 and abs(stime) != float("inf")):   # a future or non-finite session time is read as missing (a pod could write any value)
         stime = None
-    # A pod that declared itself finished is not stalled for (a) and (c): its progress file's last line is `done` or `STATUS: done`, or results.txt's last line is `STATUS: done`.
-    # (b) refusal is unchanged and still fires for a finished pod.
-    last_p = tail[-1].strip().lower() if tail else ""
-    finished = last_p in ("done", "status: done") or _results_done(data)
     # (a)
     times = [t for t in [ptime] + [_num(r["mtime"]) for r in runs] if t is not None]
     active = any(r.get("name") not in exited and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS for r in runs)
+    # Ask #2443: a pod whose server reports the session idle is not "stalled": its boss got the idle notice. (a) and (c) are the backstop for a session that never goes idle
+    # (running, or an unreadable answer); no text line decides anything. (b) refusal still fires.
+    finished = classify(data) == "idle"
     if not finished and times and not active and now - max(times) >= STALE_SECONDS:
         working, why = session_state(data, now, STALE_SECONDS)
         if not working:
@@ -255,6 +302,29 @@ def decide(data):
             log = next((r.get("last") for r in runs if r.get("name") == e.get("name")), "") or ""
             found["failed-run-idle"] = "run %s exited %s; no change for %d minutes%s; last log line: %s" % (str(e.get("name"))[:60], str(e.get("code"))[:6], (now - moved) // 60, "" if working is False else " (decided from the files: %s)" % why, log)
     return found
+
+
+def idle_notice(data):
+    """Ask #2443: the idle notice of a pod's probe answer, or None. A session the server reports idle (not active; readable last idle message) gives state "idle", keyed by the
+    idle message's id (one notice per idle); a session the server reports not running whose turn cannot be read gives state "unknown" ("idle state unknown"), keyed by the
+    session's update time; a running session, or an answer that does not even say whether it runs, gives None (never a guess). Evidence only: results file, commits ahead, jobs."""
+    cls, idle = classify(data), data.get("idle")
+    if cls == "idle" and isinstance(idle, dict) and isinstance(idle.get("id"), str) and re.fullmatch(r"msg_[A-Za-z0-9_]{1,80}", idle["id"]):
+        state, key = "idle", idle["id"]
+    elif cls != "running" and data.get("active_read") is True and _num(data.get("session_updated")) is not None:
+        state, key = "unknown", "u%d" % int(_num(data["session_updated"]))
+    else:
+        return None
+    now = _num(data.get("now"))
+    runs = [r for r in (data.get("runs") or []) if isinstance(r, dict) and _num(r.get("mtime")) is not None]
+    exited = {e.get("name") for e in (data.get("exits") or []) if isinstance(e, dict)}
+    jobs = [str(r.get("name"))[:40] for r in runs if r.get("name") not in exited and now is not None and now - _num(r["mtime"]) < RUN_ACTIVE_SECONDS][:5]
+    start, ahead = _num(data.get("turn_start")), data.get("ahead")
+    turn = data["turn"] if state == "idle" else {"outcome": None, "finish": None}
+    return {"key": key, "state": state, "outcome": turn.get("outcome"), "finish": turn.get("finish"), "jobs": jobs,
+            "turn_start": int(start / 1000 if start > 1e11 else start) if start is not None else None,
+            "results_exists": data.get("results_exists") if isinstance(data.get("results_exists"), bool) else None,
+            "ahead": ahead if isinstance(ahead, int) and not isinstance(ahead, bool) and 0 <= ahead < 10**6 else None, "text": str(data.get("msg") or "")}
 
 
 def cos_name(launcher):
@@ -299,6 +369,36 @@ def boss_of(launcher, worker):
     return boss if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) else None
 
 
+def _idle_notice_send(launcher, pod, worker, name, data, now):
+    """Ask #2443: ONE `idle-notice` audit line per idle of a pod (the key is the idle message's id, kept in the pod annotation cw/idle-notice BEFORE the send; a line that could not be
+    written puts the old mark back so the next pass tries again). The daemon adds the pod's last report and sends the message to the boss. Returns True when a line was written."""
+    try:
+        note = idle_notice(data)
+    except Exception:   # the pod's answer is untrusted: whatever it holds, the stall conditions after this call still run
+        return False
+    if note is None or _ann(pod, "idle-notice") == note["key"]:
+        return False
+    last = launcher_parse(_ann(pod, "idle-notice-at"))
+    if last is not None and 0 <= (now - last).total_seconds() < IDLE_NOTICE_MIN_SECONDS:
+        return False   # too soon after this pod's last notice: the next pass tells the newest idle
+    kube, uid = launcher.kube, (pod.get("metadata") or {}).get("uid")
+    scrub = (lambda t: kube.scrub(t, 3000)) if callable(getattr(kube, "scrub", None)) else (lambda t: t)
+    boss = boss_of(launcher, worker)
+    kube.annotate(name, uid, idle_notice=note["key"], idle_notice_at=launcher_iso(now))   # BEFORE the send
+    try:
+        wrote = launcher.audit(worker, "pod/" + name, IDLE_ACTION, 0.0, True, "",
+                               extra={"idle": note["key"], "state": note["state"], "outcome": note["outcome"], "finish": note["finish"], "turn_start": note["turn_start"],
+                                      "evidence": evidence(scrub(note["text"])), "jobs": note["jobs"], "results_exists": note["results_exists"], "ahead": note["ahead"],
+                                      "recipients": [boss] if boss else [], "ask": ask_of(launcher, worker)})
+        ok = wrote is not False
+    except Exception as e:
+        print("cloud-worker: idle notice for %s not recorded: %s" % (name, type(e).__name__), file=sys.stderr)
+        ok = False
+    if not ok:
+        kube.annotate(name, uid, idle_notice=_ann(pod, "idle-notice") or "none", idle_notice_at=_ann(pod, "idle-notice-at") or "none")
+    return ok
+
+
 def watch_pass(launcher, pods, now, name_ok):
     """One pass over the pods the reaper holds: ONE exec per pod older than 10 minutes, the alerts decided from its answer. Sets launcher.stall_counts to
     {"read": n, "alerted": m} for the pass line. Never raises, never stops or changes a pod. Returns the (pod, condition) pairs alerted, for the tests."""
@@ -315,9 +415,9 @@ def watch_pass(launcher, pods, now, name_ok):
             if started is None:
                 counts["skipped"].append("%s:%s" % (name, "no-readable-start-time"))
                 continue
-            if (now - started).total_seconds() < MIN_POD_AGE_SECONDS:
+            young = (now - started).total_seconds() < MIN_POD_AGE_SECONDS
+            if young:   # the stall conditions wait for 10 minutes of age; the idle notice does not (a quick task is idle early)
                 counts["skipped"].append("%s:%s" % (name, "younger-than-10-minutes"))
-                continue
             if time.monotonic() - began > PASS_BUDGET_SECONDS:
                 counts["skipped"].append("%s:%s" % (name, "read-budget-used"))
                 continue
@@ -326,9 +426,15 @@ def watch_pass(launcher, pods, now, name_ok):
                 if not isinstance(data, dict):
                     raise ValueError("not an object")
             except Exception:
-                counts["skipped"].append("%s:%s" % (name, "the-read-failed"))
+                if not young:
+                    counts["skipped"].append("%s:%s" % (name, "the-read-failed"))
                 continue
-            counts["read"] += 1
+            if not young:
+                counts["read"] += 1
+            if _idle_notice_send(launcher, pod, worker, name, data, now):
+                counts["notices"] = counts.get("notices", 0) + 1
+            if young:
+                continue
             data["started"] = started.timestamp()   # ask #2472: results.txt older than this is an earlier run's
             for condition, text in decide(data).items():
                 mark = _ann(pod, "stall-alert-" + condition)
