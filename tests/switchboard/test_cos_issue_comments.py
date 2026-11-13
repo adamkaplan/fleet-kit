@@ -55,7 +55,9 @@ class TestCosIssueComments(Base):
         self.assertEqual([t[:2] for t in self.told()], [("github.comment:5003", "chief")])
         self.gh.issues[31] = dict(self.gh.issues[30], number=31, id=9031, user={"login": "acct-a"})
         self.gh.comment(31, "hello", 5004, login="reviewer-1")
-        self.assertEqual([t[0] for t in self.told()], ["github.comment:5003"])
+        got = {t[0]: t[2] for t in self.told()}   # ask #2484: another account's issue is not the Chief's issue, but the comment still reaches the Chief, with that reason
+        self.assertNotIn("an issue the Chief of Staff authored", got["github.comment:5004"])
+        self.assertIn("no lane owns the issue", got["github.comment:5004"])
 
     def test_s3_a_repeated_delivery_routes_once(self):
         for _ in range(3):
@@ -70,7 +72,8 @@ class TestCosIssueComments(Base):
         comment = self.gh.comments[-1]
         for n in range(2):
             self.gh.send("issue_comment", {"action": "created", "issue": issue, "comment": comment}, delivery="d-%d" % n)
-        self.assertEqual(self.told(), [])
+        self.assertEqual([t[:2] for t in self.told()], [("github.comment:5006", "chief")])   # ask #2484: delivered with the reason, never to nobody
+        self.assertIn("no readable author", self.told()[0][2])
         self.assertEqual(len(self.audit("github.comment.chief_unknown")), 1)
 
     def test_s3_a_failed_read_of_the_issue_routes_nothing_and_audits_once(self):
@@ -79,15 +82,15 @@ class TestCosIssueComments(Base):
         self.hub.queue[item.key] = item
         self.gh.api_down = True
         self.hub.facts()
-        self.assertEqual(self.told(), [])
+        self.assertEqual(self.told(), [])   # the read itself failed: the comment stays queued and is asked again (and the one audit line is said once)
         self.assertEqual(len(self.audit("github.comment.chief_unknown")), 1)
 
-    def test_s3_no_account_and_no_signature_routes_nothing_and_audits_as_unowned(self):
+    def test_s3_no_account_and_no_signature_goes_to_the_chief_with_the_reason(self):
         self.start({})
-        self.gh.comment(30, "hello", 5008, login="reviewer-1")
-        self.assertEqual(self.told(), [])
-        self.assertEqual(self.audit("github.comment.chief_unknown"), [])
-        self.assertEqual([e["detail"]["keys"][0] for e in self.audit("github.unrouted")], ["github.comment:5008"])
+        self.gh.comment(30, "hello", 5008, login="reviewer-1")   # ask #2484: was dropped as unowned, now delivered
+        self.assertEqual([t[:2] for t in self.told()], [("github.comment:5008", "chief")])
+        self.assertEqual(len(self.audit("github.comment.chief_unknown")), 1)
+        self.assertEqual(self.audit("github.unrouted"), [])
 
     def test_s4_control_the_current_routing_sends_the_first_case_to_nobody(self):
         with mock.patch.object(sb.GitHubHub, "_chief_route", lambda hub, item, agents, now: (None, None, False)):

@@ -25,10 +25,7 @@ sys.path.insert(0, HERE)
 import test_cloud_worker as tcw  # noqa: E402
 import test_retire_gone_pod as trg  # noqa: E402
 
-_loader = importlib.machinery.SourceFileLoader("test_cloud_worker_bin", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "bin", "test-cloud-worker"))
-tcwb = importlib.util.module_from_spec(importlib.util.spec_from_loader("test_cloud_worker_bin", _loader))
-sys.modules["test_cloud_worker_bin"] = tcwb
-_loader.exec_module(tcwb)
+tcwb = trg.tcwb   # loaded once, in test_retire_gone_pod
 sb = tcwb.sb
 
 cw, sbcw = tcw.cw, trg.sbcw

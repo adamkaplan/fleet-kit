@@ -1271,11 +1271,12 @@ def delegated_clear_checks(engine, runner, now, kind, number):
         return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", line), "threshold": threshold, "source": module.OWNER_FILE}, None
     try:
         reader = _intent_reader(runner, now)
-        text = module.order_text(fetch_orders(reader, charter, engine.config.get("intent_repo")), number)
+        charter_repo = module.charter_repo(engine.config, engine.config.get("intent_repo"))   # delegated_clear.repo, else intent_repo as before
+        text = module.order_text(fetch_orders(reader, charter, charter_repo), number)
     except (IntentError, ConfigError, OSError) as err:
         return None, "the charter's orders cannot be read (%s): refused" % module.whole_line(str(err))
     if text is None:
-        return None, "order %d does not exist on charter #%d" % (number, charter)
+        return None, "order %d does not exist on charter %s#%d" % (number, charter_repo, charter)
     if module.order_hash(text) != orders[number]:   # the order numbers are POSITIONS: the text bound in the configuration must still be the text at that number
         return None, "the text of order %d is no longer the one the configuration is bound to (an order was edited, inserted or removed): the owner re-binds it" % number
     return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text), "threshold": threshold}, None

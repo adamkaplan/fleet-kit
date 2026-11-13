@@ -7,12 +7,15 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "worker", "tests"))
+import stub_support  # noqa: E402
 FRONT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "cloud", "copilot-bridge", "bridge-front.mjs")
 NODE = shutil.which("node")
 BANNED = "model banned from the council: opus"
@@ -62,11 +65,11 @@ def free_port():
 class Running:
     """One front process; its standard output is the log."""
 
-    def __init__(self, script, fake, **env):
+    def __init__(self, test, script, fake, **env):
         self.port = free_port()
         e = {"PATH": os.environ.get("PATH", ""), "BRIDGE_FRONT_PORT": str(self.port), "BRIDGE_FRONT_HOST": "127.0.0.1", "BRIDGE_UPSTREAM_PORT": str(fake.port)}
         e.update({k: str(v) for k, v in env.items()})
-        self.proc = subprocess.Popen([NODE, script], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.proc = stub_support.start(test, [NODE, script], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.lines = [self.proc.stdout.readline()]   # the "listening" line
         assert "listening" in self.lines[0], self.lines[0]
         self.reader = threading.Thread(target=self._read, daemon=True)   # the log is collected as it is written
@@ -117,7 +120,7 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def run_front(self, script=FRONT, **env):
-        r = Running(script, self.fake, **env)
+        r = Running(self, script, self.fake, **env)
         self.addCleanup(r.stop)
         return r
 
@@ -223,7 +226,7 @@ def log_problems(script, test):
     """Drive requests that carry a body text and a token-shaped string; the problems found in the front's log (empty = clean)."""
     fake = Fake()
     try:
-        f = Running(script, fake)
+        f = Running(test, script, fake)
         try:
             f.request("POST", "/chat/completions", chat("gpt-4o", text=BODY_TEXT + " " + TOKEN), {"Authorization": "Bearer " + TOKEN})
             f.request("POST", "/chat/completions", chat("claude-opus-5", text=BODY_TEXT), {"Authorization": "Bearer " + TOKEN})
