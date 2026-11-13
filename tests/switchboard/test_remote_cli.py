@@ -105,10 +105,14 @@ class TestRemoteCli(Base):
     def test_the_token_command_runs_once_without_a_shell_and_with_a_limit(self):
         self.launch()
         (argv, kw), = self.calls
-        self.assertEqual(argv, ["mint-token", "acme/widget-api", "--fd", "{fd}"])
+        self.assertEqual(argv[:3], ["mint-token", "acme/widget-api", "--fd"])
         self.assertIs(kw["shell"], False)
         self.assertEqual(kw["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kw["stdout"], subprocess.DEVNULL)
+        self.assertEqual(kw["pass_fds"], (int(argv[3]),))
         self.assertGreater(kw["timeout"], 0)
+        with self.assertRaises(OSError):
+            os.fstat(int(argv[3]))
 
     def test_a_config_without_a_token_command_sends_no_env(self):
         cfg = {k: v for k, v in self.cfg.items() if k != "repo_token_command"}
