@@ -80306,6 +80306,8 @@ class ReviewCommentEndToEndTests(Base):
 
 
 _ph_late = _ph.build_late(); TestPlanHashMarkerAsk, TestPlanHashMarkerLaunch = _ph_late   # #1713
+_ibp = importlib.import_module("test_impact_brief_pieces")   # the impact brief's recorded pieces (ask #2509)
+TestBriefPiecesPure, TestBriefPiecesFloor, TestBriefPiecesRecord = _ibp.TestBriefPiecesPure, _ibp.TestBriefPiecesFloor, _ibp.build(TestBlockTable)
 # ------------------------------------------------- every test class isolates, or says why not (#1322)
 
 # THE one exceptions table: a unittest.TestCase that is not derived from Base (which isolates HOME and the XDG directories) is listed here with a one-line reason.
@@ -80376,7 +80378,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
     "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",   # (#2483) the next two have no setUp and touch no file or state path: they call delegated_clear_checks and validate over in-memory dicts, with fetch_orders, _intent_reader, read_cos_orders patched to stubs
-    "TestDelegatedClearRepo", "TestDelegatedClearRepoOwnerFile",
+    "TestDelegatedClearRepo", "TestDelegatedClearRepoOwnerFile", "TestBriefPiecesPure",   # (#2509) TestBriefPiecesPure is pure: recorded_pieces and build_brief over in-memory dicts and copies of the module source, no state path
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
     "TestAskIsItsOwn", "TestBranchTipRead",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254; (#2392) the second runs cloud_branch_tip over a stub _api: no file, no state
@@ -80392,7 +80394,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
+    "TestBriefPiecesFloor", "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
     ),
 }
 
