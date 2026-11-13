@@ -826,9 +826,9 @@ Read before building: OpenCode's shell default is 120000 ms and the call takes a
 | Input / outside call | Test | Mutant (control first, failure text) |
 |---|---|---|
 | spec `timeout` 60000/300000/300001/3600000/absent/background | index.test.mjs "S2: six specs" | clamp only a present value: assert.equal failure (undefined !== 300000) on the absent spec |
-| installed `plugin` entry | test_tool_cap test_s3_plugin_listed_once | remove the printf entry or re-add it to the template: count mismatch (and test_entrypoint_long_run checks the written file) |
+| installed plugin file | test_tool_cap test_s3_plugin_listed_once | drop the `plugins/cw-tool-cap.js` install from `entrypoint.sh` or re-add a `"plugin"` key: assertion failure (and test_entrypoint_long_run checks the written file and the fail-closed start) |
 | config timeouts | test_s3_no_timeout_above_cap | add `mcp.timeout` 600000: list shows 600000 |
-| result text | index.test.mjs "S4: note" | drop sentence or the run.after hook line: endsWith(NOTE) fails |
+| result text | index.test.mjs "S4: note" | drop the sentence, the run.after line or the tool.execute.after hook: endsWith(NOTE) fails |
 | image copy | test_dockerfile_copies_plugin | remove COPY: count 0 != 1 |
 
 ## The daily land report (ask #2448)

@@ -39,6 +39,13 @@ test("tool.execute.after adds the note", async () => {
   await hooks["execute.after"](ev);
   assert.ok(ev.result.output.endsWith(NOTE)); assert.ok(ev.result.content[0].text.endsWith(NOTE));
   await hooks["execute.after"](null); // never throws
+  const frozen = { status: "completed", result: Object.freeze({ output: t }) };
+  await hooks["execute.after"](frozen); // a frozen result: the inner catch keeps it from throwing
+  const top = { output: t }; await hooks["execute.after"](top);
+  assert.ok(top.output.endsWith(NOTE));
+  const lines = []; const orig = console.log; console.log = (m) => lines.push(m);
+  try { await plugin.setup({ shell: { hook: () => {} }, tool: { hook: () => { throw new Error("SECRET-TEXT"); } } }); } finally { console.log = orig; }
+  assert.equal(lines.length, 1); assert.ok(!lines[0].includes("SECRET-TEXT"));
 });
 test("S4: note", () => {
   const out = noteOf("command timed out after 300000 ms");
