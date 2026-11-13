@@ -239,6 +239,14 @@ class TestParentProof(Base):
         os.chmod(str(fake), 0o755)
         pid = self.kit.start("-s", str(self.kit.script), "reap", program=str(fake))
         self.assertFalse(self.proof(pid))
+        planted = self.home / "planted"
+        planted.mkdir()
+        (planted / "python3").write_bytes(fake.read_bytes())
+        os.chmod(str(planted / "python3"), 0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(planted) + os.pathsep + os.environ["PATH"]}):   # the forger's own PATH names its copy first
+            pid = self.kit.start("-s", str(self.kit.script), "reap", program=str(planted / "python3"))
+            self.assertFalse(self.proof(pid))
+        self.assertNotIn(os.path.realpath(str(planted / "python3")), SYSTEM.interpreters())
         link = self.home / "python3-link"
         link.symlink_to(shutil.which("sh"))
         self.assertFalse(self.proof(self.kit.start("-B", str(self.kit.script), "reap", program=str(link))))

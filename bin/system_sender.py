@@ -10,7 +10,6 @@ Honest limit: this is a process-level check, as the state directory's own trust 
 (that runs the real program), or could run a program with a forged argument list. A person's pane, a session id, a pane variable, the claim variable
 or `--from` cannot make the parent process the reaper. Standard library only. Nothing here sends or writes."""
 import os
-import shutil
 import subprocess
 import sys
 
@@ -25,14 +24,13 @@ SYSTEM_SENDERS = {
 PLAIN_OPTIONS = ("-B", "-u", "-E", "-s", "-S", "-I", "-O", "-OO", "-b", "-bb", "-q")
 
 
+FIXED_INTERPRETERS = ("/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python", "/bin/python3")
+
+
 def interpreters():
-    """The real paths of the Python interpreters this switchboard knows: its own, and the `python3` and `python` the service path finds. A copy of a shell named python is none of them."""
-    found = {os.path.realpath(sys.executable)}
-    for name in ("python3", "python"):
-        path = shutil.which(name)
-        if path:
-            found.add(os.path.realpath(path))
-    return found
+    """The real paths of the Python interpreters that count: this switchboard's own, and the fixed system places. NEVER the PATH of the process asking: the process being checked
+    chooses its own PATH, so a copy of a shell named python placed first in it would be trusted. A copy or a link to a shell is none of these."""
+    return {os.path.realpath(p) for p in (sys.executable,) + FIXED_INTERPRETERS if p and os.path.exists(p)}
 
 
 def registered(name):
@@ -64,7 +62,7 @@ def read_process(pid):
 
 
 def parent_is(name, kit_root, parent=None, reader=read_process, uid=None, known=None):
-    """True only when the parent process is the registered program of `name`: the same user, a known Python interpreter (by real path), running the registered script of this kit
+    """True only when the parent process is the registered program of `name`: the same user, a known Python interpreter (by real path, from fixed places, never the caller's PATH), running the registered script of this kit
     by an absolute path, with the registered word right after it. Anything unreadable, unregistered or different is False."""
     row = SYSTEM_SENDERS.get(name) if isinstance(name, str) else None
     if row is None:
