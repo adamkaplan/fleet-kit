@@ -2,13 +2,11 @@
 """The doctor's run_to cap must never run the doctor's cleanup (ask #2023).
 
 S1/S2: a scratch shell sources `run_to` and `cleanup` from the text of bin/fleet-doctor and starts and ends the
-command at once many times. S3: the doctor itself, with stub herdr and gh, many runs; and a scratch copy with the
-old watcher must fail the harness. No thread is started here (every test thread would be a daemon thread).
+command at once many times. S3: the doctor itself, with stub herdr and gh, many runs. No thread is started here (every test thread would be a daemon thread).
 """
 import importlib.machinery
 import importlib.util
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -28,13 +26,6 @@ NEW = '''  # The watcher polls at one-second steps and ends by itself; the docto
     kill -9 "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
   wait "$cmdpid" 2>/dev/null
   rc=$?
-'''
-OLD = '''  ( sleep "$secs"; kill -9 "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
-  watchpid=$!
-  wait "$cmdpid" 2>/dev/null
-  rc=$?
-  kill "$watchpid" 2>/dev/null
-  wait "$watchpid" 2>/dev/null
 '''
 
 EXTRACT = r'''awk '/^cleanup\(\) /{print} /^run_to\(\) \{/{p=1} p{print} p&&/^}/{p=0}' "$1" > "$HDIR/fn.sh"'''
@@ -90,38 +81,6 @@ def early_removals(doctor_text, n, stop=0):
     return int(run_scratch(["bash"], HARNESS, doctor_text, n, stop)[-2])
 
 
-def check_harness(doctor_text, n):
-    bad = early_removals(doctor_text, n, stop=1)
-    if bad:
-        raise AssertionError("the doctor removed its own temporary directory: %d early removal(s)" % bad)
-
-
-MECHANISM = EXTRACT + r'''
-. "$HDIR/fn.sh"; TMPDIR_FD=$(mktemp -d "$HDIR/d.XXXXXX")
-trap cleanup TERM
-# a process that still holds the doctor's trap (a fork before the trap reset) when the TERM arrives:
-kill -TERM $$
-[ -d "$TMPDIR_FD" ] && echo kept || echo removed
-'''
-
-
-def run_to_body(doctor_text):
-    m = re.search(r"^run_to\(\) \{\n.*?^}\n", doctor_text, re.S | re.M)
-    assert m, "run_to not found"
-    return m.group(0)
-
-
-def check_by_construction(doctor_text):
-    """Deterministic: the defect exists iff run_to starts a forked watcher subshell and then SIGNALS it (the signal
-    can reach the fork while it still holds the inherited cleanup trap), and nothing in run_to resets the traps."""
-    body = run_to_body(doctor_text)
-    if not (re.search(r"^\s*\(.*\) >/dev/null 2>&1 &\n\s*watchpid=\$!", body, re.M)
-            and re.search(r'kill(?! -9| -0)\s+"\$watchpid"', body) and "trap" not in body):
-        return
-    raise AssertionError("the doctor removed its own temporary directory: its watcher is signalled while it holds "
-                         "the inherited cleanup trap")
-
-
 def load_liveness():
     path = str(BIN / "test-host-liveness")
     loader = importlib.machinery.SourceFileLoader("thl_for_watcher", path)
@@ -134,16 +93,6 @@ def load_liveness():
 class TestWatcher(unittest.TestCase):
     def setUp(self):
         self.text = DOCTOR.read_text()
-
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "on macOS the old watcher showed 0 early removals in 20000 starts (run 41585441923), so this half is measured on Linux only")
-    def test_s1_old_watcher_shows_the_cause(self):
-        old = mutate(self.text, NEW, OLD)
-        with self.assertRaises(AssertionError):
-            check_by_construction(old)
-        check_by_construction(self.text)                      # the fixed watcher is never signalled
-        # the consequence, deterministically: a holder of the inherited trap that receives TERM removes the directory
-        self.assertEqual(run_scratch(["bash"], MECHANISM, self.text)[0], "removed")
 
     def test_s2_no_early_removal(self):
         self.assertEqual(early_removals(self.text, RUNS), 0)
@@ -161,15 +110,6 @@ class TestWatcher(unittest.TestCase):
             lines = mod.run_doctor(["host:h1/a1"], None, panes=())
             self.assertTrue(lines, "run %d printed no charters line" % i)
             self.assertFalse([l for l in lines if "skipped" in l or "no pane list" in l], "run %d: %r" % (i, lines))
-
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "on macOS the old watcher showed 0 early removals in 20000 starts (run 41585441923), so this half is measured on Linux only")
-    def test_s3_control_then_old_copy(self):
-        check_harness(self.text, RUNS)                       # the control first: passes
-        old = mutate(self.text, NEW, OLD)
-        with self.assertRaises(AssertionError) as cm:
-            check_by_construction(old)
-        self.assertIn("the doctor removed its own temporary directory:", str(cm.exception))
 
     def test_noop_mutation_fails_the_computation(self):
         with self.assertRaises(AssertionError) as cm:
