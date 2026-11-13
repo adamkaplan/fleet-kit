@@ -264,8 +264,8 @@ class RealMint(Harness):
         """A pass every 60 seconds from T to T+63 minutes: (mints by T+59, the minute the token was swapped, the oldest token age seen)."""
         L = self.launcher()
         by59, swapped, oldest = None, None, 0
-        # every second minute, plus T+59 and the last: the swap (T+30), the one mint by T+59 and the age bound are all still seen
-        for minute in sorted(set(range(0, minutes + 1, 2)) | {59, minutes}):
+        # every second minute, every minute around the swap (T+30) and the expiry (T+59..): the swap (T+30), the one mint by T+59 and the age bound are all still seen
+        for minute in sorted(set(range(0, minutes + 1, 2)) | set(range(28, 33)) | set(range(56, minutes + 1))):
             self.at(minutes=minute)
             self.one_pass(L)
             if minute == 59:
