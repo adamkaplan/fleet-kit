@@ -727,15 +727,16 @@ def _hide_names(text, terms):
 
 _WRAP_WORD = 512      # the longest word joined across a fold; a longer one is no token of ours
 _WRAP_LINES = 8       # the most lines one folded secret is followed over
-_HINT = re.compile(r"sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|eyJ|://|[=:]|[A-Za-z0-9+/_-]{24}")   # what any secret shape needs: a join without one is not tried
+_HINT = re.compile(r"(?i)sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|eyJ|@|(?:token|secret|passw|api[_-]?key|credential|auth)[^=:]{0,40}[=:]|[A-Za-z0-9+/_-]{24}")
+_WRAP_BUDGET = 20000  # the most redaction attempts of one call: a text built to be slow stops being followed, it is never slow   # what any secret shape needs: a join without one is not tried
 _WRAP_LEAD = " \t>|\"'`,;+*("   # what may stand before the continuation: an indent, a quote mark, a table bar, a string quote
 _INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff]")
-_WRAP_PART = re.compile(r"[A-Za-z0-9_+/=.-]+")
+_WRAP_PART = re.compile(r"[A-Za-z0-9_+/=.&@:-]+")
 
 
 def _looks_like_rest(word):
     """A continuation of a token already redacted whole: random-looking (a digit and a letter, four characters or more), not prose."""
-    return len(word) >= 4 and bool(re.search(r"\d", word)) and bool(re.search(r"[A-Za-z]", word)) and _WRAP_PART.fullmatch(word) is not None
+    return _WRAP_PART.fullmatch(word) is not None and (len(word) >= 12 or (len(word) >= 4 and bool(re.search(r"\d", word)) and bool(re.search(r"[A-Za-z]", word))))
 
 
 def _unwrap_redact(text):
@@ -746,8 +747,11 @@ def _unwrap_redact(text):
     nothing: work is linear in the (already cut) text."""
     scrub, redact = D["_scrub_lib"](), D["redact_command_text"]
 
+    budget = [_WRAP_BUDGET]
+
     def shaped(word):
-        return redact(scrub(word, (), LAST_SCRUB_MAX))
+        budget[0] -= 1
+        return redact(scrub(word, (), LAST_SCRUB_MAX)) if budget[0] >= 0 else word   # past the budget nothing more is tried
     lines = _INVISIBLE.sub("", text).splitlines()   # invisible characters cannot split a token; every kind of line break the later steps split on
     for i in range(len(lines) - 1):
         a = lines[i].rstrip(" \t+,;|&")   # a string concatenation or a table bar after the first part

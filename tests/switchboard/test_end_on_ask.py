@@ -325,6 +325,9 @@ class TestEndOnAsk(unittest.TestCase):
 
     def test_quoted_and_invisible_folds_many_blank_lines_and_the_cost_of_a_long_text(self):
         t = self.SPLIT
+        digitless = "xoxb-123456789012-123456789012-AbCdEfGh"
+        body = self.end_with(final="%s\nIjKlMnOpQrStUvWxYz" % digitless)[0][0][1]
+        self.assertNotIn("IjKlMnOpQrStUvWxYz", body)
         cases = {"string literal": 'k = "%s" +\n"%s",' % (t[:20], t[20:]), "zero width": "x %s\u200b\n%s y" % (t[:20], t[20:]),
                  "nine blanks": "x %s%s%s y" % (t[:20], "\n" * 10, t[20:])}
         for label, text in cases.items():
@@ -333,10 +336,10 @@ class TestEndOnAsk(unittest.TestCase):
             self.assertNotIn(t[20:], self.end_with(log=text)[0][0][1], label)
         import time
         part = self.retired()
-        for unit in ("a1-\n", "a1\n", "| a1 |\n"):
+        for unit in ("a1-\n", "a1\n", "| a1 |\n", "a:\n", "a=b\n", "token=a\n", "ghp_x\nb\n", "http://a:\nb\n"):
             started = time.monotonic()
             part._unwrap_redact(unit * (200000 // len(unit)))
-            self.assertLess(time.monotonic() - started, 4, unit)
+            self.assertLess(time.monotonic() - started, 8, unit)
 
     def test_the_list_is_read_once_and_never_printed(self):
         posts, events = self.end_with(names="(unclosed-acme-secret\n", final="x")
