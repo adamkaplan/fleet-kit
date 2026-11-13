@@ -43,6 +43,8 @@ impacts:
 - <what changes> | <severity> | <probability> | <risk level> | <action>
 ```
 
+The test reviewer ends its block with `mutants-run: N`, the number of mutants it ran. It also ends it with `mutants-survived: M`, the number that survived (never above N; both 0 when none ran). The impact reviewer ends its block with `blast-radius: <one line>`, what the change can reach (1 to 80 printable ASCII characters).
+
 ## Rating the impact: MIL-STD-882E, rewritten for software
 
 The rating uses the categories of MIL-STD-882E (system safety) directly. The definitions below are rewritten for changes to software; the standard's own text is not copied.
@@ -83,5 +85,4 @@ The floor of R-LAW-13 holds changes to the paths a repository names, whatever th
 
 ## What blocks
 
-A `request-changes` verdict blocks the merge until the author resolves each blocking finding or the reviewer withdraws it. A `H` action holds the pull request for the captain: the owner
-clears a false hold by removing the label with a logged reason. Nothing else blocks.
+A `request-changes` verdict blocks the merge until the author resolves each blocking finding or the reviewer withdraws it. A `H` action holds the pull request for the captain: the owner clears a false hold by removing the label with a logged reason. Nothing else blocks.
