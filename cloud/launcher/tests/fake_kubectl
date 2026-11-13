@@ -80,8 +80,20 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
         if not st.get("sts_no_pod"):
             sts_pod(obj)
         save(); sys.exit(0)
+    if obj["kind"] == "PodDisruptionBudget":   # a budget: kept apart from "applied"; "order" records what came first
+        if st.get("fail_pdb") == "forbidden":
+            print("Error from server (Forbidden): poddisruptionbudgets.policy is forbidden", file=sys.stderr); sys.exit(1)
+        if st.get("fail_pdb") == "odd":
+            print("the server sent something odd", file=sys.stderr); sys.exit(1)
+        if obj["metadata"]["name"] in st.get("pdbs", {}):
+            exists('poddisruptionbudgets.policy "%s"' % obj["metadata"]["name"])
+        st.setdefault("pdbs", {})[obj["metadata"]["name"]] = obj
+        st.setdefault("order", []).append("pdb:" + obj["metadata"]["name"])
+        save(); sys.exit(0)
     if st.get("fail_apply"):
         print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
+    if obj["kind"] == "Pod":
+        st.setdefault("order", []).append("pod:" + obj["metadata"]["name"])
     if cmd == "create":
         if obj["metadata"]["name"] in st.get("secrets" if obj["kind"] == "Secret" else "pods", {}):
             exists('%ss "%s"' % (obj["kind"].lower(), obj["metadata"]["name"]))
@@ -223,6 +235,18 @@ elif cmd == "get" and args[1] == "pods":
         k, v = args[args.index("-l") + 1].split("=", 1)
         items = [p for p in items if p["metadata"].get("labels", {}).get(k) == v]
     print(json.dumps({"items": items}))
+elif cmd == "get" and args[1] == "poddisruptionbudget":
+    obj = st.get("pdbs", {}).get(args[2])
+    if obj is None: missing('poddisruptionbudgets.policy "%s"' % args[2])
+    print(json.dumps(obj))
+elif cmd == "get" and args[1] == "poddisruptionbudgets":
+    pdbs = list(st.get("pdbs", {}).values())
+    if "-l" in args:  # honour a label selector `key=value`
+        k, v = args[args.index("-l") + 1].split("=", 1)
+        pdbs = [o for o in pdbs if o["metadata"].get("labels", {}).get(k) == v]
+    for o in pdbs:   # the launcher's jsonpath: name, cw/pod label, creation time
+        m = o["metadata"]
+        print("\t".join([m["name"], m.get("labels", {}).get("cw/pod", ""), m.get("creationTimestamp", "2026-01-01T00:00:00Z")]))
 elif cmd == "get" and args[1] == "nodes":
     # the nodes of the cluster: the summary reads their pool label, their size label and their creation time. A login without `list` on
     # nodes is refused by the API server, exactly as a real one is.
@@ -263,6 +287,14 @@ elif cmd == "delete" and args[1] == "statefulset":
     save()
 elif cmd == "delete" and args[1] == "pod" and st.get("pods", {}).get(args[2], {}).get("metadata", {}).get("ownerReferences"):   # a pod with an owner reference comes back
     sts_recreate(st["pods"].pop(args[2]))
+    save()
+elif cmd == "delete" and args[1] == "poddisruptionbudget":
+    if args[2] == "-l":   # by label: every budget with it
+        k, v = args[3].split("=", 1)
+        for n in [n for n, o in st.get("pdbs", {}).items() if o["metadata"].get("labels", {}).get(k) == v]:
+            st["pdbs"].pop(n)
+    else:
+        st.get("pdbs", {}).pop(args[2], None)
     save()
 elif cmd == "delete":
     kind, name = args[1], args[2]

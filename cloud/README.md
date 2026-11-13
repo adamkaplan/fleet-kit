@@ -282,6 +282,66 @@ handled. `tests/fixtures/containerd-aks-installer-form.toml` is a copy of such a
 `k8s/runtimeclass.yaml` has no scheduling block: an autoscaler's template node cannot carry a label that is set only
 after install, so a worker pod selects the pool label `sysbox-install=yes` itself. Evidence for the cause: issue #365, probe comment.
 
+## Startup taint (ask #2489)
+
+**Design.** A new node of the workers pool registers with a startup taint, key `startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready`,
+value `true`, effect `NoSchedule` (set by the pool's taint setting). No worker pod tolerates it, so no pod lands on the node while containerd
+does not yet know `sysbox-runc` (the case of 12 November 2026: `FailedCreatePodSandBox ... handler "sysbox-runc" is not known`, about 100 seconds
+after the node joined). `k8s/containerd-fix.yaml` removes the taint from its own node (`TAINT_CMD`, by default `kubectl taint node $NODE_NAME ...-`)
+ONLY after the runtime is verified: the repair succeeded (config dump check passed, containerd restarted and answered `ctr version`), or the node was
+already right and answered. It never removes it when the repair failed, was rolled back, or the fix is off at its cap (`MAX_ATTEMPTS` marker); removing an
+absent taint is not an error. The fix DaemonSet and the stock Sysbox installer DaemonSet tolerate exactly this taint (and no other); the installer's
+manifest comes from upstream, so its toleration is a patch, `k8s/patches/sysbox-install-toleration.yaml`. The label step stays as it was (a record only).
+
+**Why the autoscaler still scales up.** The cluster autoscaler ignores taints with the prefix `startup-taint.cluster-autoscaler.kubernetes.io/` when it
+simulates a new node of the pool, so a pending pod that does not tolerate it is still seen as fitting a new node and scale-up goes on. A label set
+after the node joins is missing from the pool's template, which is why a label cannot do this job.
+
+**Why a gate on `sysbox-runtime=running` is wrong.** The stock installer sets that label before containerd knows the runtime, so a pod gated on it
+starts too early; and a label set after the node joins is not in the pool's template, so the autoscaler would see no node that fits and stop scaling up.
+No pod may be selected or placed by that label (rule test in `launcher/tests/test_cloud_stack.py`; `STACK_NODE_SELECTOR` in `launcher/cloud_worker.py`).
+
+**Not yet known (the proof answers it):** whether the cloud accepts the prefix on a pool update, whether the autoscaler ignores it as documented,
+whether the system DaemonSets tolerate a NoSchedule taint, and what a pool taint update does to existing nodes. If the cloud refuses the taint, the ask
+closes with that evidence and nothing has changed.
+
+(`RESOURCE_GROUP_NAME` and `CLUSTER_NAME` are the placeholders of cloud/launcher/README.md: use the real ones.)
+
+**Administrator commands, in this order (HELD for the owner's word; nothing runs before it).** The taint is applied only AFTER the DaemonSet change
+is in place and has removed it from nodes that are already right (a node that never loses the taint takes no pod).
+
+```sh
+# 1. BEFORE state: record it (the rollback uses it)
+az aks nodepool show -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --query nodeTaints -o tsv | tee /tmp/workers-taints-before.txt
+
+# 2. the DaemonSet change first. The installer's current tolerations (add them to the patch file if any, it replaces the list):
+kubectl -n kube-system get ds sysbox-deploy-k8s -o jsonpath='{.spec.template.spec.tolerations}'
+kubectl apply -f cloud/k8s/containerd-fix.yaml
+kubectl -n kube-system patch ds sysbox-deploy-k8s --patch-file cloud/k8s/patches/sysbox-install-toleration.yaml
+# verify every existing node loses nothing: all pods Running as before, the fix pod on every node, no node with the taint yet
+kubectl -n kube-system rollout status ds/sysbox-containerd-fix ds/sysbox-deploy-k8s
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints[*].key
+kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20     # expect: "startup taint already absent" on each node
+
+# 3. THEN the pool update (applies the taint to new nodes)
+az aks nodepool update -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --node-taints 'startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule'
+
+# 4. the one-pod proof: one pod that needs a new node (the worker pod spec as usual), print the time of each step
+date -u +%T; kubectl -n cw get pod <pod> -w          # the pod starts Pending
+kubectl -n cw describe pod <pod>                      # read the events: TriggeredScaleUp; NO "didn't match"; NO FailedCreatePodSandBox
+kubectl get nodes -w                                  # the new node registers WITH the taint, then loses it (the fix's removal)
+kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20   # "startup taint removed"
+date -u +%T                                           # the pod is Running
+
+# 5. rollback: the pool back to the recorded taints, then the DaemonSet from git
+az aks nodepool update -g RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME -n workers --node-taints "$(cat /tmp/workers-taints-before.txt)"   # empty: --node-taints ""
+git checkout <the commit before this change> -- cloud/k8s/containerd-fix.yaml && kubectl apply -f cloud/k8s/containerd-fix.yaml
+# the installer: patch back the toleration list recorded in step 2 (or remove the one toleration)
+# a node that still carries the taint: kubectl taint node <node> startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready=true:NoSchedule-
+```
+
+If the update in step 3 is refused, read the taints back (step 1 command) and post the refusal text on the ask: they must equal the recorded state.
+
 ## The pre-push check (`bin/cloud-prepush`)
 
 The cause: cloud workers push, and then continuous integration finds a failure the worker could have found itself (a test that reads an edited file, a repository-wide scan of added lines). A pod cannot run the whole suite in reasonable time, and each brief used to re-describe by hand which tests to pick. `bin/cloud-prepush <base>` replaces the hand-written rule.
@@ -351,6 +411,33 @@ A pod ended by its deadline or by a retire lost its unpushed work unless a fresh
 - **The word.** The stop's audit line carries one word, refresh: used, refused or none (a word, never a value), and so does the `end_hook` part of the run record.
 
 Not run in a cluster: the live check (a real pod with an ended token, and the note reaching a real session) is the operator's, after merge.
+
+## Node upgrades never end a running worker (ask #2446)
+
+A worker is a bare pod, and a node drain (an upgrade, a repair) evicts it. The launcher therefore makes ONE PodDisruptionBudget per worker pod, `<pod>-pdb`, with `minAvailable: 1` (a bare pod takes only an integer) and a selector on that pod's own `app` and `cw/worker` labels, BEFORE the pod; a refused budget create ends the launch with one line, no pod and no Secret. The budget carries the run's identity label and is deleted with the pod on every ending path (stop, by-name stop, the reaper's hard and idle stops, a failed launch) by the same run-identity check the Secrets use; the reaper also removes a budget whose pod is absent and that is over an hour old, because a budget with no pod would block a drain for ever. Persistent orchestrators (StatefulSet pods) get no budget (follow-up, with the system pool's hub and bridge). The launcher's Role (`cloud/k8s/operator-rbac.yaml`) gains `get`, `list`, `create`, `delete` on `poddisruptionbudgets` in the `policy` group; the administrator applies it.
+
+Table of every input and outside call of the change, each with its test and mutant:
+
+| Input or outside call | Failure handled | Test | Mutant |
+| --- | --- | --- | --- |
+| budget `create` before the pod | forbidden, odd answer: launch ends, 0 pods, 0 Secrets | `test_s8_*` | `test_mutant_a_refused_budget_create_is_ignored_fails_s8`, `test_mutant_pod_made_without_the_budget_first_fails_s2` |
+| budget selector | matches exactly its own pod | `test_s2_*`, `test_the_selector_keys_*` | `test_mutant_selector_on_the_shared_label_fails_s2` |
+| budget `delete` on stop, by-name stop, reaper, failed launch, gone pod | own budget removed, another's left | `test_s3_*` | `test_mutant_stop_keeps_the_budget_fails_s3`, `..._failed_launch_keeps_...`, `..._gone_pod_retire_keeps_...`, `..._reaper_keeps_orphan_budgets_...`, `..._delete_by_the_shared_label_...` |
+| budget `get` for the run-identity check | missing: nothing to do; another run's: left whole | `test_s3_a_stop_with_another_run_id_leaves_the_budget`, `test_a_young_budget_left_by_a_crashed_run_*` | none (the control run only shows the unmutated copy passes) |
+| budget list in the reaper pass | unreadable: nothing deleted, one line; a listed pod's budget is kept | `test_s3_the_reaper_pass_removes_a_budget_*`, `test_the_orphan_pass_keeps_*` | `test_mutant_reaper_keeps_orphan_budgets_fails_s3` |
+| the rendered object | name, labels, selector, `minAvailable` only | `test_s4_*` | `test_mutant_budget_copies_annotations_fails_s4` |
+
+Two delete paths do not compare the run id, on purpose: the by-name retire of a gone pod (no run id was sent, so `_mine` would also answer yes) and the reaper's orphan pass (it has no run id; it deletes only a budget whose own `cw/pod` label names an absent pod and that is over an hour old, by its exact name).
+
+Each mutant has a control run first (`test_control_*`) and an anchored failure text.
+
+### The Saturday window stays as a backstop
+
+The Saturday 07:00 to 11:00 UTC window stays: upgrades start only inside it, and the budgets protect a worker inside it. Without the window an upgrade could start at any time and meet the same budgets, so the window is the second line, not the first.
+
+A node that cannot be drained because a worker still runs is cordoned after the drain timeout (`undrainableNodeBehavior=Cordon`) and the upgrade goes on with other nodes. A cordoned node needs the operator to act once its worker has ended: look at `kubectl get nodes`, and delete the cordoned node or uncordon it. A platform-initiated action may still override a budget; if every node of a pool holds a protected worker, the upgrade stalls until a worker ends (not yet measured: stated as unknown).
+
+Cost: an upgrade adds one surge node per pool step, about 0.45 dollars per hour for the workers' size, and a cordoned node stays (and is paid for) until its worker ends.
 
 ## The stall watch (ask #2399)
 
@@ -728,23 +815,39 @@ Rollback: unset the setting, delete the Deployment (`kubectl -n cw delete deploy
 
 Tests: `test_copilot_front.py`, `test_copilot_manifest.py`, `test_council_url_render.py` in `cloud/launcher/tests/` (fakes only).
 
+## Shell call cap (ask #2447)
+
+Second layer: the worker image sets `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=300000` (`cloud/worker/Dockerfile`; a test holds it within 1..the plugin's `CAP_MS`), so a call that passes no timeout is capped even when the plugin is not loaded. This layer does NOT bound a call that passes its own longer timeout; only the plugin does. Whether the plugin's hook works on the pod's OpenCode build is decided by the pod proof (S5/S6, the operator's tester run after the next image). A hook that throws at call time leaves the spec as it was and prints one line.
+
+A pod plugin (`cloud/worker/plugins/cw-tool-cap`, registered by `entrypoint.sh` in the pod's running config, not in `opencode-worker.json`) sets the `timeout` of every shell spec in `shell.create.before` to at most 300000 ms (absent, zero or larger becomes 300000), and adds one fixed sentence (matched loosely on the words "timeout"/"timed out" of the result, so a result that merely mentions them may carry the sentence too) naming the limit and `cw-run` to a timed-out result. Anything longer goes through `cw-run start`. The note is best-effort, and the clamp fails open: when the build offers no shell hook API or registering throws, the plugin prints one plain line (`cw-tool-cap: shell hooks unavailable, calls are NOT capped`) and calls are not capped; a failing `run.after` registration is reported the same way without echoing any error text, and only the note is lost.
+
+Read before building: OpenCode's shell default is 120000 ms and the call takes a per-call `timeout`; the environment variable sets the default only; `mcp.timeout` bounds MCP servers and no key clamps a shell call. UNVERIFIED here (the local build is 2.1.4, no pod): whether 2.2.7 honours a changed spec `timeout`, and the exact timeout text and hook name for the result; the sentence hook is wired only if the build offers it. The tester's pod proof (S5, S6) settles both.
+
+| Input / outside call | Test | Mutant (control first, failure text) |
+|---|---|---|
+| spec `timeout` 60000/300000/300001/3600000/absent/background | index.test.mjs "S2: six specs" | clamp only a present value: assert.equal failure (undefined !== 300000) on the absent spec |
+| installed `plugin` entry | test_tool_cap test_s3_plugin_listed_once | remove the printf entry or re-add it to the template: count mismatch (and test_entrypoint_long_run checks the written file) |
+| config timeouts | test_s3_no_timeout_above_cap | add `mcp.timeout` 600000: list shows 600000 |
+| result text | index.test.mjs "S4: note" | drop sentence or the run.after hook line: endsWith(NOTE) fails |
+| image copy | test_dockerfile_copies_plugin | remove COPY: count 0 != 1 |
+
 ## The daily land report (ask #2448)
 
 `cloud/launcher/land_report.py` is READ-ONLY. The reaper's pass (`_land_report` in `cloud_worker.py`, one inserted call) runs `daily_pass`: at the first pass at or after 13:00 UTC of a day whose report is not complete, it reads the last 24 hours of run records and of landed commits, sends ONE message (the switchboard command `send cos --issue <the setting>`) and adds ONE comment line (`gh issue comment`) to the pinned issue. It edits no issue body. The message goes out as the registered system sender `cloud-reaper` (#2518): the reaper has no pane and no session, so it sets `SWITCHBOARD_SYSTEM_SENDER=cloud-reaper` (a name, not a secret) and the switchboard `send` accepts it only when the process that runs `send` is a child of the kit's own `cloud/launcher/cloud_worker.py reap` run by the same user (the switchboard reads the parent process from the operating system: `bin/system_sender.py`); from any other process, pane, session or `--from` the call is refused with one line and nothing is delivered. The sender may write only to `cos`. The last-sent day and each part's state (`message`, `comment`) are in `<run record dir>/.land-report.json` (0600, written atomically after each part); a part that failed is tried at the next pass, a part that went is not sent again. Rollback: remove the call.
 
-**What the records hold (read on 12 November 2026).** `run_logs` is `{runs: [{name, exit, woke, log_tail}], wake_lines}`: it has NO time field, so a per-step time of `tests:server` or `tests:pg` is not recorded. The report reads one only from a line `step=<tests:server|tests:pg> seconds=<n>` in a land run's log tail; without it the run is counted as `no step data` (never as 0). Follow-up: the land tool prints that line. Land wall time is the record's `end` minus `start` (the pod's). A landing's size and rounds come from the commit's trailer `Land-Checks: files=<n> lines=<n> rounds=<n>` (`rounds` may be in `Land-Council`); a commit without a key counts as unread. A land run is a run named `land` or `land-*`; its exit 0 is landed, 18 council, 13 tests, 3 environment, 124 or 137 time limit, any other other. A pod counts as landed when its record's `head_sha` is a landed commit of the window (a squashed landing with another sha shows as unlanded: known limit). A lane is the worker name without its trailing `-<digits>`. Windows are by the record's `end`. Median of an even count is the mean of the middle two; p90 is the nearest rank; a lane with fewer than 3 landings prints `n/a`.
+**What the records hold (read on 12 November 2026).** `run_logs` is `{runs: [{name, exit, woke, log_tail}], wake_lines}`: it has NO time field, so a per-step time of `tests:server` or `tests:pg` is not recorded. The report reads one only from a line `step=<tests:server|tests:pg> seconds=<n>` in a land run's log tail; without it the run is counted as `no step data` (never as 0). Follow-up: the land tool prints that line. Land wall time is the record's `end` minus `start` (the pod's). A landing's size and rounds come from the commit's trailer `Land-Checks: files=<n> lines=<n> rounds=<n>` (`rounds` may be in `Land-Council`); a commit without a key counts as unread. A land run is a run named `land` or `land-*`; its exit 0 is landed, 18 council, 13 tests, 3 environment, 124 or 137 time limit, any other other. A pod counts as landed when its record's `head_sha` is a landed commit of the window (a squashed landing with another sha shows as unlanded: known limit). A lane is the boss the worker reports to (the run record's `boss`, written at stop from the switchboard record's `reports_to`); a record without it falls back to the worker name up to its first `-`, printed `(lane unknown)`. Rows are per repo and lane, the repo with most attempts first (`CW_LAND_REPORT_FIRST_REPO` before it); a lane with no land run prints nothing and one trailing line counts those pods; the message stays under 20 lines and 3500 characters, extra lanes are one `N more lanes` line. Windows are by the record's `end`. Median of an even count is the mean of the middle two; p90 is the nearest rank; a lane with fewer than 3 landings prints `n/a`.
 
-Settings (the settings file; all optional): `CW_LAND_REPORT_ISSUE` (`owner/repo#N`; unset: nothing is sent, one stderr line), `CW_LAND_REPORT_SMALL_LINES` (the small bound, default 50, named in the report), `CW_LAND_REPORT_GIT_DIR` (a checkout) and `CW_LAND_REPORT_BRANCH` (default `origin/main`); without a checkout the report says `landed commits: not read`.
+Settings (the settings file; all optional): `CW_LAND_REPORT_OWN_AUTHORS` (comma list of author names whose landed commits are the cloud workers'; default: the first line of `/etc/cw-default-identity` when the host has it, else no split), `CW_LAND_REPORT_FIRST_REPO` (`owner/repo` listed first in the report; default none), `CW_LAND_REPORT_ISSUE` (`owner/repo#N`; unset: nothing is sent, one stderr line), `CW_LAND_REPORT_SMALL_LINES` (the small bound, default 50, named in the report), `CW_LAND_REPORT_GIT_DIR` (a checkout) and `CW_LAND_REPORT_BRANCH` (default `origin/main`); without a checkout the report says `landed commits: not read`.
 
 | Input or outside call | Failure handled | Test | Mutant (control first, anchored text) |
 |---|---|---|---|
 | run records directory, 24 h window | records of other days are not counted | `S1.test_control` | `S1.test_mutant_counts_every_record` (`S1 lane a`) |
 | a record that is corrupt, a link, or 5 MB | skipped and counted `N records not read`; the rest counted | `S7.test_control` | `S7.test_mutant_stops_at_corrupt` (`S7`) |
 | a secret-shaped value in a log tail or an outside error | one `scrub` on every output; log lines carry the class name only | `S7.test_scrub`, `S8.test_raising_sender_and_missing_issue` | none: the scrub is pinned by value |
-| the land wall times (median, p90, trend) | fewer than 3: `n/a` | `S2.test_control` | `S2.test_mutant_mean` (`S2 numbers`) |
+| the pod times (median, p90, trend; the pod's own life) and, from the Land-Checks trailer, the land time `total=` and `tests:server` / `tests:pg` seconds | fewer than 3: `n/a` | `S2.test_control` | `S2.test_mutant_mean` (`S2 numbers`) |
 | step times in the log tail | a missing time is `no step data`, not 0 | `S3.test_control` | `S3.test_mutant_missing_is_zero` (`S3 server`) |
 | `git log` of the default branch (one call, 60 s, no shell) | non-zero, a bad branch or no directory: `None`, the report says so | `S8.test_git_reads` | none: the failure is the test |
-| trailers `Land-Checks`, `Land-Council` (untrusted text) | only `files`, `lines`, `rounds` as digits are read | `S5.test_trailer_parse` | none |
+| trailers `Land-Checks`, `Land-Council` (untrusted text) | only `files`, `tests`, `lines`, `rounds` as digits, `total=<n>s`, the `checks=` entries `name(count):<n>s`, and `round <n>` in `Land-Council` are read; the author split is by the CLAIMED author name, not a verified identity | `S5.test_trailer_parse` | none |
 | the small bound setting | not a whole number 1 to 999999: 50 | `S4.test_small_bound_setting`, `S4.test_control` | `S4.test_mutant_at_least` (`S4 bound`) |
 | council rounds per landing | median and max, not a sum | `S5.test_control` | `S5.test_mutant_sum` (`S5 rounds`) |
 | pods ended unlanded | only pods with no landed head | `S6.test_control` | `S6.test_mutant_every_pod` (`S6 count`) |

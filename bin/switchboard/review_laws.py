@@ -80,6 +80,13 @@ def local_review_overlay(repo):
         return ""
 
 
+# The three block-line names the parser reads (#2521): the one place they are written; the reviewer-agent tie test reads them from here.
+MUTANTS_RUN_LINE = "mutants-run"
+MUTANTS_SURVIVED_LINE = "mutants-survived"
+BLAST_RADIUS_LINE = "blast-radius"
+BLOCK_LINE_NAMES = (MUTANTS_RUN_LINE, MUTANTS_SURVIVED_LINE, BLAST_RADIUS_LINE)
+
+
 def parse_review_block(text):
     """(fields, why not) from the verdict block a reviewer RETURNS as text (the reviewers hold no write command: the coder session records what
     they returned). Lines: `verdict: ...`, `head: <sha>`, optional `impact-action: ...`, `findings:` and one `- <rule> | block|note | ...` per finding. Counts
@@ -87,7 +94,7 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None, "block_count": 0}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "mutants_run": None, "mutants_survived": None, "blast_radius": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None, "block_count": 0}
     started, section = False, "findings"
     for line in lines:
         if started and line.startswith("verdict:"):
@@ -106,6 +113,12 @@ def parse_review_block(text):
             fields["impact_probability"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-reason:"):
             fields["impact_reason"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith(MUTANTS_RUN_LINE + ":"):
+            fields["mutants_run"] = line.split(":", 1)[1].strip()   # (#2509) the test reviewer's mutant run: kept only as the numbers the check below accepts
+        elif started and line.startswith(MUTANTS_SURVIVED_LINE + ":"):
+            fields["mutants_survived"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith(BLAST_RADIUS_LINE + ":"):
+            fields["blast_radius"] = line.split(":", 1)[1].strip()   # (#2509) the impact reviewer's stated blast radius: one short line
         elif started and line.startswith("files-read:"):
             section = "files"
         elif started and line.startswith("findings:"):
@@ -137,7 +150,18 @@ def parse_review_block(text):
         return None, "`impact-action:` must be hold, second-review or none"
     if fields["impact_class"] is not None and not IMPACT_CLASS_RE.fullmatch(fields["impact_class"]):
         return None, "`impact-class:` must be one lower-case word naming the class of the impact (see the matrix file's classes)"
+    for name in ("mutants_run", "mutants_survived"):   # (#2509) a count is digits only, so nothing but a number reaches the record (and the brief)
+        if fields[name] is not None and not re.fullmatch(r"[0-9]{1,6}", fields[name]):
+            return None, "`%s:` must be a whole number (up to 6 digits)" % name.replace("_", "-")
+    if (fields["mutants_run"] is None) != (fields["mutants_survived"] is None) or (fields["mutants_run"] is not None and int(fields["mutants_survived"]) > int(fields["mutants_run"])):
+        return None, "`mutants-run:` and `mutants-survived:` go together, and the survivors cannot outnumber the mutants that ran"
+    if fields["blast_radius"] is not None and not BLAST_RADIUS_RE.fullmatch(fields["blast_radius"]):
+        return None, "`blast-radius:` must be one line of 1 to 80 printable ASCII characters"
     return fields, None
+
+
+PIECE_FIELD_REVIEWER = {"mutants_run": "test", "mutants_survived": "test", "blast_radius": "impact"}   # (#2509) the block lines the impact brief reads, each with the one reviewer whose record may carry it
+BLAST_RADIUS_RE = re.compile(r"[ -~]{1,80}")   # (#2509) what a blast radius line may hold: printable ASCII, one short line
 
 
 def pr_changed_paths(raw):

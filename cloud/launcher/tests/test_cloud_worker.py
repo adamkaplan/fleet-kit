@@ -735,7 +735,7 @@ class S7Interrupt(Base):
         self.assertIn("secret/%s-pw" % name, err)
         last = self.audit_lines()[-1]
         self.assertEqual(last["action"], "create.interrupted")
-        self.assertIn("REMAINS: pod/%s, secret/%s-pw" % (name, name), last["reason"])
+        self.assertIn("REMAINS: pod/%s, poddisruptionbudget/%s-pdb, secret/%s-pw" % (name, name, name), last["reason"])
 
     def test_failed_cleanup_after_a_cloud_error_exits_nonzero_and_names_remains(self):
         self.patch_state(never_ready=True)

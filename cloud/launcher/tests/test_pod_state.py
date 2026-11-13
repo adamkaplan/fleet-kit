@@ -154,6 +154,11 @@ class FakeKube:
 
     delete_secret = delete_run_secret = get_secret
 
+    def get_pdb(self, name):
+        return None   # no budget in this fake
+
+    delete_pdb = get_pdb
+
     def delete(self, name, uid=None):
         self.log.append("delete")
         self.deleted = True

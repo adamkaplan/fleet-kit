@@ -40593,7 +40593,7 @@ class TestDecisionsCommand(DecisionsBase):
         self.world.v2.ask_permission(self.world.sessions["platform"], timed=True)
         self.pass_(1)
         code, out, err = self.cli("decisions", "--tier", "all")
-        _, first, second = out.splitlines()
+        _, first, second = out.splitlines()[:3]   # then the one note line: no escalation record yet, and a cos row could move
         self.assertEqual(first.index("waiting"), second.index("waiting"))
 
     def test_json_prints_the_files_list(self):
@@ -52537,6 +52537,7 @@ class TestDecisionBaselineViews(BaselineWorld):
         self.ask_permission("api-coder")
         self.gh.issue(API, 2, "an issue", labels=["me:awaiting-cos"])
         self.daemon_pass()
+        sb.write_escalated(self.world.state, {})  # a record exists (nothing escalated), so the list prints no missing-record note
         out = self.cmd("cos", "decisions")["out"]
         starts = {line.index("waiting") for line in out.splitlines()[1:]}
         self.assertEqual(len(starts), 1, out)
@@ -66979,6 +66980,8 @@ TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_c
 # The failure-mode scenario warning of plan_check (#1455).
 TestNoFailureMode = importlib.import_module("test_plan_failure_mode").TestNoFailureMode
 TestEveryTestFileIsWired, TestWiredCheckPlanted, TestMutantIsCaught = (_wm := importlib.import_module("test_wired_tests")).TestEveryTestFileIsWired, _wm.TestWiredCheckPlanted, _wm.TestMutantIsCaught
+# The reviewer agents write the block lines of the impact brief (#2512).
+_rbl = importlib.import_module("test_reviewer_block_lines"); TestReviewerBlockLines, TestReviewerBlockLinesControl = _rbl.TestReviewerBlockLines, _rbl.TestReviewerBlockLinesControl
 # A failed verdict says why (#2054).
 TestVerdictEvidence = importlib.import_module("test_verdict_evidence").build(LedgerBase)
 # The counting tool of the test split (S13a of #1092).
@@ -80307,6 +80310,8 @@ class ReviewCommentEndToEndTests(Base):
 
 
 _ph_late = _ph.build_late(); TestPlanHashMarkerAsk, TestPlanHashMarkerLaunch = _ph_late   # #1713
+_ibp = importlib.import_module("test_impact_brief_pieces")   # the impact brief's recorded pieces (ask #2509)
+TestBriefPiecesPure, TestBriefPiecesFloor, TestBriefPiecesRecord = _ibp.TestBriefPiecesPure, _ibp.TestBriefPiecesFloor, _ibp.build(TestBlockTable)
 # ------------------------------------------------- every test class isolates, or says why not (#1322)
 
 # THE one exceptions table: a unittest.TestCase that is not derived from Base (which isolates HOME and the XDG directories) is listed here with a one-line reason.
@@ -80377,11 +80382,12 @@ NOT_ISOLATED_BY_BASE = {
     "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
     "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
     "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",   # (#2483) the next two have no setUp and touch no file or state path: they call delegated_clear_checks and validate over in-memory dicts, with fetch_orders, _intent_reader, read_cos_orders patched to stubs
-    "TestDelegatedClearRepo", "TestDelegatedClearRepoOwnerFile",
+    "TestDelegatedClearRepo", "TestDelegatedClearRepoOwnerFile", "TestBriefPiecesPure",   # (#2509) TestBriefPiecesPure is pure: recorded_pieces and build_brief over in-memory dicts and copies of the module source, no state path
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
     "TestAskIsItsOwn", "TestBranchTipRead",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254; (#2392) the second runs cloud_branch_tip over a stub _api: no file, no state
     "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip", "TestText",   # (#2247) pure: TestGateBudget reads the shim source text and a number over an in-memory config (#2296); the other three are the land_repos reader, validate_config on dicts and sweep_refresh over stubs (#2323); no state path; "TestText" (#2365, test_worktree_root.py) is pure too: it reads the skill and agent texts and scans their lines, no state path
+    "TestReviewerBlockLines", "TestReviewerBlockLinesControl",   # (#2512) read text files of the repository and strings in memory: no World, rig or state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
@@ -80393,7 +80399,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
+    "TestBriefPiecesFloor", "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
     ),
 }
 
