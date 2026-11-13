@@ -64,3 +64,4 @@ switchboard/labels_ensure.py
 switchboard/orders_cos.py
 switchboard/checkpoint_reminders.py
 switchboard/land.py
+switchboard/land_gate.py
