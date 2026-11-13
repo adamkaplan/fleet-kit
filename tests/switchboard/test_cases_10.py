@@ -439,7 +439,8 @@ class TestRecordJsonReaders(unittest.TestCase):
     BIN = REPO / "bin"
     # readers of record text and the shared helpers: each must call parse_bounded (the helpers ARE the parse)
     READERS = {"agent_presence.py:read_record": "agent_presence", "switchboard/reminders.py:read_reminders": "reminders",
-               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry"}
+               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry",
+               "switchboard/decisions_a.py:read_escalated_checked": "decisions_a"}
     HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"

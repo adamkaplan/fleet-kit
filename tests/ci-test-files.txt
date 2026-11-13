@@ -10,6 +10,7 @@ chain bin/test-cloud-launcher.chain | bin/test-cloud-launcher
 loader bin/test-switchboard | tests/switchboard/test_*.py and tests/test_*.py, loaded by name
 run cloud/tests/test-cloud | its own step
 exempt plugins/fleet-decisions-tui/alarm.test.mjs | a node test (7 pass) that no workflow step runs yet: adding the step needs a workflow-file change, which a worker token cannot push
+exempt plugins/fleet-decisions-tui/escalated.test.mjs | a node test (5 pass) that no workflow step runs yet: adding it to the node --test step needs a workflow-file change, which a worker token cannot push
 run plugins/fleet-decisions-tui/click.test.mjs | node --test
 run plugins/fleet-decisions-tui/health.test.mjs | node --test
 run plugins/fleet-decisions-tui/kind.test.mjs | node --test

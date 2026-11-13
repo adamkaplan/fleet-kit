@@ -8144,6 +8144,16 @@ def decisions_report(state_dir, now):
     return report
 
 
+def decisions_listing(state_dir, now):
+    """`decisions_report`, then the escalation record applied at READ time (`escalation_applied`: the daemon's own key and test), so an escalation shows at once and not at the daemon's
+    next pass. The daemon's file is not touched. A record that cannot be read leaves the daemon's tier and sets `escalation_note` (one line)."""
+    report = decisions_report(state_dir, now)
+    if report["stale"] or not report["decisions"]:
+        return report
+    rows, note = escalation_applied(report["decisions"], state_dir)
+    return dict(report, decisions=rows, **({"escalation_note": note} if note else {}))
+
+
 def format_age(seconds):
     """`45s`, `12m`, `1h05m`, `3d`: the longest unit that fits, never more than a few characters."""
     seconds = max(0, int(seconds))
@@ -8239,7 +8249,7 @@ def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clea
     last = None
     try:
         while True:
-            report = decisions_report(state_dir, now())
+            report = decisions_listing(state_dir, now())
             if view is not None:
                 report = dict(report, decisions=select_decisions(report["decisions"], view))
             text = format_decisions(report, now(), view)
@@ -8318,17 +8328,21 @@ def cmd_decisions(args, runner, now):
     state = state_dir_path()
     if args.watch:
         return watch_decisions(state, now, clear=sys.stdout.isatty(), view=view)
-    report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
+    report = fresh_decisions(runner, now) if args.fresh else decisions_listing(state, now())
     shown = dict(report, decisions=select_decisions(report["decisions"], view))
     external = external_status_line(config, state, now()) if config else None
     hints = [] if report["stale"] else held_merge_order_hints(shown["decisions"], runner, now)
     if args.json:
         extra = {"external": external} if external is not None else {}
+        if report.get("escalation_note"):
+            extra["escalation_note"] = report["escalation_note"]
         if hints:
             extra["merge_order"] = hints
         print(json.dumps(dict(shown, message=report["message"] or None, view=view, **extra), indent=2, sort_keys=True))
     else:
         print(format_decisions(shown, now(), view))
+        if report.get("escalation_note"):
+            print("(%s)" % report["escalation_note"])
         for hint in hints:
             print(hint)
         if external is not None:
