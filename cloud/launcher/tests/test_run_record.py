@@ -112,6 +112,26 @@ class Record(td.Driver):
         self.assertEqual(out.count(self.shown(d)), 1, "named once on screen")
         self.assertEqual(self.read(self.env["CW_CLOUD_AUDIT"]).count(self.shown(d)), 1)
 
+    def test_the_boss_is_kept_for_the_land_report_lane(self):   # #2448: read-only from the switchboard's worker record
+        sb = os.path.join(self.tmp.name, "sb")
+        os.makedirs(sb)
+        with open(os.path.join(sb, "coder7.json"), "w") as f:
+            json.dump({"worker": "coder7", "reports_to": "orch-one"}, f)
+        self.denv["CW_CLOUD_RECORD_DIR"] = sb
+        p, out = self.run_driver()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(json.loads(self.read(os.path.join(self.the_record(), "run.json"))).get("boss"), "orch-one")
+
+    def test_a_hostile_boss_is_never_written(self):   # #2448: the worker record's reports_to is untrusted text
+        sb = os.path.join(self.tmp.name, "sb")
+        os.makedirs(sb)
+        with open(os.path.join(sb, "coder7.json"), "w") as f:
+            json.dump({"worker": "coder7", "reports_to": "Not A Name; x"}, f)
+        self.denv["CW_CLOUD_RECORD_DIR"] = sb
+        p, out = self.run_driver()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("boss", json.loads(self.read(os.path.join(self.the_record(), "run.json"))))
+
     def test_the_head_sha_is_kept_when_the_pod_can_say_it(self):
         self.patch_state(head_sha="a" * 40)
         p, out = self.run_driver()

@@ -569,7 +569,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders", "land_repos", "worktree_root"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "captain_labels", "merge_base", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders", "land_repos", "land_gate", "worktree_root"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -829,6 +829,7 @@ def validate_config(raw, source="config"):
     validate_captain_labels(config, source)
     validate_merge_base(config, source)
     validate_land_repos(config, source)   # #2320
+    validate_land_gate(config, source)   # #2517
     validate_worktree_root(config, source)   # #2363
     validate_app_config(config, source)  # #609
     return config
@@ -8144,6 +8145,16 @@ def decisions_report(state_dir, now):
     return report
 
 
+def decisions_listing(state_dir, now):
+    """`decisions_report`, then the escalation record applied at READ time (`escalation_applied`: the daemon's own key and test), so an escalation shows at once and not at the daemon's
+    next pass. The daemon's file is not touched. A record that cannot be read leaves the daemon's tier and sets `escalation_note` (one line)."""
+    report = decisions_report(state_dir, now)
+    if report["stale"] or not report["decisions"]:
+        return report
+    rows, note = escalation_applied(report["decisions"], state_dir)
+    return dict(report, decisions=rows, **({"escalation_note": note} if note else {}))
+
+
 def format_age(seconds):
     """`45s`, `12m`, `1h05m`, `3d`: the longest unit that fits, never more than a few characters."""
     seconds = max(0, int(seconds))
@@ -8239,7 +8250,7 @@ def watch_decisions(state_dir, now=time.time, sleep=time.sleep, write=None, clea
     last = None
     try:
         while True:
-            report = decisions_report(state_dir, now())
+            report = decisions_listing(state_dir, now())
             if view is not None:
                 report = dict(report, decisions=select_decisions(report["decisions"], view))
             text = format_decisions(report, now(), view)
@@ -8318,17 +8329,21 @@ def cmd_decisions(args, runner, now):
     state = state_dir_path()
     if args.watch:
         return watch_decisions(state, now, clear=sys.stdout.isatty(), view=view)
-    report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
+    report = fresh_decisions(runner, now) if args.fresh else decisions_listing(state, now())
     shown = dict(report, decisions=select_decisions(report["decisions"], view))
     external = external_status_line(config, state, now()) if config else None
     hints = [] if report["stale"] else held_merge_order_hints(shown["decisions"], runner, now)
     if args.json:
         extra = {"external": external} if external is not None else {}
+        if report.get("escalation_note"):
+            extra["escalation_note"] = report["escalation_note"]
         if hints:
             extra["merge_order"] = hints
         print(json.dumps(dict(shown, message=report["message"] or None, view=view, **extra), indent=2, sort_keys=True))
     else:
         print(format_decisions(shown, now(), view))
+        if report.get("escalation_note"):
+            print("(%s)" % report["escalation_note"])
         for hint in hints:
             print(hint)
         if external is not None:
@@ -8521,6 +8536,34 @@ def cloud_branch_tip(engine, repo, branch):
         return None
 
 
+HEADS_MAX = 5000   # the most branch lines one read keeps (ask #2470); more is a partial read, never a proof of anything
+
+
+def cloud_branch_heads(engine, repo):
+    """Ask #2470: ONE bounded read of the repository's own branch heads at the end of a pod: [(branch, full sha)], or None on any failure (an unreadable remote, a partial list).
+    One `gh api --paginate` call under the account of the repository, a 30 s timeout; an answer of more than HEADS_MAX lines is a partial read (None); the answer is a pair of fixed-shape fields, nothing else is kept."""
+    try:
+        if not (isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,99}/[A-Za-z0-9_-][A-Za-z0-9._-]{0,99}", repo)):
+            return None
+        intents = engine.intents
+        env = intents.env_for(repo)
+        argv = [intents.gh, "api", "--paginate", "repos/%s/git/matching-refs/heads?per_page=100" % repo, "--jq", '.[] | .ref + " " + .object.sha']
+        done = intents.runner(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
+        if done.returncode != 0:
+            return None
+        lines = (done.stdout or "").splitlines()
+        if len(lines) > HEADS_MAX:
+            return None
+        found = []
+        for line in lines:
+            ref, _, sha = line.partition(" ")
+            if ref.startswith("refs/heads/") and re.fullmatch(r"[0-9a-f]{40}", sha):
+                found.append((ref[len("refs/heads/"):], sha))
+        return found
+    except Exception:
+        return None
+
+
 def cloud_end_tick(engine, discovery):
     """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
     and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
@@ -8534,6 +8577,7 @@ def cloud_end_tick(engine, discovery):
                                                      lambda directory, worker: load_module("cloud_worker").bind(globals())._retired().last_message(directory, state_dir, worker),
                                                      head_checks=lambda repo, sha: cloud_head_checks(engine, repo, sha),
                                                      branch_tip=lambda repo, branch: cloud_branch_tip(engine, repo, branch),
+                                                     branch_heads=lambda repo: cloud_branch_heads(engine, repo),
                                                      last_push=load_module("cloud_end_alert").push_reader(getattr(getattr(engine, "audit", None), "path", None), load_module("record_json").parse_bounded))
 
 

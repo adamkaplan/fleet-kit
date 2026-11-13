@@ -423,6 +423,41 @@ def pr_note(workdir, res, hub=None, comment=None):
         return "PR not marked ready: the call failed (%s)" % type(e).__name__
 
 
+MADE_MAX = 100
+MADE_REFLOG = re.compile(r"commit\b|cherry-pick\b(?!: fast-forward)|rebase \((pick|continue|squash|fixup|reword|edit)\)|merge .*: Merge made|pull\b.*(\((pick|continue|squash|fixup|reword|edit)\)|: Merge made)")   # a reflog subject of a commit this clone CREATED (a fast-forward or a fetch is not)
+
+
+def made_commits(workdir, ctx=None):
+    """Ask #2470: the full shas of the commits the pod itself created in this clone (newest first, at most MADE_MAX): the commits named by `commit`, `cherry-pick`,
+    `rebase` and `merge ... Merge made` entries of the reflog of HEAD and of every local branch. The end notice names a remote branch as the pod's when its tip is one of them.
+    None when git cannot say (the notice then cannot call it `nothing pushed`). Local only, never raises."""
+    def entries(ref):
+        p = git(workdir, "reflog", "show", "--format=%H\t%gs", ref, "--", check=False, ctx=ctx)
+        if p.returncode != 0:
+            raise RuntimeError("reflog")
+        for line in p.stdout.splitlines():
+            sha, _, subject = line.partition("\t")
+            if re.fullmatch(r"[0-9a-f]{40}", sha) and MADE_REFLOG.match(subject):
+                yield sha
+    try:
+        refs = ["HEAD"] + git(workdir, "for-each-ref", "--format=%(refname)", "refs/heads", ctx=ctx).stdout.split()
+        made = []
+        for ref in refs[:200]:
+            for sha in entries(ref):
+                if sha not in made:
+                    made.append(sha)
+        return made[:MADE_MAX]
+    except Exception:
+        return None
+
+
+def with_made(workdir, res):
+    """The hook's answer with `made` added (see made_commits); a checkout-less answer gets none."""
+    if isinstance(res, dict) and not res.get("no_repository"):
+        res["made"] = made_commits(workdir)
+    return res
+
+
 def with_pr(workdir, res, hub=None, comment=None):
     """The hook's answer with `pr_note` added."""
     res["pr_note"] = pr_note(workdir, res, hub, comment)
@@ -933,7 +968,7 @@ def main():
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
     try:
-        print(json.dumps(with_runs(with_pr(workdir, run(workdir, worker)))))
+        print(json.dumps(with_runs(with_pr(workdir, with_made(workdir, run(workdir, worker))))))
         return 0
     except TokenEnded as e:
         # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.

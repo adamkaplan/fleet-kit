@@ -40592,7 +40592,7 @@ class TestDecisionsCommand(DecisionsBase):
         self.world.v2.ask_permission(self.world.sessions["platform"], timed=True)
         self.pass_(1)
         code, out, err = self.cli("decisions", "--tier", "all")
-        _, first, second = out.splitlines()
+        _, first, second = out.splitlines()[:3]   # then the one note line: no escalation record yet, and a cos row could move
         self.assertEqual(first.index("waiting"), second.index("waiting"))
 
     def test_json_prints_the_files_list(self):
@@ -52536,6 +52536,7 @@ class TestDecisionBaselineViews(BaselineWorld):
         self.ask_permission("api-coder")
         self.gh.issue(API, 2, "an issue", labels=["me:awaiting-cos"])
         self.daemon_pass()
+        sb.write_escalated(self.world.state, {})  # a record exists (nothing escalated), so the list prints no missing-record note
         out = self.cmd("cos", "decisions")["out"]
         starts = {line.index("waiting") for line in out.splitlines()[1:]}
         self.assertEqual(len(starts), 1, out)
@@ -67070,7 +67071,7 @@ TestStopFinalMessage, TestStopFinalMessageMutants, TestStopFinalMessageTwoRuns, 
     _stop_final.TestStopFinalMessageTwoRunsMutant, _stop_final.TestStopFinalMessageHardening, _stop_final.TestStopFinalMessageHardeningMutant)
 TestStopFinalMessageEdges, TestStopFinalMessageEdgesMutant = _stop_final.TestStopFinalMessageEdges, _stop_final.TestStopFinalMessageEdgesMutant
 TestStopFinalMessageBare, TestStopFinalMessageBareMutant = _stop_final.TestStopFinalMessageBare, _stop_final.TestStopFinalMessageBareMutant
-TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard; _ntt = importlib.import_module("test_notices_truth"); TestEndNoticeLastHead, TestRedCiOwnedByItsAsk, TestReadOfAnEndedWorker, TestRunRecordKeepsTheResultsFile, TestBranchTipRead, TestTheProductionWiring = _ntt.TestEndNoticeLastHead, _ntt.TestRedCiOwnedByItsAsk, _ntt.TestReadOfAnEndedWorker, _ntt.TestRunRecordKeepsTheResultsFile, _ntt.TestBranchTipRead, _ntt.TestTheProductionWiring   # ask #2392
+TestScratchGuard = importlib.import_module("test_scratch_command").TestScratchGuard; _ntt = importlib.import_module("test_notices_truth"); TestEndNoticeLastHead, TestRedCiOwnedByItsAsk, TestReadOfAnEndedWorker, TestRunRecordKeepsTheResultsFile, TestBranchTipRead, TestTheProductionWiring = _ntt.TestEndNoticeLastHead, _ntt.TestRedCiOwnedByItsAsk, _ntt.TestReadOfAnEndedWorker, _ntt.TestRunRecordKeepsTheResultsFile, _ntt.TestBranchTipRead, _ntt.TestTheProductionWiring; _ner = importlib.import_module("test_end_notice_refs"); TestEndNoticeNamesWhatThePodPushed, TestEndNoticeSaysNothingPushedOnlyWithProof, TestEndNoticeNamesAreBoundedAndSafe, TestOneBoundedReadPerEndedPod, TestTheHooksMadeCommits = _ner.TestEndNoticeNamesWhatThePodPushed, _ner.TestEndNoticeSaysNothingPushedOnlyWithProof, _ner.TestEndNoticeNamesAreBoundedAndSafe, _ner.TestOneBoundedReadPerEndedPod, _ner.TestTheHooksMadeCommits   # ask #2470
 
 # The host-disk tests of #2081.
 TestHostDisk = importlib.import_module("test_host_disk").TestHostDisk
@@ -80397,8 +80398,8 @@ NOT_ISOLATED_BY_BASE = {
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "TestBriefPiecesFloor", "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimUnlink", "TestGhShimUnlinkControls", "UnlinkBase", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
-    ),
+<<<<<<< HEAD
+    "NoticeCase", "TestBriefPiecesFloor", "TestEndNoticeNamesAreBoundedAndSafe", "TestEndNoticeNamesWhatThePodPushed", "TestEndNoticeSaysNothingPushedOnlyWithProof", "TestOneBoundedReadPerEndedPod", "TestTheHooksMadeCommits", "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimUnlink", "TestGhShimUnlinkControls", "UnlinkBase", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state   # (#2470) the end-notice classes of test_end_notice_refs.py: NoticeCase.setUp makes a tempfile.mkdtemp (removed by addCleanup), TestOneBoundedReadPerEndedPod builds a StopWorld (its own mkdtemp, CW_RUN_RECORD_DIR patched to it), TestTheHooksMadeCommits makes its own mkdtemp git clone; none reads real state
 }
 
 

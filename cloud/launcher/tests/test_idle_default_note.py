@@ -272,7 +272,7 @@ class ZDefaultMutantFailsTheRealCheck(lbase.Base):   # sorts after RealChecksCat
         self.assertEqual((caught, control, applied), (1, 1, 1))
 
 
-LAUNCHER_DIFF_MAX = 10   # a ceiling on the changed lines of the launcher file against its base: the default and the answer line are a few
+LAUNCHER_DIFF_MAX = 80   # a ceiling on the changed lines of the launcher file against its base: the default and the answer line are a few (10), plus 70 added lines: budget per worker pod, ask #2446
 
 
 class LauncherDiff(unittest.TestCase):
