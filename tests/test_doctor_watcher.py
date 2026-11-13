@@ -2,14 +2,14 @@
 """The doctor's run_to cap must never run the doctor's cleanup (ask #2023).
 
 S1/S2: a scratch shell sources `run_to` and `cleanup` from the text of bin/fleet-doctor and starts and ends the
-command at once many times. S3: the doctor itself, with stub herdr and gh, many runs. No thread is started here (every test thread would be a daemon thread).
+command at once many times. S3: the doctor itself, with stub herdr and gh, many runs.
+No thread is started here (every test thread would be a daemon thread).
 """
 import importlib.machinery
 import importlib.util
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,8 +76,6 @@ def run_scratch(shell, script, doctor_text, *args):
 
 
 def early_removals(doctor_text, n, stop=0):
-    """Count early removals over n starts (a bounded count; used for the fixed watcher, where 0 is expected)."""
-    assert n > 0
     return int(run_scratch(["bash"], HARNESS, doctor_text, n, stop)[-2])
 
 
