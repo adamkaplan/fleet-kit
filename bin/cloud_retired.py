@@ -728,6 +728,7 @@ def _hide_names(text, terms):
 _WRAP_WORD = 512      # the longest word joined across a fold; a longer one is no token of ours
 _WRAP_LINES = 8       # the most lines one folded secret is followed over
 _HINT = re.compile(r"(?i)sk-|gh[pousr]_|github_pat_|glpat-|xox|AKIA|eyJ|@|(?:token|secret|passw|api[_-]?key|credential|auth)[^=:]{0,40}[=:]|[A-Za-z0-9+/_-]{24}")
+_WRAP_USED = [0]      # the redaction attempts of the last _unwrap_redact call
 _WRAP_BUDGET = 20000  # the most redaction attempts of one call: a text built to be slow stops being followed, it is never slow   # what any secret shape needs: a join without one is not tried
 _WRAP_LEAD = " \t>|\"'`,;+*("   # what may stand before the continuation: an indent, a quote mark, a table bar, a string quote
 _INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff]")
@@ -748,9 +749,11 @@ def _unwrap_redact(text):
     scrub, redact = D["_scrub_lib"](), D["redact_command_text"]
 
     budget = [_WRAP_BUDGET]
+    _WRAP_USED[0] = 0
 
     def shaped(word):
         budget[0] -= 1
+        _WRAP_USED[0] = min(_WRAP_BUDGET, _WRAP_BUDGET - budget[0])   # the attempts made (the tests read it: the cap is a count, not a time)
         return redact(scrub(word, (), LAST_SCRUB_MAX)) if budget[0] >= 0 else word   # past the budget nothing more is tried
     lines = _INVISIBLE.sub("", text).splitlines()   # invisible characters cannot split a token; every kind of line break the later steps split on
     for i in range(len(lines) - 1):
