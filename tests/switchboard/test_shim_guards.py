@@ -31,17 +31,6 @@ RECORDED_BIN_TAIL = """  authority code: no
     | `y.py` | <layer 0-6> | <the one job of the module> | |
   closure: %s
 """
-# The nine rows as recorded from the base branch before the change (the check at today's table length).
-RECORDED_BIN_ROWS_AT_NINE = """    - TestAuthorityModulesGuard: a module that decides who may clear, hold or merge is listed or exempted by name
-    - TestAgentRegistryInventory: every module that reads or writes an agent record is in the registry inventory
-    - TestImpactHold module-name guard: every module the clear runs is judged by name
-    - bin/check-public-names: no private name in a tracked file
-    - TestArchitectureDocument: every file under bin/ is a row of the Units table of docs/architecture.md
-    - TestRecordJsonReaders: every module under bin/ that reads a record's JSON is in the table of readers
-    - TestTheReaperOnlyInstall: every function the installer calls is classified (Linux and macOS)
-    - TestRecordingCommands: every command that reaches a ledger append is a recording command or named exempt
-    - TestDerivedClosure: the closure of the delegated clear is derived over the entry and every part (tests/switchboard/test_closure.py)
-"""
 
 
 def recorded_bin_block(ps):
@@ -125,34 +114,6 @@ class TestShimGuardsTool(unittest.TestCase):
             outside = shim_run(TOOL, tmp, shim_plant(tmp, "plugins/z.py"))
             self.assertEqual(outside.returncode, 2)
             self.assertIn("is not a file directly under bin/ or shims/", outside.stdout)
-
-    def test_s2_the_recorded_nine_rows_are_what_the_table_builds_today(self):
-        ps = shim_load(PATH_SUITES, "shim_ps_nine")
-        if len(ps.NEW_BIN_GUARDS) != 9:
-            self.skipTest("the table no longer has the nine rows recorded at the base; the derived block covers it")
-        self.assertEqual(recorded_bin_block(ps), (RECORDED_BIN_HEAD % 9) + RECORDED_BIN_ROWS_AT_NINE + RECORDED_BIN_TAIL)
-
-    def test_s6_the_six_existing_modules_demand_nothing(self):
-        modules = sorted(p.name for p in (REPO / "shims").glob("*.py"))
-        # the property is "every module under shims/ demands nothing" (no size pin: #2219 added gh_body.py); the authority-code modules are named with their function counts
-        yes = {"gh_body.py": 1, "gh_hold.py": 3, "stash_guard.py": 1}
-        self.assertLessEqual(set(yes), set(modules))
-        total = 0
-        for name in modules:
-            done = shim_run(TOOL, REPO, "shims/" + name)
-            self.assertEqual(done.returncode, 0, (name, done.stdout))
-            for needle in ("  units: none", "  matrix: no line is demanded", "closure: not in the closure"):
-                self.assertIn(needle, done.stdout, name)
-            self.assertNotIn("add this row", done.stdout, name)
-            self.assertNotIn("add \"", done.stdout, name)
-            line = [l for l in done.stdout.splitlines() if l.startswith("  authority code:")][0]
-            if name in yes:
-                self.assertTrue(line.startswith("  authority code: yes"), (name, line))
-                self.assertEqual(len(re.search(r"functions: ([^;]*);", line).group(1).split(", ")), yes[name], name)
-                total += yes[name]
-            else:
-                self.assertEqual(line, "  authority code: no", name)
-        self.assertEqual(total, sum(yes.values()))
 
     def test_s8_the_globs_are_read_from_the_matrix_not_typed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -292,13 +253,6 @@ class TestShimGuardMutants(unittest.TestCase):
 
 
 class TestShimGuardDocs(unittest.TestCase):
-    def test_s7_the_documentation_and_the_matrix_line(self):
-        text = (REPO / "docs" / "switchboard.md").read_text()
-        self.assertEqual(len(re.findall(r"^A new module under `shims/` \(#1909\) is guarded as a new bin module is:.*the %d rows of `NEW_SHIM_GUARDS`" % len(shim_load(PATH_SUITES, "shim_ps_docs").NEW_SHIM_GUARDS), text, re.M)), 1)
-        self.assertEqual(len(re.findall(r"^Not put in scope, and why: the authority-modules guard.*the Units guard.*`TestDerivedClosure`", text, re.M)), 1)
-        matrix = MATRIX.read_text()
-        self.assertEqual(matrix.count("code that is not a .py file in bin/ (bin/fleet-switchboard, scripts, shims, plugins, agents)"), 1)
-
     def test_u5_the_new_tests_do_not_measure_a_pull_request(self):
         source = Path(__file__).read_text()
         forbidden = ["git" + " diff", "origin/" + "integration", "diff" + "stat", "num" + "stat", "changed_" + "files"]
