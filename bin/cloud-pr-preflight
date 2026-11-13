@@ -176,7 +176,9 @@ def _on_signal(signum, frame):
 
 
 def main():
-    for sg in (signal.SIGTERM, signal.SIGHUP):
+    # SIGINT too, explicitly: a process started in the background by a non-interactive shell inherits SIGINT as ignored, and Python then installs no
+    # KeyboardInterrupt handler, so a SIGINT did nothing and the temp copy was left (ask #2387)
+    for sg in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sg, _on_signal)
     expect = []
     quick = os.environ.get("CLOUD_PREFLIGHT_MODE") == "quick"
