@@ -66,6 +66,10 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
         if fact.kind in ("decoration", "decision") or key.startswith(("decoration:", "decision:")):
             return False
         if fact.kind in ("send", "worker.idle", "reminder") and key.startswith(("send:", "worker.idle:", "reminder:")):
+            # a fact made at this very moment (a fresh send), a stalled notice, or one keyed by a send/reminder
+            # id (12 or 16 hex characters) follows its own batch flag; seam notices and the rest batch
+            if fact.created == now or ":stalled:" in key or len(key.rpartition(":")[2]) in (12, 16):
+                return bool(fact.batch)
             return True
         return bool(fact.batch)
 
