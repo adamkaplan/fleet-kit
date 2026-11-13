@@ -6,6 +6,7 @@ Controls: the same call with no claim is what the current code does for the reap
 import contextlib
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -231,6 +232,16 @@ class TestParentProof(Base):
         self.assertTrue(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: (real[0], sys.executable, real[2])))
         self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: real))                              # a shell with the same argument list
         self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: (real[0], None, real[2])))          # an executable that cannot be read
+
+    def test_a_copy_of_a_shell_named_python_is_not_an_interpreter(self):
+        fake = self.home / "python"
+        fake.write_bytes(Path(shutil.which("sh")).resolve().read_bytes())
+        os.chmod(str(fake), 0o755)
+        pid = self.kit.start("-s", str(self.kit.script), "reap", program=str(fake))
+        self.assertFalse(self.proof(pid))
+        link = self.home / "python3-link"
+        link.symlink_to(shutil.which("sh"))
+        self.assertFalse(self.proof(self.kit.start("-B", str(self.kit.script), "reap", program=str(link))))
 
     def test_a_reader_that_fails_is_no_proof(self):
         self.assertFalse(SYSTEM.parent_is(NAME, self.kit.root, parent=1, reader=lambda pid: None))

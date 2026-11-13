@@ -10,7 +10,9 @@ Honest limit: this is a process-level check, as the state directory's own trust 
 (that runs the real program), or could run a program with a forged argument list. A person's pane, a session id, a pane variable, the claim variable
 or `--from` cannot make the parent process the reaper. Standard library only. Nothing here sends or writes."""
 import os
+import shutil
 import subprocess
+import sys
 
 SYSTEM_SENDER_ENV = "SWITCHBOARD_SYSTEM_SENDER"   # names the claimed sender; it is not a credential and proves nothing
 
@@ -21,6 +23,16 @@ SYSTEM_SENDERS = {
 
 
 PLAIN_OPTIONS = ("-B", "-u", "-E", "-s", "-S", "-I", "-O", "-OO", "-b", "-bb", "-q")
+
+
+def interpreters():
+    """The real paths of the Python interpreters this switchboard knows: its own, and the `python3` and `python` the service path finds. A copy of a shell named python is none of them."""
+    found = {os.path.realpath(sys.executable)}
+    for name in ("python3", "python"):
+        path = shutil.which(name)
+        if path:
+            found.add(os.path.realpath(path))
+    return found
 
 
 def registered(name):
@@ -51,8 +63,8 @@ def read_process(pid):
         return None
 
 
-def parent_is(name, kit_root, parent=None, reader=read_process, uid=None):
-    """True only when the parent process is the registered program of `name`: the same user, a Python interpreter, running the registered script of this kit
+def parent_is(name, kit_root, parent=None, reader=read_process, uid=None, known=None):
+    """True only when the parent process is the registered program of `name`: the same user, a known Python interpreter (by real path), running the registered script of this kit
     by an absolute path, with the registered word right after it. Anything unreadable, unregistered or different is False."""
     row = SYSTEM_SENDERS.get(name) if isinstance(name, str) else None
     if row is None:
@@ -63,7 +75,7 @@ def parent_is(name, kit_root, parent=None, reader=read_process, uid=None):
     owner, exe, argv = info
     if owner != (os.getuid() if uid is None else uid):
         return False
-    if not exe or not os.path.basename(exe).startswith("python"):   # no readable executable, no proof
+    if not exe or os.path.realpath(exe) not in (interpreters() if known is None else known):   # the executable must BE a known interpreter (by real path, never by name); unreadable, no proof
         return False
     options = 1
     while options < len(argv) and argv[options] in PLAIN_OPTIONS:   # only options that take no value and run no code: `-c`, `-m`, `-W x` and the like are never skipped
