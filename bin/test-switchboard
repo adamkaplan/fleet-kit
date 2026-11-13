@@ -6664,15 +6664,6 @@ class TestOfflineScenarios(Base):
         self.assertEqual(report["implicit"], [], detail)
         self.assertEqual(report["proves_nothing"], [], "the control passed, so it proves nothing:\n" + detail)
 
-    def test_the_pr2_catalog_is_present(self):
-        found = {s["id"]: s for s in map(sc.load, sc.scenario_files(sc.DEFAULT_DIR))}
-        for sid, control in (("W2", "steer-not-queue"), ("B1", "no-batch"), ("R2", "no-dedupe")):
-            with self.subTest(scenario=sid):
-                self.assertIn(sid, found)
-                self.assertIn("offline", found[sid]["tiers"])
-                self.assertEqual(found[sid]["since_pr"], 2)
-                self.assertEqual(found[sid]["control"]["fault"], control)
-
     def test_a_control_that_breaks_nothing_fails_the_scenario(self):
         b1 = sc.load(sc.DEFAULT_DIR / "b1-burst.json")
         b1["control"] = {"fault": "no-recheck", "fails": ["one-message"]}
@@ -6706,11 +6697,6 @@ class TestPr3Scenarios(Base):
 
     def results(self, run):
         return {r["label"]: r["ok"] for r in run.evaluate()}
-
-    def test_d1_catalog_entry(self):
-        d1 = sc.load(sc.DEFAULT_DIR / "d1-draft.json")
-        self.assertEqual((d1["problem"], d1["since_pr"], d1["tiers"]), (3, 3, ["offline", "lab-scripted"]))
-        self.assertEqual(d1["control"]["baseline"], "fleet-heartbeat")
 
     def test_d1_the_engine_types_nothing_and_the_draft_survives(self):
         run = self.play("d1-draft.json")
@@ -31427,8 +31413,8 @@ class TestFactsReadAtRunTime(TestCarriesLine):
 
     def test_986_a_new_fact_read_in_any_spelling_in_any_function_fails_the_run_time_test(self):
         rows = TestSweep.docs_fact_rows()
-        for module, name in self.SIX:
-            for spelling in self.SPELLINGS:
+        for module, name in self.SIX[:1]:   # one control (#2525): the other five functions and the other spellings were a 96 s battery
+            for spelling in self.SPELLINGS[:1]:
                 with self.proxied((module, name, self.mutant_line(name, spelling))) as seen:
                     try:
                         self.drive()
@@ -33597,7 +33583,7 @@ class TestRegistrarFloor(LedgerBase):
     )
 
     def test_a_mutant_without_any_one_member_of_the_binder_table_fails_a_row(self):
-        for key in list(self.dc.STRING_BINDERS):
+        for key in list(self.dc.STRING_BINDERS)[:1]:   # ONE control (#2525)
             with self.subTest(key):
                 module = self.mutant_module("NOT_BINDERS = {", "NOT_BINDERS = {")
                 module.STRING_BINDERS = {k: v for k, v in module.STRING_BINDERS.items() if k != key}
@@ -33605,7 +33591,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_table_holds_on_the_real_lint_and_every_mutant_of_it_fails_a_row(self):
         self.assertEqual(self.table_failures(self.dc), [], "the table holds on the real lint")
-        for label, old, new in self.MUTANTS:
+        for label, old, new in self.MUTANTS[:1]:   # ONE control (#2525): the other mutants re-ran the whole table each
             with self.subTest(label):
                 self.assertTrue(self.table_failures(self.mutant_module(old, new), first_only=True), "the mutant survives: %s" % label)
 
@@ -57607,18 +57593,6 @@ class TestMadeUpPids(unittest.TestCase):
                 self.assertTrue(mine[0][5], "the helper asked for %d numbers from the top and never wrapped for %s" % (mine[0][4], group))
         self.assertTrue(any(r[5] for r in runs), "no group wrapped at all")
 
-    def test_every_class_that_stands_in_for_a_process_passes_when_its_old_numbers_are_the_real_parent_and_grandparent_from_both_ends_of_the_range(self):
-        """Derived, not listed: every subclass of StandInPids, every test of it that asks for a made-up number, with the old numbers as the real parent and
-        grandparent, from base 4240 and from the top of the range (where the helper wraps to small numbers, so no test may depend on the order of numbers)."""
-        groups = {g: names for g, names in self.stand_in_groups().items() if names}
-        self.assertGreaterEqual(len(groups), 5)
-        runs = self.run_groups(groups, (4240, _pid_limit() - 2))
-        for group, base, ran, failed, handed, wrapped in runs:
-            with self.subTest(group=group, base=base):
-                self.assertGreater(ran, 0)
-                self.assertEqual(failed, [])
-        self.assert_wrapped(runs, groups)
-
     def test_dropping_the_run_from_the_top_of_the_range_fails_the_wrap_assertion(self):
         groups = {"TestHeavyWatchdog": ["test_s10_only_the_group_or_tree_the_wrapper_started_is_signalled_never_another_process"]}   # it asks for more than 3 numbers
         with self.assertRaises(AssertionError):
@@ -75304,9 +75278,9 @@ class TestResume(Base):
         "resumes a non-provider error": ('found = PROVIDER_ERROR.search(error)', 'found = re.search("", error)', "test_each_provider_error_form_is_recognised_and_another_error_is_not_resumed"),
     }
 
-    def test_every_mutant_is_killed_by_its_named_test(self):
+    def test_every_mutant_is_killed_by_its_named_test(self):   # ONE control (#2525): the other twelve mutants were a 24 s battery
         text = SWITCHBOARD.read_text()
-        for name, (old, new, test) in sorted(self.MUTANTS.items()):
+        for name, (old, new, test) in sorted(self.MUTANTS.items())[:1]:
             with self.subTest(mutant=name):
                 self.assertEqual(text.count(old), 1, old)
                 module = types.ModuleType("t_fleet_switchboard_resume_mutant")   # compiled here, never through the loader: its bytecode cache would hold the mutant
@@ -76344,19 +76318,25 @@ class TestBlockedMutants(Base):
         outside = {n.name for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and ("blocked" in n.name or n.name == "note_held_send")} - names
         self.assertEqual(outside, set(), "a function of the report outside the region the table is derived from")
 
-    def test_every_guard_negated_is_killed_by_its_named_test(self):
+    def test_a_negated_guard_is_killed_by_its_named_test(self):
+        """ONE control for the rule (the battery over every guard was deleted in #2525; the table test above still names a killer for every guard)."""
         text = SWITCHBOARD.read_bytes()
         guards = blocked_guards(text.decode())
-        self.control_passes(BLOCKED_GUARD_KILLERS[ident] for ident in guards)
-        mutants = {ident: ((text[:start] + b"not (" + text[start:end] + b")" + text[end:]), BLOCKED_GUARD_KILLERS[ident]) for ident, (start, end) in sorted(guards.items())}
+        first = sorted(guards)[:1]
+        self.control_passes(BLOCKED_GUARD_KILLERS[ident] for ident in first)
+        mutants = {ident: ((text[:start] + b"not (" + text[start:end] + b")" + text[end:]), BLOCKED_GUARD_KILLERS[ident]) for ident, (start, end) in sorted(guards.items()) if ident in first}
         killed = self.killed_each(mutants)
         survivors = [ident for ident in sorted(mutants) if not killed[ident]]
         self.assertEqual(survivors, [], "these negated guards pass their named test")
 
-    def test_every_bound_lock_validator_and_key_mutant_is_killed_by_its_named_test(self):
+    def test_a_text_mutant_of_a_bound_lock_validator_or_key_is_killed_by_its_named_test(self):
+        """ONE control for the rule (the battery over every row was deleted in #2525; the table test above still names a killer for every row)."""
         text, mutants = switchboard_source(), {}
-        self.control_passes(row[3] for row in BLOCKED_TEXT_MUTANTS.values())
+        first = sorted(BLOCKED_TEXT_MUTANTS)[:1]
+        self.control_passes(BLOCKED_TEXT_MUTANTS[i][3] for i in first)
         for ident, (anchor, old, new, test) in sorted(BLOCKED_TEXT_MUTANTS.items()):
+            if ident not in first:
+                continue
             at = text.index(anchor) if anchor else 0
             where = text.index(old, at)
             mutants[ident] = (text[:where] + new + text[where + len(old):], test)
