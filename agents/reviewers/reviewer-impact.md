@@ -113,7 +113,6 @@ files-read:
 findings:
 - <rule id> | block | <file:line> | <why it matters, one sentence> | <what would resolve it>
 - <rule id> | note | <file:line> | <why> | <what would resolve it>
-blast-radius: <one line, 1 to 80 printable ASCII characters>
 ```
 
 The coder session records your block; you never run the command. End every block with `blast-radius: <one line of 1 to 80 printable ASCII characters>`, as in the example below: the impact brief reads it. A block with no `impact-severity:` and `impact-probability:` line is recorded WITHOUT a score and clears nothing by score, so always give both.
