@@ -94,7 +94,7 @@ def refresh(log, path=TABLE):
 
 
 def main(argv):
-    n = 8
+    n = 6
     if "--n" in argv:
         n = int(argv[argv.index("--n") + 1])
     if "--refresh" in argv:
