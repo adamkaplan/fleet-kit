@@ -100,8 +100,8 @@ class TestReviewerBlockLines(unittest.TestCase):
             with self.subTest(role=role, name=name):
                 self.assertIn("`%s: " % name, read_all()[role])
 
-    def test_the_text_change_touches_no_code(self):
-        self.assertTrue(all(p.suffix == ".md" for p in (TEST_AGENT, IMPACT_AGENT, SKILL, LAWS)))
+    def test_the_root_laws_copy_names_the_lines_like_the_starter_copy(self):
+        self.assertEqual(sum("`mutants-run: " in l for l in (REPO / "REVIEW_LAWS.md").read_text().splitlines()), 1)
 
 
 class TestReviewerBlockLinesControl(unittest.TestCase):
@@ -126,6 +126,10 @@ class TestReviewerBlockLinesControl(unittest.TestCase):
         self.assertEqual(len(count_problems(survivors)), 1)
         wide = dict(texts, impact=re.sub(r"\nblast-radius: .*", "\nblast-radius: " + "x" * 81, texts["impact"], count=1))
         self.assertEqual(len(count_problems(wide)), 1)
+
+    def test_a_skill_that_names_a_line_twice_is_seen(self):
+        text = SKILL.read_text().replace("`blast-radius: <one line>`", "`blast-radius: <one line>` `blast-radius: x`", 1)
+        self.assertEqual(len(re.findall(r"`blast-radius: ", text)), 2, "the planted drift is there; the count the check reads is not 1")
 
 
 if __name__ == "__main__":

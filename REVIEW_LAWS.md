@@ -43,7 +43,9 @@ impacts:
 - <what changes> | <severity> | <probability> | <risk level> | <action>
 ```
 
-The test reviewer ends its block with `mutants-run: N`, the number of mutants it ran. It also ends it with `mutants-survived: M`, the number that survived (never above N; both 0 when none ran). The impact reviewer ends its block with `blast-radius: <one line>`, what the change can reach (1 to 80 printable ASCII characters).
+The test reviewer ends its block with `mutants-run: N`.
+It also ends it with `mutants-survived: M` (at most N).
+The impact reviewer ends its block with `blast-radius: <one line>`.
 
 ## Rating the impact: MIL-STD-882E, rewritten for software
 
@@ -58,7 +60,7 @@ The rating uses the categories of MIL-STD-882E (system safety) directly. The def
 | Marginal | Limited harm that is recoverable: a degraded feature, a wrong result in a corner, a rollback that is a single revert |
 | Negligible | No effect that a user or operator would notice: documentation, comments, formatting, an internal rename with no external reach |
 
-**Probability**: how likely that outcome is. Judge likelihood at the scale the change will run: a rare per-call fault becomes frequent across many calls.
+**Probability**: how likely that outcome is.
 
 | Probability | Meaning for a software defect |
 |---|---|
@@ -79,7 +81,7 @@ review, `.` = no action:
 | Marginal | Low (.) | Medium (2) | Medium (2) | Serious (H) | Serious (H) |
 | Negligible | Low (.) | Low (.) | Low (.) | Medium (2) | Medium (2) |
 
-The table equals `impact-matrix.json` in the starter set, the single source of truth (a test keeps them equal; a repository's copy of this file copies that table). The risk levels are the standard's (High, Serious, Medium, Low). The cell assignments are this repository's own and stricter than the standard in places, by design (R-LAW-12); a
+The table equals `impact-matrix.json` in the starter set, the single source of truth (a test keeps them equal; a repository's copy of this file copies that table). The cell assignments are this repository's own and stricter than the standard in places, by design (R-LAW-12); a
 repository may tighten them but not loosen them without the owner.
 The floor of R-LAW-13 holds changes to the paths a repository names, whatever the rating says. The size of a change is an input to the rating, never a hold by itself.
 
