@@ -192,7 +192,7 @@ def mutated_launcher(replacements):
 
 
 IDLE_DEFAULT = 'DEFAULT_IDLE = "60m"'
-HARD_DEFAULT = 'c.add_argument("--hard", default="2h")'
+HARD_DEFAULT = 'DEFAULT_HARD = "2h"'
 
 
 class FollowsTheLauncher(lbase.Base):
@@ -216,7 +216,7 @@ class FollowsTheLauncher(lbase.Base):
         self.assertIn("hard limit 2h (default)", n1)
         self.assertIsNone(follow_problem(n1, real))
         self.setUp()   # a fresh fake cluster for the changed launcher
-        changed, applied = mutated_launcher([(IDLE_DEFAULT, 'DEFAULT_IDLE = "45m"'), (HARD_DEFAULT, 'c.add_argument("--hard", default="3h")')])
+        changed, applied = mutated_launcher([(IDLE_DEFAULT, 'DEFAULT_IDLE = "45m"'), (HARD_DEFAULT, 'DEFAULT_HARD = "3h"')])
         ans = self.answer_of(changed)
         n2 = self.note_of(ans)
         followed = int("idle limit 45m (default)" in n2) + int("hard limit 3h (default)" in n2)

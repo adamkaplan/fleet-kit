@@ -66,6 +66,7 @@ class Scratch(unittest.TestCase):
         git(self.work, "add", "-A")
         git(self.work, "commit", "-q", "-m", "first")
         git(self.work, "push", "-q", "origin", "base")   # the remote holds the first commit; origin/base tracks it
+        git(t, "-C", self.bare, "config", "core.hooksPath", os.path.join(self.bare, "hooks"))   # a global core.hooksPath (the pod's) must not hide the counting hook
         hook = os.path.join(self.bare, "hooks", "pre-receive")
         with open(hook, "w") as f:
             f.write("#!/bin/sh\necho attempt >> %s\nexit 1\n" % self.log)   # from now on the remote refuses every push, after counting it
@@ -124,6 +125,7 @@ class S7Fetch(Scratch):
         self.remote = os.path.join(t, "o", "r.git")
         os.rename(self.bare, self.remote)
         self.bare = self.remote
+        git(t, "-C", self.bare, "config", "core.hooksPath", os.path.join(self.bare, "hooks"))   # the moved repository names its own hooks again
         git(self.work, "remote", "set-url", "origin", "https://github.com/o/r.git")
         git(self.work, "fetch", "-q", self.remote, "+refs/heads/*:refs/remotes/origin/*")
         helper_dir = os.path.join(t, "bin")

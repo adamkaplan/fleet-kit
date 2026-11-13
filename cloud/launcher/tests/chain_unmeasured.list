@@ -1,3 +1,4 @@
+cloud/launcher/tests/test_all_reds.py
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
 cloud/launcher/tests/test_azure_config_dir.py
@@ -31,9 +32,11 @@ cloud/launcher/tests/test_kept_expiry.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
+cloud/launcher/tests/test_l_hard_default.py
 cloud/launcher/tests/test_land_report.py
 cloud/launcher/tests/test_land_shape.py
 cloud/launcher/tests/test_launch_idempotent.py
+cloud/launcher/tests/test_launcher_shards.py
 cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_long_run_setting.py
 cloud/launcher/tests/test_m_cap_stopped.py
@@ -54,6 +57,7 @@ cloud/launcher/tests/test_pr_label_reaper.py
 cloud/launcher/tests/test_preflight_repo_read.py
 cloud/launcher/tests/test_preflight_step.py
 cloud/launcher/tests/test_probe_redirect.py
+cloud/launcher/tests/test_proof_operator_kubectl.py
 cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_readonly_root.py
 cloud/launcher/tests/test_reap_concurrent.py
@@ -65,6 +69,8 @@ cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_reaper_unauthorized.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py
+cloud/launcher/tests/test_results_own_run.py
+cloud/launcher/tests/test_results_own_run_wiring.py
 cloud/launcher/tests/test_retire_gone_exact.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
@@ -72,6 +78,7 @@ cloud/launcher/tests/test_scrub_linear.py
 cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_secret_dir.py
 cloud/launcher/tests/test_secret_dir_publish.py
+cloud/launcher/tests/test_stall_structural.py
 cloud/launcher/tests/test_stall_watch.py
 cloud/launcher/tests/test_stop_failed_pod.py
 cloud/launcher/tests/test_stop_no_checkout.py

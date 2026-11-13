@@ -8154,13 +8154,14 @@ class TestGithubRouting(Base):
         rig.gh.comment(40, "hi", 5001)
         self.assertEqual({f.key: f.recipient for f in rig.hub.facts()}, {"github.comment:5001": "coder"})
 
-    def test_an_issue_nobody_owns_is_dropped_and_audited_once(self):
+    def test_an_issue_nobody_owns_goes_to_the_chief_of_staff_and_is_audited_once(self):
+        # ask #2484: two Chief lanes here (no repository of their own): delivered to the first by name, the reason names both
         self.gh.comment(20, "hi", 5001)
-        self.assertEqual(self.routed(), {})
-        self.assertEqual(self.rig.keys(), [])
+        self.assertEqual(self.routed(), {"github.comment:5001": "platform"})
         self.hub.facts()
-        unrouted = [e for e in self.rig.world.audit() if e["event"] == "github.unrouted"]
-        self.assertEqual([e["detail"]["keys"][0] for e in unrouted], ["github.comment:5001"])
+        self.assertEqual([e for e in self.rig.world.audit() if e["event"] == "github.unrouted"], [])
+        lines = [e for e in self.rig.world.audit() if e["event"] == "github.comment.chief_unknown"]
+        self.assertEqual(len(lines), 1)
 
     def test_nothing_is_dropped_while_the_fleet_cannot_be_read(self):
         self.gh.comment(12, "hi", 5001)
@@ -45063,8 +45064,8 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
 
     ITEMS = 1200
 
-    def rig(self):
-        rig = GithubRig(self, config={"triage": False})  # the pass budget under test is the routing's; triage has its own (pass_seconds)
+    def rig(self, agents=None):
+        rig = GithubRig(self, agents=agents, config={"triage": False})  # the pass budget under test is the routing's; triage has its own (pass_seconds)
         self.calls = 0
         original = rig.gh.runner
 
@@ -45103,7 +45104,7 @@ class TestASlowCatchUpDoesNotFreezeThePass(Base):
             self.assertFalse(sb.decisions_report(rig.world.state, rig.world.clock.now())["stale"])
 
     def test_it_drains_over_passes_and_audits_the_unowned_in_counts_not_one_line_each(self):
-        rig = self.rig()
+        rig = self.rig(agents={})   # no Chief-of-Staff lane runs: nobody can receive an unowned comment (ask #2484's documented exception)
         rig.hub.catch_up(rig.watch(), rig.world.clock.now())
         kept = len(rig.hub.queue)
         for _ in range(kept):
@@ -66977,6 +66978,8 @@ TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_c
 # The failure-mode scenario warning of plan_check (#1455).
 TestNoFailureMode = importlib.import_module("test_plan_failure_mode").TestNoFailureMode
 TestEveryTestFileIsWired, TestWiredCheckPlanted, TestMutantIsCaught = (_wm := importlib.import_module("test_wired_tests")).TestEveryTestFileIsWired, _wm.TestWiredCheckPlanted, _wm.TestMutantIsCaught
+# The reviewer agents write the block lines of the impact brief (#2512).
+_rbl = importlib.import_module("test_reviewer_block_lines"); TestReviewerBlockLines, TestReviewerBlockLinesControl = _rbl.TestReviewerBlockLines, _rbl.TestReviewerBlockLinesControl
 # A failed verdict says why (#2054).
 TestVerdictEvidence = importlib.import_module("test_verdict_evidence").build(LedgerBase)
 # The counting tool of the test split (S13a of #1092).
@@ -67088,6 +67091,7 @@ TestCloudLaunchArmsCheckpoint = importlib.import_module("test_cloud_checkpoint")
 TestIntentEditToldOnce = importlib.import_module("test_intent_told_once").build(TestIntentEditWiring, GithubRig)   # #1437
 TestRunLauncherShapes, TestStatusLines, TestTurnEnd, TestDictCallersUnchanged = (_ss := importlib.import_module("test_status_shape")).TestRunLauncherShapes, _ss.TestStatusLines, _ss.TestTurnEnd, _ss.TestDictCallersUnchanged
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
+_t2483 = importlib.import_module("test_delegated_clear_repo"); TestDelegatedClearRepo, TestDelegatedClearRepoOwnerFile = _t2483.TestDelegatedClearRepo, _t2483.TestDelegatedClearRepoOwnerFile   # #2483
 _pass_recheck = importlib.import_module("test_pass_recheck"); _pass_recheck.World = World; TestPassRecheck, TestPassRecheckMutants, TestDropStaleOnce, TestUnreadUnitKeepsTheItem, TestUnreadUnitKeepsTheDigest, TestHiddenFindings, TestMissingCases, TestTriageHiddenGuard, TestPlanNewestForgotten, TestTriageHiddenMutants, TestPlanKeyHash, TestPlanWakeMutants, TestSeenAllConditions, TestSeenAllMutants, TestSweepOnRealPass, TestTriageOnRealPass = _pass_recheck.TestPassRecheck, _pass_recheck.TestPassRecheckMutants, _pass_recheck.TestDropStaleOnce, _pass_recheck.TestUnreadUnitKeepsTheItem, _pass_recheck.TestUnreadUnitKeepsTheDigest, _pass_recheck.TestHiddenFindings, _pass_recheck.TestMissingCases, _pass_recheck.TestTriageHiddenGuard, _pass_recheck.TestPlanNewestForgotten, _pass_recheck.TestTriageHiddenMutants, _pass_recheck.TestPlanKeyHash, _pass_recheck.TestPlanWakeMutants, _pass_recheck.TestSeenAllConditions, _pass_recheck.TestSeenAllMutants, _pass_recheck.TestSweepOnRealPass, _pass_recheck.TestTriageOnRealPass; _pass_recheck.TestPlanWake = TestPlanWake   # #1542
 TestQueuedBehindTurn = importlib.import_module("test_queued_behind_turn").TestQueuedBehindTurn
 TestHeaderDate, TestHeaderDateCallSites, TestHeaderInfiniteTime = (_hd := importlib.import_module("test_header_date")).TestHeaderDate, _hd.TestHeaderDateCallSites, _hd.TestHeaderInfiniteTime
@@ -67122,6 +67126,7 @@ TestDaemonSummary = importlib.import_module("test_pod_silence").TestDaemonSummar
 TestUnreadableSummary = importlib.import_module("test_pod_silence").TestUnreadableSummary   # the unreadable summary of #2173
 _stage_events = importlib.import_module("test_stage_events"); _stage_events.GithubRig, _stage_events.GH_REPO = GithubRig, GH_REPO; TestStageEvents = _stage_events.TestStageEvents; TestStageEvents.CONF = {"github_stage_repos": [GH_REPO], "github_stage_bots": ["github-actions[bot]"]}
 _cos_issue_comments = importlib.import_module("test_cos_issue_comments"); _cos_issue_comments.GithubRig = GithubRig; TestCosIssueComments = _cos_issue_comments.TestCosIssueComments   # ask #2445
+_outside_comment_route = importlib.import_module("test_outside_comment_route"); _outside_comment_route.GithubRig = GithubRig; TestOutsideCommentRoute = _outside_comment_route.TestOutsideCommentRoute   # ask #2484
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
@@ -80303,6 +80308,8 @@ class ReviewCommentEndToEndTests(Base):
 
 
 _ph_late = _ph.build_late(); TestPlanHashMarkerAsk, TestPlanHashMarkerLaunch = _ph_late   # #1713
+_ibp = importlib.import_module("test_impact_brief_pieces")   # the impact brief's recorded pieces (ask #2509)
+TestBriefPiecesPure, TestBriefPiecesFloor, TestBriefPiecesRecord = _ibp.TestBriefPiecesPure, _ibp.TestBriefPiecesFloor, _ibp.build(TestBlockTable)
 # ------------------------------------------------- every test class isolates, or says why not (#1322)
 
 # THE one exceptions table: a unittest.TestCase that is not derived from Base (which isolates HOME and the XDG directories) is listed here with a one-line reason.
@@ -80372,22 +80379,25 @@ NOT_ISOLATED_BY_BASE = {
     "TestPlanHashMarkerMutants", "TestPlanHashMarkerNoSizeTest", "TestPlanHashMarkerPure", "TestPlanHashMarkerStored", "TestPlanHashMarkerTally", "TestPlanKeyHash",
     "TestPlanWakeMutants", "TestPodSilence", "TestPodSilenceTick", "TestReadPagesStrict", "TestReadPagesStrictMutant", "TestSeenAllMutants",
     "TestStopFinalMessageBareMutant", "TestStopFinalMessageEdgesMutant", "TestStopFinalMessageHardeningMutant", "TestStopFinalMessageMutants", "TestStopFinalMessageTwoRunsMutant", "TestSummaryCluster",
-    "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",
+    "TestTriageHiddenMutants", "TestTwoBranchesAddingATestFile", "TestUnconsumedRecord", "TestUnreadableSummary",   # (#2483) the next two have no setUp and touch no file or state path: they call delegated_clear_checks and validate over in-memory dicts, with fetch_orders, _intent_reader, read_cos_orders patched to stubs
+    "TestDelegatedClearRepo", "TestDelegatedClearRepoOwnerFile", "TestBriefPiecesPure",   # (#2509) TestBriefPiecesPure is pure: recorded_pieces and build_brief over in-memory dicts and copies of the module source, no state path
     "TestCloudHeadChecks",   # (#2247) pure: cloud_head_checks over a mock engine and a stubbed _api, no state path; the file came with #2267
     "TestGithubWriteGuard",   # (#2247) pure: reads the repository sources read-only and scans strings in memory, no state path; the file came with #2263
     "TestAskIsItsOwn", "TestBranchTipRead",   # (#2247) pure: _ask_of on strings and dicts; the file came with #2254; (#2392) the second runs cloud_branch_tip over a stub _api: no file, no state
     "TestGateBudget", "TestReader", "TestConfigLoader", "TestSweepSkip", "TestText",   # (#2247) pure: TestGateBudget reads the shim source text and a number over an in-memory config (#2296); the other three are the land_repos reader, validate_config on dicts and sweep_refresh over stubs (#2323); no state path; "TestText" (#2365, test_worktree_root.py) is pure too: it reads the skill and agent texts and scans their lines, no state path
+    "TestReviewerBlockLines", "TestReviewerBlockLinesControl",   # (#2512) read text files of the repository and strings in memory: no World, rig or state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
     "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
     "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
     "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile", "TestTheProductionWiring",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392
+    "TestLandAttribution", "TestEndOnAsk", "TestLaunchRecordsTheAsk", "TestNotesAndRunLogsTogether",   # (#2393) TestNotesAndRunLogsTogether has no setUp of its own: it calls TestEndOnAsk.end, whose StopWorld uses one mkdtemp removed by addCleanup, mocks, no real state; TestLandAttribution derives from the push-watch Case (a TemporaryDirectory removed by addCleanup, fake engine and GitHub, no state path); TestEndOnAsk builds its StopWorld (mkdtemp removed by addCleanup); TestLaunchRecordsTheAsk runs the stubbed launch inside its own TemporaryDirectory
     "TestClaimBodyRead", "TestClaimHandMerge",   # (#2465 for TestClaimBodyRead, the same reason) (#2454) its own isolating setUp: it builds a TestClaimUnionAtLastMerge (a LedgerBase, so a Base) fixture and runs that fixture's setUp, which isolates the state; it reads no real state
     "TestPodReportedLostOnlyWhenSilent",   # (#2247) its Rig makes its own tempfile.mkdtemp for the engine, the launcher log and the memory, and reads no real state; the class came with #2261
     "TestStopFinalMessage", "TestStopFinalMessageBare", "TestStopFinalMessageEdges", "TestStopFinalMessageHardening", "TestStopFinalMessageTwoRuns",
     "TestEndNoticeHeadLine", "TestPodReportedLostOnlyWhenSilent",   # (#2247) each builds its own temp directory through its rig (StopWorld mkdtemp; Rig mkdtemp); the files came with #2267 and #2255
-    "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimUnlink", "TestGhShimUnlinkControls", "UnlinkBase", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
+    "TestBriefPiecesFloor", "TestGithubWriteAudit", "TestGuardSetRun", "TestGatesSkipped", "TestLandCompletion", "TestEndNoticeOwnPushes", "TestRefusedLaunchIsToldToItsLane", "TestGhBodyReadNamesItsStderr", "TestGhBodyReadNamesTheRepositoryOfTheWrite", "HookRig", "TestGhShimHookControls", "TestGhShimUnlink", "TestGhShimUnlinkControls", "UnlinkBase", "TestGhShimHookDelete", "Home", "TestKey", "TestCheck", "TestWorktreeLaunch",   # (#2247) each makes its own temp directory (a mkdtemp, a TemporaryDirectory, StopWorld, Rig, FakeGhMixin or BodyRig) and reads no real state; the files came with #2263, #2270, #2313, #2310, #2307, #2309 and #2323 and the forwarder hook files (#2397); Home, TestKey, TestCheck and TestWorktreeLaunch (#2365, test_worktree_root.py) each make their own temporary HOME, ~/Code and git repository (Home.setUp patches HOME and tempfile.tempdir) and read no real state
     ),
 }
 

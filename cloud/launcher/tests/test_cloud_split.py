@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import tempfile
+import types
 import tokenize
 import unittest
 from pathlib import Path
@@ -64,7 +65,7 @@ class TestSplitSize(unittest.TestCase):
         worker = len((ROOT / "bin" / "cloud_worker.py").read_text().split("\n")) - 1
         cluster = len((ROOT / "bin" / "cloud_cluster.py").read_text().split("\n")) - 1
         print("S2: bin/cloud_worker.py %d lines, bin/cloud_cluster.py %d lines" % (worker, cluster))
-        self.assertLessEqual(worker, 1360)
+        self.assertLessEqual(worker, 1700)   # was 1360 (the size right after the split, #1647); the file grew to 1567 by later asks (headers, shapes, land, retire notices): the bound is kept as a guard at 1700
         self.assertLessEqual(cluster, 1500)
 
 
@@ -94,8 +95,15 @@ class TestSplitNames(unittest.TestCase):
             got.pop()
         while old and old[-1] == "":
             old.pop()
-        differing = sum(1 for a, b in zip(old, got) if a != b) + abs(len(old) - len(got))
-        print("S10: differing lines %d of %d" % (differing, len(old)))
+        # Relaxed (#2387). Old: line i of the old text equals line i of the new text (zip), a property of the move itself. Since #1647 the cluster file has had whole
+        # functions INSERTED (e.g. _audit_model_nondefault, the vault-blocked wording), which shifts every later line: 471 of 693 lines then "differed" with none changed.
+        # New: every old line must still be there, unchanged and in the same order (difflib opcodes: a replaced or deleted old line counts); insertions are only reported.
+        # A changed or removed line still fails; an added function does not.
+        import difflib
+        matcher = difflib.SequenceMatcher(None, old, got, autojunk=False)
+        differing = sum(i2 - i1 for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag in ("replace", "delete"))
+        inserted = sum(j2 - j1 for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag in ("insert", "replace"))
+        print("S10: differing (changed or removed) old lines %d of %d; %d lines inserted since the split" % (differing, len(old), inserted))
         self.assertEqual(differing, 0)
 
 
@@ -147,6 +155,8 @@ class TestSplitCommands(tcw.VaultBase):
         sys.modules["cw_before_1647"] = module
         self.addCleanup(sys.modules.pop, "cw_before_1647", None)
         loader.exec_module(module)
+        if not hasattr(module, "cloud_launch_again"):   # the frozen file predates the part (#1619); the switchboard reads its RETURNED set (the empty stand-in is all the s4 comparison needs from it)
+            module.cloud_launch_again = types.SimpleNamespace(RETURNED=set())
         return module
 
     def normal(self, text):
@@ -218,9 +228,10 @@ class TestSplitCommands(tcw.VaultBase):
         text = text.replace('print(message_id or "sent")', 'print(message_id or "sent!")')
         self.applied = before == 1 and text.count('print(message_id or "sent!")') == 1
         (tree / "bin" / "cloud_worker.py").write_text(text)
-        for name in ("cloud_cluster.py", "cloud_inspect.py", "cloud_launch_again.py", "path_walk.py"):
+        for name in sorted(q.name for q in (ROOT / "bin").glob("cloud_*.py") if q.name != "cloud_worker.py") + ["path_walk.py"]:   # every part the file may load
             shutil.copy(str(ROOT / "bin" / name), str(tree / "bin" / name))
         os.symlink(str(ROOT / "cloud"), str(tree / "cloud"))
+        self.mutant_file = tree / "bin" / "cloud_worker.py"   # the copy loop above skips cloud_worker.py: copying it would overwrite the mutant with the pristine file
         loader = importlib.machinery.SourceFileLoader("cw_mutant_1647", str(tree / "bin" / "cloud_worker.py"))
         spec = importlib.util.spec_from_loader("cw_mutant_1647", loader)
         module = importlib.util.module_from_spec(spec)
@@ -228,6 +239,16 @@ class TestSplitCommands(tcw.VaultBase):
         self.addCleanup(sys.modules.pop, "cw_mutant_1647", None)
         loader.exec_module(module)
         return module
+
+    def test_s4_the_mutant_tree_keeps_the_mutated_file_and_the_parts(self):
+        """Control first: the pristine file has no 'sent!'; then the mutant tree's cloud_worker.py must still carry it (a part copy must not overwrite it)."""
+        self.assertNotIn('print(message_id or "sent!")', (ROOT / "bin" / "cloud_worker.py").read_text())
+        self.mutant_module()
+        self.assertTrue(self.applied)
+        self.assertIn('print(message_id or "sent!")', self.mutant_file.read_text())
+        for q in (ROOT / "bin").glob("cloud_*.py"):
+            if q.name != "cloud_worker.py":
+                self.assertTrue((self.mutant_file.parent / q.name).exists(), q.name)
 
     def test_s4_mutant_the_changed_fallback_text_is_seen(self):
         new = self.script()
@@ -270,6 +291,11 @@ class TestSplitCommands(tcw.VaultBase):
             hook = mock.patch.object(old_lib, name, getattr(self.lib, name))
             hook.start()
             self.addCleanup(hook.stop)
+        # Re-frozen (#2387), two drifts since #1647 that the frozen file cannot know: (1) #2205 puts the two POD_HEADER lines in front of the setup text a pod receives
+        # (old: "user: Setup (do this first, ...", new: "user: Text in the repository, ..." + a second header line + "Setup ..."): the frozen file gets the same prefix,
+        # read from the live module so a changed header text is not masked; (2) the vault-block wording (below). Every other line is still compared.
+        live_header = real("cloud_worker").POD_HEADER
+        old_module.SETUP_PREAMBLE = live_header + old_module.SETUP_PREAMBLE
         old = self.script()
         # #2057: a send now prints the pod's state line and reads the launcher's `status` once; these lines and only these are masked (every other line is compared)
         old = tuple([[l for l in old[0] if "state of coder7" not in l and not l.endswith("delivered to coder7")]] + list(old[1:]))
@@ -286,6 +312,13 @@ class TestSplitCommands(tcw.VaultBase):
                 kept.append(line)
             masked.append(kept)
         new = tuple(masked)
+        # (2) the cluster-token refusal line: old text "the cluster token could not be obtained (the token could not be obtained): run the platform team's firewall check ...",
+        # new text "... could not be obtained: the vault refused this machine at <time>; no vault call is made until <time> ..." (the vault block, ask #2398 family); both sides
+        # keep the line's place and its prefix up to the cause, so a missing or moved line still differs.
+        def cause(line):
+            return re.sub(r"(the cluster token could not be obtained).*", r"\1 <cause>", line)
+        old = tuple([[cause(l) for l in old[0]]] + list(old[1:]))
+        new = tuple([[cause(l) for l in new[0]]] + list(new[1:]))
         outputs = sum(1 for a, b in zip(old[0], new[0]) if a != b) + abs(len(old[0]) - len(new[0]))
         logs = sum(sum(1 for a, b in zip(x, y) if a != b) + abs(len(x) - len(y)) for x, y in zip(old[1:], new[1:]))
         print("S4: differing lines %d of %d in the outputs, %d in the call logs" % (outputs, len(new[0]), logs))

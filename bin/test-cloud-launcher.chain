@@ -1,5 +1,6 @@
 bin/test-cloud-cost-report
 bin/test-cloud-retired
+cloud/launcher/tests/test_all_reds.py
 cloud/launcher/tests/test_app_token.py
 cloud/launcher/tests/test_app_token_route.py
 cloud/launcher/tests/test_app_token_service.py
@@ -67,9 +68,11 @@ cloud/launcher/tests/test_kept_expiry.py
 cloud/launcher/tests/test_kept_failed_once.py
 cloud/launcher/tests/test_kept_running_once.py
 cloud/launcher/tests/test_known_forms.py
+cloud/launcher/tests/test_l_hard_default.py
 cloud/launcher/tests/test_land_report.py
 cloud/launcher/tests/test_land_shape.py
 cloud/launcher/tests/test_launch_idempotent.py
+cloud/launcher/tests/test_launcher_shards.py
 cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_long_run_setting.py
 cloud/launcher/tests/test_m_cap.py
@@ -96,6 +99,7 @@ cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_preflight_repo_read.py
 cloud/launcher/tests/test_preflight_step.py
 cloud/launcher/tests/test_probe_redirect.py
+cloud/launcher/tests/test_proof_operator_kubectl.py
 cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_readonly_root.py
 cloud/launcher/tests/test_reap_concurrent.py
@@ -110,6 +114,8 @@ cloud/launcher/tests/test_refusal_label.py
 cloud/launcher/tests/test_registry_endpoint.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_repo_min_shape.py
+cloud/launcher/tests/test_results_own_run.py
+cloud/launcher/tests/test_results_own_run_wiring.py
 cloud/launcher/tests/test_retire_gone_exact.py
 cloud/launcher/tests/test_retire_gone_pod.py
 cloud/launcher/tests/test_run_record.py
@@ -122,6 +128,7 @@ cloud/launcher/tests/test_secret_dir_publish.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
+cloud/launcher/tests/test_stall_structural.py
 cloud/launcher/tests/test_stall_watch.py
 cloud/launcher/tests/test_stop_cause.py
 cloud/launcher/tests/test_stop_failed_pod.py

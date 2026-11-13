@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# council [--base REF] [--head REF] [--roles a,b] [--author-model ID] [--class fast]: the council in a box (see council.mjs). Synchronous.
+here=$(dirname "$(readlink -f "$0")")
+. "$here/versions.sh"; spire_versions "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1 # the project's pinned tool versions, not the host's defaults
+exec node "$here/council.mjs" "$@"

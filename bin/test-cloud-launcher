@@ -3,8 +3,39 @@
 # The chain is the list file bin/test-cloud-launcher.chain, ONE entry per line (a path), sorted, with one fixed last line.
 # (It used to be ONE shell line of more than forty commands joined by &&; every member appended to it and every pair conflicted.)
 # To add a test: add one line to bin/test-cloud-launcher.chain at its alphabetical place, ABOVE the fixed last line (even if it sorts after it).
+# Sharding (ask #2500): `bin/test-cloud-launcher --shard K/N` runs only the entries whose 1-based position among the non-blank lines of the chain list
+# satisfies (position - 1) % N == K - 1 (K from 1 to N), so every entry is in exactly one shard and the chain list stays the ONE source of the file list.
+# `--list` (with --shard) prints the shard's entries and exits. bin/check-launcher-shards fails when a launcher test file is in no CI job or in two.
+# Without --shard the whole chain runs, as before. Arguments after these options go to the entries that take them, as before.
+SHARD=""; SHARD_SET=0; MODE=run
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --shard) SHARD=${2:-}; SHARD_SET=1; shift; [ $# -gt 0 ] && shift ;;
+    --list) MODE=list; shift ;;
+    *) break ;;
+  esac
+done
+# CI sets the shard by the environment variable CLOUD_LAUNCHER_SHARD=K/N (the step's command stays `bin/test-cloud-launcher 2>&1`, as the CI lists read it); an option wins over it.
+[ "$SHARD_SET" = 0 ] && [ -n "${CLOUD_LAUNCHER_SHARD:-}" ] && { SHARD=$CLOUD_LAUNCHER_SHARD; SHARD_SET=1; }
 cd "$(dirname "$0")/.." || exit 1
 LIST=bin/test-cloud-launcher.chain
+shard_entries() { # $1 = K, $2 = N: the entries of shard K of N, in chain order
+  awk -v k="$1" -v n="$2" 'NF { p++; if ((p - 1) % n == k - 1) print }' "$LIST"
+}
+SHARD_K=""; SHARD_N=""
+if [ "$SHARD_SET" = 1 ]; then
+  case "$SHARD" in
+    [0-9]*/[0-9]*) SHARD_K=${SHARD%/*}; SHARD_N=${SHARD#*/} ;;
+  esac
+  case "$SHARD_K$SHARD_N" in ''|*[!0-9]*) echo "NOT RUN: --shard needs K/N, for example 1/4 (got '$SHARD')"; echo "RESULT: FAIL"; exit 1 ;; esac
+  if [ "$SHARD_N" -lt 1 ] || [ "$SHARD_K" -lt 1 ] || [ "$SHARD_K" -gt "$SHARD_N" ]; then
+    echo "NOT RUN: --shard K/N needs 1 <= K <= N (got '$SHARD')"; echo "RESULT: FAIL"; exit 1
+  fi
+fi
+if [ "$MODE" = list ]; then
+  [ -n "$SHARD_K" ] || { echo "NOT RUN: --list needs --shard K/N"; echo "RESULT: FAIL"; exit 1; }
+  shard_entries "$SHARD_K" "$SHARD_N"; exit 0
+fi
 # Completeness check: every test_*.py must be listed in $LIST, or named here with a reason; every listed entry must exist.
 EXCEPTIONS="test_cloud_pod_deadline.py:slow(26s),not-yet-chained test_cloud_stop_nonce.py:slow(57s),not-yet-chained test_reaper_record_family.py:did-not-finish-in-120s,not-yet-chained"
 [ -f "$LIST" ] || { echo "NOT RUN: $LIST is missing"; echo "RESULT: FAIL"; exit 1; }
@@ -56,6 +87,12 @@ PAR=bin/test-cloud-launcher.parallel
 [ -f "$PAR" ] || PAR=/dev/null   # no parallel list: every entry runs serially
 OUT=$(mktemp -d) || exit 1
 trap 'rm -rf "$OUT"' EXIT
+# The lists this run walks: the whole chain and parallel list, or only the entries of the chosen shard (the checks above ran on the whole chain).
+RUNLIST=$LIST; RUNPAR=$PAR
+if [ "$SHARD_SET" = 1 ]; then
+  shard_entries "$SHARD_K" "$SHARD_N" > "$OUT/shard.chain"; RUNLIST="$OUT/shard.chain"
+  grep -Fxf "$OUT/shard.chain" "$PAR" > "$OUT/shard.par"; RUNPAR="$OUT/shard.par"
+fi
 run_entry() { # $1 = entry; runs it with the arguments it took in the old chain; prints its own RUN and TIME lines
   e=$1; shift
   case "$ARGS_ENTRIES" in *" $(basename "$e") "*) a=1 ;; *) a=0 ;; esac
@@ -81,25 +118,36 @@ lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, outpu
     f=$(printf %s "$e" | tr / _)
     run_entry "$e" "$@" > "$OUT/$f.out" 2>&1
     echo $? > "$OUT/$f.rc"
-  done < "$PAR"
+  done < "$RUNPAR"
 }
 pids=""
 for l in 0 1 2; do lane "$l" "$@" & pids="$pids $!"; done
 ran=0
 fail=0
+FAILED=""
+nfail=0
 while IFS= read -r e; do
   [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
   is_parallel "$e" && continue
-  run_entry "$e" "$@" || { echo "RESULT: FAIL"; kill $pids 2>/dev/null; exit 1; }
+  # a red entry is recorded and the loop goes on: every entry runs and every red is listed at the end
+  run_entry "$e" "$@" || { FAILED="$FAILED$e
+"; nfail=$((nfail + 1)); }
   ran=$((ran + 1))
-done < "$LIST"
+done < "$RUNLIST"
 wait
 while IFS= read -r e; do
   [ -n "$e" ] || continue
   f=$(printf %s "$e" | tr / _)
   cat "$OUT/$f.out"
-  [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || { echo "RESULT: FAIL"; exit 1; }
+  [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || { FAILED="$FAILED$e
+"; nfail=$((nfail + 1)); }
   ran=$((ran + 1))
-done < "$PAR"
+done < "$RUNPAR"
 echo "ran $ran entries"
+if [ "$nfail" -gt 0 ]; then
+  echo "FAILED FILES ($nfail):"
+  printf %s "$FAILED"
+  echo "RESULT: FAIL"
+  exit 1
+fi
 echo "RESULT: PASS"
