@@ -47,6 +47,8 @@ class T(unittest.TestCase):
             os.mkdir(x)
         for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
             shutil.copy(os.path.join(WORKER, src), os.path.join(self.share, name))
+        os.makedirs(os.path.join(self.share, "plugins/cw-tool-cap"), exist_ok=True)
+        shutil.copy(os.path.join(WORKER, "plugins/cw-tool-cap/index.js"), os.path.join(self.share, "plugins/cw-tool-cap/index.js"))
         subprocess.run(["git", "init", "-q", self.work], check=True)
         subprocess.run(["git", "-C", self.work, "remote", "add", "origin", "https://github.com/%s.git" % P.REPO], check=True)
         self.cw = P.CW_GH

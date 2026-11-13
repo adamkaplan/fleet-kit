@@ -26,6 +26,8 @@ class Base(unittest.TestCase):
             os.mkdir(x)
         for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md"), ("agents/orchestrator.md", "orchestrator.md")):
             shutil.copy(os.path.join(CLOUD, "worker", src), os.path.join(self.share, name))
+        os.makedirs(os.path.join(self.share, "plugins/cw-tool-cap"), exist_ok=True)
+        shutil.copy(os.path.join(os.path.join(CLOUD, "worker"), "plugins/cw-tool-cap/index.js"), os.path.join(self.share, "plugins/cw-tool-cap/index.js"))
         oc = os.path.join(self.bin, "opencode")
         shutil.copy(os.path.join(HERE, "fake_opencode.sh"), oc); os.chmod(oc, 0o755)
 
@@ -53,7 +55,10 @@ class Rows(Base):
         self.assertEqual(got, tpl)
         # the written config (valid JSON) lists the clamp plugin once, under the share dir
         with open(self.conf()) as f:
-            self.assertEqual(json.load(f)["plugin"], [os.path.join(self.share, "plugins/cw-tool-cap/index.js")])
+            self.assertNotIn("plugin", json.load(f))
+        inst = os.path.join(os.path.dirname(self.conf()), "plugins", "cw-tool-cap.js")
+        with open(inst) as a, open(os.path.join(self.share, "plugins/cw-tool-cap/index.js")) as b:
+            self.assertEqual(a.read(), b.read())
 
     def test_s7_rows_and_order(self):
         r = self.start(PATTERNS)

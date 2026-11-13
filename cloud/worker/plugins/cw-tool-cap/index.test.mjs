@@ -31,6 +31,15 @@ test("hooks registered through the plugin", async () => {
   try { await plugin.setup({ shell: { hook: (n) => { if (n === "run.after") throw new Error("SECRET-TEXT"); } } }); } finally { console.log = orig; }
   assert.equal(lines.length, 1); assert.ok(!lines[0].includes("SECRET-TEXT"));
 });
+test("tool.execute.after adds the note", async () => {
+  const hooks = {};
+  await plugin.setup({ shell: { hook: () => {} }, tool: { hook: (n, f) => { hooks[n] = f; } } });
+  const t = "Command exceeded timeout of 300000 ms.";
+  const ev = { status: "completed", result: { output: t, content: [{ type: "text", text: t }] } };
+  await hooks["execute.after"](ev);
+  assert.ok(ev.result.output.endsWith(NOTE)); assert.ok(ev.result.content[0].text.endsWith(NOTE));
+  await hooks["execute.after"](null); // never throws
+});
 test("S4: note", () => {
   const out = noteOf("command timed out after 300000 ms");
   assert.ok(/300000|5 minutes/.test(NOTE) && NOTE.includes("cw-run"));

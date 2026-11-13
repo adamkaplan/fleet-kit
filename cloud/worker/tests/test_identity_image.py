@@ -39,6 +39,8 @@ def apt_packages(text):
 _SHARE = tempfile.TemporaryDirectory()   # what the image's COPY lays down under /usr/local/share/cw
 for _src, _name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
     shutil.copy(os.path.join(WORKER, _src), os.path.join(_SHARE.name, _name))
+os.makedirs(os.path.join(_SHARE.name, "plugins/cw-tool-cap"), exist_ok=True)
+shutil.copy(os.path.join(WORKER, "plugins/cw-tool-cap/index.js"), os.path.join(_SHARE.name, "plugins/cw-tool-cap/index.js"))
 S = "sys" + "tem"
 G = "glo" + "bal"   # spelled in pieces: the repository scan for config writes reads the added lines
 GITCFG = "." + "git" + "config"
