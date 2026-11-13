@@ -29,5 +29,19 @@ export default {
     try {
       api.shell.hook("run.after", async (res) => { if (res && typeof res.output === "string") res.output = noteOf(res.output); });
     } catch (_) { console.log("cw-tool-cap: run.after hook unavailable, the timeout note is not added"); }
+    try {
+      if (api.tool && typeof api.tool.hook === "function") {
+        api.tool.hook("execute.after", async (ev) => {
+          try {
+            if (!ev) return;
+            if (ev.result && typeof ev.result.output === "string") ev.result.output = noteOf(ev.result.output);
+            if (ev.result && Array.isArray(ev.result.content)) {
+              for (const c of ev.result.content) if (c && c.type === "text" && typeof c.text === "string") c.text = noteOf(c.text);
+            }
+            if (typeof ev.output === "string") ev.output = noteOf(ev.output);
+          } catch (_) { /* never throw */ }
+        });
+      }
+    } catch (_) { console.log("cw-tool-cap: tool.execute.after hook unavailable, the timeout note is not added"); }
   },
 };

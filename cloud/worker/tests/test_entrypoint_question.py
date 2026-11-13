@@ -24,6 +24,8 @@ class Q(unittest.TestCase):
             os.mkdir(x)
         for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md"), ("agents/orchestrator.md", "orchestrator.md")):
             shutil.copy(os.path.join(CLOUD, "worker", src), os.path.join(self.share, name))
+        os.makedirs(os.path.join(self.share, "plugins/cw-tool-cap"), exist_ok=True)
+        shutil.copy(os.path.join(os.path.join(CLOUD, "worker"), "plugins/cw-tool-cap/index.js"), os.path.join(self.share, "plugins/cw-tool-cap/index.js"))
         oc = os.path.join(self.bin, "opencode")
         shutil.copy(os.path.join(HERE, "fake_opencode.sh"), oc); os.chmod(oc, 0o755)
         self.rec = os.path.join(self.d, "rec"); os.mkdir(self.rec)

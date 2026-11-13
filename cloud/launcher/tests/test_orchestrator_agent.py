@@ -235,6 +235,8 @@ class Entrypoint(unittest.TestCase):
             os.mkdir(p)
         for name, text in (("worker.md", "worker agent\n"), ("orchestrator.md", "---\npermission:\n  question: allow\n---\norchestrator agent\n"), ("opencode-worker.json", "{\n}\n")):
             pathlib.Path(os.path.join(share, name)).write_text(text)
+        os.makedirs(os.path.join(share, "plugins", "cw-tool-cap"))
+        pathlib.Path(os.path.join(share, "plugins", "cw-tool-cap", "index.js")).write_text("export default {};\n")
         with open(os.path.join(run, "channel-secret"), "w") as f:
             f.write("c" * 64)
         marker = os.path.join(d, "server-ran")

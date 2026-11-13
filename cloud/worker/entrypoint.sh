@@ -67,7 +67,12 @@ if [ "$AGENT" = orchestrator ]; then
   fi
 fi
 ( umask 077; mkdir -p "$cfgdir/opencode"
-  printf '{"model": "%s", "plugin": ["%s/plugins/cw-tool-cap/index.js"],\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" "${CW_SHARE_DIR:-/usr/local/share/cw}" > "$cfgdir/opencode/opencode.json"
+  printf '{"model": "%s",\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" > "$cfgdir/opencode/opencode.json"
+  capsrc="${CW_SHARE_DIR:-/usr/local/share/cw}/plugins/cw-tool-cap/index.js"
+  [ -f "$capsrc" ] || { echo "worker: $capsrc is missing; refusing to start" >&2; exit 1; }
+  mkdir -p "$cfgdir/opencode/plugins"
+  cp "$capsrc" "$cfgdir/opencode/plugins/cw-tool-cap.js" || exit 1
+  chmod 600 "$cfgdir/opencode/plugins/cw-tool-cap.js"
   # the worker agent (default) and the shell tool's permission (the catch-all allow; the question tool denied): the template's first line is its opening brace
   tail -n +2 "${CW_SHARE_DIR:-/usr/local/share/cw}/opencode-worker.json" >> "$cfgdir/opencode/opencode.json"
   mkdir -p "$cfgdir/opencode/agents"

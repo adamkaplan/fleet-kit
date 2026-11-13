@@ -30,7 +30,8 @@ class ToolCap(unittest.TestCase):
         self.assertNotIn("plugin", self.cfg())
         with open(os.path.join(W, "entrypoint.sh")) as f:
             ep = f.read()
-        self.assertEqual(ep.count('"plugin": ["%s/plugins/cw-tool-cap/index.js"]'), 1)
+        self.assertNotIn('"plugin"', ep)
+        self.assertIn("plugins/cw-tool-cap.js", ep)
 
     def test_s3_no_timeout_above_cap(self):
         vals = list(timeouts(self.cfg()))
