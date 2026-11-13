@@ -234,6 +234,7 @@ class FakeKube:
 
 
 LIB = None
+PC11_RUNS = {}   # (script, mutation) -> (code, stderr, stdout) of a scratch run, shared by the tests of the class
 
 
 def build():
@@ -759,17 +760,23 @@ print(counts)
 """
         PC11_U23 = r"""
 forms = {"v4": "10.99.88.77", "v6": "fd00:abcd:1234:5678:9abc:def0:1234:5678", "mapped": "0:0:0:0:0:ffff:10.99.88.77"}
+# one run of address characters longer than WINDOW is cut into windows of WINDOW that start every WINDOW - WINDOW_OVERLAP: the first window ends at WINDOW,
+# so an address is split exactly when it starts before that end and ends after it: every such offset, one more on each side, for each form
+END = lib.WINDOW
+TOTAL = END + 100
 split = []
+checked = 0
 for name, form in sorted(forms.items()):
-    for offset in range(120, 281):
-        line = "." * offset + form + "." * (400 - offset - len(form))
-        assert len(line) == 400
-        want = "." * offset + "[address]" + "." * (400 - offset - len(form))
-        out = lib._mask_addresses(line)
-        if out != want:
+    for offset in range(END - len(form) - 1, END + 2):
+        line = "." * offset + form + "." * (TOTAL - offset - len(form))
+        assert len(line) == TOTAL
+        want = "." * offset + "[address]" + "." * (TOTAL - offset - len(form))
+        checked += 1
+        if lib._mask_addresses(line) != want:
             split.append((name, offset))
+            break    # the first leak is the answer: the rest of the offsets are not run for a mutant
 if split:
-    sys.exit("an address split by a window boundary leaked: %d of 483, first %r" % (len(split), split[:3]))
+    sys.exit("an address split by a window boundary leaked: %d of %d, first %r" % (len(split), len(forms), split[:3]))
 """
 
         PC11_U24 = r"""
@@ -880,6 +887,12 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
             self.assertIn("a mapped or dotted-tail form with glue was left", err)
 
         def pc11_run(self, script, mutate=None):
+            key = (script, mutate)
+            if key not in PC11_RUNS:   # a control is run once for the whole class: the launcher sources do not change during a run
+                PC11_RUNS[key] = self.pc11_run_uncached(script, mutate)
+            return PC11_RUNS[key]
+
+        def pc11_run_uncached(self, script, mutate=None):
             import shutil, subprocess, tempfile
             root = Path(__file__).resolve().parents[2]
             with tempfile.TemporaryDirectory(prefix="pc11-") as tmp:

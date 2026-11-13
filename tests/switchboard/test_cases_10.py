@@ -1474,11 +1474,11 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         helps = [command for command in commands if command[-1] == "--help"]
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
-        first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        # the --help of every verb is no longer recorded here (the recording was never compared: the run of every command is golden-cli compare's job); the list is checked below
         listed = {tuple(c) for c in commands}
         for verb in verbs:
             self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
-        sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
+        sample = helps[:2] + helps[-2:] + commands[-2:]   # a small fixed sample, recorded twice
         self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):

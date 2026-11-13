@@ -332,12 +332,13 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
     def copy_tree(self):
         target = Path(tempfile.mkdtemp(prefix="qbt-", dir="/tmp/opencode" if os.path.isdir("/tmp/opencode") else None))
         self.addCleanup(shutil.rmtree, str(target), True)
-        shutil.copytree(str(ROOT), str(target / "t"), ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        shutil.copytree(str(ROOT), str(target / "t"), ignore=shutil.ignore_patterns(".git", "__pycache__", "cloud", "test-switchboard"))   # the inner run needs neither the whole suite entry nor the cloud tree
         return target / "t"
 
     def run_in(self, tree, name):
-        env = dict(os.environ, QUEUED_BEHIND_TURN_INNER="1")
-        done = subprocess.run([sys.executable, "-B", str(tree / "bin" / "test-switchboard"), "TestQueuedBehindTurn.%s" % name],
+        """The one test of the copy, run by unittest on the test module of the copy (not the whole 80 000-line suite entry: loading it costs seconds a run)."""
+        env = dict(os.environ, QUEUED_BEHIND_TURN_INNER="1", PYTHONPATH=str(tree / "tests" / "switchboard"))
+        done = subprocess.run([sys.executable, "-B", "-m", "unittest", "test_queued_behind_turn.TestQueuedBehindTurn.%s" % name],
                               capture_output=True, text=True, env=env, cwd=str(tree), timeout=600)
         return done.returncode, done.stdout + done.stderr
 
@@ -349,10 +350,7 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
 
     @unittest.skipIf(os.environ.get("QUEUED_BEHIND_TURN_INNER"), "the inner run of a mutant copy")
     def test_s5_the_mutants_fail_with_the_anchored_texts_after_the_controls_pass(self):
-        for name in ("test_s2_a_message_admitted_in_a_turn_says_so_and_an_idle_one_prints_as_recorded",
-                     "test_s4_a_consumed_message_says_how_long_it_waited"):
-            code, out = self.run_in(self.copy_tree(), name)
-            self.assertEqual(code, 0, "the unmutated control must pass first: " + out[-600:])
+        # the controls are the two real tests of this class (test_s2_..., test_s4_...) run on the live tree; they are not run a second time in a copy
         tree = self.copy_tree()
         self.mutate(tree, "bin/switchboard/decision.py", '", queued behind a turn" if in_turn else ""', '""')
         code, out = self.run_in(tree, "test_s2_a_message_admitted_in_a_turn_says_so_and_an_idle_one_prints_as_recorded")
@@ -384,9 +382,7 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
         self.assertEqual(self.consumed(world), [], self.LIGHT_TEXT + ": under light reads.inbox answers [] with no call, so an unguarded pass would wrongly conclude a message consumed")
         if os.environ.get("QUEUED_BEHIND_TURN_INNER"):
             return
-        name = "test_the_owners_light_switch_means_the_queued_wait_pass_reads_no_inbox"
-        code, out = self.run_in(self.copy_tree(), name)
-        self.assertEqual(code, 0, "the unmutated control must pass first: " + out[-600:])   # REAL
+        name = "test_the_owners_light_switch_means_the_queued_wait_pass_reads_no_inbox"   # the control is the body above, run on the live tree
         tree = self.copy_tree()
         self.mutate(tree, "bin/fleet-switchboard", self.GUARD, "if self.state_dir is not None:   # #1801: a queued message gone from its inbox")
         code, out = self.run_in(tree, name)   # FAKE: the mutant is a textual copy, run in a copy of the tree

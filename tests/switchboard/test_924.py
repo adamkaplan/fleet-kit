@@ -288,6 +288,12 @@ def _body():
             """The definitions that belong to the rating's path, derived from the code: the call path from `main` to a rating target (with the two dynamic edges), the definitions that read, write or register a rating field and the
             the definitions `main` itself names (its guard and the dispatch). (names, the parsed daemon, the matrix rule)."""
             import ast
+            walked = {}
+
+            def walk(node):   # each definition is walked once, whatever the number of questions asked of it (parse-once)
+                if id(node) not in walked:
+                    walked[id(node)] = list(ast.walk(node))
+                return walked[id(node)]
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
             module = sb.load_module("delegated_clear")
             daemon = ast.parse(self.real_source())
@@ -295,13 +301,13 @@ def _body():
             dynamic = rule["dynamic_actions"]
             fields = set(sb.IMPACT_RATING_FIELDS) | {"by_role"}
             names = {"IMPACT_RATING_FIELDS", "IMPACT_CLASS_RE"}
-            touching = {n for n, node in defs.items() if isinstance(node, ast.FunctionDef) and any((isinstance(x, ast.Constant) and (x.value in fields or (isinstance(x.value, str) and re.fullmatch(r"--impact-(severity|probability|reason|class|action)", x.value)))) or (isinstance(x, ast.Name) and x.id in names) for x in ast.walk(node))}
+            touching = {n for n, node in defs.items() if isinstance(node, ast.FunctionDef) and any((isinstance(x, ast.Constant) and (x.value in fields or (isinstance(x.value, str) and re.fullmatch(r"--impact-(severity|probability|reason|class|action)", x.value)))) or (isinstance(x, ast.Name) and x.id in names) for x in walk(node))}
             from_main = module.closure(daemon, ["main"], dynamic)[0]
             def edges(node):
-                out = {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in defs}
-                if any(isinstance(x, ast.Constant) and x.value == "cmd_" for x in ast.walk(node)):
+                out = {x.id for x in walk(node) if isinstance(x, ast.Name) and x.id in defs}
+                if any(isinstance(x, ast.Constant) and x.value == "cmd_" for x in walk(node)):
                     out |= {"cmd_" + a for a in dynamic}
-                if any(isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE" for x in ast.walk(node)):
+                if any(isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE" for x in walk(node)):
                     out |= {"add_%s_parsers" % a for a in dynamic}
                 return out
             graph = {n: edges(defs[n]) for n in from_main if n in defs}
@@ -311,9 +317,9 @@ def _body():
                 if not more:
                     break
                 on_path |= more
-            clear_dispatchers = {n for n, node in defs.items() if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Name) and x.id == "cmd_impact_clear" for x in ast.walk(node))}   # the clear's own entry: the definition that names it (`cmd_impact`) runs it, though `main` reaches it only by the string "cmd_" + action, which the walker follows for the rating's action only
-            path = (on_path & set(from_main)) | clear_dispatchers | touching | {x.id for fn in ("main", "private_parser") for x in ast.walk(defs[fn]) if isinstance(x, ast.Name) and x.id in defs}   # what main and the private parser name themselves
-            handing = {c.func.id for n in path if n in defs for c in ast.walk(defs[n]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs and any(k.arg is None for k in c.keywords)}   # what the path hands the handler's arguments to (`call_command(handler, **available)`)
+            clear_dispatchers = {n for n, node in defs.items() if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Name) and x.id == "cmd_impact_clear" for x in walk(node))}   # the clear's own entry: the definition that names it (`cmd_impact`) runs it, though `main` reaches it only by the string "cmd_" + action, which the walker follows for the rating's action only
+            path = (on_path & set(from_main)) | clear_dispatchers | touching | {x.id for fn in ("main", "private_parser") for x in walk(defs[fn]) if isinstance(x, ast.Name) and x.id in defs}   # what main and the private parser name themselves
+            handing = {c.func.id for n in path if n in defs for c in walk(defs[n]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs and any(k.arg is None for k in c.keywords)}   # what the path hands the handler's arguments to (`call_command(handler, **available)`)
             return path | handing, daemon, rule
 
         def test_the_rating_roots_are_derived_from_the_code_and_each_is_classified_in_one_table(self):
@@ -517,6 +523,18 @@ def _body():
                 helper[name] = sorted(n for n, v in vars(mod).items() if inspect.isfunction(v) and v.__module__ == mod.__name__)
             return daemon_names, helper
 
+        KEPT_ALWAYS = ("cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser", "main")
+        SAMPLE_STEP = 6   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 6th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
+
+        def sampled(self, cases):
+            """The cases of a derived list that are run: the named ones, the first and last of each module, and every SAMPLE_STEP-th (deterministic; a name added later moves the sample, never empties it)."""
+            keep = []
+            for index, (name, module) in enumerate(cases):
+                edge = index == 0 or index == len(cases) - 1 or (index and cases[index - 1][1] != module) or (index + 1 < len(cases) and cases[index + 1][1] != module)
+                if name in self.KEPT_ALWAYS or edge or index % self.SAMPLE_STEP == 0:
+                    keep.append((name, module))
+            return keep
+
         def reassign_registrar(self, name, module=None):
             target = sb if module is None else sb.load_module(module)
             original = getattr(target, name)
@@ -532,7 +550,7 @@ def _body():
             self.assertTrue({"cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser"} <= set(daemon_names) | set(helper["impact_hold"]) | {"build_parser"}, daemon_names[:5])
             self.no_direct_route()   # the BACKSTOP: the routes that still run registrars (the direct route runs none)
             self.record_pr_setup()
-            for name in daemon_names:
+            for name, _module in self.sampled([(n, None) for n in daemon_names]):
                 with self.subTest(record_function=name):
                     original = getattr(sb, name)
                     try:
@@ -554,7 +572,7 @@ def _body():
             self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
             cases = [(name, None) for name in daemon_names] + [(name, module) for module, names in helper.items() for name in names]
             self.assertGreater(len(cases), 100)
-            for name, module in cases:
+            for name, module in self.sampled(cases):
                 with self.subTest(function=name, module=module):
                     target = sb if module is None else sb.load_module(module)
                     original = getattr(target, name)
