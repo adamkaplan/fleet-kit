@@ -109,19 +109,19 @@ while IFS= read -r e; do
   [ -n "$e" ] || continue
   grep -qx "$e" "$LIST" || { echo "NOT RUN: parallel entry $e is not in $LIST"; echo "RESULT: FAIL"; exit 1; }
 done < "$PAR"
-lane() { # $1 = lane number: every 4th entry of $PAR, one after the other, output in $OUT/<entry>.out, status in $OUT/<entry>.rc
+lane() { # $1 = lane number: every 6th entry of $PAR, one after the other, output in $OUT/<entry>.out, status in $OUT/<entry>.rc
   l=$1; shift; n=0
   while IFS= read -r e; do
     [ -n "$e" ] || continue
     n=$((n + 1))
-    [ $(( (n - 1) % 4 )) = "$l" ] || continue
+    [ $(( (n - 1) % 6 )) = "$l" ] || continue
     f=$(printf %s "$e" | tr / _)
     run_entry "$e" "$@" > "$OUT/$f.out" 2>&1
     echo $? > "$OUT/$f.rc"
   done < "$RUNPAR"
 }
 pids=""
-for l in 0 1 2 3; do lane "$l" "$@" & pids="$pids $!"; done
+for l in 0 1 2 3 4 5; do lane "$l" "$@" & pids="$pids $!"; done
 ran=0
 fail=0
 FAILED=""
