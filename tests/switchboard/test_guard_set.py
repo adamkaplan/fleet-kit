@@ -57,7 +57,7 @@ class TestGuardSet(unittest.TestCase):
         # in-process: the copy's own test_wired_tests module (loaded from the tree copy) runs the guard's test; no child run per step
         import importlib.util
         with tempfile.TemporaryDirectory() as d:
-            tree = Path(d) / "tree"
+            tree = (Path(d) / "tree").resolve()   # macOS: /var is /private/var, and the module resolves its own __file__
             shutil.copytree(REPO, tree, ignore=shutil.ignore_patterns(".git", "__pycache__"))
             spec = importlib.util.spec_from_file_location("guard_tree_wired", tree / "tests" / "switchboard" / "test_wired_tests.py")
             mod = importlib.util.module_from_spec(spec)
