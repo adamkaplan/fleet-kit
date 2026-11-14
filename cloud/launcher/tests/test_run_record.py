@@ -1,4 +1,6 @@
 """Slice S3 (#638): the run record (S5, U2) and the report path (S6). Offline: the fake kubectl and the stub server."""
+import contextlib
+import io
 import pathlib
 import base64
 import json
@@ -236,10 +238,17 @@ class Record(td.Driver):
             fds.append(r)
             args += ["--run-secret-fd", "%s=%d" % (name, r)]
         env = dict(os.environ, **self.env)
-        p = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "cloud_worker.py")] + args, env=env,
-                           capture_output=True, text=True, pass_fds=fds + [pw_w], timeout=120)
-        os.close(pw_w)
-        self.assertEqual(p.returncode, 0, p.stderr)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cw.main(args, env)   # in this process: the fake kubectl runs in process too (the Kube patch of Base)
+        finally:
+            for fd in fds + [pw_w, pw_r]:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.assertEqual(code, 0, err.getvalue())
 
     def test_s5_the_launchers_stop_alone_writes_the_record_so_retire_gets_one(self):
         self.check_stop_alone()
@@ -287,11 +296,11 @@ class Record(td.Driver):
 
     def test_a_server_that_drips_one_byte_at_a_time_cannot_keep_the_pod_past_the_deadline(self):
         t = time.monotonic()
-        self.check_timed_out(t, 25, STUB_DRIP="1", CW_RECORD_SECONDS="3", CW_RECORD_TIMEOUT="30")
+        self.check_timed_out(t, 25, STUB_DRIP="1", CW_RECORD_SECONDS="1.5", CW_RECORD_TIMEOUT="30")
 
     def test_kubectl_reads_that_each_hang_near_their_limit_are_bounded_by_the_one_deadline(self):
-        t = time.monotonic()   # ls + cat + git each sleep 2 s: the sum (6 s+) is over the 3 s deadline
-        self.check_timed_out(t, 25, FAKE_KUBE_EXEC_SLEEP="2", CW_RECORD_SECONDS="3")
+        t = time.monotonic()   # ls + cat + git each sleep 1 s: the sum (3 s+) is over the 1.5 s deadline
+        self.check_timed_out(t, 25, FAKE_KUBE_EXEC_SLEEP="1", CW_RECORD_SECONDS="1.5")
 
     def test_the_record_deadline_default_maximum_and_bad_values(self):
         rr = cw.run_record

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -165,9 +166,8 @@ class Preflight(unittest.TestCase):
         # a private copy of the program: its repo-approvals.json is the only approvals file there is
         self.copy = os.path.join(self.dir, "launcher")
         os.makedirs(self.copy)
-        for n in ("preflight.py", "app_token.py", "token_mint.py", "repo-approvals.json"):
-            shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), n), self.copy)
-        self.prog = os.path.join(self.copy, "preflight.py")
+        shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), "repo-approvals.json"), self.copy)   # the program runs in this process on THIS file (run_pf)
+        self.prog = PREFLIGHT
 
     def approvals(self, content, raw=False):
         """Write the private copy's repo-approvals.json; returns its path."""
@@ -179,7 +179,16 @@ class Preflight(unittest.TestCase):
     def run_pf(self, *args, **env):
         e = dict(os.environ, CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
         e.update(env)
-        return subprocess.run([sys.executable, self.prog, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
+        if self.prog != PREFLIGHT or "PLANTED_SECRET" in env:   # a symlink to the program, or a secret in the environment: a real process
+            return subprocess.run([sys.executable, self.prog, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, e, clear=True), mock.patch.object(pf, "APPROVALS", os.path.join(self.copy, "repo-approvals.json")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = pf.main([REPO, *args])
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else (0 if exit_.code is None else 1)
+        return subprocess.CompletedProcess([PREFLIGHT, REPO, *args], code, out.getvalue(), err.getvalue())
 
     def test_fully_protected_passes_and_only_reads(self):
         p = self.run_pf()
@@ -366,8 +375,10 @@ class Preflight(unittest.TestCase):
         os.makedirs(other)
         with open(os.path.join(other, "repo-approvals.json"), "w") as f:
             json.dump({self.KEY: self.ENTRY}, f)  # a grant beside the link
+        for n in ("preflight.py", "app_token.py", "token_mint.py", "repo-approvals.json"):
+            shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), n), self.copy)
         link = os.path.join(other, "preflight.py")
-        os.symlink(self.prog, link)
+        os.symlink(os.path.join(self.copy, "preflight.py"), link)
         self.prog = link
         p = self.run_pf()
         self.assertEqual(p.returncode, 1, p.stdout)

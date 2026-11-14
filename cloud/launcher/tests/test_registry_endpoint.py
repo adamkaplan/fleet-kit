@@ -268,11 +268,28 @@ class Mutants(unittest.TestCase):
          "    _registry_note(engine, \"retire\", state, args.name, reason)\n    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, extra, STOP_SECONDS, cluster=cluster)", "^(FAIL|ERROR): test_matches_a_failed_stop_leaves_the_row "),
     )
 
+    @staticmethod
+    def link_tree(copy, real):
+        """A scratch tree of ROOT: the paths in `real` are copied (the mutation and the test run touch only those), everything else is a symlink."""
+        def build(src, dst, rels):
+            dst.mkdir(parents=True, exist_ok=True)
+            for entry in sorted(src.iterdir()):
+                if entry.name in (".git", "__pycache__"):
+                    continue
+                here = [r for r in rels if r == entry.name or r.startswith(entry.name + "/")]
+                if not here:
+                    (dst / entry.name).symlink_to(entry)
+                elif entry.name in here:
+                    shutil.copytree(entry, dst / entry.name, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+                else:
+                    build(entry, dst / entry.name, [r[len(entry.name) + 1:] for r in here])
+        build(ROOT, copy, list(real))
+
     def run_tree(self, rel=None, old=None, new=None, only=None):
         """Run Behaviour in a scratch copy; with a mutation, it is asserted applied (counted). Returns (exit code, output, applied)."""
         with tempfile.TemporaryDirectory() as tmp:
             copy = Path(tmp) / "tree"
-            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            self.link_tree(copy, ("cloud/launcher", "bin"))
             applied = False
             self.occurrences = 0
             if rel:

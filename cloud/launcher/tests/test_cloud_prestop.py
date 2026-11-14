@@ -1,3 +1,4 @@
+import atexit
 """Ask #1142: the pod's pre-stop hook (cw-prestop / cw-end-hook --prestop). Fake cluster = run the rendered spec's own command."""
 import argparse, datetime as dt, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
 import pathlib
@@ -29,6 +30,29 @@ def sh(*a, cwd=None, env=None):
     return subprocess.run(a, cwd=cwd, env=env, capture_output=True, text=True, check=True).stdout.strip()
 
 
+_TEMPLATE = []
+
+
+def _template():
+    """origin, evil and repo as the old setUp built them with git init / clone / commit / push (nothing in them names the temp directory)."""
+    if not _TEMPLATE:
+        t = tempfile.mkdtemp()
+        atexit.register(shutil.rmtree, t, True)
+        origin, evil, work = (os.path.join(t, n) for n in ("origin", "evil", "repo"))
+        sh("git", "init", "-q", "--bare", "-b", "main", evil)
+        sh("git", "init", "-q", "--bare", "-b", "main", origin)
+        sh("git", "clone", "-q", origin, work)
+        for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
+            sh("git", "-C", work, "config", k, v)
+        pathlib.Path(os.path.join(work, "a.txt")).write_text("a")
+        sh("git", "-C", work, "add", "-A")
+        sh("git", "-C", work, "commit", "-qm", "base")
+        sh("git", "-C", work, "push", "-q", "origin", "HEAD:main")
+        sh("git", "-C", work, "remote", "set-url", "origin", URL)   # origin is named like the pod's repository; the hook never uses it
+        _TEMPLATE.append(t)
+    return _TEMPLATE[0]
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp()
@@ -49,18 +73,10 @@ class Base(unittest.TestCase):
         self.opts = " ".join(cw_end_hook.safe_opts(self.helper))
         self.push_url = "file://%s/%s.git" % (self.t, REPO)
         self.refspec = "--no-verify %s HEAD:refs/heads/w1/wip" % self.push_url
-        sh("git", "init", "-q", "--bare", "-b", "main", self.evil)
-        sh("git", "init", "-q", "--bare", "-b", "main", self.origin)
-        sh("git", "clone", "-q", self.origin, self.work)
-        for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
-            sh("git", "-C", self.work, "config", k, v)
-        pathlib.Path(os.path.join(self.work, "a.txt")).write_text("a")
-        sh("git", "-C", self.work, "add", "-A")
-        sh("git", "-C", self.work, "commit", "-qm", "base")
-        sh("git", "-C", self.work, "push", "-q", "origin", "HEAD:main")
-        # the hook is installed under the names the image gives it
-        # origin is named like the pod's repository; the hook never uses it (it pushes to the explicit address, which the seam points at the bare repo)
-        sh("git", "-C", self.work, "remote", "set-url", "origin", URL)
+        template = _template()   # the two bare remotes and the clone, made once by real git and copied here
+        shutil.copytree(os.path.join(template, "evil"), self.evil, symlinks=True)
+        shutil.copytree(os.path.join(template, "origin"), self.origin, symlinks=True)
+        shutil.copytree(os.path.join(template, "repo"), self.work, symlinks=True)
         shutil.copy(self.seam(HOOK), os.path.join(self.bin, "cw-end-hook"))
         self.out = os.path.join(self.t, "out")
         # macOS has no GNU timeout: a small stand-in at the front of PATH ('timeout [-k N] SECONDS cmd args' runs cmd args).
