@@ -263,10 +263,23 @@ def _wait_gone(pids, seconds):
     return [p for p in pids if _alive(p)]
 
 
+_START_MARKS = {}
+
+
+def _may_have_children(directory):
+    d = Path(directory)
+    if stub_support.STARTED[0] != _START_MARKS.get(str(directory), -1):
+        return True
+    try:
+        return (d / "stub" / "pf.pid").exists() or any((d / "tmp").rglob("tunnel-*.pid"))
+    except OSError:
+        return True
+
+
 def end_children_and_remove(tmp, directory):
     """Cleanup of Base.setUp: end every child naming the scratch directory (SIGTERM, wait, SIGKILL), then remove it."""
     import signal
-    pids = _children_of(directory)
+    pids = _children_of(directory) if _may_have_children(directory) else []   # the process listing costs a spawn: only when something could have left a child
     for sig, wait in ((signal.SIGTERM, CHILD_END_WAIT_SECONDS), (signal.SIGKILL, 5)):
         for p in pids:
             try:
@@ -290,9 +303,12 @@ def end_children_and_remove(tmp, directory):
 
 
 class Base(unittest.TestCase):
+    _shared_remote = None
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()   # the platform's temporary directory, never the repository root: an entry that judges the root runs beside the entries that load this fixture
         self.home = Path(tmp.name).resolve()
+        _START_MARKS[str(self.home)] = stub_support.STARTED[0]
         self.addCleanup(end_children_and_remove, tmp, self.home)
         self.stub_dir = self.home / "stub"
         self.stub_dir.mkdir()
@@ -302,8 +318,10 @@ class Base(unittest.TestCase):
         fake_opencode = self.home / "opencode"
         fake_opencode.write_text("#!/bin/sh\nexit 1\n")
         fake_opencode.chmod(0o755)
-        self.remote = FakeRemote(PASSWORD)
-        self.addCleanup(self.remote.close)
+        if Base._shared_remote is None:
+            Base._shared_remote = FakeRemote(PASSWORD)   # one server for every test: binding a socket and a thread per test cost seconds
+        self.remote = Base._shared_remote
+        self.remote.password, self.remote.requests, self.remote.bodies, self.remote.messages = PASSWORD, [], [], []
         import hashlib
         for name, body in (("kubectl", KUBECTL % {"python": sys.executable}), ("az", AZ)):
             (self.stub_dir / name).write_text(body)
