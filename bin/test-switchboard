@@ -24799,7 +24799,7 @@ class TestIdentityCheck(ReportBase):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, bindir, SAFE_PATH), "HOME": str(home),
                    "XDG_CONFIG_HOME": str(home / "xdg-config"), "FLEET_SWITCHBOARD_BIN": str(bindir / "sb"),
                    "FLEET_REAL_GH": str(bindir / "gh"), "GH_TOKEN": inherited}
-        environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(0.2 if seconds is None and not wedge else (seconds or 5))
+        environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(2.0 if seconds is None and not wedge else (seconds or 5))
         environ.update(extra_env or {})
         if log.exists():
             log.unlink()

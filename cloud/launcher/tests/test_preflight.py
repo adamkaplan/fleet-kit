@@ -143,10 +143,10 @@ class Preflight(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
-        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.srv.serve_forever, daemon=True, kwargs={"poll_interval": 0.01}).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
         cls.other = http.server.HTTPServer(("127.0.0.1", 0), Other)
-        threading.Thread(target=cls.other.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.other.serve_forever, daemon=True, kwargs={"poll_interval": 0.01}).start()
 
     @classmethod
     def tearDownClass(cls):
@@ -521,9 +521,14 @@ class Preflight(unittest.TestCase):
 
     def test_bad_targets_are_refused(self):
         for bad in ("a/..", "../b", ".", "a/b/c", "a/", "/b", "a/./b"):
-            p = subprocess.run([sys.executable, PREFLIGHT, bad], capture_output=True, text=True,
-                               env=dict(os.environ, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN))
-            self.assertEqual(p.returncode, 2, bad)
+            out, err = io.StringIO(), io.StringIO()   # in process: the target is refused before any network call
+            with mock.patch.dict(os.environ, {"CW_PREFLIGHT_TOKEN_CMD": "echo " + TOKEN}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = pf.main([bad])
+                except SystemExit as exit_:
+                    code = exit_.code
+            self.assertEqual(code, 2, bad)
         self.assertEqual(self.run_pf("--branch", "a/../b").returncode, 2)
 
     def test_unreadable_answers_exit_2(self):

@@ -44,7 +44,7 @@ def wait_until(fn, seconds=8.0):
     while time.time() < end:
         if fn():
             return True
-        time.sleep(0.05)
+        time.sleep(0.02)
     return fn()
 
 

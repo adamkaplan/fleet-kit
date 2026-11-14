@@ -20,6 +20,7 @@ def sh(cwd, *a):
 class Repo:
     def __init__(self):
         self.d = tempfile.mkdtemp(prefix="pf-test-")
+        self.tmp = tempfile.mkdtemp(prefix="pf-tmp-")
         sh(self.d, "git", "init", "-q", "-b", "main")
         sh(self.d, "git", "config", "user.email", "t@example.com")
         sh(self.d, "git", "config", "user.name", "t")
@@ -44,7 +45,8 @@ class Repo:
         sh(self.d, "git", "commit", "-q", "-m", m)
 
     def run(self, script=SCRIPT, args=(), **env):
-        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="5", CLOUD_PREFLIGHT_BASE="main")
+        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="5", CLOUD_PREFLIGHT_BASE="main",
+                 TMPDIR=self.tmp, TEMP=self.tmp, TMP=self.tmp)
         e.update(env)
         p = subprocess.run([sys.executable, script, *args], cwd=self.d, env=e, capture_output=True, text=True)
         return p.returncode, p.stdout
@@ -54,6 +56,7 @@ class Repo:
 
     def close(self):
         shutil.rmtree(self.d, ignore_errors=True)
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 def mutant(old, new):
@@ -70,12 +73,12 @@ class T(unittest.TestCase):
         self.addCleanup(self.r.close)
 
     def test_clean_passes_and_writes_nothing(self):
-        before = set(os.listdir(tempfile.gettempdir()))
+        before = set(os.listdir(self.r.tmp))
         rc, out = self.r.run()
         self.assertEqual(rc, 0, out)
         self.assertIn("RESULT: PASS", out)
         self.assertEqual(self.r.status(), "")
-        self.assertEqual([x for x in set(os.listdir(tempfile.gettempdir())) - before if x.startswith("cloud-preflight-")], [])
+        self.assertEqual([x for x in set(os.listdir(self.r.tmp)) - before if x.startswith("cloud-preflight-")], [])
 
     def test_unchained_new_file_named(self):
         self.r.put("cloud/launcher/tests/test_new.py", PASS); self.r.commit("new")
@@ -172,8 +175,8 @@ class T(unittest.TestCase):
         self.assertIn("test_b.py  +", self.r.run()[1])
 
 
-def leftovers(before):
-    return [x for x in set(os.listdir(tempfile.gettempdir())) - before if x.startswith("cloud-preflight-")]
+def leftovers(before, tmpdir=None):
+    return [x for x in set(os.listdir(tmpdir or tempfile.gettempdir())) - before if x.startswith("cloud-preflight-")]
 
 
 SLEEP = "import time\ntime.sleep(60)\n"
@@ -186,24 +189,25 @@ class Signals(unittest.TestCase):
         self.r.put("cloud/launcher/tests/test_a.py", SLEEP); self.r.commit("sleepy")
 
     def go(self, sig, script=SCRIPT, ignored=False):
-        before = set(os.listdir(tempfile.gettempdir()))
-        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main")
+        before = set(os.listdir(self.r.tmp))
+        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main",
+                 TMPDIR=self.r.tmp, TEMP=self.r.tmp, TMP=self.r.tmp)
         p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              preexec_fn=(lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)) if ignored else None)
         for _ in range(100):
-            if leftovers(before):
+            if leftovers(before, self.r.tmp):
                 break
             time.sleep(0.1)
         time.sleep(0.5)
-        self.assertTrue(leftovers(before), "no temp copy appeared")
+        self.assertTrue(leftovers(before, self.r.tmp), "no temp copy appeared")
         p.send_signal(sig)
         try:
             rc = p.wait(timeout=20)
         except subprocess.TimeoutExpired:
             p.kill(); p.wait(); rc = "hung"
-        left = leftovers(before)
+        left = leftovers(before, self.r.tmp)
         for x in left:
-            shutil.rmtree(os.path.join(tempfile.gettempdir(), x), ignore_errors=True)
+            shutil.rmtree(os.path.join(self.r.tmp, x), ignore_errors=True)
         return rc, left
 
     def test_sigterm_cleans_up(self):

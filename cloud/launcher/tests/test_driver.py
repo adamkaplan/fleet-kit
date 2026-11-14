@@ -166,9 +166,9 @@ class Driver(base.Base):
         proc = self.spawn(**env)
         end = time.time() + 40
         while time.time() < end and not ready():
-            time.sleep(0.1)
+            time.sleep(0.02)
         self.assertTrue(ready(), "the driver never reached the phase")
-        time.sleep(0.1)
+        time.sleep(0.02)
         proc.send_signal(sig)
         out, err = proc.communicate(timeout=120)
         return proc.returncode, out + err
