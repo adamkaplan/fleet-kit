@@ -2,6 +2,7 @@
 """Ask #1289: the end hook and its --prestop path name the untracked files they saved (S1-S6, S9, S10, S12, U2). Offline: a bare
 repository and a clone under the temporary directory. The hook module is driven in process, so the real code path runs; each mutant is
 the hook's own source with one change, loaded as a module, and must fail at least one case."""
+import atexit
 import contextlib
 import io
 import json
@@ -44,30 +45,49 @@ def mutant(old, new):
     return load(src.replace(old, new))
 
 
-class Tree:
-    """A bare origin, a clone with one pushed commit, and (for the prestop path) a fake credential helper."""
-    def __init__(self, prestop):
-        self.t = tempfile.mkdtemp()
-        self.prestop = prestop
-        self.origin = os.path.join(self.t, REPO + ".git")
-        self.work = os.path.join(self.t, "repo")
-        os.makedirs(os.path.dirname(self.origin))
-        sh("init", "-q", "--bare", "-b", "main", self.origin)
-        sh("clone", "-q", self.origin, self.work)
+_TEMPLATES = {}   # prestop -> a finished tree, built once and copied for each case
+
+
+def _template(prestop):
+    if prestop not in _TEMPLATES:
+        tmpl = tempfile.mkdtemp()
+        atexit.register(shutil.rmtree, tmpl, True)
+        origin, work = os.path.join(tmpl, REPO + ".git"), os.path.join(tmpl, "repo")
+        os.makedirs(os.path.dirname(origin))
+        sh("init", "-q", "--bare", "-b", "main", origin)
+        sh("clone", "-q", origin, work)
         for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
-            sh("-C", self.work, "config", k, v)
-        self.put("a.txt", "a")
-        sh("-C", self.work, "add", "-A")
-        sh("-C", self.work, "commit", "-qm", "base")
-        sh("-C", self.work, "push", "-q", "origin", "HEAD:main")
+            sh("-C", work, "config", k, v)
+        with open(os.path.join(work, "a.txt"), "w") as f:
+            f.write("a")
+        sh("-C", work, "add", "-A")
+        sh("-C", work, "commit", "-qm", "base")
+        sh("-C", work, "push", "-q", "origin", "HEAD:main")
         if prestop:
-            sh("-C", self.work, "remote", "set-url", "origin", "https://github.com/%s.git" % REPO)
-            self.helper_dir = os.path.join(self.t, "helper")
-            os.makedirs(self.helper_dir)
-            helper = os.path.join(self.helper_dir, "git-credential-cw")
+            sh("-C", work, "remote", "set-url", "origin", "https://github.com/%s.git" % REPO)
+            helper_dir = os.path.join(tmpl, "helper")
+            os.makedirs(helper_dir)
+            helper = os.path.join(helper_dir, "git-credential-cw")
             with open(helper, "w") as f:
                 f.write("#!/bin/sh\ncat > /dev/null\nprintf 'username=x\\npassword=pw\\n'\n")
             os.chmod(helper, 0o755)
+        _TEMPLATES[prestop] = tmpl
+    return _TEMPLATES[prestop]
+
+
+class Tree:
+    """A bare origin, a clone with one pushed commit, and (for the prestop path) a fake credential helper: a copy of the template."""
+    def __init__(self, prestop):
+        tmpl = _template(prestop)
+        self.t = tempfile.mkdtemp()
+        self.prestop = prestop
+        shutil.copytree(tmpl, self.t, symlinks=True, dirs_exist_ok=True)
+        self.origin = os.path.join(self.t, REPO + ".git")
+        self.work = os.path.join(self.t, "repo")
+        if prestop:
+            self.helper_dir = os.path.join(self.t, "helper")
+        else:
+            sh("-C", self.work, "remote", "set-url", "origin", self.origin)
 
     def put(self, name, content=CONTENT):
         path = os.path.join(self.work, name)

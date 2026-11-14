@@ -4,6 +4,7 @@ These tests RUN the launch, the stop and the clear (bin/test-cloud-worker's fake
 the registry's own file. The mutants copy the source tree to a scratch directory, assert the change was applied, and run the behaviour tests there:
 a mutant is caught when that run exits 1.
 """
+import concurrent.futures
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -291,14 +292,14 @@ class Mutants(unittest.TestCase):
             copy = Path(tmp) / "tree"
             self.link_tree(copy, ("cloud/launcher", "bin"))
             applied = False
-            self.occurrences = 0
+            occurrences = 0
             if rel:
                 target = copy / rel
                 text = target.read_text()
-                self.occurrences = text.count(old)
-                self.assertEqual(self.occurrences, 1, "the mutation does not apply once")
+                occurrences = text.count(old)
+                self.assertEqual(occurrences, 1, "the mutation does not apply once")
                 target.write_text(text.replace(old, new))
-                applied = target.read_text() != text and self.occurrences == 1
+                applied = target.read_text() != text and occurrences == 1
                 self.assertTrue(applied, "the mutation was not applied")
             done = subprocess.run([sys.executable, "-m", "unittest"] + (["-f", "test_registry_endpoint.Behaviour." + only] if only else ["-f", "test_registry_endpoint.Behaviour"]), cwd=str(copy / "cloud/launcher/tests"),
                                   env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
@@ -328,15 +329,19 @@ class Mutants(unittest.TestCase):
         ran, control_failed = self.counts(control_output)
         control_passed = ran - control_failed if control_code == 0 else 0
         self.assertEqual(control_code, 0, "the control must pass first: " + control_output[-1500:])
-        for label, rel, old, new, anchor in self.CASES:
+        def one(case):
+            label, rel, old, new, anchor = case
+            names = re.search(r"\(FAIL\|ERROR\): (test_\w+)", anchor)
+            return self.run_tree(rel, old, new, only=names.group(1) if names else None)
+        # a mutant is killed by its first failing check: run only the anchored test when the anchor names one, else stop at the first failure
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(one, self.CASES))
+        for (label, rel, old, new, anchor), (code, output, applied) in zip(self.CASES, results):
             with self.subTest(label):
-                # a mutant is killed by its first failing check: run only the anchored test when the anchor names one, else stop at the first failure
-                names = re.search(r"\(FAIL\|ERROR\): (test_\w+)", anchor)
-                code, output, applied = self.run_tree(rel, old, new, only=names.group(1) if names else None)
                 named = bool(re.search(anchor, output, re.M))
                 _, mutant_failed = self.counts(output)
-                print("mutant %s: control passes %d of %d, mutant fails %d checks (exit %d), anchored check named %s, mutation applied %s (fragment occurs %d time in the original)"
-                      % (label, control_passed, ran, mutant_failed, code, named, applied, self.occurrences))
+                print("mutant %s: control passes %d of %d, mutant fails %d checks (exit %d), anchored check named %s, mutation applied %s"
+                      % (label, control_passed, ran, mutant_failed, code, named, applied))
                 self.assertEqual(code, 1, label)
                 self.assertTrue(named, "%s: the anchored text %r is missing" % (label, anchor))
 

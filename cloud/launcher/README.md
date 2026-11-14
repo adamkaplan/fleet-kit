@@ -253,10 +253,10 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 |---|---|---|
 | `bin/test-cloud-cost-report` | 1 | serial |
 | `bin/test-cloud-retired` | 66 | parallel |
-| `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 5 | parallel |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
 | `cloud/launcher/tests/test_cloud_end_alert.py` | 0 | serial |
-| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | parallel |
 | `cloud/launcher/tests/test_stop_cause.py` | 0 | parallel |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_docs_wording.py` | 1 | serial |
@@ -266,7 +266,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_cloud_pr_preflight.py` | 25 | parallel |
 | `cloud/launcher/tests/test_cloud_preflight_quick.py` | 14 | parallel |
 | `cloud/launcher/tests/test_cloud_preflight_wired.py` | 42 | parallel |
-| `cloud/launcher/tests/test_cloud_quick_guards.py` | 7 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 7 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_settings.py` | 15 | parallel |
 | `cloud/launcher/tests/test_cloud_shapes.py` | 27 | parallel |
@@ -295,7 +295,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_identity_image.py` | 4 | serial |
 | `cloud/worker/tests/test_identity_required.py` | 0 | serial |
 | `cloud/worker/tests/test_question_denied.py` | 0 | serial |
-| `cloud/worker/tests/test_root_scanner.py` | 6 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 6 | parallel |
 | `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
 | `cloud/worker/tests/test_stack_up.py` | 1 | serial |
 | `cloud/worker/tests/test_cloud_prepush_preflight.py` | 21 | serial |
@@ -374,6 +374,31 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_activity_message.py` | 4 | parallel |
 | `cloud/worker/tests/test_cw_gh.py` | 10 | parallel |
 | `cloud/worker/tests/test_cw_run_wake.py` | 12 | parallel |
+| `cloud/launcher/tests/test_scratch_clean.py` | 45 | parallel |
+| `cloud/launcher/tests/test_render_namespace.py` | 22 | parallel |
+| `cloud/worker/tests/test_land_gate_enforce.py` | 30 | parallel |
+| `cloud/worker/tests/test_pod_notes_log.py` | 2 | parallel |
+| `cloud/worker/tests/test_pre_push_hook.py` | 24 | parallel |
+| `cloud/worker/tests/test_scan_dpkg_skip.py` | 29 | parallel |
+| `cloud/launcher/tests/test_launcher_shards.py` | 31 | parallel |
+| `cloud/launcher/tests/test_reaper_restart.py` | 16 | parallel |
+| `cloud/launcher/tests/test_end_hook_nothing_to_push.py` | 20 | parallel |
+| `cloud/launcher/tests/test_fixture_root.py` | 21 | parallel |
+| `cloud/worker/tests/test_shell_check.py` | 15 | parallel |
+| `cloud/launcher/tests/test_pod_state.py` | 7 | parallel |
+| `cloud/launcher/tests/test_image_gate.py` | 3 | parallel |
+| `cloud/launcher/tests/test_nudge_reused.py` | 12 | parallel |
+| `cloud/launcher/tests/test_final_note.py` | 19 | parallel |
+| `cloud/launcher/tests/test_wip_rebasable.py` | 4 | parallel |
+| `cloud/launcher/tests/test_reaper_unauthorized.py` | 1 | parallel |
+| `cloud/launcher/tests/test_l_hard_default.py` | 6 | parallel |
+| `cloud/launcher/tests/test_land_report.py` | 1 | parallel |
+| `cloud/launcher/tests/test_mint_retry.py` | 7 | parallel |
+| `cloud/launcher/tests/test_orphan_secrets.py` | 4 | parallel |
+| `cloud/launcher/tests/test_pr_label_reaper.py` | 9 | parallel |
+| `cloud/launcher/tests/test_reaper_reload.py` | 4 | parallel |
+| `cloud/launcher/tests/test_wip_root.py` | 1 | parallel |
+| `cloud/launcher/tests/test_startup_taint.py` | 3 | parallel |
 
 ### Ubuntu (per entry)
 
@@ -381,10 +406,10 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 |---|---|---|
 | `bin/test-cloud-cost-report` | 0 | serial |
 | `bin/test-cloud-retired` | 33 | parallel |
-| `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 1 | parallel |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_end_alert.py` | 0 | serial |
-| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | parallel |
 | `cloud/launcher/tests/test_stop_cause.py` | 0 | parallel |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_docs_wording.py` | 0 | serial |
@@ -394,7 +419,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_cloud_pr_preflight.py` | 10 | parallel |
 | `cloud/launcher/tests/test_cloud_preflight_quick.py` | 6 | parallel |
 | `cloud/launcher/tests/test_cloud_preflight_wired.py` | 5 | parallel |
-| `cloud/launcher/tests/test_cloud_quick_guards.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 2 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_settings.py` | 10 | parallel |
 | `cloud/launcher/tests/test_cloud_shapes.py` | 11 | parallel |
@@ -423,7 +448,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_identity_image.py` | 1 | serial |
 | `cloud/worker/tests/test_identity_required.py` | 0 | serial |
 | `cloud/worker/tests/test_question_denied.py` | 0 | serial |
-| `cloud/worker/tests/test_root_scanner.py` | 1 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 1 | parallel |
 | `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
 | `cloud/worker/tests/test_stack_up.py` | 0 | serial |
 | `cloud/worker/tests/test_cloud_prepush_preflight.py` | 15 | serial |
@@ -502,6 +527,31 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_activity_message.py` | 4 | parallel |
 | `cloud/worker/tests/test_cw_gh.py` | 10 | parallel |
 | `cloud/worker/tests/test_cw_run_wake.py` | 12 | parallel |
+| `cloud/launcher/tests/test_scratch_clean.py` | 45 | parallel |
+| `cloud/launcher/tests/test_render_namespace.py` | 22 | parallel |
+| `cloud/worker/tests/test_land_gate_enforce.py` | 30 | parallel |
+| `cloud/worker/tests/test_pod_notes_log.py` | 2 | parallel |
+| `cloud/worker/tests/test_pre_push_hook.py` | 24 | parallel |
+| `cloud/worker/tests/test_scan_dpkg_skip.py` | 29 | parallel |
+| `cloud/launcher/tests/test_launcher_shards.py` | 31 | parallel |
+| `cloud/launcher/tests/test_reaper_restart.py` | 16 | parallel |
+| `cloud/launcher/tests/test_end_hook_nothing_to_push.py` | 20 | parallel |
+| `cloud/launcher/tests/test_fixture_root.py` | 21 | parallel |
+| `cloud/worker/tests/test_shell_check.py` | 15 | parallel |
+| `cloud/launcher/tests/test_pod_state.py` | 7 | parallel |
+| `cloud/launcher/tests/test_image_gate.py` | 3 | parallel |
+| `cloud/launcher/tests/test_nudge_reused.py` | 12 | parallel |
+| `cloud/launcher/tests/test_final_note.py` | 19 | parallel |
+| `cloud/launcher/tests/test_wip_rebasable.py` | 4 | parallel |
+| `cloud/launcher/tests/test_reaper_unauthorized.py` | 1 | parallel |
+| `cloud/launcher/tests/test_l_hard_default.py` | 6 | parallel |
+| `cloud/launcher/tests/test_land_report.py` | 1 | parallel |
+| `cloud/launcher/tests/test_mint_retry.py` | 7 | parallel |
+| `cloud/launcher/tests/test_orphan_secrets.py` | 4 | parallel |
+| `cloud/launcher/tests/test_pr_label_reaper.py` | 9 | parallel |
+| `cloud/launcher/tests/test_reaper_reload.py` | 4 | parallel |
+| `cloud/launcher/tests/test_wip_root.py` | 1 | parallel |
+| `cloud/launcher/tests/test_startup_taint.py` | 3 | parallel |
 
 ## The vault block (ask #1427)
 

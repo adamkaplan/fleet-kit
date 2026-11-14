@@ -181,6 +181,12 @@ class Mint(unittest.TestCase):
             f.write('#!/bin/sh\n{ echo "ARGV $*"; env; } >> "%s"\nexec openssl "$@"\n' % cls.argv_log)
         os.chmod(wrap, 0o700)
         cls.wrap = wrap
+        cls.fast_openssl = os.path.join(d, "openssl-fast")   # no signature is checked by the copy runs: a stand-in that reads its input and answers a fixed signature
+        with open(cls.fast_openssl, "w") as f:
+            f.write("#!/bin/sh\ncat >/dev/null\nprintf 'fakesig'\n")
+        os.chmod(cls.fast_openssl, 0o700)
+        with open(os.path.join(os.path.dirname(MINT), "token_mint.py")) as f:
+            cls.token_mint_src = f.read()
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
         threading.Thread(target=cls.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
@@ -595,13 +601,12 @@ class Mint(unittest.TestCase):
 
     def run_copy(self, src_text, repo=REAL, runner=None):
         d = tempfile.mkdtemp(dir=self.tmp.name)
-        for n in ("token_mint.py",):
-            with open(os.path.join(os.path.dirname(MINT), n)) as f, open(os.path.join(d, n), "w") as g:
-                g.write(f.read())
+        with open(os.path.join(d, "token_mint.py"), "w") as g:
+            g.write(self.token_mint_src)
         path = os.path.join(d, "app_token.py")
         with open(path, "w") as f:
             f.write(src_text)
-        e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap, RAISE_CLASS="RecursionError")
+        e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.fast_openssl, RAISE_CLASS="RecursionError")
         argv = [sys.executable, "-c", runner, path, repo] if runner else [sys.executable, path, repo]
         return via_route(argv, e)
 

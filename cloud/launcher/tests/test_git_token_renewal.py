@@ -10,6 +10,7 @@ The families are derived from the code, never listed twice:
 import argparse
 import ast
 import contextlib
+import copy
 import base64
 import datetime as dt
 import hashlib
@@ -99,23 +100,31 @@ def quiet_sites(tree):
             if isinstance(n, ast.Return) and isinstance(n.value, ast.Constant) and n.value.value is False]
 
 
+_SOURCE_TREE = ast.parse(load_source())
+_GUARD_COUNT = len(guard_nodes(_SOURCE_TREE))
+_HOLDER = [n for n in _SOURCE_TREE.body if isinstance(n, ast.ClassDef) and any(isinstance(f, ast.FunctionDef) and f.name in FUNCTIONS for f in n.body)]
+assert len(_HOLDER) == 1 and len(guard_nodes(ast.Module(body=_HOLDER, type_ignores=[]))) == _GUARD_COUNT   # every guard lives in the one class
+
+
 def mutant_module(index):
-    """The real source with the index-th plain guard removed; (module, number of guards)."""
-    tree = ast.parse(load_source())
-    guards = guard_nodes(tree)
-    if index >= len(guards):
-        return None, len(guards)
-    target = guards[index]
+    """The real module with the index-th plain guard removed from the class that holds the renewal; (module, number of guards).
+    Only that class is compiled again: the rest of the module is the real one's."""
+    if index >= _GUARD_COUNT:
+        return None, _GUARD_COUNT
+    holder = copy.deepcopy(_HOLDER[0])
+    target = guard_nodes(ast.Module(body=[holder], type_ignores=[]))[index]
 
     class Drop(ast.NodeTransformer):
         def visit_If(self, node):
             if node is target:
                 return ast.copy_location(ast.Pass(), node)
             return self.generic_visit(node)
+    Drop().visit(holder)
     mod = types.ModuleType("cloud_worker_mutant")
+    mod.__dict__.update(cw.__dict__)
     mod.__file__ = SOURCE_PATH
-    exec(compile(ast.fix_missing_locations(Drop().visit(tree)), SOURCE_PATH, "exec"), mod.__dict__)
-    return mod, len(guards)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[holder], type_ignores=[])), SOURCE_PATH, "exec"), mod.__dict__)
+    return mod, _GUARD_COUNT
 
 
 class Harness(base.Base):
