@@ -301,7 +301,7 @@ def _body():
                 return walked[id(node)]
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
             module = sb.load_module("delegated_clear")
-            daemon = ast.parse(self.real_source())
+            daemon = self.real_tree()
             defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
             dynamic = rule["dynamic_actions"]
             fields = set(sb.IMPACT_RATING_FIELDS) | {"by_role"}
@@ -356,7 +356,7 @@ def _body():
         def core_statements(self):
             """The (first line number, text) of every statement of the moved registrar `add_core_parsers`, derived from the code."""
             import ast
-            node = next(n for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef) and n.name == self.CORE)
+            node = next(n for n in self.real_tree().body if isinstance(n, ast.FunctionDef) and n.name == self.CORE)
             return [(s.lineno, s.end_lineno) for s in node.body[1:]]
 
         def test_a_flag_or_a_subcommand_of_another_command_is_not_clear_machinery_every_statement_of_the_registrar_and_the_four_shapes(self):
@@ -456,13 +456,13 @@ def _body():
             self.assertEqual(sorted(top_names), sorted(top.choices), "each registered command appears once in the walk")
             self.assertEqual(len(top_names), len(set(top_names)))
             self.assertEqual(sorted(top.choices), sorted(parser.commands))
-            registrar_calls = sum(1 for n in ast.walk(ast.parse(self.real_source())) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "add_parser" and not any(isinstance(a, ast.Name) for a in n.args[:1]))
+            registrar_calls = sum(1 for n in ast.walk(self.real_tree()) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "add_parser" and not any(isinstance(a, ast.Name) for a in n.args[:1]))
             seen = {r[0] for r in rows if r[9] == "_HelpAction"}
             self.assertGreaterEqual(len(seen) - 1, registrar_calls - 5, "every add_parser call (a literal name) is a parser in the walk")
             for command in ("send", "status", "run", "report", "notice", "ensure", "poke", "launch", "pending", "remind", "version"):
                 self.assertIn(command, top.choices)
             self.assertIn((("review", "record"), ("--impact-severity",)), {(r[0], r[1]) for r in rows}, "a nested flag is in the walk (the help fixtures do not see it)")
-            core = ast.parse(self.real_source())
+            core = self.real_tree()
             node = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == self.CORE)
             names = {c.args[0].value for c in ast.walk(node) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "add_parser" and c.args and isinstance(c.args[0], ast.Constant)}
             self.assertTrue(names <= set(top.choices) and len(names) >= 10, sorted(names))
@@ -523,7 +523,7 @@ def _body():
             import ast, inspect
             module = sb.load_module("delegated_clear")
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
-            daemon = ast.parse(self.real_source())
+            daemon = self.real_tree()
             reach = module.closure(daemon, module.daemon_roots(rule), rule["dynamic_actions"])[0]
             functions = {n.name for n in daemon.body if isinstance(n, ast.FunctionDef) and n.name in vars(sb)}   # a factory deleted after its one call (`make_cmd_impact`) is not a name a registrar can reach
             daemon_names = sorted(n for n in reach if n in functions)
@@ -757,7 +757,7 @@ def _body():
             """The module-level definitions of the daemon file that RUN (a real call, observed by the interpreter) while the real `main` runs `argv`: (names, the run's exit code)."""
             import ast
             path = os.path.realpath(sb.__file__) if hasattr(sb, "__file__") else None
-            defs = {(n.name, min([n.lineno] + [d.lineno for d in n.decorator_list])) for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef)}   # name AND line: a method of the same name is not the definition
+            defs = {(n.name, min([n.lineno] + [d.lineno for d in n.decorator_list])) for n in self.real_tree().body if isinstance(n, ast.FunctionDef)}   # name AND line: a method of the same name is not the definition
             seen = set()
             def profile(frame, event, arg):
                 code = frame.f_code
@@ -776,7 +776,7 @@ def _body():
             import ast
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
             module = sb.load_module("delegated_clear")
-            tree = ast.parse(self.real_source())
+            tree = self.real_tree()
             self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
             cleared, code, err = self.traced_daemon_definitions("cos", "impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity", "--brief-digest", self.FIXTURE_BRIEF["digest"], "--brief-text", self.FIXTURE_BRIEF["text"])
             self.assertEqual(code, 0, err)

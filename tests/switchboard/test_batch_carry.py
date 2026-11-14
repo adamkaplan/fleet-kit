@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,13 +86,21 @@ class TestBatchCarry(unittest.TestCase):
 
     REPO = BatchOverGit.REPO
     PROTECTED = ("bin/impact_hold.py", "docs/review-laws/impact-matrix.json")
+    _template = None
+    _template_tmp = None
 
     def setUp(self):
         self.cc = sb.load_module("clear_carry")
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name) / "repo"
-        self.api = self.make(self.dir)
+        if TestBatchCarry._template is None:   # the base repository (a git init and a commit) is made once; each test works on a copy of it
+            TestBatchCarry._template_tmp = tempfile.TemporaryDirectory()
+            self.addClassCleanup(TestBatchCarry._template_tmp.cleanup)
+            TestBatchCarry._template = Path(TestBatchCarry._template_tmp.name) / "repo"
+            self.make(TestBatchCarry._template)
+        shutil.copytree(str(TestBatchCarry._template), str(self.dir), symlinks=True)
+        self.api = BatchOverGit(self.dir)
 
     @staticmethod
     def write(directory, path, text):

@@ -29073,6 +29073,7 @@ class LedgerBase(Base):
 
     def setUp(self):
         super().setUp()
+        self.enterContext(mock.patch.object(sb, "PANE_SETTLE_SECONDS", 0))   # the two looks before a close are instant in tests
         self.world = World(self, agents=self.NAMES)
         self.plan_issue = {"number": 7, "state": "open", "title": "plan", "body": LEDGER_PLAN, "updated_at": "2026-01-01T00:00:00Z"}
         self.comments = []
@@ -37851,6 +37852,7 @@ class TestImpactHold(LedgerBase):
             if node is not None and j + 1 < node.end_lineno:
                 parsed = ast.parse("\n" * i + "\n".join(head[i:node.end_lineno])).body[0]
                 cache["heads"][head_source] = ast.Module(body=[parsed if n is node else n for n in cache["tree"].body], type_ignores=[])
+                cache.setdefault("same_closure_ids", set()).add(id(cache["heads"][head_source]))   # the edit only adds a comment: no node is added or removed, and a closure is by name, so it is the unchanged tree's closure
         return head_source, diff
 
     def closure_check(self, head, diff, rule=None, roots=None, dynamic=None):
@@ -37867,7 +37869,7 @@ class TestImpactHold(LedgerBase):
                     return cache["tree"] if src is cache["source"] else cache["heads"].get(src) or real_ast.parse(src)
                 return real_ast.parse(src, *a, **k)
         def cached_closure(tree, roots, dyn=()):
-            if tree is not cache["tree"]:
+            if tree is not cache["tree"] and id(tree) not in cache.get("same_closure_ids", ()):
                 return real_closure(tree, roots, dyn)
             if roots == cache["roots"] and tuple(dyn) == tuple(cache["dyn"]):
                 return cache["closure"]
