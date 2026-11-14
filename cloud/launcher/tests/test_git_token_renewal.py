@@ -239,7 +239,7 @@ class RealMint(Harness):
         cls.keyfile = os.path.join(cls.keydir.name, "k.pem")
         subprocess.run(["openssl", "genrsa", "-out", cls.keyfile, "2048"], check=True, capture_output=True)
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), ta.Stub)
-        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):

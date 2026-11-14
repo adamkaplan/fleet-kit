@@ -67,7 +67,7 @@ class AgentApi:
             def log_message(self, *a):
                 pass
         self.server = HTTPServer(("127.0.0.1", 0), H)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
 
     def close(self):
@@ -91,7 +91,7 @@ class Hub:
         reviewer = module.make_reviewer(kube or fake_kube(self.calls), audience=audience, sa_dir=str(t / "sa"))
         self.inbox = module.Inbox(str(self.agents), timeout=2)
         self.server = module.make_hub(("127.0.0.1", 0), reviewer, self.inbox, self.lines.append, str(self.decisions), namespace="fleet-agents")
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     def __enter__(self):
         return self
@@ -319,7 +319,7 @@ class SecretsHub(Hub):
         self.server.server_close()
         self.server = module.make_hub(("127.0.0.1", 0), module.make_secrets_reviewer(str(self.secrets), "fleet-agents"), self.inbox,
                                       self.lines.append, str(self.decisions), namespace="fleet-agents")
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
 
 class TestSecretsMode(unittest.TestCase):
@@ -418,7 +418,7 @@ class TestSecretsMode(unittest.TestCase):
                 reviewer = lambda t, a, n=name: {"authenticated": True, "audiences": [a],
                                                  "user": {"username": "system:serviceaccount:fleet-agents:" + n}}
                 hub.server = load().make_hub(("127.0.0.1", 0), reviewer, hub.inbox, hub.lines.append, str(hub.decisions), namespace="fleet-agents")
-                threading.Thread(target=hub.server.serve_forever, daemon=True).start()
+                threading.Thread(target=hub.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
                 self.assertEqual(hub.send(sender=name)[0], 401)
                 self.assertEqual(hub.api.got, [])
 
@@ -430,7 +430,7 @@ class TestSecretsMode(unittest.TestCase):
             reviewer = lambda t, a: {"authenticated": True, "audiences": [a],
                                      "user": {"username": "system:serviceaccount:fleet-agents:captain"}}
             hub.server = module.make_hub(("127.0.0.1", 0), reviewer, hub.inbox, hub.lines.append, str(hub.decisions), namespace="fleet-agents")
-            threading.Thread(target=hub.server.serve_forever, daemon=True).start()
+            threading.Thread(target=hub.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
             self.assertNotEqual(hub.send(sender="captain")[0], 401)   # only the hub guard answers 401 here
 
     def test_mutant_non_constant_time_compare(self):
@@ -824,7 +824,7 @@ class NsHub(Hub):
         self.server.server_close()
         reviewer = module.make_reviewer(kube_users(users), audience="aud-x", sa_dir=str(Path(self.tmp.name) / "sa"))
         self.server = module.make_hub(("127.0.0.1", 0), reviewer, self.inbox, self.lines.append, str(self.decisions), namespace=namespace)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
 
 SA = "system:serviceaccount:"
@@ -1096,7 +1096,7 @@ class TestDecisionsAge(unittest.TestCase):
         with Hub(module) as hub:
             server = module.make_hub(("127.0.0.1", 0), module.make_reviewer(kube_with({"tok-a": "agent-a"}), audience="aud-x", sa_dir=str(Path(hub.tmp.name) / "sa")),
                                      hub.inbox, hub.lines.append, None, namespace="fleet-agents")
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+            threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
             try:
                 conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
                 conn.request("GET", "/decisions", headers={"Authorization": "Bearer tok-a"})
