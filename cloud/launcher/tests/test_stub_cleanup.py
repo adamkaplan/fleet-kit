@@ -183,7 +183,7 @@ class TestStubEndsByItself(unittest.TestCase):
         self.assertTrue(wait_until(lambda: not pid_alive(pid), 5), "the orphaned stub is still running")
 
     def test_s4_an_idle_stub_with_a_live_parent_ends_after_its_cap(self):
-        p = self.start_stub(env={"STUB_IDLE_SECONDS": "1"})
+        p = self.start_stub(env={"STUB_IDLE_SECONDS": "0.3"})
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the idle stub is still running")
 
 
@@ -224,7 +224,7 @@ class TestStubParentDiesDuringStartup(unittest.TestCase):
         # The "parent" starts the stub (which names it in STUB_PARENT_PID) and is killed at once: the stub's own getppid() at its start may already be 1.
         mid_code = ("import os,subprocess,sys\n"
                     "env=dict(os.environ,STUB_PARENT_PID=str(os.getpid()))\n"
-                    "p=subprocess.Popen(['sh','-c','sleep 1; exec \"$0\" \"$@\"',sys.executable,sys.argv[1],sys.argv[2]],env=env)\n"
+                    "p=subprocess.Popen(['sh','-c','sleep 0.2; exec \"$0\" \"$@\"',sys.executable,sys.argv[1],sys.argv[2]],env=env)\n"
                     "print(p.pid,flush=True)\nos._exit(0)\n")
         mid = stub_support.spawn([sys.executable, "-c", mid_code, STUB, str(port)], stdout=subprocess.PIPE, text=True)
         self.addCleanup(stub_support.stop_group, mid, port)
@@ -259,7 +259,7 @@ class TestSpawnPassesWhatTheStubNeeds(unittest.TestCase):
         # The parent starts the stub THROUGH spawn (a delayed exec, so the parent is gone before the stub looks) and exits: only the
         # STUB_PARENT_PID that spawn passes lets the stub see that its parent is gone (its getppid() is already 1 or a reaper).
         mid_code = ("import os,sys\nsys.path.insert(0,sys.argv[1])\nimport stub_support\n"
-                    "p=stub_support.spawn(['sh','-c','sleep 1; exec \"$0\" \"$@\"',sys.executable,sys.argv[2],sys.argv[3]])\n"
+                    "p=stub_support.spawn(['sh','-c','sleep 0.2; exec \"$0\" \"$@\"',sys.executable,sys.argv[2],sys.argv[3]])\n"
                     "print(p.pid,flush=True)\nos._exit(0)\n")
         mid = stub_support.spawn([sys.executable, "-c", mid_code, os.path.dirname(STUB), STUB, str(port)], stdout=subprocess.PIPE, text=True)
         self.addCleanup(stub_support.stop_group, mid, port)
@@ -335,16 +335,16 @@ class TestStopGroupPins(unittest.TestCase):
 
     def test_low_the_idle_timer_is_refreshed_by_requests(self):
         port = stub_support.free_port()
-        p = stub_support.start(self, [sys.executable, STUB, str(port)], port=port, env=dict(os.environ, STUB_IDLE_SECONDS="2"))
+        p = stub_support.start(self, [sys.executable, STUB, str(port)], port=port, env=dict(os.environ, STUB_IDLE_SECONDS="0.5"))
         self.assertTrue(wait_until(lambda: not stub_support.port_is_free(port)))
-        end = time.time() + 5   # longer than the 2 s cap, with a request every half second
+        end = time.time() + 1.1   # longer than the 0.5 s cap, with a request every 0.15 s
         while time.time() < end:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
             c.request("GET", "/api/info")
             c.getresponse().read()
             c.close()
             self.assertIsNone(p.poll(), "the stub ended while it was being asked")
-            time.sleep(0.5)
+            time.sleep(0.15)
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the stub did not end once the requests stopped")
 
 

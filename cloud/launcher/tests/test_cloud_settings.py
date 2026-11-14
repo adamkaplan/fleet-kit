@@ -1,7 +1,7 @@
 """The settings file (#876, slice 1): the one reader `apply_settings`, its refusals, and the driver's use of it. Offline, no cluster.
 
 Every set below is derived from the code's own tables (SETTINGS, SECRET_SHAPES), with a completeness test, so a new member that has no case here fails."""
-import contextlib, io, json, os, re, stat, sys, tempfile, unittest
+import contextlib, functools, io, json, os, re, stat, sys, tempfile, unittest
 import urllib.parse as urllib_parse
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -755,11 +755,16 @@ def names_in(text):
     return {n.value for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Constant) and isinstance(n.value, str) and NAME.fullmatch(n.value)}
 
 
+@functools.lru_cache(maxsize=None)
+def _file_names(path):
+    with open(path) as f:
+        return frozenset(names_in(f.read()))
+
+
 def derived():
     out = set()
     for path in source_files():
-        with open(path) as f:
-            out |= names_in(f.read())
+        out |= _file_names(path)
     return out
 
 
@@ -789,9 +794,9 @@ class Complete(unittest.TestCase):
 
     def test_s16_mutant_a_made_up_environment_read_fails(self):
         for path in source_files():
-            with self.subTest(path=os.path.basename(path)), open(path) as f:
-                text = f.read() + "\nimport os\n_x = os.environ.get('CW_MADE_UP_SETTING')\n"
-                self.assertEqual(unaccounted(names_in(text)), ["CW_MADE_UP_SETTING"])
+            with self.subTest(path=os.path.basename(path)):
+                text = "\nimport os\n_x = os.environ.get('CW_MADE_UP_SETTING')\n"
+                self.assertEqual(unaccounted(_file_names(path) | names_in(text)), ["CW_MADE_UP_SETTING"])
 
     def test_s18_every_prefix_has_a_member_in_the_code_and_the_launcher_variable_is_listed_with_its_reason(self):
         for prefix in PREFIXES:
@@ -804,9 +809,9 @@ class Complete(unittest.TestCase):
     def test_s18_mutant_a_made_up_read_of_each_prefix_fails(self):
         for prefix in PREFIXES:
             for path in source_files():
-                with self.subTest(prefix=prefix, path=os.path.basename(path)), open(path) as f:
-                    text = f.read() + "\nimport os\n_x = os.environ.get('%sMADE_UP')\n" % prefix
-                    self.assertEqual(unaccounted(names_in(text)), [prefix + "MADE_UP"])
+                with self.subTest(prefix=prefix, path=os.path.basename(path)):
+                    text = "\nimport os\n_x = os.environ.get('%sMADE_UP')\n" % prefix
+                    self.assertEqual(unaccounted(_file_names(path) | names_in(text)), [prefix + "MADE_UP"])
 
     def test_s18_mutant_a_scan_restricted_to_cw_misses_the_made_up_read(self):
         """The scan a build with only the CW_ prefix would run: it finds nothing for a made-up read of the switchboard prefix, which this test calls a failure."""

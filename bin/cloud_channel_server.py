@@ -101,6 +101,10 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None, *, namespace
             timer = threading.Timer(self.deadline, self._expire)
             timer.daemon = True
             timer.start()
+            # a loopback read blocked in recv() is not always woken by shutdown(SHUT_RD) (macOS), so the socket timeout also ends at the deadline (a little after the timer, which sets expired first)
+            wake = timer.interval + 0.05
+            if self.timeout is None or wake < self.timeout:
+                self.connection.settimeout(wake)
             try:
                 super().handle()
             finally:

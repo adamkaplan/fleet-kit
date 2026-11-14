@@ -1,6 +1,6 @@
 import atexit
 """Ask #1142: the pod's pre-stop hook (cw-prestop / cw-end-hook --prestop). Fake cluster = run the rendered spec's own command."""
-import argparse, datetime as dt, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
+import argparse, contextlib, datetime as dt, io, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
 import pathlib
 from unittest import mock
 
@@ -43,12 +43,14 @@ def _template():
         sh("git", "init", "-q", "--bare", "-b", "main", evil)
         sh("git", "init", "-q", "--bare", "-b", "main", origin)
         sh("git", "clone", "-q", origin, work)
+        sh("git", "-C", work, "config", "maintenance.auto", "false")
         for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
             sh("git", "-C", work, "config", k, v)
         pathlib.Path(os.path.join(work, "a.txt")).write_text("a")
         sh("git", "-C", work, "add", "-A")
         sh("git", "-C", work, "commit", "-qm", "base")
         sh("git", "-C", work, "push", "-q", "origin", "HEAD:main")
+        sh("git", "-C", work, "config", "--unset", "maintenance.auto")   # the hook refuses any key outside its allowed list: the setting only guards the template's own commits
         sh("git", "-C", work, "remote", "set-url", "origin", URL)   # origin is named like the pod's repository; the hook never uses it
         _TEMPLATE.append(t)
     return _TEMPLATE[0]
@@ -75,9 +77,9 @@ class Base(unittest.TestCase):
         self.push_url = "file://%s/%s.git" % (self.t, REPO)
         self.refspec = "--no-verify %s HEAD:refs/heads/w1/wip" % self.push_url
         template = _template()   # the two bare remotes and the clone, made once by real git and copied here
-        shutil.copytree(os.path.join(template, "evil"), self.evil, symlinks=True)
-        shutil.copytree(os.path.join(template, "origin"), self.origin, symlinks=True)
-        shutil.copytree(os.path.join(template, "repo"), self.work, symlinks=True)
+        shutil.copytree(os.path.join(template, "evil"), self.evil, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        shutil.copytree(os.path.join(template, "origin"), self.origin, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        shutil.copytree(os.path.join(template, "repo"), self.work, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
         shutil.copy(self.seam(HOOK), os.path.join(self.bin, "cw-end-hook"))
         self.out = os.path.join(self.t, "out")
         # macOS has no GNU timeout: a small stand-in at the front of PATH ('timeout [-k N] SECONDS cmd args' runs cmd args).
@@ -466,7 +468,21 @@ class Grammar(Base):
         return self.run_hook(hook, **kw)
 
     def run_hook(self, hook, **kw):
-        return subprocess.run([self._seam_hook if hook == HOOK else self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+        if hook != HOOK:   # a mutated copy of the hook is a file of its own: it runs as a process
+            return subprocess.run([self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+        # the real hook runs in this process (84 interpreter starts cost most of the time), with the same seam values the launcher script sets
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        git_bin = os.path.join(self.bin, "git")
+        with mock.patch.multiple(cw_end_hook, HOST_URL="file://%s/" % self.t, HELPER_DIR=self.helper_dir,
+                                 GIT_BIN=git_bin if os.path.exists(git_bin) else cw_end_hook.GIT_BIN), \
+                mock.patch.dict(os.environ, self.env(**kw), clear=True), \
+                mock.patch.object(sys, "argv", [HOOK, "--prestop"]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cw_end_hook.main()
+            except SystemExit as e:
+                code = e.code or 0
+        return subprocess.CompletedProcess([self._seam_hook, "--prestop"], code or 0, out.getvalue(), err.getvalue())
 
     def set_local(self, key, value):
         head, _, name = key.rpartition(".")

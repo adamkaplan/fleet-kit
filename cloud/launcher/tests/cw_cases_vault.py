@@ -425,28 +425,28 @@ class TestVaultCheckProcess(VaultBase):
         return sorted(zip(starts, ends))
 
     def test_s8b_two_launches_run_the_check_once_and_the_second_reads_again_first(self):
-        self.make_checkout(code=10, fixes=True, sleep=1.5)
+        self.make_checkout(code=10, fixes=True, sleep=0.4)
         results = self.two_launches()
         self.assertEqual(len(self.check_runs()), 1)
         self.assertEqual([r[0] for r in results], [0, 0])
         self.assertEqual(self.az_reads(), 2 + 0)   # the second's re-read answered: no read after a check of its own
 
     def test_s8b_when_the_re_read_is_still_refused_the_second_runs_its_own_check_with_no_overlap(self):
-        self.make_checkout(code=0, fixes=False, sleep=1.0)
+        self.make_checkout(code=0, fixes=False, sleep=0.3)
         self.two_launches()
         spans = self.intervals()
         self.assertEqual(len(spans), 2)
         self.assertLessEqual(spans[0][1], spans[1][0], "the two checks overlapped")
 
     def test_a_lock_that_is_not_freed_in_time_refuses_naming_the_lock(self):
-        self.make_checkout(code=0, fixes=False, sleep=3)
+        self.make_checkout(code=0, fixes=False, sleep=0.8)
         env = dict(os.environ)
         results = [None]
         holder = threading.Thread(target=self.recover, args=(results, 0), daemon=True)
         holder.start()
         self.wait_started()
         recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)
-        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw.cloud_cluster, "VAULT_LOCK_GRACE", 0.3):
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw.cloud_cluster, "VAULT_LOCK_GRACE", 0.15):
             with self.assertRaises(self.cw.Refusal) as caught:
                 recovery(lambda: self.cw._capture(["az", "x"], env=env), env)
         self.assertIn("vault-check.lock", str(caught.exception))

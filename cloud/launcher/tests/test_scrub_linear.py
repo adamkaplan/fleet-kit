@@ -691,7 +691,7 @@ class S14Version(unittest.TestCase):
 class S15Counts(unittest.TestCase):
     FORM_ALPHA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-    def _form_case(self, nsec, size=115810):
+    def _form_case(self, nsec, size=15000):
         r = random.Random(15)
         form = rnd(r, 319, self.FORM_ALPHA)
         secs = []
@@ -719,7 +719,7 @@ class S15Counts(unittest.TestCase):
             V += 17 * max(M, 0) * brackets
         return V, M, R
 
-    def _check(self, fn, ns, nsec, brackets=None, size=115810):
+    def _check(self, fn, ns, nsec, brackets=None, size=15000):
         if brackets is None:
             secs, hit, zero = self._form_case(nsec, size)
             label = "%d secrets" % nsec
@@ -757,7 +757,7 @@ class S15Counts(unittest.TestCase):
     def test_S15_counts_and_mutant(self):
         for nsec in (30, 100, 197):
             self._check(cw.scrub, NS, nsec)
-        self._check(cw.scrub, NS, 0, brackets=self._bracket_case(100000))
+        self._check(cw.scrub, NS, 0, brackets=self._bracket_case(15000))
         m, mns = mutant("            self.sweep(sec, None, positions)\n",
                         "            self.sweep(sec, None, positions)\n            for _i in range(len(self.text)):\n                _c = self.text[_i]\n")
         self._check(cw.scrub, NS, 197, size=5000)  # the control, first

@@ -99,7 +99,7 @@ class TestBatchCarry(unittest.TestCase):
             self.addClassCleanup(TestBatchCarry._template_tmp.cleanup)
             TestBatchCarry._template = Path(TestBatchCarry._template_tmp.name) / "repo"
             self.make(TestBatchCarry._template)
-        shutil.copytree(str(TestBatchCarry._template), str(self.dir), symlinks=True)
+        shutil.copytree(str(TestBatchCarry._template), str(self.dir), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
         self.api = BatchOverGit(self.dir)
 
     @staticmethod
