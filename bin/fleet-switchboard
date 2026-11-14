@@ -15809,11 +15809,35 @@ def epic_batches(get, repo, default):
     return out, False
 
 
-def epic_contains(get, repo, merged, default=None):
+def epic_contains(get, repo, merged, default=None, config=None):
     """contains(head) -> (True, None) or (False, why). `merged` is [(number, merge commit[, base])]. EMPTY is refused (nothing to contain). A claimant is contained when (a) its merge commit is behind `head` or is it (GitHub's compare), or (b) its
     base is not the default branch and its merge commit is behind or is the head commit of a merged pull request of the default branch (the batch) whose own merge commit is behind or is `head`. The batch pull requests are the bounded
-    read of `epic_batches`; beyond the bound, or unreadable, the claimant is refused (fail closed). A compare that fails is (False, ...)."""
+    read of `epic_batches`; beyond the bound, or unreadable, the claimant is refused (fail closed). A compare that fails is (False, ...). Ask #2539: on a land repository (`config`'s `land_repos`) with no merged pull request, `head` is contained
+    when it is a commit of the default branch carrying the land proof trailers; otherwise empty is refused as before."""
     cache, batches = {}, []
+
+    def landed(head):
+        """(True, None) or (False, why) for a commit of a land repository's default branch with the land trailers."""
+        try:
+            branch = default or (get("repos/%s" % repo) or {}).get("default_branch")
+            if not isinstance(branch, str) or not branch:
+                raise ValueError("no default branch")
+            cmp = get("repos/%s/compare/%s...%s" % (repo, urllib.parse.quote(branch, safe=""), head))
+        except Exception:
+            return False, "the default branch of %s could not be read" % repo
+        if not (isinstance(cmp, dict) and cmp.get("status") in ("identical", "behind")):
+            return False, "%s is not on the default branch %s of %s" % (head[:12], branch, repo)
+        try:
+            commit = get("repos/%s/commits/%s" % (repo, head))
+        except Exception:
+            return False, "the commit %s could not be read" % head[:12]
+        message = commit.get("commit", {}).get("message") if isinstance(commit, dict) else None
+        if not isinstance(commit, dict) or commit.get("sha") != head or not isinstance(message, str):
+            return False, "the commit %s could not be read" % head[:12]
+        missing = land_trailers_missing(message)
+        if missing:
+            return False, "%s has no trailer %s" % (head[:12], ", ".join(missing))
+        return True, None
 
     def behind(old, new):
         got = get("repos/%s/compare/%s...%s" % (repo, old, new))
@@ -15833,7 +15857,7 @@ def epic_contains(get, repo, merged, default=None):
         if head not in cache:
             cache[head] = (True, None)
             if not merged:
-                cache[head] = (False, "no merged pull request of the plan: nothing to contain")
+                cache[head] = landed(head) if is_land_repo(config, repo) else (False, "no merged pull request of the plan: nothing to contain")
             for entry in merged:
                 number, sha = entry[0], entry[1]
                 base = entry[2] if len(entry) > 2 else None
@@ -15852,6 +15876,16 @@ def epic_contains(get, repo, merged, default=None):
                     break
         return cache[head]
     return contains
+
+
+def epic_land_writers(get, repo, head):
+    """The logins that wrote the commit `head` (author, committer): never its judges. Unreadable: none (the containment read already refused an unreadable commit)."""
+    try:
+        commit = get("repos/%s/commits/%s" % (repo, head))
+        who = lambda key: (commit.get(key) or {}).get("login") if isinstance(commit.get(key), dict) else None
+        return {w for w in (who("author"), who("committer")) if isinstance(w, str) and w}
+    except Exception:
+        return set()
 
 
 def epic_changed(get, repo):
@@ -15895,9 +15929,12 @@ def epic_target(ctx, runner, now, named):
     if opened:
         raise LedgerCommandError("refused: pull request %s of the plan %s is still open: an epic scenario is recorded after every pull request of the plan has merged; nothing was recorded"
                                  % (", ".join("#%s" % n for n in opened[:5]), ctx.source))
-    ok, why = epic_contains(get, ctx.repo, merged, default)(head)
+    land = is_land_repo(ctx.config, ctx.repo)
+    ok, why = (epic_contains(get, ctx.repo, merged, default, ctx.config) if land else epic_contains(get, ctx.repo, merged, default))(head)
     if not ok:
         raise LedgerCommandError("refused: %s: nothing was recorded" % why)
+    if land and not merged:
+        writers = set(writers) | epic_land_writers(get, ctx.repo, head)
     return head, default, writers
 
 
@@ -15923,7 +15960,10 @@ def epic_view(ctx, runner, now):
         why = "the default branch's head could not be read (%s)" % _one_line(str(err), 100)
     try:
         merged, _, writers = epic_claimants(ctx, runner, now, get)
-        contains = epic_contains(get, ctx.repo, merged, default)
+        land = is_land_repo(ctx.config, ctx.repo)
+        contains = epic_contains(get, ctx.repo, merged, default, ctx.config) if land else epic_contains(get, ctx.repo, merged, default)
+        if land and not merged and default_head:
+            writers = set(writers) | epic_land_writers(get, ctx.repo, default_head)
     except Exception as err:
         why = why or "the pull requests of the plan could not be read (%s)" % _one_line(str(err), 100)
         contains = lambda head: (False, "the pull requests of the plan could not be read")

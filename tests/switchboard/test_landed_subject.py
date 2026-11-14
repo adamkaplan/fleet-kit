@@ -261,6 +261,45 @@ def build(LedgerBase):
             self.assertEqual(self.prove_at(ref)[0], 0, "the same call with the landed path records")
             self.assertEqual(len(self.ledger()), 1)
 
+        def contain_at(self, repo, sha, config, merged=(), default="main", broken=()):
+            """epic_contains(...)(sha) on a fake GitHub that answers from the tables above (#2539)."""
+            def get(path):
+                if any(b in path for b in broken):
+                    raise ValueError("boom")
+                tail = path.rsplit("/", 1)[-1].split("...")[-1]
+                if "/compare/" in path:
+                    return {"status": ON_BRANCH.get(tail, "diverged")}
+                if "/commits/" in path:
+                    return {"sha": tail, "commit": {"message": MESSAGES[tail]}} if tail in MESSAGES else None
+                return {"default_branch": "main"}
+            return sb.epic_contains(get, repo, list(merged), default, config)(sha)
+
+        def test_S1_epic_contains_accepts_a_landed_commit_on_a_land_repo_with_no_pull_request(self):
+            config = {"land_repos": ["acme/land"]}
+            for default in ("main", None):
+                self.assertEqual(self.contain_at("acme/land", SHA, config, default=default), (True, None))
+            self.assertEqual(self.contain_at("acme/land", TIP, config), (True, None))
+
+        def test_S2_epic_contains_refuses_a_commit_off_the_branch_without_trailers_or_unreadable(self):
+            config = {"land_repos": ["acme/land"]}
+            for sha, word in ((BARE, "no trailer"), (HALF, "no trailer"), (OFF, "not on the default branch"), (AHEAD, "not on the default branch"), ("e" * 40, "not on the default branch")):
+                ok, why = self.contain_at("acme/land", sha, config)
+                self.assertFalse(ok)
+                self.assertIn(word, why)
+            for broken, word in (("/compare/", "default branch"), ("/commits/", "could not be read")):
+                ok, why = self.contain_at("acme/land", SHA, config, broken=(broken,))
+                self.assertFalse(ok)
+                self.assertIn(word, why)
+
+        def test_S3_a_repo_off_the_land_path_keeps_refusing_an_empty_claimant_set(self):
+            for config in ({}, {"land_repos": ["acme/other"]}, None):
+                self.assertEqual(self.contain_at("acme/land", SHA, config), (False, "no merged pull request of the plan: nothing to contain"))
+
+        def test_S4_with_merged_pull_requests_a_land_repo_is_judged_by_the_merges(self):
+            ok, why = self.contain_at("acme/land", SHA, {"land_repos": ["acme/land"]}, merged=[(5, "e" * 40)])
+            self.assertFalse(ok)
+            self.assertIn("does not contain the merge of #5", why)
+
         def test_U1_the_trailer_match_is_one_function_with_the_stated_form(self):
             missing = sb.land_trailers_missing
             block = lambda lines: "subject\n\n" + "\n".join(lines) + "\n"
