@@ -13,6 +13,7 @@ importlib.import_module / __import__ of one (or of a name the scan cannot read).
 does not parse (a template with a placeholder) fails closed on any use of the primitive. A Python file the scan cannot parse is a site. Such a site passes only when
 it is listed in EMBEDDED_OK by its exact text, with a reason. What the scan cannot follow is LIMITS, below, and a test counts it."""
 import ast
+import copy
 import errno
 import http.client
 import io
@@ -182,7 +183,7 @@ class TestStubEndsByItself(unittest.TestCase):
         self.assertTrue(wait_until(lambda: not pid_alive(pid), 5), "the orphaned stub is still running")
 
     def test_s4_an_idle_stub_with_a_live_parent_ends_after_its_cap(self):
-        p = self.start_stub(env={"STUB_IDLE_SECONDS": "2"})
+        p = self.start_stub(env={"STUB_IDLE_SECONDS": "1"})
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the idle stub is still running")
 
 
@@ -722,7 +723,7 @@ def mutate(tree, site, how="remove"):
     alias, how = how == "alias", ("remove" if how == "alias" else how)   # alias: the remove mutant, with the started call renamed through an alias
     if alias and site["kind"] not in ("popen", "process", "thread", "helper"):
         return None
-    t = ast.parse(ast.unparse(tree))   # a private copy; the same site is found again by its place among the sites of its kind in the file
+    t = copy.deepcopy(tree)   # a private copy; the same site is found again by its place among the sites of its kind in the file
     ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"]].index(site["line"])
     target = sorted([x for x in scan_tree(site["file"], t) if x["kind"] == site["kind"]], key=lambda x: x["line"])[ordinal]
     par, node, kind = target["par"], target["node"], site["kind"]
@@ -1053,7 +1054,7 @@ def _mutant_case(s, how):
             first = f.readline()
         with open(dest, "w") as f:
             f.write((first if first.startswith("#!") else "") + src)   # unparse drops the shebang that tells the scan it is Python
-        bad = [x for x in find_sites(d) if not x["ok"]]
+        bad = [x for x in scan_tree(s["file"], parse(dest)) if not x["ok"]]
         self.assertEqual(sorted({x["func"] for x in bad}), [s["func"] if s["kind"] != "embedded" else "<string>"], "the scan missed the %s mutant of %s" % (how, site_name(s)))
     return run
 

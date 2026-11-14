@@ -161,12 +161,18 @@ def stall_scenario(mod, all_due=False):
     clock = Clock()
     go, done = threading.Semaphore(0), threading.Semaphore(0)
 
+    ready = [False]
+
     def wait():
-        done.release()
+        if ready[0]:
+            done.release()   # only after the previous wakeup's due()/tick() has finished
+        else:
+            ready[0] = True
         go.acquire()
 
     def stop(args, reason):
-        done.acquire()   # the thread is parked in its wait
+        while not ready[0]:   # the thread is parked in its first wait
+            time.sleep(0.001)
         for _ in range(50):
             clock.now += MIN
             go.release()

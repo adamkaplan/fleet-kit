@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import http.server
 import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -26,14 +27,17 @@ import end_hook  # noqa: E402
 import token_mint  # noqa: E402
 
 FAKE_KUBECTL = os.path.join(HERE, "fake_kubectl")
-_fake_kubectl_mod = importlib.machinery.SourceFileLoader("fake_kubectl_mod", FAKE_KUBECTL).load_module()
+_fk_loader = importlib.machinery.SourceFileLoader("fake_kubectl_mod", FAKE_KUBECTL)
+_fake_kubectl_mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fake_kubectl_mod", _fk_loader))
+sys.modules["fake_kubectl_mod"] = _fake_kubectl_mod
+_fk_loader.exec_module(_fake_kubectl_mod)
 _inproc_lock = threading.RLock()   # one in-process fake kubectl at a time: it swaps argv, stdin, stdout and the environment
 
 
 def _inproc_ok(kube, cmd):
     e = kube.env
     return (kube.bin == FAKE_KUBECTL and "port-forward" not in cmd and not e.get("FAKE_KUBE_HANG")
-            and not e.get("FAKE_KUBE_EXEC_SLEEP"))
+            and not e.get("FAKE_KUBE_EXEC_SLEEP") and os.environ.get("FAKE_KUBE_SUBPROCESS") != "1")
 
 
 def _inproc_call(kube, cmd, stdin):
@@ -61,6 +65,37 @@ def _inproc_call(kube, cmd, stdin):
     return code, out.getvalue(), err.getvalue()
 
 
+def patch_kube_module(m):
+    """The Kube of module m (the real one, or a mutant's fresh copy) runs the fake kubectl in this process. Idempotent."""
+    if getattr(m.Kube._run, "_fast", False):
+        return
+    orig_run, orig_raw = m.Kube._run, m.Kube._raw
+
+    def prefix(k):
+        return [k.bin] + (["--kubeconfig", k.kubeconfig] if k.kubeconfig else []) + ["--context", k.context, "-n", k.ns]
+
+    def fast_run(kube, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
+        if not kube.context or not _inproc_ok(kube, prefix(kube) + list(args)):
+            return orig_run(kube, args, stdin, ok_missing, keep_stdout, timeout, missing_what)
+        code, out, err = _inproc_call(kube, prefix(kube) + list(args), stdin)
+        if code != 0:
+            if keep_stdout and out.strip():
+                return out
+            if ok_missing and m._not_found_exactly(err, missing_what):
+                return None
+            last = (kube.scrub(err, limit=m.SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
+            raise m.CloudError("kubectl %s: %s" % (args[0], kube.scrub(last)))
+        return out
+
+    def fast_raw(kube, args, timeout=120):
+        if not kube.context or not _inproc_ok(kube, prefix(kube) + list(args)):
+            return orig_raw(kube, args, timeout)
+        return _inproc_call(kube, prefix(kube) + list(args), None)
+
+    fast_run._fast = fast_raw._fast = True
+    m.Kube._run, m.Kube._raw = fast_run, fast_raw
+
+
 T0 = dt.datetime(2026, 10, 14, 12, 0, 0, tzinfo=dt.timezone.utc)
 
 
@@ -73,6 +108,9 @@ class Clock:
 
     def advance(self, **kw):
         self.t += dt.timedelta(**kw)
+
+
+patch_kube_module(cw)   # at import: every Kube call of the real module runs in process
 
 
 class Base(unittest.TestCase):
@@ -96,32 +134,9 @@ class Base(unittest.TestCase):
         self.patch_kube(cw)
 
     def patch_kube(self, m):   # the Kube of module m (the real one, or a mutant's copy) runs the fake kubectl in this process
-        orig_run, orig_raw = m.Kube._run, m.Kube._raw
-        self.addCleanup(setattr, m.Kube, "_run", orig_run)
-        self.addCleanup(setattr, m.Kube, "_raw", orig_raw)
-
-        def prefix(k):
-            return [k.bin] + (["--kubeconfig", k.kubeconfig] if k.kubeconfig else []) + ["--context", k.context, "-n", k.ns]
-
-        def fast_run(kube, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
-            if not kube.context or not _inproc_ok(kube, prefix(kube) + list(args)):
-                return orig_run(kube, args, stdin, ok_missing, keep_stdout, timeout, missing_what)
-            code, out, err = _inproc_call(kube, prefix(kube) + list(args), stdin)
-            if code != 0:
-                if keep_stdout and out.strip():
-                    return out
-                if ok_missing and m._not_found_exactly(err, missing_what):
-                    return None
-                last = (kube.scrub(err, limit=m.SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
-                raise m.CloudError("kubectl %s: %s" % (args[0], kube.scrub(last)))
-            return out
-
-        def fast_raw(kube, args, timeout=120):
-            if not kube.context or not _inproc_ok(kube, prefix(kube) + list(args)):
-                return orig_raw(kube, args, timeout)
-            return _inproc_call(kube, prefix(kube) + list(args), None)
-
-        m.Kube._run, m.Kube._raw = fast_run, fast_raw
+        self.addCleanup(setattr, m.Kube, "_run", m.Kube._run)
+        self.addCleanup(setattr, m.Kube, "_raw", m.Kube._raw)
+        patch_kube_module(m)
 
     def write_state(self, st):
         with open(self.state, "w") as f:

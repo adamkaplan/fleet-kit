@@ -1,5 +1,9 @@
 import ast
+import contextlib
 import hashlib
+import importlib.machinery
+import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -39,6 +43,30 @@ scenarios:
 """ % (size, cover, pass_rule, discr)
 
 
+_LOADED = {}
+
+
+def _load(name, path):
+    """A source file with no .py suffix, loaded once per process (the switchboard is 24,000 lines)."""
+    if name not in _LOADED:
+        loader = importlib.machinery.SourceFileLoader(name, path)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+        sys.modules[name] = mod
+        loader.exec_module(mod)
+        _LOADED[name] = mod
+    return _LOADED[name]
+
+
+def _in_process(main, argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = main(argv)
+        except SystemExit as e:
+            code = e.code
+    return subprocess.CompletedProcess(argv, 0 if code is None else code, out.getvalue(), err.getvalue())
+
+
 def read(p):
     with open(p, "rb") as f:
         return f.read()
@@ -60,6 +88,12 @@ class PlanCheckInPod(unittest.TestCase):
 
     def local(self, path):
         return subprocess.run([sys.executable, SWITCHBOARD, "plan", "check", "--file", path, "--done-when", DONE], capture_output=True, text=True)
+
+    def both(self, path, extra=()):
+        """The pod command and the local command on one file, run in this process (the two subprocess forms stay in the s2 and s3 tests)."""
+        pod = _in_process(_load("cw_plan_check_pod", POD).main, ["--file", path, "--done-when", DONE] + list(extra))
+        loc = _in_process(_load("sb_plan_check_local", SWITCHBOARD).main, ["plan", "check", "--file", path, "--done-when", DONE] + list(extra))
+        return pod, loc
 
     def test_s1_docs_section(self):
         text = read(os.path.join(ROOT, "docs", "cloud-worker-interface.md")).decode()
@@ -95,7 +129,7 @@ class PlanCheckInPod(unittest.TestCase):
         self.assertGreaterEqual(len(fixtures), 12)
         for i, fx in enumerate(fixtures):
             p = self.write(fx)
-            pod, loc = self.pod(p), self.local(p)
+            pod, loc = self.both(p)
             self.assertEqual((pod.stdout, pod.returncode), (loc.stdout, loc.returncode), i)
 
     def test_unknown_argument_and_unreadable(self):
@@ -188,8 +222,7 @@ class PlanCheckInPod(unittest.TestCase):
         for name, text in cases.items():
             p = self.write(text)
             for extra in ((), ("--json",)):
-                pod = self.pod(p, extra)
-                loc = subprocess.run([sys.executable, SWITCHBOARD, "plan", "check", "--file", p, "--done-when", DONE] + list(extra), capture_output=True, text=True)
+                pod, loc = self.both(p, extra)
                 self.assertEqual((pod.returncode, pod.stdout), (loc.returncode, loc.stdout), name)
         p = self.write(cases["differs"])
         r = self.pod(p)

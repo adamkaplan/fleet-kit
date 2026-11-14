@@ -96,23 +96,31 @@ def _shapes(out):
     return re.sub(r"[^\x20-\x7e]", "?", out)
 
 
+def _find_all(text, sub):
+    pos = text.find(sub, 0)
+    while pos != -1:
+        yield pos
+        pos = text.find(sub, pos + 1)
+
+
 def match_intervals(text, secs):
     """The matches of every known form on the ORIGINAL text, found by brute force (not by the code under test): from each position whose
     8-character window is a window of a form, the longest run that is still a piece of that form; the overlapping ones merged."""
     forms = forms_of(secs)
-    wins = {f[k:k + cw.MIN_FRAGMENT] for f in forms for k in range(len(f) - cw.MIN_FRAGMENT + 1)}
     raw = []
+    n, mf = len(text), cw.MIN_FRAGMENT
     for f in forms:  # for each form, left to right: a match is the longest run from its start, the next start is after it
-        i = 0
-        while i <= len(text) - cw.MIN_FRAGMENT:
-            if text[i:i + cw.MIN_FRAGMENT] not in wins or text[i:i + cw.MIN_FRAGMENT] not in f:
-                i += 1
+        fwins = {f[k:k + mf] for k in range(len(f) - mf + 1)}
+        starts = sorted({pos for w in fwins for pos in _find_all(text, w)})
+        next_i = 0
+        for i in starts:
+            if i < next_i:
                 continue
-            j = i + cw.MIN_FRAGMENT
-            while j < len(text) and text[i:j + 1] in f:
+            j = i + mf
+            while j < n and text[i:j + 1] in f:
                 j += 1
             raw.append((i, j))
-            i = j
+            next_i = j
     merged = []
     for a, b in sorted(raw):
         if merged and a <= merged[-1][1]:
