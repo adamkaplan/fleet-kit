@@ -65,22 +65,32 @@ class Wake(unittest.TestCase):
         f = Fake(mode); self.addCleanup(f.close); return f
 
     def start(self, f, script, name="job", tool=TOOL, gap="0.2", limit="1.5"):
-        env = {"PATH": "/usr/bin:/bin", "CW_RUNS_DIR": self.runs, "CW_PROGRESS_FILE": self.prog, "CW_RUN_TICK": "300",
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CW_RUNS_DIR": self.runs, "CW_PROGRESS_FILE": self.prog, "CW_RUN_TICK": "300",
                "CW_RUN_SERVER": f.url, "CW_RUN_SERVER_PASSWORD_FILE": os.path.join(self.d, "pw"), "CW_RUN_CLIENT": self.client,
                "FLEET_BOSS": "boss1", "CW_RUN_TEST": "1", "CW_RUN_WAKE_GAP": gap, "CW_RUN_WAKE_LIMIT": limit}
         r = subprocess.run([sys.executable, tool, "start", "--name", name, "--", "sh", "-c", script], env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        try:
+            return "Z" not in open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return True
+
     def finish(self, name="job", secs=20):
         """Wait until the detached wrapper has ended (marker written, wake done: the pid is gone)."""
         end = time.time() + secs
         pid = int(open(os.path.join(self.runs, name + ".pid")).read())
+        marker = os.path.join(self.runs, name + ".exit")
         while time.time() < end:
-            try:
-                os.kill(pid, 0)
-                if "Z" in open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[0]:
-                    break
-            except (ProcessLookupError, OSError):
+            if os.path.exists(marker) and not self.alive(pid):   # the marker is written right before the wake: both must hold
                 break
             time.sleep(0.1)
         else:
