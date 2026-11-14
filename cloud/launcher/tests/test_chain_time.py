@@ -16,6 +16,10 @@ TEMP_MARKERS = {
     "TemporaryDirectory": r"\bTemporaryDirectory\(",
     "test_cloud_worker": r"^\s*(import|from) test_cloud_worker\b",
     "test_driver": r"^\s*(import|from) test_driver\b",
+    # Wave 4 (#2525): fixture modules that own a temporary directory, and a stub server on port 0 that writes no file.
+    "fixture_import": r"^\s*(import|from) (test_failed_pod_record|test_run_record|test_preflight|test_image_gate|test_cloud_worker)\b",
+    "worker_fixture_loaded": r"SourceFileLoader\([^\n]*bin\" / \"test-cloud-worker\"",
+    "port_zero_stub_server": r"ThreadingHTTPServer\(\(\"127\.0\.0\.1\", 0\)",
 }
 # What a parallel entry must not do: bind a fixed port (a nonzero literal or a constant) or write a fixed absolute path.
 SHARED = {

@@ -3672,7 +3672,11 @@ class Launcher:
 
     def _raise_on_race(self, name, pod):
         uid = (pod or {}).get("metadata", {}).get("uid")
-        for ev in self.kube.pod_events(name):
+        try:
+            events = self.kube.pod_events(name)
+        except (CloudError, ValueError, KeyError):
+            return
+        for ev in events:
             if uid and (ev.get("involvedObject") or {}).get("uid") not in (None, uid):
                 continue   # an event of an earlier pod of the same name
             if ev.get("reason") == "FailedCreatePodSandBox" and STACK_RACE_RE.search(ev.get("message") or ""):
