@@ -15752,7 +15752,17 @@ def _epic_same_plan(default_repo):
 
 
 def epic_get(ctx, runner):
-    return impact_carry_get(ctx.engine, runner, ctx.repo)
+    """The GitHub GET of the repository, with a per-call cache of the commit reads that succeeded (a valid commit dict with its sha): one commit is never read twice."""
+    inner, seen = impact_carry_get(ctx.engine, runner, ctx.repo), {}
+
+    def get(path):
+        if path in seen:
+            return seen[path]
+        got = inner(path)
+        if "/commits/" in path and isinstance(got, dict) and isinstance(got.get("sha"), str) and got.get("sha"):
+            seen[path] = got
+        return got
+    return get
 
 
 def epic_default_head(get, repo):
@@ -15879,13 +15889,12 @@ def epic_contains(get, repo, merged, default=None, config=None):
 
 
 def epic_land_writers(get, repo, head):
-    """The logins that wrote the commit `head` (author, committer): never its judges. Unreadable: none (the containment read already refused an unreadable commit)."""
-    try:
-        commit = get("repos/%s/commits/%s" % (repo, head))
-        who = lambda key: (commit.get(key) or {}).get("login") if isinstance(commit.get(key), dict) else None
-        return {w for w in (who("author"), who("committer")) if isinstance(w, str) and w}
-    except Exception:
-        return set()
+    """The logins that wrote the commit `head` (author, committer): never its judges. Raises when the commit cannot be read."""
+    commit = get("repos/%s/commits/%s" % (repo, head))
+    if not isinstance(commit, dict) or commit.get("sha") != head:
+        raise ValueError("the commit %s could not be read" % str(head)[:12])
+    who = lambda key: (commit.get(key) or {}).get("login") if isinstance(commit.get(key), dict) else None
+    return {w for w in (who("author"), who("committer")) if isinstance(w, str) and w}
 
 
 def epic_changed(get, repo):
@@ -15934,7 +15943,10 @@ def epic_target(ctx, runner, now, named):
     if not ok:
         raise LedgerCommandError("refused: %s: nothing was recorded" % why)
     if land and not merged:
-        writers = set(writers) | epic_land_writers(get, ctx.repo, head)
+        try:
+            writers = set(writers) | epic_land_writers(get, ctx.repo, head)
+        except Exception as err:
+            raise LedgerCommandError("refused: the commit %s could not be read (%s): nothing was recorded" % (head[:12], _one_line(str(err), 120))) from None
     return head, default, writers
 
 
@@ -15953,7 +15965,7 @@ def epic_view(ctx, runner, now):
     if not scenarios:
         return [], None, None
     get = epic_get(ctx, runner)
-    default_head, why, default, writers = None, None, None, set()
+    default_head, why, default, writers, writers_ok = None, None, None, set(), True
     try:
         default, default_head = epic_default_head(get, ctx.repo)
     except Exception as err:
@@ -15962,13 +15974,20 @@ def epic_view(ctx, runner, now):
         merged, _, writers = epic_claimants(ctx, runner, now, get)
         land = is_land_repo(ctx.config, ctx.repo)
         contains = epic_contains(get, ctx.repo, merged, default, ctx.config) if land else epic_contains(get, ctx.repo, merged, default)
-        if land and not merged and default_head:
-            writers = set(writers) | epic_land_writers(get, ctx.repo, default_head)
+        if land and not merged:
+            heads = ({default_head} if default_head else set()) | {
+                e.get("head") for e in ctx.entries
+                if e.get("pr") == ctx.pr and e.get("via") == load_module("epic_record").EPIC_VIA and e.get("kind") == "proof" and isinstance(e.get("head"), str) and e.get("head")}
+            if not heads:
+                raise ValueError("no commit of %s could be read for writer exclusion" % ctx.repo)
+            for h in sorted(heads):
+                writers = set(writers) | epic_land_writers(get, ctx.repo, h)
     except Exception as err:
+        writers_ok = False
         why = why or "the pull requests of the plan could not be read (%s)" % _one_line(str(err), 100)
         contains = lambda head: (False, "the pull requests of the plan could not be read")
     try:
-        authors = epic_authors(ctx) | writers
+        authors = epic_authors(ctx) | writers if writers_ok else None
     except ItemAgentsUnreadable as err:
         authors = None
         why = why or str(err)
