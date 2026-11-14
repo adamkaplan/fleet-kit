@@ -49,6 +49,14 @@ class TestLandText(unittest.TestCase):
         self.assertIn("spire land", pod.payload(BRIEF, repo="acme/other", config={"land_repos": ["acme/*"]}))
         self.assertNotIn("spire land", pod.payload(BRIEF, repo="acme-org/widget", config={"land_repos": []}))
 
+    def test_cloud_launch_text_has_no_land_gate_command(self):
+        for repo in ("acme-org/widget", "acme/other"):
+            text = pod.payload(BRIEF, repo=repo, config=ON)
+            self.assertNotIn("land-gate", text, repo)
+            self.assertNotIn("fleet-switchboard land-gate", text, repo)
+        self.assertIn("spire land", pod.payload(BRIEF, repo="acme-org/widget", config=ON))
+        self.assertNotIn("spire land", pod.payload(BRIEF, repo="acme/other", config=ON))
+
     def test_the_helper(self):
         uses = fpn.sb.uses_spire_land
         self.assertFalse(uses({}, "acme-org/x"), "absent key: off")
@@ -102,6 +110,7 @@ class TestLandText(unittest.TestCase):
                 self.assertEqual(launch_again._finish_starting(args, None, types.SimpleNamespace(config=dict(ON, call_timeout_seconds=5)), state, record, repo, "b"), 0)
             self.assertTrue(sent, repo)
             self.assertEqual(len([l for l in "\n".join(sent).splitlines() if "spire land" in l]), expect, repo)
+            self.assertNotIn("land-gate", "\n".join(sent), repo)   # no land-gate command reaches a cloud pod: the git proxy gates the push
 
     OLD_LINE = "- This repository lands with `spire land`: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, or the exit code and what stopped it; exit 22 = held for a person: stop and say so.\n"   # the launch line before this fix
 
