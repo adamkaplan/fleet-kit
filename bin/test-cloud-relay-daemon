@@ -841,9 +841,7 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        for name, short in (("RECORD_WAIT_SECONDS", 0.5), ("RECORD_PROGRESS_SECONDS", 0.2)):   # a writer behind a lock a mutant holds gives up fast instead of after the full wait
-            self.addCleanup(setattr, plan_ledger, name, getattr(plan_ledger, name))
-            setattr(plan_ledger, name, short)
+        [(self.addCleanup(setattr, plan_ledger, n, getattr(plan_ledger, n)), setattr(plan_ledger, n, v)) for n, v in (("RECORD_WAIT_SECONDS", 0.5), ("RECORD_PROGRESS_SECONDS", 0.2))]   # a writer behind a lock a mutant holds gives up fast
         calls, free = [], []
         first_in, settled = threading.Event(), threading.Event()
         release = [threading.Event(), threading.Event()]   # one per call: the TEST releases them
@@ -909,8 +907,7 @@ class LiveHead(Fixture):
         self.backend.live_head = blocked
         answer, audits = [], len(self.backend.audits)
         t = threading.Thread(target=lambda: answer.append(self.run_one(CODER, "prove", **PROVE)), daemon=True)
-        t.start()
-        t.join(1.5)   # same guard (the honest answer comes at HEAD_TIMEOUT, 0.2 s)
+        t.start(); t.join(1.5)   # same guard (the honest answer comes at HEAD_TIMEOUT, 0.2 s)
         answered, still_blocked = bool(answer), not release.is_set()
         release.set()
         t.join(10)
