@@ -362,6 +362,10 @@ class Base(unittest.TestCase):
         quick = mock.patch.object(lib, "check_repo_preflight", quick_preflight)
         quick.start()
         self.addCleanup(quick.stop)
+        capacity = mock.patch.object(sb.load_module("cloud_worker"), "_print_capacity",   # the read-only block is information on stderr that no test here judges: no child process for it
+                                     lambda runner, cluster: print("cloud capacity before the create: not read", file=sys.stderr))
+        capacity.start()
+        self.addCleanup(capacity.stop)
         for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID", "CW_KUBE_CONTEXT", "CW_TOOLING_REPO", "CW_CLUSTER_TOKEN_CMD"):
             os.environ.pop(name, None)
         config = self.home / "cfg" / "fleet-switchboard" / "config.json"

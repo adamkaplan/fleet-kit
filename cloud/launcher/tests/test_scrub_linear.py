@@ -1394,9 +1394,12 @@ def scan_uses(roots):
             if not path.is_file() or path.is_symlink() or ".git" in path.parts or path.stat().st_size > 20 * 2 ** 20:
                 continue
             try:
-                lines = path.read_text(encoding="utf-8", errors="strict").split("\n")
+                raw = path.read_text(encoding="utf-8", errors="strict")
             except (UnicodeDecodeError, OSError):
                 continue
+            if not any(tok in raw for tok in ("_forms", "_built", "_lock", "_version", "__setattr__", "pickle", "copy")):
+                continue   # every pattern below holds one of these words: a file without them has no use
+            lines = raw.split("\n")
             own = class_lines(path, lines)
             for n, line in enumerate(lines, 1):
                 if n in own or PROBE in line:
