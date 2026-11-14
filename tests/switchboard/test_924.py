@@ -253,7 +253,12 @@ def _body():
 
         # ---- #924 round 4: the check is a closure cell of each effect, never a parameter and never read from the namespace at bind time
 
+        def real_guard(self):
+            """Put back the real code snapshot (Base.setUp skips it): the tests of a registrar that replaces code need the guard that notices."""
+            sb.code_snapshot, sb.code_replaced = self._real_code_snapshot, self._real_code_replaced   # (the setUp patch restores the originals at cleanup)
+
         def hostile(self, body):
+            self.real_guard()
             """Run `body(seen)` as a registrar of the real `main`; (seen, the DELETE writes, main's code, its stderr)"""
             self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
             seen = {}
@@ -556,6 +561,7 @@ def _body():
 
         def test_a_registrar_that_reassigns_any_function_the_clear_or_the_rating_runs_by_stops_the_command_for_every_action(self):
             """#924, the real `main()` with a real registrar that REASSIGNS one function (one case for each, derived from the closure by `guarded_names`): `review record` writes nothing, `impact clear` clears nothing, and any other action stops too."""
+            self.real_guard()
             daemon_names, helper = self.guarded_names()
             self.assertTrue({"cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser"} <= set(daemon_names) | set(helper["impact_hold"]) | {"build_parser"}, daemon_names[:5])
             self.no_direct_route()   # the BACKSTOP: the routes that still run registrars (the direct route runs none)
@@ -577,6 +583,7 @@ def _body():
             self.addCleanup(patcher.stop)
 
         def test_a_registrar_that_reassigns_a_function_of_the_clear_leaves_the_hold_as_it_was(self):
+            self.real_guard()
             daemon_names, helper = self.guarded_names()
             self.no_direct_route()
             self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()

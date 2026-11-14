@@ -68,7 +68,7 @@ class Base(unittest.TestCase):
     def run_cli(self, args, source=None, **env_over):
         script = Path(self.tmp.name) / "cloud_cli.py"
         script.write_text(source or SOURCE)
-        (Path(self.tmp.name) / "cloud_client.py").write_text(getattr(self, "client_source", None) or (BIN / "cloud_client.py").read_text())
+        (Path(self.tmp.name) / "cloud_client.py").write_text((getattr(self, "client_source", None) or (BIN / "cloud_client.py").read_text()).replace("BACKOFF_SECONDS = 0.5", "BACKOFF_SECONDS = 0.01"))
         env = {"PATH": os.environ.get("PATH", ""), "FLEET_AGENT_NAME": "worker-a", "FLEET_BOSS": "boss-a",
                "FLEET_CLOUD_CHANNEL_URL": self.url, "FLEET_CLOUD_TOKEN_FILE": str(self.tok)}
         env.update(env_over)
@@ -440,6 +440,7 @@ class Wire(unittest.TestCase):
             def log_message(self, *a):
                 pass
         _, url = self.serve(H)
+        self.addCleanup(release.set)   # after serve: cleanups run last-in first-out, so the stalled handler is let go before the server waits for it
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         script = Path(tmp.name) / "run.py"
@@ -449,7 +450,7 @@ class Wire(unittest.TestCase):
             (Path(tmp.name) / "cloud_client.py").write_text((BIN / "cloud_client.py").read_text())
             script.write_text("import sys; sys.path.insert(0, %r)\nimport cloud_cli\nprint(cloud_cli.make_post(%r)(%r)['status'])\n"
                               % (tmp.name, url, self.request()))
-            return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=6).stdout.strip()
+            return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=3).stdout.strip()
         fast = SOURCE.replace("TIMEOUT = 10\n", "TIMEOUT = 1\n")
         self.assertNotEqual(fast, SOURCE)
         self.assertEqual(run(fast), "0")

@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import types
 import shutil
 import subprocess
 import sys
@@ -38,18 +39,38 @@ def tool_module():
     loader = importlib.machinery.SourceFileLoader("derive_closure_t", str(TOOL))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader("derive_closure_t", loader))
     loader.exec_module(module)
+    real_parse = module.ast.parse
+    cache = {}
+
+    def parse(source, *a, **kw):
+        # derive_closure only walks trees, so one tree per distinct text is shared.
+        if not isinstance(source, str):
+            return real_parse(source, *a, **kw)
+        key = (source, a, tuple(sorted(kw.items())))
+        if key not in cache:
+            cache[key] = real_parse(source, *a, **kw)
+        return cache[key]
+
+    module.ast = types.SimpleNamespace(**{**vars(module.ast), "parse": parse})
+    real_held, held = module.held_names, {}
+
+    def held_names(tree):
+        if id(tree) not in held:
+            held[id(tree)] = (tree, real_held(tree))
+        return held[id(tree)][1]
+
+    module.held_names = held_names
     return module
-
-
-_TOOL_MOD = tool_module()
 
 
 def run(*args):
     """The tool's main, in this process (the one test of the matrix runs the real entry point: run_process)."""
+    if TestDerivedClosure._TOOL_MOD is None:
+        TestDerivedClosure._TOOL_MOD = tool_module()
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
         try:
-            code = _TOOL_MOD.main(list(args))
+            code = TestDerivedClosure._TOOL_MOD.main(list(args))
         except SystemExit as done:
             code = done.code
     return (code if isinstance(code, int) else (0 if code is None else 1)), out.getvalue()
@@ -101,6 +122,8 @@ def function_lines(source, name):
 
 
 class TestDerivedClosure(unittest.TestCase):
+    _TOOL_MOD = None
+
     def test_the_matrix_is_what_the_code_derives_and_the_closure_holds(self):
         code, out = run_process("--check")
         self.assertEqual(code, 0, out)   # the property: the matrix equals what the code derives, in both directions
