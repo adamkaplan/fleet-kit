@@ -1152,7 +1152,7 @@ class HubReadAndTransport(unittest.TestCase):
     # and that the cause is not found, so the test no longer depends on any measured duration.
     def test_mutant_without_the_total_deadline_is_caught(self):
         mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
-        old, mod.READ_DEADLINE = relay.READ_DEADLINE, 0.1
+        old, mod.READ_DEADLINE = relay.READ_DEADLINE, 0.3
         import time
         finished = threading.Event()
         written = [0]
