@@ -451,6 +451,19 @@ class TestV2ClientBigReply(Base):
 
 
 class TestScenarioVocabularyPR4(Base):
+    def run_cli(self, path, *argv):
+        """bin/fleet-scenario runs in this process (its main, with the streams captured), as TestScenarioFiles runs it; `frobnicate` keeps one real process."""
+        if str(path) != str(SCENARIO) or argv == ("frobnicate",):
+            return super().run_cli(path, *argv)
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = sc.main(list(argv))
+            except SystemExit as done:
+                code = done.code
+        return subprocess.CompletedProcess([str(path), *argv], code if isinstance(code, int) else (0 if code is None else 1), out.getvalue(), err.getvalue())
+
     def put(self, name, obj, directory=None):
         directory = directory or (self.home / "scenarios")
         directory.mkdir(parents=True, exist_ok=True)

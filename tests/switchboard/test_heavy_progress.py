@@ -415,7 +415,8 @@ class TestHeavyProgress(unittest.TestCase):
         here = os.path.dirname(os.path.abspath(__file__))
         outcome = {}
         with tempfile.TemporaryDirectory() as scratch:
-            for kind, body in (("control", text), ("mutant", text.replace(anchor, "got_lock = progress_lock.acquire()"))):
+            short = text.replace(anchor, "got_lock = progress_lock.acquire(timeout=0.3)").replace("progress_thread.join(2)", "progress_thread.join(0.3)")   # the in-code bounds shortened: the outer bound can be short too
+            for kind, body in (("control", short), ("mutant", text.replace(anchor, "got_lock = progress_lock.acquire()").replace("progress_thread.join(2)", "progress_thread.join(0.3)"))):
                 path = os.path.join(scratch, kind + "_heavy_slots.py")
                 open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 with open(path, "w") as handle:
@@ -424,7 +425,7 @@ class TestHeavyProgress(unittest.TestCase):
                 child = subprocess.Popen([sys.executable, __file__, "TestHeavyProgress.test_s14_inner_a_blocked_write_does_not_hold_the_return"], cwd=here, env=env,
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
                 try:
-                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "6")))   # the outer bound: only the mutant reaches it
+                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "3")))   # the outer bound: only the mutant reaches it
                     outcome[kind] = (child.returncode, output, False)
                 except subprocess.TimeoutExpired:
                     child.send_signal(signal.SIGUSR1)   # the job's kill notice: the child names the hang and ends

@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 TOOL = REPO / "tools" / "guard-set"
@@ -84,25 +85,23 @@ class TestGuardSet(unittest.TestCase):
             self.assertEqual(l, "python3 bin/test-switchboard " + e["class"] + want)
 
     def test_a_class_with_no_loader_line_is_caught_by_the_wired_guard_control_first(self):
-        # in-process: the copy's own test_wired_tests module (loaded from the tree copy) runs the guard's test; no child run per step
-        import importlib.util
+        # in-process: the real test_wired_tests module runs the guard's test with its paths pointed at a tree of links to the real files (so the parse caches hold); no child run per step
+        import test_wired_tests as wired
         with tempfile.TemporaryDirectory() as d:
-            tree = (Path(d) / "tree").resolve()   # macOS: /var is /private/var, and the module resolves its own __file__
-            (tree / "bin").mkdir(parents=True)   # only what the copy's guard reads: the runner and the test directory
-            shutil.copy(REPO / "bin" / "test-switchboard", tree / "bin" / "test-switchboard")
-            shutil.copytree(REPO / "tests" / "switchboard", tree / "tests" / "switchboard", ignore=shutil.ignore_patterns("__pycache__"))
-            spec = importlib.util.spec_from_file_location("guard_tree_wired", tree / "tests" / "switchboard" / "test_wired_tests.py")
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            self.assertEqual(mod.TESTS, tree / "tests" / "switchboard")      # the copy's own paths, not the repository's
-            self.assertEqual(mod.RUNNER, tree / "bin" / "test-switchboard")
+            tree = Path(d).resolve()
+            (tree / "bin").mkdir()   # only what the guard reads: the runner and the test directory
+            (tree / "bin" / "test-switchboard").symlink_to(REPO / "bin" / "test-switchboard")
+            (tree / "tests" / "switchboard").mkdir(parents=True)
+            for path in (REPO / "tests" / "switchboard").glob("*.py"):
+                (tree / "tests" / "switchboard" / path.name).symlink_to(path)
 
             def guard_run():
                 result = unittest.TestResult()
-                mod.TestEveryTestFileIsWired("test_the_real_directory_is_wired").run(result)
+                with mock.patch.object(wired, "TESTS", tree / "tests" / "switchboard"), mock.patch.object(wired, "RUNNER", tree / "bin" / "test-switchboard"):
+                    wired.TestEveryTestFileIsWired("test_the_real_directory_is_wired").run(result)
                 return result, "".join(t for _, t in result.failures + result.errors)
             c, text = guard_run()
-            self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated copy
+            self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated tree
             self.assertGreaterEqual(c.testsRun, 1)     # the named guard test ran (not a skipped-everything pass)
             self.assertEqual(c.skipped, [], "the guard test ran, it was not skipped")   # a skipped guard is a pass that checked nothing
             # since #2210 a Test* class is bound by the runner's self-registration; a class with no loader line AND not named Test* is the one nothing reaches

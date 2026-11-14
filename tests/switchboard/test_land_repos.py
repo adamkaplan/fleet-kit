@@ -10,9 +10,11 @@ import unittest
 import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_push_watch import Case, NOW, load, record, parse_iso   # noqa: E402  (the push watch's own fake world)
+from support.loader import captured, sb   # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SHA = "d" * 40
@@ -127,7 +129,12 @@ class TestGatesSkipped(unittest.TestCase):
         if self.log.exists():
             self.log.unlink()
         args = [command, "%s#7" % repo] + (["--for", "merge"] if command == "gates-check" else []) + list(extra)
-        done = subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard")] + args, capture_output=True, text=True, env=env, timeout=90)
+        with mock.patch.dict(os.environ, env), captured() as (out, err):   # the entry's main in this process: no interpreter start and import per call
+            try:
+                code = sb.main(args)
+            except SystemExit as stop:
+                code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        done = subprocess.CompletedProcess(args, code or 0, out.getvalue(), err.getvalue())
         calls = [json.loads(l) for l in self.log.read_text().splitlines()] if self.log.exists() else []
         return done, calls
 

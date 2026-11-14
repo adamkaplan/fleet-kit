@@ -1,11 +1,14 @@
 """`gates ci-record` records the proof of each CI scenario as well as its verdict (#2091)."""
+import ast
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
+from unittest import mock
 
 from support.fake_hubs import LEDGER_HEAD, LEDGER_PLAN
 
@@ -111,25 +114,26 @@ def build(LedgerBase):
             self.assertEqual(len([l for l in out.splitlines() if "no merge ref" in l]), 1)
 
         def test_S5_the_proof_write_has_a_mutant_the_S2_case_catches(self):
-            """Copy the tree, run S2 on the unmutated copy (passes), then on a copy without the proof write (fails with the anchored text in its own output)."""
-            root = Path(__file__).resolve().parents[2]
-            case = "test_S2_three_ci_scenarios"
-            with tempfile.TemporaryDirectory() as tmp:
-                copy = Path(tmp) / "tree"
-                shutil.copytree(root, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
-                env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
+            """Run S2 in this process on the unmutated daemon (passes), then with `ci_record_core` rebuilt without the proof write (fails with the anchored text in its own output)."""
+            from support import loader
+            daemon = loader.sb
+            case = "test_S2_three_ci_scenarios_get_a_proof_and_a_verdict_and_g1_misses_none"
 
-                def run():
-                    return subprocess.run([sys.executable, str(copy / "bin" / "test-switchboard"), case], cwd=str(copy), env=env, capture_output=True, text=True, timeout=600)
-                clean = run()
-                self.assertEqual(clean.returncode, 0, "the unmutated copy passes S2: " + (clean.stdout + clean.stderr)[-600:])
-                core = copy / "bin" / "fleet-switchboard"
-                text = core.read_text()
-                head, sep, tail = text.partition("    for scenario in wanted:   # the proof of each ci scenario")
-                self.assertTrue(sep and "plan_ledger.append_once(" in tail, "the proof write is where the mutant expects it")
-                core.write_text(head + sep + tail.replace("plan_ledger.append_once(", "(lambda *a: None)(", 1))
-                mutant = run()
-                self.assertNotEqual(mutant.returncode, 0, "the mutant fails S2")
-                self.assertIn("ci-record records the proof and the verdict", mutant.stdout + mutant.stderr)
+            def run():
+                result = unittest.TestResult()
+                type(self)(case).run(result)
+                return result, "".join(text for _, text in result.failures + result.errors)
+            clean, text = run()
+            self.assertTrue(clean.wasSuccessful() and clean.testsRun == 1, "the unmutated daemon passes S2: " + text[-600:])
+            source = (Path(__file__).resolve().parents[2] / "bin" / "fleet-switchboard").read_text()
+            node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "ci_record_core")
+            head, sep, tail = ast.get_source_segment(source, node).partition("    for scenario in wanted:   # the proof of each ci scenario")
+            self.assertTrue(sep and "plan_ledger.append_once(" in tail, "the proof write is where the mutant expects it")
+            namespace = {}
+            exec(compile(head + sep + tail.replace("plan_ledger.append_once(", "(lambda *a: None)(", 1), "<mutant ci_record_core>", "exec"), daemon.__dict__, namespace)
+            with mock.patch.object(daemon, "ci_record_core", namespace["ci_record_core"]):
+                mutant, text = run()
+            self.assertFalse(mutant.wasSuccessful(), "the mutant fails S2")
+            self.assertIn("ci-record records the proof and the verdict", text)
 
     return TestCiRecordProof

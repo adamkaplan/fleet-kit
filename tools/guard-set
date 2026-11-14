@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import time
+import functools
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -27,7 +28,8 @@ def load(path):
     return json.loads(Path(path).read_text())
 
 
-def defined_classes():
+@functools.lru_cache(maxsize=None)
+def defined_classes():   # parsed once per process: the sources do not change under one run
     out = set()
     files = sorted((REPO / "tests" / "switchboard").glob("*.py")) + [REPO / "bin" / "test-switchboard", REPO / "tests" / "test_installed_guard.py"]
     for f in files:

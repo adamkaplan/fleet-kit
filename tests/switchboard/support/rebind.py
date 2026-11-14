@@ -62,7 +62,19 @@ def _shim_code(shim_path=None):
     return _REAL_SHIM_CODE[0]
 
 
-def run_in_process(runner, args, environ, stdin="", shim_path=None, setup=None):
+def run_in_process(runner, args, environ, stdin="", shim_path=None, setup=None, cwd=None):
+    """`_run_in_process`, in the directory `cwd` when one is given (the shim and the children it runs see it)."""
+    import os
+    before = os.getcwd()
+    try:
+        if cwd is not None:
+            os.chdir(str(cwd))
+        return _run_in_process(runner, args, environ, stdin, shim_path, setup)
+    finally:
+        os.chdir(before)
+
+
+def _run_in_process(runner, args, environ, stdin="", shim_path=None, setup=None):
     """The runner text of a shim test run in this process (no interpreter start) as `python -c runner *args` in `environ`: the CompletedProcess it
     would have given. The shim's exec of the real gh becomes a child run whose output is kept. With `runner` None the shim file itself is run:
     its code is executed as a module that is not __main__, `setup(namespace)` may set its test seams, and its `main(args)` is called."""
