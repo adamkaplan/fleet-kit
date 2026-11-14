@@ -190,7 +190,7 @@ def check_command_failure_is_unreachable(module):
 
 def check_real_timeout_is_unreachable(module):
     try:
-        module.command_fetch([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+        module.command_fetch([sys.executable, "-c", "import time; time.sleep(3)"], timeout=0.3)
         raise AssertionError("a timeout was believed")
     except module.Unreachable as why:
         assert "timed out" in str(why), str(why)
@@ -296,15 +296,15 @@ def check_temp_file_is_exclusive_private_and_random(module):
 
 
 def check_group_is_killed_when_a_grandchild_holds_the_pipe(module):
-    code = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); "
+    code = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)']); "
             "sys.stdout.write('{}'); sys.stdout.flush()")
     start = time.time()
     try:
-        module.command_fetch([sys.executable, "-c", code], timeout=1)
+        module.command_fetch([sys.executable, "-c", code], timeout=0.3)
         raise AssertionError("a source held open by a grandchild was believed")
     except module.Unreachable as why:
         assert "timed out" in str(why), str(why)
-    assert time.time() - start < 10, "blocked past the deadline"
+    assert time.time() - start < 2, "blocked past the deadline"
 
 
 @breaks_as(RecursionError)
@@ -607,8 +607,18 @@ def check_cli_age_command(module):
         assert run("--age-command", "%s -c 'print(500)'" % sys.executable) == "marked-stale"
 
 
+_DAEMON_KEYS = None
+
+
 def daemon_keys():
-    """The keys the daemon's DecisionStore.publish writes into decisions.json, read from its source."""
+    """The keys the daemon's DecisionStore.publish writes into decisions.json, read from its source (once per run)."""
+    global _DAEMON_KEYS
+    if _DAEMON_KEYS is None:
+        _DAEMON_KEYS = _daemon_keys()
+    return set(_DAEMON_KEYS)
+
+
+def _daemon_keys():
     text = daemon_source()
     start = text.index("    def publish(self, decisions, errors, now, provisional=False):")
     block = text[start:text.index("temp = path.with_name", start)]
@@ -768,11 +778,14 @@ def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
             out["r"] = pull_quiet(module, state, good(), NOW, err=err, age=5)
             out["t"] = time.monotonic() - start
         thread = threading.Thread(target=run, daemon=True)
+        wait = module.LOCK_WAIT
+        module.LOCK_WAIT = 0.02   # the eight tries 0.25 s apart are the real bound; a short pause keeps the same eight tries
         try:
             thread.start()
-            thread.join(8)
+            thread.join(1.5)
             assert not thread.is_alive(), "the pull hangs on a held lock"
         finally:
+            module.LOCK_WAIT = wait
             os.close(fd)
             thread.join(8)   # a blocked pull wakes on release: let it finish before the directory is removed
         assert out["r"] == "untouched" and out["t"] < 4, out
