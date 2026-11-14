@@ -18,7 +18,7 @@ from support.paths import BIN, REPO
 GB = 10 ** 9
 SMALL = shutil._ntuple_diskusage(1000 * GB, 995 * GB, 5 * GB)
 CORE = REPO / "tests" / "switchboard" / "support" / "core.py"
-NAMED = ("TestStoppedNews", "TestShadowClassifier", "TestCosOrdersFact", "TestV2LightGuards", "TestForegroundScenarios", "TestOfflineScenarios", "TestDecorationIsAFact")
+NAMED = ("TestStoppedNews", "TestShadowClassifier", "TestCosOrdersFact", "TestV2LightGuards", "TestDecorationIsAFact")
 # Of the one-scenario-per-test class TestOfflineScenarios (about 30 scenarios, 1 to 29 s each) only these four run in the group: each drives a real engine pass in a
 # test world (an ask comment, a mid-turn pass, a report, a restart), which is what reads the disk; the rest differ in their steps, not in the disk they read.
 FOREGROUND_KEPT = ("test_the_pr8_catalog_is_present_with_its_tiers_and_controls",)   # one catalog check

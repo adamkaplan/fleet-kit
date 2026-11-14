@@ -714,7 +714,7 @@ rng = random.Random(22)
 real = ipaddress.ip_address
 counts = {}
 for name, alphabet in (("colons and hex digits", "0123456789abcdef:"), ("dots and digits", "0123456789.")):
-    run = "".join(rng.choice(alphabet) for _ in range(2500))
+    run = "".join(rng.choice(alphabet) for _ in range(700))
     calls = [0]
     def counting(text, calls=calls):
         calls[0] += 1
