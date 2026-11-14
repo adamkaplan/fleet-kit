@@ -32513,7 +32513,6 @@ class TestRegistrarFloor(LedgerBase):
     def setUp(self):
         super().setUp()
         self.dc = sb.load_module("delegated_clear")
-        self.once_per_tree()
         self.rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         if TestRegistrarFloor.cache is None:   # the real file and its closure, derived once for the class
             import ast
@@ -32522,6 +32521,7 @@ class TestRegistrarFloor(LedgerBase):
             reach = self.dc.closure(tree, self.dc.daemon_roots(self.rule), self.rule["dynamic_actions"])
             TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]), self.small_source(tree, set(reach[0] | reach[1])))
         self.base_src, self.tree, self.names, self.defs, self.bindings, self.small_src = TestRegistrarFloor.cache
+        self.once_per_tree()
         self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
         self.configure()
 
@@ -32557,11 +32557,13 @@ class TestRegistrarFloor(LedgerBase):
         (the base, again and again) and its head three times each. The answers are the module's own, unchanged; only a repeat of the same text or the same tree is answered from the class's table."""
         import ast, hashlib, types
         memo, dc = TestRegistrarFloor.memo, self.dc
+        pinned = {("parse", hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()) for text in (self.base_src, self.small_src)}
+        memo.setdefault(("parse", hashlib.sha1(self.base_src.encode("utf-8", "surrogatepass")).hexdigest()), (None, self.tree))
 
         def keep(key, tree, make):
             if key not in memo:
                 while len(memo) >= 24:
-                    del memo[next(iter(memo))]
+                    del memo[next((k for k in memo if k not in pinned), None)]   # the two parses of the big real texts (the daemon file and its small fixture) stay: each is seconds to redo
                 memo[key] = (tree, make())
             return memo[key][1]
 

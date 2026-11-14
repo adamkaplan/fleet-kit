@@ -6,7 +6,9 @@ derivation in both directions, that a change to a closure definition inside a pa
 moving a definition without regenerating fails, and the floor of the assembled closure. Nothing here runs the daemon.
 """
 import ast
+import contextlib
 import difflib
+import io
 import importlib.machinery
 import importlib.util
 import json
@@ -27,7 +29,7 @@ MATRIX = "docs/review-laws/impact-matrix.json"
 PARTS = "bin/switchboard/"
 
 
-def run(*args):
+def run_process(*args):
     done = subprocess.run([sys.executable, str(TOOL)] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
     return done.returncode, done.stdout
 
@@ -37,6 +39,20 @@ def tool_module():
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader("derive_closure_t", loader))
     loader.exec_module(module)
     return module
+
+
+_TOOL_MOD = tool_module()
+
+
+def run(*args):
+    """The tool's main, in this process (the one test of the matrix runs the real entry point: run_process)."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        try:
+            code = _TOOL_MOD.main(list(args))
+        except SystemExit as done:
+            code = done.code
+    return (code if isinstance(code, int) else (0 if code is None else 1)), out.getvalue()
 
 
 def counts(out):
@@ -86,7 +102,7 @@ def function_lines(source, name):
 
 class TestDerivedClosure(unittest.TestCase):
     def test_the_matrix_is_what_the_code_derives_and_the_closure_holds(self):
-        code, out = run("--check")
+        code, out = run_process("--check")
         self.assertEqual(code, 0, out)   # the property: the matrix equals what the code derives, in both directions
         found = counts(out)
         self.assertLessEqual(found[0], found[1], "the entry's own closure is inside the assembled closure")

@@ -8,13 +8,18 @@ a signed form whose body cannot be read is refused. Known limits (not signed, no
 endpoint, short flags bundled together (`-dcx`), and a flag before the verb (ask #1639).
 """
 import ast
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -67,10 +72,18 @@ def forms_without_an_example(source):
     return missing
 
 
+_SHIM_CODE = {}   # shim source text -> its compiled code (one compile for every call of every rig)
+
+
+class _ExecDone(Exception):
+    """The real gh was exec'd in place of the shim: nothing more of the shim runs."""
+
+
 class Rig:
     """A copy of the shim, a fake real gh and a fake switchboard in a private directory."""
 
     def __init__(self, shim_source=None):
+        self.shim_source = shim_source
         self.home = Path(tempfile.mkdtemp(prefix="gh-sign-"))
         self.shims = self.home / "shims"
         shutil.copytree(str(SHIM_DIR), str(self.shims))
@@ -100,9 +113,93 @@ class Rig:
             env["FLEET_SWITCHBOARD_BIN"] = str(broken)
         if self.log.exists():
             self.log.unlink()
-        done = subprocess.run([sys.executable, str(self.shims / "gh"), *args], input=stdin, capture_output=True, text=True, env=env, timeout=60)
+        if self.in_process(no_whoami):
+            done = self.run_in_process(args, stdin, env)
+        else:
+            done = subprocess.run([sys.executable, str(self.shims / "gh"), *args], input=stdin, capture_output=True, text=True, env=env, timeout=60)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return done, calls
+
+    def in_process(self, no_whoami):
+        """The shim (the real one or a planted mutant that compiles), in front of the unchanged fake gh and fake switchboard, runs in this process (its two children are
+        the two fakes, answered below); a rig with any other gh or switchboard file keeps the real processes."""
+        try:
+            source = (self.shims / "gh").read_text()
+            if source not in _SHIM_CODE:
+                _SHIM_CODE[source] = compile(source, str(self.shims / "gh"), "exec")
+            return not no_whoami and (self.bin / "gh").read_text() == RECORDING_GH and self.sb.read_text() == FAKE_SB
+        except (OSError, SyntaxError, ValueError):
+            return False
+
+    def record(self, argv, stdin, env):
+        """What the fake gh writes to its log for one call."""
+        files = {}
+        for a in argv:
+            for p in (a, a.split("=@", 1)[-1], a[2:]):
+                if os.path.isfile(p):
+                    files[p] = open(p).read()
+        with open(env["FAKE_GH_LOG"], "a") as out:
+            out.write(json.dumps({"argv": list(argv), "stdin": stdin, "files": files}) + "\n")
+
+    def run_in_process(self, args, stdin, env):
+        shim = self.shims / "gh"
+        source = shim.read_text()
+        if source not in _SHIM_CODE:
+            _SHIM_CODE[source] = compile(source, str(shim), "exec")
+        module = types.ModuleType("gh_shim")
+        module.__file__ = str(shim)
+        exec(_SHIM_CODE[source], module.__dict__)
+        fake_gh, fake_sb = str(self.bin / "gh"), str(self.sb)
+        rig = self
+        stdin_stream = io.TextIOWrapper(io.BytesIO((stdin or "").encode("utf-8")), encoding="utf-8")
+
+        def left_on_stdin():
+            return stdin_stream.read()
+
+        def execute(path, argv, *rest):
+            if str(path) != fake_gh:
+                raise AssertionError("an exec of %s" % path)
+            rig.record(list(argv)[1:], left_on_stdin(), env)
+            raise _ExecDone()
+
+        def spawn(argv, *a, **kw):
+            program = str(argv[0])
+            if program == fake_gh:
+                if kw.get("input") is not None:
+                    given = kw["input"]
+                elif kw.get("stdin") is subprocess.DEVNULL:
+                    given = ""
+                else:
+                    given = left_on_stdin()
+                rig.record(list(argv)[1:], given, env)
+                empty = "" if (kw.get("text") or kw.get("universal_newlines")) else b""
+                return subprocess.CompletedProcess(argv, 0, empty if kw.get("capture_output") else None, empty if kw.get("capture_output") else None)
+            if program == fake_sb:   # the fake switchboard: `whoami` in any form answers the identity, anything else exits 2
+                ok = len(argv) > 1 and argv[1] == "whoami"
+                text = '{"name": "alice-bot", "repo": "acme/app"}\n' if ok else ""
+                text_mode = kw.get("text") or kw.get("universal_newlines")
+                return subprocess.CompletedProcess(argv, 0 if ok else 2, text if text_mode else text.encode(), "" if text_mode else b"")
+            return subprocess.run(argv, *a, **kw)
+
+        module.os = types.SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith("__")})
+        module.os.execve, module.os.execv = execute, lambda path, argv: execute(path, argv)
+        module.subprocess = types.SimpleNamespace(**{name: getattr(subprocess, name) for name in dir(subprocess) if not name.startswith("__")})
+        module.subprocess.run = spawn
+        module.signal = types.SimpleNamespace(**{name: getattr(__import__("signal"), name) for name in dir(__import__("signal")) if name.isupper()}, signal=lambda *a: None)
+        out, err = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True), io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)
+        code = 0
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "stdin", stdin_stream), mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            module.sys = sys
+            try:
+                code = module.main(list(args))
+            except _ExecDone:
+                code = 0
+            except SystemExit as done:
+                code = done.code if isinstance(done.code, int) else (0 if done.code is None else 1)
+            except Exception:
+                traceback.print_exc()
+                code = 1
+        return subprocess.CompletedProcess([sys.executable, str(shim), *args], code, out.buffer.getvalue().decode("utf-8", "replace"), err.buffer.getvalue().decode("utf-8", "replace"))
 
 
 def battery(rig):

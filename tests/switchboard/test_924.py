@@ -1008,7 +1008,17 @@ def _body():
 
         EFFECTS = ("cmd_impact", "cmd_impact_clear", "cmd_review", "impact_clear_core")   # the functions that write: the clear (and its core) and the record
 
+        _effect_globals_cache = None
+        _surface_cache = None
+
         def effect_globals(self, daemon_source=None, namespace=None):
+            if daemon_source is not None or namespace is not None:
+                return self._effect_globals(daemon_source, namespace)
+            if TestImpactHold924._effect_globals_cache is None:
+                TestImpactHold924._effect_globals_cache = self._effect_globals()
+            return {name: set(found) for name, found in TestImpactHold924._effect_globals_cache.items()}
+
+        def _effect_globals(self, daemon_source=None, namespace=None):
             """The ATTACK SET, derived by ast: every name the effect functions read at call time from their module globals (a Load that no parameter, assignment, import, def or comprehension variable of the function binds, and that the daemon's namespace holds)."""
             import ast, builtins
             namespace = vars(sb) if namespace is None else namespace
@@ -1251,6 +1261,13 @@ def _body():
                    ("decorate", "effect"), ("guarded_effect", "args"), ("guarded_effect", "kwargs"), ("rebuilt", "function"), ("rebuilt", "namespace"), ("make_effect_latch", None)}
 
         def derived_surface(self, daemon_source=None):
+            if daemon_source is not None:
+                return self._derived_surface(daemon_source)
+            if TestImpactHold924._surface_cache is None:
+                TestImpactHold924._surface_cache = self._derived_surface()
+            return set(TestImpactHold924._surface_cache)
+
+        def _derived_surface(self, daemon_source=None):
             import ast
             found = set()
             for is_hold, source in ((False, daemon_source or self.real_source()), (True, (BIN / "impact_hold.py").read_text())):

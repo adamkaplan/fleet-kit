@@ -1,4 +1,5 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): offline_fakes."""
+import contextlib
 import fcntl
 import fnmatch
 import json
@@ -244,7 +245,15 @@ class OfflineRun:
         os.environ[sb.FAULT_ENV] = ",".join(sorted(set(self.faults) | set(step_faults)))
         first = len(self.world.v2.writes)
         try:
-            self.world.engine.run_pass()
+            if (self.world.state / "cloud").exists():
+                self.world.engine.run_pass()
+            else:
+                # no cloud pod in the world: the cloud ticks (each re-reads a helper module from disk) have nothing to find on any of the thousands of passes
+                quiet = ("lost_worker_tick", "push_watch_tick", "pod_silence_tick", "cloud_watch_tick", "cloud_end_tick", "cloud_stall_tick", "cloud_turn_tick")
+                with contextlib.ExitStack() as stack:
+                    for name in quiet:
+                        stack.enter_context(mock.patch.object(sb, name, lambda *a, **k: None))
+                    self.world.engine.run_pass()
         except sb.SimulatedCrash:
             self.crashed_writes.update(range(first, len(self.world.v2.writes)))
             self.world.engine = self.world.new_engine()
