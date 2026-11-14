@@ -261,6 +261,142 @@ def build(LedgerBase):
             self.assertEqual(self.prove_at(ref)[0], 0, "the same call with the landed path records")
             self.assertEqual(len(self.ledger()), 1)
 
+        def contain_at(self, repo, sha, config, merged=(), default="main", broken=(), info=None, commit="table"):
+            """epic_contains(...)(sha) on a fake GitHub that answers from the tables above (#2539)."""
+            def get(path):
+                if any(b in path for b in broken):
+                    raise ValueError("boom")
+                tail = path.rsplit("/", 1)[-1].split("...")[-1]
+                if "/compare/" in path:
+                    return {"status": ON_BRANCH.get(tail, "diverged")}
+                if "/commits/" in path and commit != "table":
+                    return commit
+                if "/commits/" in path:
+                    return {"sha": tail, "commit": {"message": MESSAGES[tail]}} if tail in MESSAGES else None
+                return {"default_branch": "main"} if info is None else info
+            return sb.epic_contains(get, repo, list(merged), default, config)(sha)
+
+        def test_S1_epic_contains_accepts_a_landed_commit_on_a_land_repo_with_no_pull_request(self):
+            config = {"land_repos": ["acme/land"]}
+            for default in ("main", None):
+                self.assertEqual(self.contain_at("acme/land", SHA, config, default=default), (True, None))
+            self.assertEqual(self.contain_at("acme/land", TIP, config), (True, None))
+
+        def test_S2_epic_contains_refuses_a_commit_off_the_branch_without_trailers_or_unreadable(self):
+            config = {"land_repos": ["acme/land"]}
+            for sha, word in ((BARE, "no trailer"), (HALF, "no trailer"), (OFF, "not on the default branch"), (AHEAD, "not on the default branch"), ("e" * 40, "not on the default branch")):
+                ok, why = self.contain_at("acme/land", sha, config)
+                self.assertFalse(ok)
+                self.assertIn(word, why)
+            for broken, word in (("/compare/", "default branch"), ("/commits/", "could not be read")):
+                ok, why = self.contain_at("acme/land", SHA, config, broken=(broken,))
+                self.assertFalse(ok)
+                self.assertIn(word, why)
+            for broken in (("repos/acme/land",), ("repos/acme/land", "/compare/")):
+                self.assertEqual(self.contain_at("acme/land", SHA, config, default=None, broken=broken), (False, "the default branch of acme/land could not be read"))
+            self.assertEqual(self.contain_at("acme/land", SHA, config, default=None, info={}), (False, "the default branch of acme/land could not be read"))
+            for bad in (None, {"sha": "wrong"}, {"sha": SHA, "commit": {"message": 123}}):
+                ok, why = self.contain_at("acme/land", SHA, config, commit=bad)
+                self.assertFalse(ok, bad)
+                self.assertIn("could not be read", why)
+
+        def land_get(self, bad=()):
+            """A fake GitHub read for acme/land: the commit tables above; a path with a fragment of `bad` raises."""
+            def get(path):
+                if any(b in path for b in bad):
+                    raise ValueError("boom")
+                tail = path.rsplit("/", 1)[-1].split("...")[-1]
+                if "/commits/" in path:
+                    tail = {"main": TIP}.get(tail, tail)
+                    if tail not in MESSAGES:
+                        return None
+                    return {"sha": tail, "commit": {"message": MESSAGES[tail]}, "author": {"login": AUTHORS[tail]} if tail in AUTHORS else None, "committer": {"login": COMMITTERS.get(tail, "someone")}}
+                if "/compare/" in path:
+                    return {"status": ON_BRANCH.get(tail, "diverged")}
+                return {"default_branch": "main"}
+            return get
+
+        def test_S2_epic_land_writers_names_author_and_committer_and_fails_closed(self):
+            both = {"sha": SHA, "author": {"login": "tst"}, "committer": {"login": "other"}}
+            self.assertEqual(sb.epic_land_writers(lambda path: both, "acme/land", SHA), {"tst", "other"})
+            def boom(path):
+                raise ValueError("boom")
+            for get in (boom, lambda path: None, lambda path: {"sha": "wrong"}):
+                with self.assertRaises(ValueError):
+                    sb.epic_land_writers(get, "acme/land", SHA)
+
+        def test_S2_epic_get_reads_one_commit_once(self):
+            calls = []
+            def inner(path):
+                calls.append(path)
+                return {"sha": SHA} if "/commits/" in path else None
+            with mock.patch.object(sb, "impact_carry_get", lambda *a: inner):
+                get = sb.epic_get(mock.Mock(repo="acme/land", engine=None), None)
+            for _ in range(3):
+                get("repos/acme/land/commits/" + SHA)
+                get("repos/acme/land/compare/main..." + SHA)
+            self.assertEqual(len([c for c in calls if "/commits/" in c]), 1)
+
+        def epic_ctx(self, entries=()):
+            plan = {"plan_hash": "h", "scenarios_parsed": [{"id": "S1", "evaluator": "tester", "claim": "epic"}]}
+            return mock.Mock(repo="acme/land", config={"land_repos": ["acme/land"]}, entries=list(entries), pr="acme/ask#1", plan=plan, source="acme/app#7", engine=None)
+
+        def patched(self, get):
+            return (mock.patch.object(sb, "epic_get", lambda ctx, runner: get), mock.patch.object(sb, "epic_claimants", lambda *a: ([], [], set())),
+                    mock.patch.object(sb, "epic_authors", lambda ctx: {"asker"}), mock.patch.object(sb, "epic_changed", lambda get, repo: (lambda old, new: [])))
+
+        def test_S2_epic_target_on_a_land_repo_with_no_pull_request_excludes_the_commit_writers(self):
+            for patch in self.patched(self.land_get()):
+                patch.start()
+                self.addCleanup(patch.stop)
+            self.assertEqual(sb.epic_target(self.epic_ctx(), None, 0, None), (TIP, "main", {"someone"}))
+            self.assertEqual(sb.epic_target(self.epic_ctx(), None, 0, MINE), (MINE, "main", {"tst", "someone"}))
+
+        def test_S2_epic_target_fails_closed_when_the_commit_writers_cannot_be_read(self):
+            with self.patched(self.land_get())[0], self.patched(self.land_get())[1]:
+                def raising(get, repo, head):
+                    raise ValueError("boom")
+                with mock.patch.object(sb, "epic_land_writers", raising), mock.patch.object(sb, "epic_contains", lambda *a, **k: (lambda head: (True, None))):
+                    with self.assertRaises(sb.LedgerCommandError) as caught:
+                        sb.epic_target(self.epic_ctx(), None, 0, None)
+                self.assertIn("could not be read", str(caught.exception))
+                self.assertIn("nothing was recorded", str(caught.exception))
+
+        def recorded_entries(self, by):
+            base = {"pr": "acme/ask#1", "via": sb.load_module("epic_record").EPIC_VIA, "scenario": "S1", "plan_hash": "h"}
+            return [dict(base, kind="proof", head=MINE, result="pass", seq=1, by="coder"),
+                    dict(base, kind="verdict", head=MINE, result="pass", seq=2, by=by, evaluator="tester")]
+
+        def view_rows(self, by, bad=()):
+            patches = self.patched(self.land_get(bad))
+            for patch in patches:
+                patch.start()
+                self.addCleanup(patch.stop)
+            rows, head, why = sb.epic_view(self.epic_ctx(self.recorded_entries(by)), None, 0)
+            return rows[0]
+
+        def test_S2_epic_view_excludes_the_writers_of_a_recorded_proof_commit_after_the_tip_moves(self):
+            row = self.view_rows("tst")   # the proof is at MINE (written by tst); the default branch is at TIP
+            self.assertNotEqual(row["status"], "ok")
+            self.assertTrue(row["missing"])
+            self.assertEqual(self.view_rows("indep")["status"], "ok")
+
+        def test_S2_epic_view_fails_closed_when_a_commit_of_the_writers_cannot_be_read(self):
+            for bad in ("/commits/" + MINE, "/commits/main", "/commits/" + TIP):
+                with self.subTest(bad=bad):
+                    row = self.view_rows("indep", bad=(bad,))
+                    self.assertNotEqual(row["status"], "ok")
+                    self.assertTrue(row["missing"])
+
+        def test_S3_a_repo_off_the_land_path_keeps_refusing_an_empty_claimant_set(self):
+            for config in ({}, {"land_repos": ["acme/other"]}, None):
+                self.assertEqual(self.contain_at("acme/land", SHA, config), (False, "no merged pull request of the plan: nothing to contain"))
+
+        def test_S4_with_merged_pull_requests_a_land_repo_is_judged_by_the_merges(self):
+            ok, why = self.contain_at("acme/land", SHA, {"land_repos": ["acme/land"]}, merged=[(5, "e" * 40)])
+            self.assertFalse(ok)
+            self.assertIn("does not contain the merge of #5", why)
+
         def test_U1_the_trailer_match_is_one_function_with_the_stated_form(self):
             missing = sb.land_trailers_missing
             block = lambda lines: "subject\n\n" + "\n".join(lines) + "\n"
