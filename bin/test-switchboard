@@ -24805,8 +24805,8 @@ class TestIdentityCheck(ReportBase):
         if log.exists():
             log.unlink()
         started = time.monotonic()
-        done = subprocess.run([sys.executable, str(SHIM)] + list(args or ("issue", "list")), capture_output=True, text=True,
-                              env=environ, timeout=60)
+        runner = "import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nm = importlib.util.module_from_spec(importlib.util.spec_from_loader('gh', loader))\nloader.exec_module(m)\nm.__file__ = %r\nsys.exit(m.main(sys.argv[1:]))\n" % (str(SHIM), str(SHIM))
+        done = importlib.import_module("support.rebind").run_in_process(runner, list(args or ("issue", "list")), environ) if not wedge else subprocess.run([sys.executable, str(SHIM)] + list(args or ("issue", "list")), capture_output=True, text=True, env=environ, timeout=60)
         self.shim_seconds = time.monotonic() - started
         return done, (json.loads(log.read_text()) if log.exists() else None)
 

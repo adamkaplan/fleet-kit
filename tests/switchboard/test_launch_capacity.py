@@ -24,6 +24,33 @@ MUTANT_TEXT = "a refused read stopped the launch"
 WRITE_VERBS = ("create", "patch", "apply", "delete", "annotate", "replace", "edit")
 
 V4, V6, MAPPED = "10.99.88.77", "fd00:abcd::1", "::ffff:10.99.88.77"
+SCRATCH_RUNS = {}
+
+
+def scratch_run(prefix, checker, with_bin_worker, mutate, assert_equal):
+    """The checker run on a scratch copy of the launcher sources (with the mutation applied, once asserted present). The sources do not change
+    during a run: a (checker, mutation) pair runs once for the whole class, and the copy is made in one pass."""
+    import shutil, subprocess, tempfile
+    key = (checker, with_bin_worker, mutate)
+    if key not in SCRATCH_RUNS:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory(prefix=prefix + "-") as tmp:
+            sources = sorted((root / "cloud" / "launcher").glob("*.py")) + ([root / "bin" / "cloud_worker.py"] if with_bin_worker else []) + [root / "bin" / "path_walk.py"]
+            for src in sources:
+                rel = src.relative_to(root)
+                (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(src, Path(tmp) / rel)
+            if mutate:
+                rel, old, new = mutate
+                text = (Path(tmp) / rel).read_text()
+                assert_equal(text.count(old), 1, "the mutant's text is not in the copy: " + old)
+                (Path(tmp) / rel).write_text(text.replace(old, new))
+            done = subprocess.run([sys.executable, "-c", checker, tmp], capture_output=True, text=True, timeout=60,
+                                  env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
+        SCRATCH_RUNS[key] = (done.returncode, done.stderr)
+    return SCRATCH_RUNS[key]
+
+
 U11_CHECKER = r"""
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("launcher_u11", sys.argv[1] + "/cloud/launcher/cloud_worker.py")
@@ -463,21 +490,7 @@ def build():
 
         # -- U10: the real read verbs, the shipped bound and the refused read, each with a control and a mutant on a scratch copy
         def scratch_check(self, mutate=None):
-            import shutil, subprocess, tempfile
-            root = Path(__file__).resolve().parents[2]
-            with tempfile.TemporaryDirectory(prefix="u10-") as tmp:
-                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "cloud_worker.py", root / "bin" / "path_walk.py"]:
-                    rel = src.relative_to(root)
-                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(src, Path(tmp) / rel)
-                if mutate:
-                    rel, old, new = mutate
-                    text = (Path(tmp) / rel).read_text()
-                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
-                    (Path(tmp) / rel).write_text(text.replace(old, new))
-                done = subprocess.run([sys.executable, "-c", CHECKER, tmp], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
-            return done.returncode, done.stderr
+            return scratch_run("u10-", CHECKER, True, mutate, self.assertEqual)
 
         def test_u10_the_real_launcher_reads_are_three_gets_and_no_write_verb(self):
             kube = LIB.Kube.__new__(LIB.Kube)
@@ -555,21 +568,7 @@ def build():
             self.assertIn("an address reached the block", err)
 
         def scratch_u11(self, mutate=None):
-            import shutil, subprocess, tempfile
-            root = Path(__file__).resolve().parents[2]
-            with tempfile.TemporaryDirectory(prefix="u11-") as tmp:
-                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
-                    rel = src.relative_to(root)
-                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(src, Path(tmp) / rel)
-                if mutate:
-                    rel, old, new = mutate
-                    text = (Path(tmp) / rel).read_text()
-                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
-                    (Path(tmp) / rel).write_text(text.replace(old, new))
-                done = subprocess.run([sys.executable, "-c", U11_CHECKER, tmp], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
-            return done.returncode, done.stderr
+            return scratch_run("u11-", U11_CHECKER, False, mutate, self.assertEqual)
 
         # -- U11 (PC-10), the upper-case and zero-group mapped forms: the dotted tail is masked whole, none of its octets is left
         def u11b_event(self):
@@ -593,21 +592,7 @@ def build():
             self.assertIn("an address reached the block", err)
 
         def scratch_u11b(self, mutate=None):
-            import shutil, subprocess, tempfile
-            root = Path(__file__).resolve().parents[2]
-            with tempfile.TemporaryDirectory(prefix="u11b-") as tmp:
-                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
-                    rel = src.relative_to(root)
-                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(src, Path(tmp) / rel)
-                if mutate:
-                    rel, old, new = mutate
-                    text = (Path(tmp) / rel).read_text()
-                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
-                    (Path(tmp) / rel).write_text(text.replace(old, new))
-                done = subprocess.run([sys.executable, "-c", U11B_CHECKER, tmp], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
-            return done.returncode, done.stderr
+            return scratch_run("u11b-", U11B_CHECKER, False, mutate, self.assertEqual)
 
 
         # -- U11 (PC-10), the cut: an address that starts at character 192 of the printed line (counted from its first character, `FailedScheduling <pod>: ` included)
@@ -634,21 +619,7 @@ def build():
             self.assertIn("part of an address reached the block", err)
 
         def scratch_cut(self, mutate=None):
-            import shutil, subprocess, tempfile
-            root = Path(__file__).resolve().parents[2]
-            with tempfile.TemporaryDirectory(prefix="u11cut-") as tmp:
-                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
-                    rel = src.relative_to(root)
-                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(src, Path(tmp) / rel)
-                if mutate:
-                    rel, old, new = mutate
-                    text = (Path(tmp) / rel).read_text()
-                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
-                    (Path(tmp) / rel).write_text(text.replace(old, new))
-                done = subprocess.run([sys.executable, "-c", U11_CUT_CHECKER, tmp], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
-            return done.returncode, done.stderr
+            return scratch_run("u11cut-", U11_CUT_CHECKER, False, mutate, self.assertEqual)
 
         # -- U21, U22, U23 (PC-11): the masking is decided by `ipaddress`; checked in a subprocess on the real launcher (or on a scratch copy with a mutant)
         PC11_LOAD = r"""
@@ -954,21 +925,7 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
 
         # -- U27 (PC-14): known secrets are scrubbed first (no cut), then addresses are masked, then the cut
         def scratch_u27(self, mutate=None):
-            import shutil, subprocess, tempfile
-            root = Path(__file__).resolve().parents[2]
-            with tempfile.TemporaryDirectory(prefix="u27-") as tmp:
-                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "path_walk.py"]:
-                    rel = src.relative_to(root)
-                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy(src, Path(tmp) / rel)
-                if mutate:
-                    rel, old, new = mutate
-                    text = (Path(tmp) / rel).read_text()
-                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
-                    (Path(tmp) / rel).write_text(text.replace(old, new))
-                done = subprocess.run([sys.executable, "-c", U27_CHECKER, tmp], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
-            return done.returncode, done.stderr
+            return scratch_run("u27-", U27_CHECKER, False, mutate, self.assertEqual)
 
         def test_u27_a_known_secret_with_an_address_and_a_straddling_address_leave_nothing(self):
             code, err = self.scratch_u27()
