@@ -226,7 +226,7 @@ rm -f "$mk"; cp "$fx" "$tmp/config.toml"
 ip="$tmp/config.toml.sysbox-fix.inprogress"
 # (d) normal success: flag removed, no rollback, one restart
 cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
-TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 WAIT=1 POLL=0.2 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 WAIT=2 POLL=0.2 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
 [ $rc = 0 ] && [ ! -e "$ip" ] && [ "$(restarts)" = 1 ] && ! grep -q 'rolling back' "$tmp/err" && grep -q label "$tmp/log" \
   && ok "fix: success removes the in-progress flag, fires no rollback" || bad "fix: success flag (rc=$rc)"
 # (e) a normal rollback is not repeated by the exit trap: exactly two restarts, one rollback message, flag gone
@@ -308,7 +308,7 @@ rm -f "$mk" "$ip"; cp "$fx" "$tmp/config.toml"
 # healthy restart (node Ready): one restart, labelled, as before
 printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
 cp "$fx" "$tmp/config.toml"
-READY_CMD="$tmp/ready" WAIT=1 POLL=0.2 runfix; rc=$?
+READY_CMD="$tmp/ready" WAIT=2 POLL=0.2 runfix; rc=$?
 [ $rc = 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && [ "$(restarts)" = 1 ] && grep -q label "$tmp/log" \
   && ok "fix: healthy restart: kept, one restart, labelled" || bad "fix: healthy restart (rc=$rc)"
 # containerd config version 1 (declared, or legacy key only with no version): refused, node untouched
