@@ -338,7 +338,7 @@ class TestVaultCheckProcess(VaultBase):
 
     def test_a_check_past_its_limit_is_killed_and_is_a_stop(self):
         self.make_checkout(code=10, fixes=True, sleep=30)
-        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0.25), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
             code, out, err = self.launch()
         self.assertEqual(code, 2, err)
         self.assertIn("the owner of the vault access check", err)
@@ -375,7 +375,7 @@ class TestVaultCheckProcess(VaultBase):
 
     def test_a_grandchild_is_killed_with_a_check_that_timed_out(self):
         self.make_checkout(code=10, fixes=True, grandchild=True, sleep=30)
-        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0.25), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
             result = self.lib.run_vault_check(dict(os.environ))
         self.assertEqual((result.code, result.outcome), (None, "timed-out"))
         self.assertTrue(self.pid_gone(int((self.checkout / "grandchild.pid").read_text())), "the grandchild survived")

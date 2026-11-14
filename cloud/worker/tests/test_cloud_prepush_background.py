@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Scenarios S2-S10 of ask #1616: the background run of bin/cloud-prepush and its result file, on throwaway repositories."""
 import atexit
+import concurrent.futures
 import importlib.machinery
 import importlib.util
 import json
@@ -196,7 +197,7 @@ class Background(Base):
         self.assertIn("cloud-prepush: run 3, identical: 2", r.stdout)
 
     def test_s7_a_run_in_progress_is_reported_as_running_and_never_as_passed(self):
-        repo = self.repo(0.8)
+        repo = self.repo(0.4)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "30"})
         d = self.wait(result, lambda d: any(f["file"].endswith("test_b_slow.py") and "running" in (f["branch"], f["base"]) for f in d["files"]), 12)
         r = self.read(installed, result, repo)
@@ -239,17 +240,17 @@ class Mutants(Base):
         return p.returncode
 
     def test_s8_the_mutants_fail_their_scenario(self):
-        failing = applied = 0
-        for name, old, new, test in (
+        cases = (
             ("running reported as passed", 'IN_PROGRESS = "running"', 'IN_PROGRESS = "pass"',
              "Background.test_s7_a_run_in_progress_is_reported_as_running_and_never_as_passed"),
             ("run kept in the starter's group", "stdin=nul, stdout=out, stderr=out, start_new_session=True, close_fds=True)",
              "stdin=nul, stdout=out, stderr=out, close_fds=True)",
              "Background.test_s3_s4_start_returns_at_once_and_the_run_finishes_after_the_starter_and_its_group_end"),
-        ):
-            rc = self.run_mutant(name, old, new, test)
-            applied += 1
-            failing += 1 if rc == 1 else 0
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:   # each mutant has its own scratch directory and script
+            codes = list(pool.map(lambda c: self.run_mutant(*c), cases))
+        applied = len(codes)
+        failing = sum(1 for rc in codes if rc == 1)
         print("S8: %d of 2 mutants fail, %d of 2 mutations applied" % (failing, applied), file=sys.stderr)
         self.assertEqual((failing, applied), (2, 2))
 

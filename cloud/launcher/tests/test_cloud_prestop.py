@@ -43,14 +43,12 @@ def _template():
         sh("git", "init", "-q", "--bare", "-b", "main", evil)
         sh("git", "init", "-q", "--bare", "-b", "main", origin)
         sh("git", "clone", "-q", origin, work)
-        sh("git", "-C", work, "config", "maintenance.auto", "false")
         for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
             sh("git", "-C", work, "config", k, v)
         pathlib.Path(os.path.join(work, "a.txt")).write_text("a")
         sh("git", "-C", work, "add", "-A")
         sh("git", "-C", work, "commit", "-qm", "base")
         sh("git", "-C", work, "push", "-q", "origin", "HEAD:main")
-        sh("git", "-C", work, "config", "--unset", "maintenance.auto")   # the hook refuses any key outside its allowed list: the setting only guards the template's own commits
         sh("git", "-C", work, "remote", "set-url", "origin", URL)   # origin is named like the pod's repository; the hook never uses it
         _TEMPLATE.append(t)
     return _TEMPLATE[0]

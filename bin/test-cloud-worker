@@ -919,7 +919,7 @@ class TestWiring(Base):
         child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before and child.poll() is None:
-            time.sleep(0.1)
+            time.sleep(0.03)
         self.assertTrue(self.root.exists() and any(self.root.iterdir()), "the command is not yet at its tunnel")
         child.send_signal(signum)
         out, err = child.communicate(timeout=60)
@@ -1068,12 +1068,12 @@ class TestSignalsAndOrphans(Base):
         child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before:
-            time.sleep(0.1)
+            time.sleep(0.03)
         notes = []
         deadline = time.time() + 60
         while time.time() < deadline and not notes:
             notes = list(self.root.glob("cmd-*/tunnel-*.pid"))
-            time.sleep(0.1)
+            time.sleep(0.03)
         self.assertTrue(notes, "the tunnel was not recorded")
         child.kill()
         child.communicate(timeout=60)

@@ -53,7 +53,6 @@ def _build_repo(tmp, tests):
     repo = os.path.join(tmp, "repo")
     os.makedirs(repo)
     git(repo, "init", "-q", "-b", "trunk")
-    git(repo, "config", "maintenance.auto", "false")
     put(repo, "a.txt", "one\n", 0o644)
     for rel, text in tests.items():
         put(repo, rel, text)

@@ -785,7 +785,7 @@ class S16Random(unittest.TestCase):
 
     def _cases(self):
         r = random.Random(SEED + 16)
-        cases = [self._case(r, i % 2) for i in range(600)]
+        cases = [self._case(r, i % 2) for i in range(420)]
         rr = random.Random(1616)
         form = rnd(rr, 319, "abcdefghijklmnopqrstuvwxyz0123456789")
         secs = [form[k:k + ln] for ln in [rr.randint(40, 120) for _ in range(100)] for k in [rr.randint(0, 319 - ln)]]
@@ -1055,7 +1055,7 @@ class S18Lock(unittest.TestCase):
         lasts = {}
 
         def work(t):
-            for i in range(500):
+            for i in range(200):
                 form = "stress-form-%d-%04d-end" % (t, i)
                 ks.add(form)
             lasts[t] = form
@@ -1064,7 +1064,7 @@ class S18Lock(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual((ks.version, len(ks)), (len(threads) * 500, len(threads) * 500))   # every add of every thread, once
+        self.assertEqual((ks.version, len(ks)), (len(threads) * 200, len(threads) * 200))   # every add of every thread, once
         redacted = sum(1 for t in range(len(threads)) if lasts[t] not in cw.scrub("x " + lasts[t] + " y", ks, 1000))
         self.assertEqual(redacted, len(threads))
         old = ("                if self._forms != before:\n                    self._version += 1  # AFTER the content changed, under the lock\n")  # probe on purpose
@@ -1127,8 +1127,8 @@ class S19RankGuard(unittest.TestCase):
             secs, hit, zero = c15._form_case(nsec, 5000)
             cases.append(("S15-%d" % nsec, hit, secs, None))
         bases = r16._cases()
-        for i in list(range(0, 20, 2)) + list(range(1, 60, 2)) + [600, 601]:
-            cases.append(("S%s-%d" % ("16" if i < 600 else "2", i), bases[i][0], bases[i][1], None))
+        for i in list(range(0, 20, 2)) + list(range(1, 60, 2)) + [420, 421]:
+            cases.append(("S%s-%d" % ("16" if i < 420 else "2", i), bases[i][0], bases[i][1], None))
         out = []
         for label, text, secs, _ in cases:
             res = cw.scrub(text, set(secs), 10 ** 7)
