@@ -7992,11 +7992,12 @@ class TestIntentEditWiring(Base):
     def intent_facts(self):
         return [f for f in self.hub.facts() if f.kind == "intent.edit"]
 
-    def test_an_intent_edit_is_an_old_to_new_item_for_the_chief_of_staff(self):
+    def test_an_intent_edit_is_a_one_line_item_for_the_chief_of_staff(self):
         self.assertEqual(self.edit()[0], 202)
         (fact,) = self.intent_facts()
         self.assertEqual((fact.recipient, fact.issue, fact.sender), ("cos", 12, "you"))
-        self.assertIn("Done when: returns 200 -> returns 200 and JSON", fact.summary)
+        self.assertIn("Intent / Done when changed by you (Done when)", fact.summary)
+        self.assertNotIn("JSON", fact.summary)
 
     def test_it_also_asks_for_a_toast_through_the_one_toast_path(self):
         self.edit()
@@ -8092,7 +8093,7 @@ class TestIntentEditFilter(TestIntentEditWiring):
         self.hub._resolve = broken
         self.edit_issue(12)
         (fact,) = self.intent_facts()
-        self.assertIn("chain unreadable: woken to be safe", fact.summary)
+        self.assertTrue(fact.summary.endswith("(chain unreadable: woken to be safe)") and "\n" not in fact.summary)
         self.hub._resolve = orig
 
     def test_the_owner_logins_are_validated_like_the_ignored_authors(self):

@@ -4187,7 +4187,9 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
     holds an edit that changed the Intent section, and gives each Chief of Staff
     the old-to-new item and, through the render step's one toast path, a toast.
     Checked live: the next message carried the new Done when, the item showed
-    old to new, herdr reported the toast shown.
+    old to new, herdr reported the toast shown. (Since 8 November 2026 the item
+    is one line, who and which sections with the issue link, never the text: a
+    long edit was split into parts and woke the Chief of Staff once per part.)
   - **An Intent edit wakes the Chief of Staff only when it is ours (#96).** An edit to an issue's Intent section
     now reaches the Chief of Staff (item and toast) only when the editor is one of the config's `owner_logins` (a list
     of GitHub logins, default none), or the issue is one of our charters or an ask or work item under one: the same

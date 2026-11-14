@@ -10778,7 +10778,7 @@ class GitHubHub:
                     if not wakes:
                         continue
                     if note:
-                        fact.summary += "\n(%s)" % note
+                        fact.summary += " (%s)" % note   # a second line is where untrusted text would pass the one-line rule
                     found.append(fact)
         return found
 
@@ -14925,6 +14925,20 @@ def _payload_issue(payload):
     return number, updated, created
 
 
+INTENT_EDIT_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?")   # a GitHub login: anything else is not named in the notice
+
+
+def _intent_edit_line(number, repo, login, changes):
+    """The Chief of Staff's notice of an Intent edit: ONE line, never the text of the sections (the link has it).
+    The editor's login is untrusted: only the shape of a GitHub login is named, else "github". The repo is already
+    checked against REPO_RE (fullmatch); the link is added after the clip so it is never cut."""
+    who = login if isinstance(login, str) and INTENT_EDIT_LOGIN_RE.fullmatch(login) else "github"
+    sections = ", ".join(label for label, _old, _new in changes)
+    where = "%s#%d" % (repo, number) if repo else "#%d" % number
+    head = _one_line("%s: Intent / Done when changed by %s (%s)" % (where, who, sections), 200)
+    return head + (": https://github.com/%s/issues/%d" % (repo, number) if repo else "")
+
+
 def intent_change_fact(payload, recipient="chief-of-staff"):
     """The Chief of Staff's item for an Intent edit, or None when the edit left
     the Intent section alone. Key `intent.edit:<issue>:<updated_at>`, so a
@@ -14935,8 +14949,8 @@ def intent_change_fact(payload, recipient="chief-of-staff"):
     number, updated, created = _payload_issue(payload)
     login = (payload.get("sender") or {}).get("login")
     repo = (payload.get("repository") or {}).get("full_name")
-    repo = repo if isinstance(repo, str) and REPO_RE.match(repo) else None
-    summary = "\n".join(["The Intent section of #%d was edited on GitHub:" % number] + _change_lines(changes))
+    repo = repo if isinstance(repo, str) and REPO_RE.fullmatch(repo) else None   # fullmatch: `$` accepts a trailing newline
+    summary = _intent_edit_line(number, repo, login, changes)
     # PR 15: the same number in two repos is two issues, so the key that stops a repeat names the repo
     key = "intent.edit:%s:%s" % ("%s#%d" % (repo, number) if repo else number, updated)
     return Fact(key, recipient, "intent.edit", summary, created, issue=number,
