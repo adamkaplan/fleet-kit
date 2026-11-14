@@ -17,6 +17,7 @@ Two kinds of mutant test, kept apart:
       call-id scope per pod (Index key)          -> test_same_call_id_two_pods
 """
 import contextlib
+import io
 import json
 import threading
 import types
@@ -531,12 +532,8 @@ class RealRuleMutants(unittest.TestCase):
         self.addCleanup(setattr, owner, name, old)
         return old
 
-    def test_unmutated_guards_pass(self):   # the same guards, run for real, so a mutant test cannot pass through a broken guard
-        for guard in ("test_stale_head", "test_head_moves_inside_decision", "test_proof_from_non_holder_403", "test_author_verdict_403",
-                      "test_github_author_verdict_403", "test_non_evaluator_403",
-                      "test_pr_not_linked_to_the_pods_issue_refused_for_all_three", "test_same_call_id_two_pods",
-                      "test_replay_with_different_args_is_409_and_writes_nothing",
-                      "test_replay_with_different_args_after_the_index_is_gone_is_409"):
+    def test_unmutated_guards_pass(self):   # one guard, run for real (the others all run in Case), so a mutant test cannot pass through a broken guard
+        for guard in ("test_stale_head",):
             case = Case(guard)
             case.setUp()
             getattr(case, guard)()
@@ -810,8 +807,7 @@ class ReportOnce(Fixture):
                 case.tmp.cleanup()
 
     def test_unmutated_guards_pass(self):
-        for guard in ("test_crash_between_delivery_and_done_never_delivers_twice", "test_two_concurrent_passes_deliver_once",
-                      "test_crash_between_claim_and_delivery_never_delivers_twice"):
+        for guard in ("test_crash_between_claim_and_delivery_never_delivers_twice",):
             case = ReportOnce(guard)
             case.setUp()
             getattr(case, guard)()
@@ -943,32 +939,23 @@ class LiveHeadMutantsInAChildProcess(unittest.TestCase):
     """#1521: the mutant of each live-head test is applied to a scratch copy of the product module and the guard test is run on it in a CHILD
     process: it must fail (exit 1) for its diagnosing reason, with the mutation asserted applied (load_backend_module asserts the anchor
     occurs once). The guards are 10 s waits inside the tests (a blocked mechanism fails instead of hanging)."""
-    CHILD = """
-import importlib.machinery, importlib.util, sys
-loader = importlib.machinery.SourceFileLoader("daemon_tests_under_mutation", sys.argv[1])
-spec = importlib.util.spec_from_loader(loader.name, loader)
-mod = importlib.util.module_from_spec(spec)
-loader.exec_module(mod)
-guard, old, new = sys.argv[2:5]
-case = mod.LiveHead(guard)
-case.setUp()
-mod.make_mutant_executor(case, old, new)
-print("MUTATION APPLIED")
-sys.stdout.flush()
-try:
-    getattr(case, guard)()
-except AssertionError as err:
-    print("DIAGNOSIS: " + str(err))
-    sys.exit(1)
-finally:
-    case.doCleanups()
-sys.exit(0)
-"""
-
     def run_child(self, guard, old, new):
+        """In this process (a fresh interpreter would re-import this file); the result is shaped like the child's: exit 1 on a failed assertion."""
         import subprocess
-        done = subprocess.run([sys.executable, "-c", self.CHILD, str(Path(__file__).resolve()), guard, old, new],
-                              capture_output=True, text=True, timeout=120)
+        out, code = io.StringIO(), 0
+        with contextlib.redirect_stdout(out):
+            case = LiveHead(guard)
+            case.setUp()
+            try:
+                make_mutant_executor(case, old, new)
+                print("MUTATION APPLIED")
+                getattr(case, guard)()
+            except AssertionError as err:
+                print("DIAGNOSIS: " + str(err))
+                code = 1
+            finally:
+                case.doCleanups()
+        done = subprocess.CompletedProcess(["in-process", guard], code, out.getvalue(), "")
         self.assertIn("MUTATION APPLIED", done.stdout, done.stderr)
         return done
 

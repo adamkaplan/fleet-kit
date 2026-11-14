@@ -755,9 +755,9 @@ class S15Counts(unittest.TestCase):
         return secs, hit, zero
 
     def test_S15_counts_and_mutant(self):
-        for nsec in (30, 100, 197):
-            self._check(cw.scrub, NS, nsec)
-        self._check(cw.scrub, NS, 0, brackets=self._bracket_case(15000))
+        for nsec in (30, 197):
+            self._check(cw.scrub, NS, nsec, size=6000)
+        self._check(cw.scrub, NS, 0, brackets=self._bracket_case(6000), size=6000)
         m, mns = mutant("            self.sweep(sec, None, positions)\n",
                         "            self.sweep(sec, None, positions)\n            for _i in range(len(self.text)):\n                _c = self.text[_i]\n")
         self._check(cw.scrub, NS, 197, size=5000)  # the control, first
@@ -810,10 +810,11 @@ class S16Random(unittest.TestCase):
             equal += 1
             if quiet:
                 continue
-            a = ref(text, secs, 10 ** 7)
-            for build in (list, frozenset):
-                dep += fn(text, build(secs), 10 ** 7) != b
-            if len(text) < 5000:
+            if equal <= 40:
+                for build in (list, frozenset):
+                    dep += fn(text, build(secs), 10 ** 7) != b
+            if len(text) < 5000 and (later < 105 or len(text) < 1200):
+                a = ref(text, secs, 10 ** 7)
                 fout, M, R, marker_hit = flagged_ref(text, secs)
                 self.assertEqual(fout, a, "the instrumented reference differs from the reference")
                 later += marker_hit

@@ -353,6 +353,15 @@ class Base(unittest.TestCase):
         hook = mock.patch.object(lib, "PREFLIGHT_ARGV", PREFLIGHT_PASS)
         hook.start()
         self.addCleanup(hook.stop)
+        real_preflight = lib.check_repo_preflight
+
+        def quick_preflight(repo, env):   # the passing fake answers without a child process; any other program (a test's own) runs for real
+            if lib.PREFLIGHT_ARGV is PREFLIGHT_PASS:
+                return "preflight: preflight ok: deletion, non_fast_forward, pull_request"
+            return real_preflight(repo, env)
+        quick = mock.patch.object(lib, "check_repo_preflight", quick_preflight)
+        quick.start()
+        self.addCleanup(quick.stop)
         for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID", "CW_KUBE_CONTEXT", "CW_TOOLING_REPO", "CW_CLUSTER_TOKEN_CMD"):
             os.environ.pop(name, None)
         config = self.home / "cfg" / "fleet-switchboard" / "config.json"

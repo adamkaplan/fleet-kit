@@ -66,6 +66,8 @@ class Base(unittest.TestCase):
         self.url = "http://127.0.0.1:%d/send" % self.srv.server_address[1]
 
     def run_cli(self, args, source=None, **env_over):
+        if source is None and getattr(self, "client_source", None) is None:   # the real modules: run in this process (no interpreter start)
+            return self.run_in_process(args, env_over)
         script = Path(self.tmp.name) / "cloud_cli.py"
         script.write_text(source or SOURCE)
         (Path(self.tmp.name) / "cloud_client.py").write_text((getattr(self, "client_source", None) or (BIN / "cloud_client.py").read_text()).replace("BACKOFF_SECONDS = 0.5", "BACKOFF_SECONDS = 0.01"))
@@ -75,6 +77,35 @@ class Base(unittest.TestCase):
         env = {k: v for k, v in env.items() if v is not None}
         p = subprocess.run([sys.executable, str(script)] + args, env=env, capture_output=True, text=True, timeout=60)
         return p.returncode, p.stdout, p.stderr
+
+    def run_in_process(self, args, env_over):
+        sys.path.insert(0, str(BIN))
+        try:
+            import cloud_cli
+            import cloud_client
+        finally:
+            sys.path.remove(str(BIN))
+        env = {"PATH": os.environ.get("PATH", ""), "FLEET_AGENT_NAME": "worker-a", "FLEET_BOSS": "boss-a",
+               "FLEET_CLOUD_CHANNEL_URL": self.url, "FLEET_CLOUD_TOKEN_FILE": str(self.tok)}
+        env.update(env_over)
+        env = {k: v for k, v in env.items() if v is not None}
+        out, err = io.StringIO(), io.StringIO()
+        old_backoff = cloud_client.BACKOFF_SECONDS
+        cloud_client.BACKOFF_SECONDS = 0.01
+        code = 0
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = cloud_cli.main(args, env)
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                except Exception:   # an uncaught error of a child: the traceback on stderr, exit 1
+                    import traceback
+                    traceback.print_exc()
+                    code = 1
+        finally:
+            cloud_client.BACKOFF_SECONDS = old_backoff
+        return code, out.getvalue(), err.getvalue()
 
     def mutate(self, old, new):
         assert SOURCE.count(old) == 1, old

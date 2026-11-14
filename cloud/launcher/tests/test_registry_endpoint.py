@@ -281,7 +281,12 @@ class Mutants(unittest.TestCase):
                 if not here:
                     (dst / entry.name).symlink_to(entry)
                 elif entry.name in here:
-                    shutil.copytree(entry, dst / entry.name, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+                    if entry.is_dir():
+                        shutil.copytree(entry, dst / entry.name, ignore=shutil.ignore_patterns(".git", "__pycache__", "test-switchboard"))   # the 5 MB switchboard suite is not copied
+                        if (entry / "test-switchboard").exists():
+                            (dst / entry.name / "test-switchboard").symlink_to(entry / "test-switchboard")
+                    else:
+                        shutil.copy2(entry, dst / entry.name)
                 else:
                     build(entry, dst / entry.name, [r[len(entry.name) + 1:] for r in here])
         build(ROOT, copy, list(real))

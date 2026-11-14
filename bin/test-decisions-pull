@@ -426,8 +426,18 @@ def check_directory_is_fsynced_after_rename(module):
         assert events == [("fsync", False), ("replace", False), ("fsync", True)], events
 
 
+_DAEMON_SOURCE = []
+
+
 def daemon_source():
-    """The daemon's whole source: the entry and every part of its manifest, in manifest order."""
+    """The daemon's whole source: the entry and every part of its manifest, in manifest order (read once)."""
+    if _DAEMON_SOURCE:
+        return _DAEMON_SOURCE[0]
+    _DAEMON_SOURCE.append(_read_daemon_source())
+    return _DAEMON_SOURCE[0]
+
+
+def _read_daemon_source():
     lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
     return "\n".join((BIN / n).read_text() for n in lines)
 
@@ -925,22 +935,20 @@ class RealDaemon(unittest.TestCase):
         Fails, never skips, when node is missing."""
         node = shutil.which("node")
         self.assertIsNotNone(node, "node is required: the plugin round trip must not be skipped")
-        script = ("import {loadSnapshot} from '%s'; const s = loadSnapshot(process.argv[1], Number(process.argv[2])); console.log(s.status)"
+        script = ("import {loadSnapshot} from '%s'; const now = Number(process.argv[1]); "
+                  "console.log(JSON.stringify(process.argv.slice(2).map(d => loadSnapshot(d, now).status)))"
                   % (BIN.parent / "plugins/fleet-decisions-tui/decisions.mjs"))
-
-        def status(state):
-            out = subprocess.run([node, "--input-type=module", "-e", script, state, str(int(NOW * 1000))], stdout=subprocess.PIPE, check=True).stdout
-            return out.decode().strip()
         module = load()
-        with tempfile.TemporaryDirectory() as state:
-            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=0), NOW, age=None), "wrote")   # the pull pre-writes the file
-            self.assertEqual(status(state), "ok")
-            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=400), NOW, age=None), "marked-stale")
-            self.assertEqual(status(state), "stale")
-            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=180), NOW, age=None), "wrote")
-            self.assertEqual(status(state), "ok")
-            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=181), NOW, age=None), "marked-stale")
-            self.assertEqual(status(state), "stale")
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "work")
+            os.mkdir(state)
+            dirs = [os.path.join(root, "s%d" % i) for i in range(4)]
+            steps = ((0, "wrote"), (400, "marked-stale"), (180, "wrote"), (181, "marked-stale"))
+            for d, (age, want) in zip(dirs, steps):   # the pulls follow one another in one directory; each result is kept, so one node run judges all four
+                self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=age), NOW, age=None), want)
+                shutil.copytree(state, d)
+            out = subprocess.run([node, "--input-type=module", "-e", script, str(int(NOW * 1000))] + dirs, stdout=subprocess.PIPE, check=True).stdout
+            self.assertEqual(json.loads(out.decode()), ["ok", "stale", "ok", "stale"])
 
 
 class Mutants(unittest.TestCase):

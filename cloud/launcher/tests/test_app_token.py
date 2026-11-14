@@ -27,6 +27,9 @@ def iso(seconds):
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_CODE_CACHE = {}
+
+
 def run_in_process(argv, env):
     """The mint script run in this process (no interpreter start): the environment, argv, streams and temp dir are swapped and restored."""
     out, err = io.StringIO(), io.StringIO()
@@ -40,7 +43,10 @@ def run_in_process(argv, env):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)   # a GC warning would be the last stderr line
             try:
-                runpy.run_path(argv[1], run_name="__main__")
+                with open(argv[1]) as sf:
+                    src = sf.read()
+                code_obj = _CODE_CACHE.get(src) or _CODE_CACHE.setdefault(src, compile(src, argv[1], "exec"))
+                exec(code_obj, {"__name__": "__main__", "__file__": argv[1]})
             except SystemExit as e:
                 code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
                 if isinstance(e.code, str):
@@ -183,7 +189,7 @@ class Mint(unittest.TestCase):
         cls.wrap = wrap
         cls.fast_openssl = os.path.join(d, "openssl-fast")   # no signature is checked by the copy runs: a stand-in that reads its input and answers a fixed signature
         with open(cls.fast_openssl, "w") as f:
-            f.write("#!/bin/sh\ncat >/dev/null\nprintf 'fakesig'\n")
+            f.write("#!/bin/sh\ncat \"$4\" >/dev/null 2>&1 || true\ncat >/dev/null\nprintf 'fakesig'\n")
         os.chmod(cls.fast_openssl, 0o700)
         with open(os.path.join(os.path.dirname(MINT), "token_mint.py")) as f:
             cls.token_mint_src = f.read()

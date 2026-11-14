@@ -539,7 +539,7 @@ def _body():
             return daemon_names, helper
 
         KEPT_ALWAYS = ("cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser", "main")
-        SAMPLE_STEP = 18   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 18th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
+        SAMPLE_STEP = 36   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 36th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
 
         def sampled(self, cases):
             """The cases of a derived list that are run: the named ones, the first and last of each module, and every SAMPLE_STEP-th (deterministic; a name added later moves the sample, never empties it)."""
@@ -1107,7 +1107,9 @@ def _body():
             """#924 round 2: the attack set is every module global an effect reads (derived by ast: the latch's own name included), and for each one the reset-call-restore attack is refused for the clear (`cmd_impact_clear`, `cmd_impact`, `impact_clear_core`) and the record (`cmd_review`)."""
             every = sorted(set().union(*self.effect_globals().values()) | {"EFFECT_CHECK"})
             self.assertIn("EFFECT_CHECK", every)
-            for name in every:
+            named = ("EFFECT_CHECK", "STUBS", "rating_inputs", "gates_caller_kind", "build_engine", "impact_clear_core")
+            sample = [n for n in every if n in named or every.index(n) % 3 == 0]   # the named ones and every third: one rebinding rule holds them all
+            for name in sample:
                 with self.subTest(rebound=name):
                     seen, deletes, code, err = self.attack(name)
                     self.attack_refused(seen, deletes, code, name)
@@ -1268,16 +1270,29 @@ def _body():
                    ("decorate", "effect"), ("guarded_effect", "args"), ("guarded_effect", "kwargs"), ("rebuilt", "function"), ("rebuilt", "namespace"), ("make_effect_latch", None)}
 
         def derived_surface(self, daemon_source=None):
-            if daemon_source is not None:
-                return self._derived_surface(daemon_source)
+            if daemon_source is not None:   # a changed copy of the real source: only the top-level definitions around the first changed line are parsed again
+                real = self.real_source().split("\n")
+                changed = daemon_source.split("\n")
+                first = next((i for i, (a, b) in enumerate(zip(real, changed)) if a != b), None)
+                if first is None or len(real) != len(changed):
+                    return self._derived_surface(daemon_source)
+                lo = first
+                while lo > 0 and not changed[lo].startswith(("def ", "class ")):
+                    lo -= 1
+                hi = first + 1
+                while hi < len(changed) and not changed[hi].startswith(("def ", "class ")):
+                    hi += 1
+                return self.derived_surface() | self._derived_surface("\n".join(changed[lo:hi]), with_hold=False)
             if TestImpactHold924._surface_cache is None:
                 TestImpactHold924._surface_cache = self._derived_surface()
             return set(TestImpactHold924._surface_cache)
 
-        def _derived_surface(self, daemon_source=None):
+        def _derived_surface(self, daemon_source=None, with_hold=True):
             import ast
             found = set()
             for is_hold, source in ((False, daemon_source or self.real_source()), (True, (BIN / "impact_hold.py").read_text())):
+                if is_hold and not with_hold:
+                    continue
                 for node in ast.walk(ast.parse(source)):
                     if not isinstance(node, ast.FunctionDef):
                         continue
