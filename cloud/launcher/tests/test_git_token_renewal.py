@@ -23,6 +23,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -151,7 +152,6 @@ class Harness(base.Base):
         with open(script) as f:
             mint_src = f.read()
         real_run = subprocess.run
-        self.addCleanup(setattr, subprocess, "run", real_run)
 
         def run_in_process(cmd, *a, **kw):   # the fake mint run here, not in a new interpreter: the same (status, stdout, stderr)
             if not (isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == script):
@@ -171,7 +171,9 @@ class Harness(base.Base):
                     os.environ.clear()
                     os.environ.update(old)
             return subprocess.CompletedProcess(cmd, code, out.getvalue(), err.getvalue())
-        subprocess.run = run_in_process
+        patcher = mock.patch("subprocess.run", run_in_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         if self.cwm is not cw:
             self.patch_kube(self.cwm)
         self.env.update(CW_CLOUD_RECORD_DIR=self.records, CW_GIT_TOKEN_CMD="%s %s" % (sys.executable, script),
