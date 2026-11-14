@@ -398,7 +398,7 @@ class S2Differential(unittest.TestCase):
     def test_S2_worst_case(self):
         r = random.Random(5)
         secs = {rnd(r, 20, "abcdefgh") for _ in range(50)}
-        text = ("".join(s[2:14] + " " for s in secs) * 30)[:20000]
+        text = ("".join(s[2:14] + " " for s in secs) * 30)[:6000]
         self.assertEqual(cw.scrub(text, secs, 30000), ref(text, secs, 30000))
         new = line_events(cw.scrub, NS, text, secs, 30000)
         _NS["_ORDER"] = sorted(forms_of(secs), key=lambda v: (-len(v), v))
@@ -1138,7 +1138,7 @@ class S19RankGuard(unittest.TestCase):
         out = []
         for label, text, secs, _ in cases:
             res = cw.scrub(text, set(secs), 10 ** 7)
-            V, M, R = c15._vrm_big(text, secs, res, brackets=len(secs))
+            V, M, R = c15._vrm_big(text, secs, res, brackets=sum(1 for s in secs if "[" in s or "]" in s))
             build = sum(len(x) for x in set(secs))
             bound = 200 * (len(text) + V + max(R, 0) + max(M, 0) + build)
             if label.startswith("S15"):

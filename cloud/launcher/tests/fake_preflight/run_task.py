@@ -15,6 +15,18 @@ import run_task  # noqa: E402
 
 FAKE_PREFLIGHT = ["sh", "-c", 'echo "preflight: preflight ok: deletion, non_fast_forward, pull_request"']
 run_task.cw.PREFLIGHT_ARGV = FAKE_PREFLIGHT
+_FAKE_LINE = "preflight: preflight ok: deletion, non_fast_forward, pull_request"
+_real_check_repo_preflight = run_task.cw.check_repo_preflight
+
+
+def _fast_check_repo_preflight(repo, env):
+    """The fake's one line, without starting a shell for it, while the argv is still the fake above; any other argv takes the real path."""
+    if run_task.cw.PREFLIGHT_ARGV is FAKE_PREFLIGHT:
+        return _FAKE_LINE
+    return _real_check_repo_preflight(repo, env)
+
+
+run_task.cw.check_repo_preflight = _fast_check_repo_preflight
 
 _original_run_cloud_worker = run_task.Driver.run_cloud_worker
 
