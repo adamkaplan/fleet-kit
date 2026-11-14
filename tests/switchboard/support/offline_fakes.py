@@ -81,10 +81,12 @@ class OfflineRun:
         with mock.patch.object(os.path, "realpath", realpath), mock.patch.object(sb.V2Client, "__init__", client_init):
             if getattr(world.engine, "v2", None) is not None and hasattr(world.engine.v2, "calls"):
                 world.engine.v2.clock = lambda: float(world.clock.t)   # the engine made in __init__
-            # no cloud pod anywhere in the scenario: its ticks have nothing to find on any pass, so quiet them once for the whole play
-            if not (world.state / "cloud").exists() and "cloud" not in json.dumps(self.scenario):
+            # the ticks this scenario cannot notice (no cloud pod, no impact, pane health, chat, health file or call record anywhere in it) have
+            # nothing to find on any pass: quiet them once for the whole play
+            ticks = self.quiet_ticks()
+            if ticks:
                 with contextlib.ExitStack() as stack:
-                    for name in self.CLOUD_TICKS:
+                    for name in ticks:
                         stack.enter_context(mock.patch.object(sb, name, lambda *a, **k: None))
                     self._outer_patched = True
                     try:
@@ -93,6 +95,16 @@ class OfflineRun:
                         self._outer_patched = False
             return self._play()
 
+    def quiet_ticks(self):
+        text = json.dumps(self.scenario).lower()
+        ticks = [] if (self.world.state / "cloud").exists() or "cloud" in text else list(self.CLOUD_TICKS)
+        for name, words in self.OPTIONAL_TICKS:
+            if not any(word in text for word in words):
+                ticks.append(name)
+        return ticks
+
+    OPTIONAL_TICKS = (("impact_would_hold_pass", ("impact", "would_hold", "would-hold")), ("pane_health_pass", ("pane_health", "detach", "fleetpane", "close-agent", "adopt", "exit")),
+                      ("chat_clear_pass", ("chat", "clear")), ("health_write", ("health",)), ("record_v2_calls", ("call", "budget")))
     CLOUD_TICKS = ("lost_worker_tick", "push_watch_tick", "pod_silence_tick", "cloud_watch_tick", "cloud_end_tick", "cloud_stall_tick", "cloud_turn_tick")
 
     def _play(self):
@@ -257,12 +269,11 @@ class OfflineRun:
         os.environ[sb.FAULT_ENV] = ",".join(sorted(set(self.faults) | set(step_faults)))
         first = len(self.world.v2.writes)
         try:
-            if getattr(self, "_outer_patched", False) or (self.world.state / "cloud").exists():
+            if getattr(self, "_outer_patched", False):
                 self.world.engine.run_pass()
             else:
-                # no cloud pod in the world: the cloud ticks (each re-reads a helper module from disk) have nothing to find on any of the thousands of passes
-                with contextlib.ExitStack() as stack:
-                    for name in self.CLOUD_TICKS:
+                with contextlib.ExitStack() as stack:   # a pass run alone (a step) is quieted the same way
+                    for name in self.quiet_ticks():
                         stack.enter_context(mock.patch.object(sb, name, lambda *a, **k: None))
                     self.world.engine.run_pass()
         except sb.SimulatedCrash:
