@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "bin"
@@ -184,6 +185,26 @@ class TestMutants(unittest.TestCase):
         self.assertIn(old, src, "the mutation anchor moved: " + name)
         return src.replace(old, new, 1)
 
+    def run_in_process(self, name, mutated, test_name):
+        """Run one named TestImpactHold test of the running bin/test-switchboard against the mutated module, in this process: (ok, output), or None when this
+        is not that run (`python3 -m unittest tests.test_brief_integration`) and the caller runs a whole suite copy instead."""
+        host = sys.modules.get("__main__")
+        case, daemon = getattr(host, "TestImpactHold", None), getattr(host, "sb", None)
+        if case is None or daemon is None or not hasattr(daemon, "_MODULES_DONE"):
+            return None
+        path = BIN / (name + ".py")
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader=None))
+        module.__dict__["__file__"] = str(path)
+        exec(compile(mutated, str(path), "exec"), module.__dict__)
+        result = unittest.TestResult()
+        with mock.patch.dict(sys.modules, {name: module}), mock.patch.dict(daemon._MODULES_DONE, {name: module}), mock.patch.dict(vars(daemon)) as namespace:
+            if name == "impact_hold":   # the daemon's copies of the moved functions are rebuilt from the mutant, as at import, and put back after
+                for moved in module.MOVED:
+                    namespace.pop(moved, None)
+                module.bind(vars(daemon), daemon.EFFECT_CHECK)
+            case(test_name).run(result)
+        return result.wasSuccessful(), "".join(text for _, text in result.failures + result.errors)
+
     def run_suite_copy(self, name, mutated, *tokens):
         tmp = Path(tempfile.mkdtemp(prefix="mut-"))
         self.addCleanup(shutil.rmtree, str(tmp), True)
@@ -196,12 +217,26 @@ class TestMutants(unittest.TestCase):
 
     def test_s22_dropping_the_brief_from_the_audit_line_fails_the_audit_test(self):
         mutated = self.mutate("impact_hold.py", 'detail["brief_digest"], detail["brief_text"] = brief["digest"], brief["text"]', "pass")
+        test = "test_s10_the_audit_line_carries_the_brief_its_hash_the_decider_and_the_reasons"
+        found = self.run_in_process("impact_hold", mutated, test)
+        if found is not None:
+            control = self.run_in_process("impact_hold", (BIN / "impact_hold.py").read_text(), test)
+            self.assertTrue(control[0], "the same run on the unchanged module passes: " + control[1])
+            self.assertFalse(found[0], "the mutant passes the audit test")
+            return
         done = self.run_suite_copy("impact_hold.py", mutated, "test_s10_the_audit")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("test_s10_the_audit_line_carries", done.stdout + done.stderr)
 
     def test_s22_accepting_a_stale_brief_fails_the_stale_test(self):
         mutated = self.mutate("delegated_clear.py", 'if brief_digest != floor_brief["digest"] or brief_text != floor_brief.get("text"):', "if False:")
+        test = "test_s11_s12_a_clear_with_no_brief_or_a_stale_brief_is_refused_and_nothing_is_written"
+        found = self.run_in_process("delegated_clear", mutated, test)
+        if found is not None:
+            control = self.run_in_process("delegated_clear", (BIN / "delegated_clear.py").read_text(), test)
+            self.assertTrue(control[0], "the same run on the unchanged module passes: " + control[1])
+            self.assertFalse(found[0], "the mutant passes the stale-brief test")
+            return
         done = self.run_suite_copy("delegated_clear.py", mutated, "test_s11_s12_a_clear_with_no_brief")
         self.assertNotEqual(done.returncode, 0)
 

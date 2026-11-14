@@ -30254,7 +30254,7 @@ class TestRecordingCommands(LedgerBase):
     """#1049: every recording command (the set is read from the code: the functions marked `@recording`) ends with ONE line, `recorded #<id>`, `already recorded #<id>` or
     `not recorded: <reason>`, within ONE bound (`RECORD_WAIT_SECONDS`), and the same record again writes nothing. One row per member; one mutant per member."""
 
-    WAIT, PROGRESS = 1, 0.2   # the bound and the first word, shortened for the tests (the real values are the module's constants)
+    WAIT, PROGRESS = 0.3, 0.1   # the bound and the first word, shortened for the tests (the real values are the module's constants)
     EXEMPT = {   # commands that reach a ledger append and are NOT recording commands of this contract (the plan's out-of-scope list); a new one is a failure until it is placed
         "gates": "reads; its `ci-record` form is the daemon's recorder", "gates_ci_record": "the built-in `ci` recorder",
         "item_prove": "a work item, not a pull request", "item_verdict": "a work item, not a pull request", "item_ci_record": "a work item, not a pull request",
@@ -33498,6 +33498,7 @@ class TestRegistrarFloor(LedgerBase):
         module = types.ModuleType("delegated_clear_mutant")
         module.__file__ = str(path)
         exec(compile(text.replace(old, new), str(path), "exec"), module.__dict__)
+        module.ast = self.dc.ast   # the mutant's own functions, but the shared parse cache for `ast.parse`
         return module
 
     MUTANTS = (
@@ -33704,6 +33705,7 @@ class TestRegistrarFloor(LedgerBase):
         mutant = types.ModuleType("delegated_clear_mutant")
         mutant.__file__ = str(path)
         exec(compile(text, str(path), "exec"), mutant.__dict__)
+        mutant.ast = self.dc.ast   # the shared parse cache for `ast.parse`
         mutant._applied = getattr(module, "_applied", []) + [(old, new)]
         return mutant
 
@@ -33752,9 +33754,9 @@ class TestRegistrarFloor(LedgerBase):
 
     HOSTILE = "global %s\n%s = None"
 
-    def serve(self, head_src):
+    def serve(self, head_src, base_src=None):
         self.pr = dict(self.pr, baseRefOid=self.BASE, changedFiles=1, files=[{"path": "bin/fleet-switchboard", "additions": 3, "deletions": 0}])
-        base_src = self.base_src
+        base_src = base_src or self.small_src   # the small fixture unless the case names closure names of the real file
         def text(engine, repo, path, ref):
             return base_src if ref == self.BASE else head_src
         patcher = mock.patch.object(sb, "_file_text_at", text)
@@ -33769,7 +33771,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
         function, binding, module = self.pick()
-        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src))
+        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src), self.base_src)
         shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
@@ -33784,7 +33786,7 @@ class TestRegistrarFloor(LedgerBase):
         self.assertTrue(any("registrar add_zzz_parsers" in r for r in got["reasons"]))
 
     def test_a_flag_only_registrar_edit_and_an_unchanged_daemon_file_do_not_add_a_reason(self):
-        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)", base=self.base_src))
+        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)", base=self.small_src))
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual(report["registrar_reasons"], [])
         self.pr = dict(self.pr, changedFiles=1, files=[{"path": "docs/a.md", "additions": 1, "deletions": 0}])
@@ -36711,16 +36713,6 @@ class TestImpactHold(LedgerBase):
 
     def setUp(self):
         super().setUp()
-        cache, dc = self._daemon_cache, sb.load_module("delegated_clear")
-        if cache:   # the unchanged daemon file's registrar findings are computed once for the class, not on every pass
-            real_registrar = dc.registrar_findings
-            def registrar_findings(before, after, rule, *a, **k):
-                if before == cache["source"] and after == cache["source"] and rule == sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"] and not a and not k:
-                    return cache["reg_unchanged"]
-                return real_registrar(before, after, rule, *a, **k)
-            patcher = mock.patch.object(dc, "registrar_findings", registrar_findings)
-            patcher.start()
-            self.addCleanup(patcher.stop)
         top_tier_migrations(self)
         self.writes = []
         self.hold_config = {"enabled": True}
@@ -37428,14 +37420,14 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(missing, [], "a function the real clear ran in a module that is not refused whole is not in module_roots")
         self.assertTrue(seen, "the profile saw the clear run")
         # every module's config readers run at config load (a key set or not): its validate and settings are roots
-        for path in sorted(BIN.glob("*.py")):
-            tree = ast.parse(path.read_text())
+        bin_trees = {p: ast.parse(p.read_text()) for p in sorted(BIN.glob("*.py"))}
+        for path, tree in bin_trees.items():
             readers = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings")]
             if readers and not matches("bin/" + path.name, rule["clear_code_paths"]):
                 self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
         # the modules the clear loads or runs, DERIVED: every loader of the daemon (a `load_module("x")` call, a name in HELPER_MODULES, a function that returns one) is enumerated by ast; a module
         # is judged when the clear reaches its loader, the daemon loads it at import, it has a config reader, or the recorded run executed it; every other loaded module is listed with its reason
-        daemon, hold = self.real_tree(), ast.parse((BIN / "impact_hold.py").read_text())
+        daemon, hold = self.real_tree(), bin_trees[BIN / "impact_hold.py"]
         names = {p.stem for p in BIN.glob("*.py")}
         helper = next(ast.literal_eval(n.value) for n in daemon.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in n.targets))
         defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
@@ -37448,7 +37440,8 @@ class TestImpactHold(LedgerBase):
                     found |= ({helper[x.id]} if x.id in helper else set()) | loaders.get(x.id, set())
             return found
         clear_functions = [n for n in hold.body if isinstance(n, ast.FunctionDef)]
-        wanted_roots = sorted({x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[0]) | {x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[1]))
+        idx, clear_names = sb.load_module("delegated_clear")._index(daemon), {x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)}
+        wanted_roots = sorted(clear_names & set(idx[0]) | clear_names & set(idx[1]))
         bind_reads = {x.slice.value for f in ast.walk(hold) if isinstance(f, ast.FunctionDef) and f.name == "bind" for x in ast.walk(f) if isinstance(x, ast.Subscript) and isinstance(x.slice, ast.Constant) and isinstance(x.slice.value, str) and x.slice.value.isupper()}   # #924 round 4: `bind` reads NO daemon name from the namespace by key
         self.assertEqual(bind_reads, set())
         self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader", "RepoIssue", "issue_arg", "parse_issue_ref"} | bind_reads), "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
@@ -37472,7 +37465,7 @@ class TestImpactHold(LedgerBase):
                     if f == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
                         at_load.add(x.args[0].value)
                     at_load |= ({helper[f]} if f in helper else set()) | loaders.get(f, set())
-        with_reader = {p.stem for p in BIN.glob("*.py") if any(isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings") for n in ast.parse(p.read_text()).body)}
+        with_reader = {p.stem for p in BIN.glob("*.py") if any(isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings") for n in bin_trees[p].body)}
         profiled = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
         named = lambda m: matches("bin/%s.py" % m, rule["clear_code_paths"])
         judged = {m for m in (reached | at_load | with_reader | profiled) if m in names and not named(m)}
@@ -37827,7 +37820,7 @@ class TestImpactHold(LedgerBase):
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         source = switchboard_source()
         tree = _ast.parse(source)    # the daemon file is parsed once; its closure is computed once
-        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"]), "roots": mod.daemon_roots(rule), "dyn": rule["dynamic_actions"], "heads": {}, "reg_unchanged": mod.registrar_findings(source, source, rule)}
+        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"]), "roots": mod.daemon_roots(rule), "dyn": rule["dynamic_actions"], "heads": {}}
 
     def real_source(self):
         return self._daemon_cache["source"] if self._daemon_cache else switchboard_source()
@@ -37857,7 +37850,7 @@ class TestImpactHold(LedgerBase):
                 cache.setdefault("same_closure_ids", set()).add(id(cache["heads"][head_source]))   # the edit only adds a comment: no node is added or removed, and a closure is by name, so it is the unchanged tree's closure
         return head_source, diff
 
-    def closure_check(self, head, diff, rule=None, roots=None, dynamic=None):
+    def closure_check(self, head, diff, rule=None, roots=None, dynamic=None, base=None):
         rule = rule or sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         import unittest.mock as mock
         mod = sb.load_module("delegated_clear")
@@ -37881,7 +37874,7 @@ class TestImpactHold(LedgerBase):
                 known[key] = real_closure(tree, roots, dyn)
             return known[key]
         with mock.patch.object(mod, "ast", CachedAst()), mock.patch.object(mod, "closure", cached_closure):
-            return mod.closure_refusals(self.real_source(), head, diff, mod.daemon_roots(rule) if roots is None else roots, set(rule["clear_entry_points"]), False, rule["dynamic_actions"] if dynamic is None else dynamic)
+            return mod.closure_refusals(self.real_source() if base is None else base, head, diff, mod.daemon_roots(rule) if roots is None else roots, set(rule["clear_entry_points"]), False, rule["dynamic_actions"] if dynamic is None else dynamic)
 
     def test_the_five_functions_hunk_headers_missed_are_refused_by_the_ast_on_the_real_daemon_file(self):
         source = self.real_source()
@@ -37921,7 +37914,8 @@ class TestImpactHold(LedgerBase):
         self.assertTrue(refuse(lines[:k] + ["def broken(:"] + lines[k:]), "a syntax error after the change")
         self.assertTrue(self.closure_check(source, None), "no patch")
         self.assertTrue(self.closure_check(source, "@@ garbage @@"), "a hunk header that cannot be read")
-        comment = list(lines); comment.insert(k, "# a comment between the definitions")
+        blank = next(i for i in range(k - 1, -1, -1) if not lines[i].strip())
+        comment = list(lines); comment[blank] = "# a comment between the definitions"   # replaces a blank line: line numbers stay put, so the cached tree is spliced rather than the whole file re-parsed
         self.assertEqual(refuse(comment), [], "a comment between top-level statements changes nothing")
 
     def test_a_name_read_through_a_binding_is_followed_to_what_it_runs(self):
@@ -37937,16 +37931,13 @@ class TestImpactHold(LedgerBase):
         self.assertNotEqual(mutant, lines, "the mutant changed the loader table")
         self.assertTrue(refuse(mutant), "load_impact_floor, generated from the table, returning another module")
         k = next(i for i, l in enumerate(lines) if l.startswith("def _make_loader("))
-        mutant = list(lines)
-        mutant.insert(k + 1, "    # touched")
+        mutant = list(lines); mutant[k + 1] = mutant[k + 1] + "  # touched"
         self.assertTrue(refuse(mutant), "the function that makes the loaders")
         k = next(i for i, l in enumerate(lines) if l.startswith("class _LazyImpactFloor"))
-        mutant = list(lines)
-        mutant.insert(k + 2, "    # touched")
+        mutant = list(lines); mutant[k + 2] = mutant[k + 2] + "  # touched"
         self.assertTrue(refuse(mutant), "a line in the lazy loader class")
         k = next(i for i, l in enumerate(lines) if l.startswith("class _LazyPlanLedger"))
-        mutant = list(lines)
-        mutant.insert(k + 2, "    # touched")
+        mutant = list(lines); mutant[k + 2] = mutant[k + 2] + "  # touched"
         self.assertTrue(refuse(mutant), "a line in the lazy ledger class")
 
     def synthetic(self, base, head):
@@ -38612,7 +38603,7 @@ class TestImpactHold(LedgerBase):
             return any((isinstance(x, ast.Constant) and (x.value in fields or (isinstance(x.value, str) and re.fullmatch(r"--impact-(severity|probability|reason|class|action)", x.value)))) or (isinstance(x, ast.Name) and x.id in names) for x in ast.walk(node))
         touching = sorted(n.name for n in daemon.body if isinstance(n, ast.FunctionDef) and touches(n))
         self.assertTrue({"parse_review_block", "cmd_review", "add_review_parsers"} <= set(touching), touching)
-        reach = module.closure(daemon, module.daemon_roots(rule), rule["dynamic_actions"])[0]
+        reach = self._daemon_cache["closure"][0]
         self.assertIn("impact_rating_entries", reach)
         self.assertEqual([n for n in touching if n not in reach], [], "every definition that reads, writes, defaults or registers a rating field is in the closure of what she can never clear (completeness: derived from the code)")
         for name in sorted(set(touching) | set(rule["rating_roots"])):
@@ -38652,7 +38643,7 @@ class TestImpactHold(LedgerBase):
         dynamic = rule["dynamic_actions"]
         self.assertEqual(dynamic, ["review"])
         targets = {"cmd_review", "parse_review_block", "add_review_parsers"}
-        from_main = module.closure(daemon, ["main"], dynamic)[0]
+        from_main = self._daemon_cache.get("from_main") or self._daemon_cache.setdefault("from_main", module.closure(daemon, ["main"], dynamic)[0])
         def edges(node):   # the DIRECT edges of a definition: the names it uses, and the two string edges for the named actions
             out = {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in defs}
             if any(isinstance(x, ast.Constant) and x.value == "cmd_" for x in ast.walk(node)):
@@ -38669,7 +38660,7 @@ class TestImpactHold(LedgerBase):
             on_path |= more
         on_path = sorted(n for n in on_path & set(from_main))
         self.assertTrue({"main", "dispatch", "resolve_command", "cmd_review", "build_parser", "command_registrars", "add_review_parsers"} <= set(on_path), on_path)
-        reach = module.closure(daemon, module.daemon_roots(rule), dynamic)[0]
+        reach = self._daemon_cache["closure"][0]
         self.assertEqual([n for n in on_path if n not in reach], [], "every function on the call path from main to the rating code is in the closure")
         # every dynamic construct (globals, getattr with a computed name, setattr, vars, importlib, __import__, eval, exec) in a function of the call path
         found = {}
@@ -38693,8 +38684,8 @@ class TestImpactHold(LedgerBase):
             with self.subTest(root=name):
                 head, diff = self.edit_one_line_under(self.real_source(), name)
                 self.assertTrue(self.closure_check(head, diff), name)
-        probes = {"a default filled in dispatch": ("if args.action == \"version\":", "if args.action == \"review\" and args.impact_severity is None:\n        args.impact_severity = \"Negligible\"\n    if args.action == \"version\":"),
-                  "the resolver sends review elsewhere": ("    handler = globals().get(\"cmd_\" + action.replace(\"-\", \"_\"))", "    handler = globals().get(\"cmd_\" + action.replace(\"-\", \"_\"))\n    if action == \"review\":\n        handler = cmd_plan")}
+        probes = {"a default filled in dispatch": ("if args.action == \"version\":", "if (setattr(args, \"impact_severity\", \"Negligible\") if args.action == \"review\" and args.impact_severity is None else False) or args.action == \"version\":"),
+                  "the resolver sends review elsewhere": ("    handler = globals().get(\"cmd_\" + action.replace(\"-\", \"_\"))", "    handler = cmd_plan if action == \"review\" else globals().get(\"cmd_\" + action.replace(\"-\", \"_\"))")}
         import difflib
         source = self.real_source()
         for label, (old, new) in probes.items():
@@ -67212,17 +67203,23 @@ class TestSupportRebinding(unittest.TestCase):
         lines = source.split("\n")
         parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
         roots = ("sys.modules[__name__]", "sys.modules['__main__']", "globals()", "__main__", "vars()")
+        def shape(e):
+            """`ast.unparse(e)` for the few shapes that can be one of the `roots` (a name, `globals()`/`vars()`, `sys.modules[...]`); "" for every other node (unparsing all of them is the slow part)."""
+            if isinstance(e, ast.Name) and e.id == "__main__" or isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id in ("globals", "vars") and not e.args and not e.keywords \
+                    or isinstance(e, ast.Subscript) and isinstance(e.value, ast.Attribute) and e.value.attr == "modules":
+                return ast.unparse(e)
+            return ""
         aliases = set()   # every name the module is bound to: an assignment, an annotated assignment, a walrus, a tuple of them, `import __main__ as m`
         for n in ast.walk(tree):
             if isinstance(n, ast.Assign):
                 for t in n.targets:
-                    if isinstance(t, ast.Name) and ast.unparse(n.value) in roots:
+                    if isinstance(t, ast.Name) and shape(n.value) in roots:
                         aliases.add(t.id)
                     elif isinstance(t, (ast.Tuple, ast.List)) and isinstance(n.value, (ast.Tuple, ast.List)) and len(t.elts) == len(n.value.elts):
-                        aliases |= {a.id for a, v in zip(t.elts, n.value.elts) if isinstance(a, ast.Name) and ast.unparse(v) in roots}
-            elif isinstance(n, ast.AnnAssign) and n.value is not None and isinstance(n.target, ast.Name) and ast.unparse(n.value) in roots:
+                        aliases |= {a.id for a, v in zip(t.elts, n.value.elts) if isinstance(a, ast.Name) and shape(v) in roots}
+            elif isinstance(n, ast.AnnAssign) and n.value is not None and isinstance(n.target, ast.Name) and shape(n.value) in roots:
                 aliases.add(n.target.id)
-            elif isinstance(n, ast.NamedExpr) and ast.unparse(n.value) in roots:
+            elif isinstance(n, ast.NamedExpr) and shape(n.value) in roots:
                 aliases.add(n.target.id)
             elif isinstance(n, ast.Import):
                 aliases |= {a.asname for a in n.names if a.name == "__main__" and a.asname}
@@ -67230,12 +67227,12 @@ class TestSupportRebinding(unittest.TestCase):
         def is_module(e):
             if isinstance(e, ast.NamedExpr):
                 return is_module(e.value)
-            text = ast.unparse(e)
+            text = shape(e)
             if text in roots or (isinstance(e, ast.Name) and e.id in aliases):
                 return True
             if isinstance(e, ast.Attribute) and e.attr == "__dict__":
                 return is_module(e.value)
-            return isinstance(e, ast.Call) and ast.unparse(e.func) == "vars" and bool(e.args) and is_module(e.args[0])
+            return isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id == "vars" and bool(e.args) and is_module(e.args[0])
 
         def paired(node, name):
             above = parents.get(id(node))
@@ -67328,7 +67325,7 @@ class TestSupportRebinding(unittest.TestCase):
             elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in moved and module_scope(node, node.name):
                 found.append((node.lineno, "a match capture %s" % node.name))
             elif isinstance(node, ast.Call):
-                what = ast.unparse(node.func)
+                what = node.func.id if isinstance(node.func, ast.Name) else node.func.value.id + "." + node.func.attr if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) else ast.unparse(node.func)
                 if what.endswith(".patch") or what == "patch":   # a string target
                     target = node.args[0] if node.args else None
                     if isinstance(target, ast.Constant) and isinstance(target.value, str) and target.value.split(".")[0] in ("__main__", "tsb") and "." in target.value:
@@ -67346,7 +67343,7 @@ class TestSupportRebinding(unittest.TestCase):
                         flag(node, "patch.multiple", [k.arg for k in node.keywords] or [None])
                     elif what.split(".")[-1] in ("patch", "setattr", "delattr") or what.endswith("patch.object"):
                         flag(node, what, [node.args[1].value if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) else None])
-                    elif ast.unparse(node.args[0]) in roots:   # an unknown callee handed the module itself (not an alias: a name like `module` is common)
+                    elif shape(node.args[0]) in roots:   # an unknown callee handed the module itself (not an alias: a name like `module` is common)
                         flag(node, "a call that takes the module: " + what, [None])
                 if isinstance(node.func, ast.Attribute) and is_module(node.func.value) and node.func.attr in ("update", "pop", "popitem", "setdefault", "clear", "__setitem__", "__delitem__"):
                     flag(node, "module.%s" % node.func.attr, [None])
