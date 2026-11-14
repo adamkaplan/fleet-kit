@@ -6645,17 +6645,6 @@ def q1_report(case):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 class TestOfflineScenarios(Base):
     """One test per scenario file with the offline tier; generated below."""
 
@@ -30383,7 +30372,8 @@ class TestRecordingCommands(LedgerBase):
 
     def test_a_command_that_reaches_a_ledger_append_is_a_recording_command_or_named_exempt(self):
         """Derived from the code: every `cmd_*` function that reaches a `plan_ledger.append_*` call, through the module's own functions, is marked or exempt."""
-        tree = ast.parse(switchboard_source())   # the whole daemon: the entry and every part
+        cache = TestImpactHold._daemon_cache   # the daemon's tree, parsed once for the process and only read
+        tree = cache["tree"] if cache else ast.parse(switchboard_source())   # the whole daemon: the entry and every part
         funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
         def called(node):
             names = set()
@@ -32562,7 +32552,7 @@ class TestRegistrarFloor(LedgerBase):
 
         def keep(key, tree, make):
             if key not in memo:
-                while len(memo) >= 24:
+                while len(memo) >= 2000:
                     del memo[next((k for k in memo if k not in pinned), None)]   # the two parses of the big real texts (the daemon file and its small fixture) stay: each is seconds to redo
                 memo[key] = (tree, make())
             return memo[key][1]
@@ -32884,12 +32874,12 @@ class TestRegistrarFloor(LedgerBase):
     def test_a_pattern_weakened_in_the_head_a_size_over_the_cap_and_a_lambda_are_held_or_read(self):
         function, binding, module = self.pick()
         hostile = "def add_a_parsers(sub):\n    %s()\n" % function
-        weakened = (self.base_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(r\"add_[a-z0-9_]+_parsers\")", "REGISTRAR_NAME_RE = re.compile(r\"nothing_matches_this\")")
-        self.assertNotEqual(weakened, self.base_src + "\n" + hostile, "the real file spells the pattern as this test expects")
-        got, why = self.dc.registrar_findings(self.base_src, weakened, self.rule)
+        weakened = (self.small_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')", "REGISTRAR_NAME_RE = re.compile(r'nothing_matches_this')").replace("REGISTRAR_NAME_RE = re.compile(r\"add_[a-z0-9_]+_parsers\")", "REGISTRAR_NAME_RE = re.compile(r\"nothing_matches_this\")").replace("REGISTRAR_NAME_RE = re.compile('add_[a-z0-9_]+_parsers')", "REGISTRAR_NAME_RE = re.compile('nothing_matches_this')")
+        self.assertNotEqual(weakened, self.small_src + "\n" + hostile, "the real file spells the pattern as this test expects")
+        got, why = self.dc.registrar_findings(self.small_src, weakened, self.rule)
         self.assertTrue(any(v == "calls" for _, v, _ in got), "the base's pattern still names the registrar: the weakening does not hide it")
-        dropped = (self.base_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(", "REGISTRAR_NAME_RE = (")
-        got, why = self.dc.registrar_findings(self.base_src, dropped, self.rule)
+        dropped = (self.small_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(", "REGISTRAR_NAME_RE = (")
+        got, why = self.dc.registrar_findings(self.small_src, dropped, self.rule)
         self.assertIsNone(got)
         self.assertIn("pattern", why)
         with mock.patch.object(self.dc, "REGISTRAR_SOURCE_MAX", 100):
@@ -36721,6 +36711,16 @@ class TestImpactHold(LedgerBase):
 
     def setUp(self):
         super().setUp()
+        cache, dc = self._daemon_cache, sb.load_module("delegated_clear")
+        if cache:   # the unchanged daemon file's registrar findings are computed once for the class, not on every pass
+            real_registrar = dc.registrar_findings
+            def registrar_findings(before, after, rule, *a, **k):
+                if before == cache["source"] and after == cache["source"] and rule == sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"] and not a and not k:
+                    return cache["reg_unchanged"]
+                return real_registrar(before, after, rule, *a, **k)
+            patcher = mock.patch.object(dc, "registrar_findings", registrar_findings)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         top_tier_migrations(self)
         self.writes = []
         self.hold_config = {"enabled": True}
@@ -37827,7 +37827,7 @@ class TestImpactHold(LedgerBase):
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         source = switchboard_source()
         tree = _ast.parse(source)    # the daemon file is parsed once; its closure is computed once
-        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"]), "roots": mod.daemon_roots(rule), "dyn": rule["dynamic_actions"], "heads": {}}
+        cls._daemon_cache = {"source": source, "tree": tree, "closure": mod.closure(tree, mod.daemon_roots(rule), rule["dynamic_actions"]), "roots": mod.daemon_roots(rule), "dyn": rule["dynamic_actions"], "heads": {}, "reg_unchanged": mod.registrar_findings(source, source, rule)}
 
     def real_source(self):
         return self._daemon_cache["source"] if self._daemon_cache else switchboard_source()

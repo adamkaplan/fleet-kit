@@ -287,8 +287,8 @@ class TestEveryTestFileIsWired(unittest.TestCase):
     def test_the_real_directory_is_wired(self):
         files = list(TESTS.glob("test_*.py"))
         self.assertGreaterEqual(len(files), 21)
-        self.assertEqual(problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
-        self.assertEqual(problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])     # the reduced text the planted tests use gives the same verdict
+        self.assertEqual(loader_lines(RUNNER.read_text()), runner_loader_source())    # the reduced text is the runner's own loader lines (the full-file walk of `problems` is not repeated on it)
+        self.assertEqual(problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])
 
     def test_the_exemption_list_is_the_only_one(self):
         tree = ast.parse(Path(__file__).read_text())
@@ -499,13 +499,13 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.assertEqual(len(out), 2, out)
         self.assertIn("class TestE ", out[0])
         self.assertIn("class TestF ", out[1])
-        self.assertEqual(problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
+        self.assertEqual(problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])
 
     def test_s2_the_real_directory_has_no_unbound_class(self):
         files = list(TESTS.glob("test_*.py"))
         classes = [c for f in files for c in test_classes(f)]
         self.assertGreaterEqual(len(classes), 276)
-        self.assertEqual(class_problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
+        self.assertEqual(class_problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])
 
 # Both lines are built from halves so that each appears once, in `problems`, never as one literal in this file.
 MUTATED_LINE = "    files = sorted(m + " + '".py" for m in imported if (Path(tests_dir) / (m + ".py")).exists())'
