@@ -15,6 +15,7 @@ import random
 import re
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -144,6 +145,8 @@ def old_redacted(text, secs):
     for sec in order:
         for v in {sec, sec.strip()}:
             s_ = "".join(ch)
+            if v not in s_:
+                continue   # nothing found: the loop below would only copy the two lists
             nch, nids, pos = [], [], 0
             while True:
                 at = s_.find(v, pos)
@@ -155,22 +158,28 @@ def old_redacted(text, secs):
                 pos = at + len(v)
             ch, ids = nch + ch[pos:], nids + ids[pos:]
         s_ = "".join(ch)
+        mf = cw.MIN_FRAGMENT
+        wins = {sec[k:k + mf] for k in range(len(sec) - mf + 1)}   # the 8-character heads that are a piece of sec
+        if not wins:
+            continue
+        seek = re.compile("|".join(re.escape(w) for w in sorted(wins))).search   # the leftmost head that is a piece of sec
         nch, nids, i = [], [], 0
         while i < len(s_):
-            head = s_[i:i + cw.MIN_FRAGMENT]
-            if len(head) == cw.MIN_FRAGMENT and head in sec:
-                j = i + cw.MIN_FRAGMENT
-                while j < len(s_) and s_[i:j + 1] in sec:
-                    j += 1
-                (via if None in ids[i:j] else gone).update(x for x in ids[i:j] if x is not None)
-                nch += mark
-                nids += [None] * len(mark)
-                i = j
-            else:
-                nch.append(s_[i])
-                nids.append(ids[i])
-                i += 1
-        ch, ids = nch, nids
+            m = seek(s_, i)
+            if m is None:
+                break
+            if m.start() > i:   # the characters before it stay as they are
+                nch += ch[i:m.start()]
+                nids += ids[i:m.start()]
+                i = m.start()
+            j = i + mf
+            while j < len(s_) and s_[i:j + 1] in sec:
+                j += 1
+            (via if None in ids[i:j] else gone).update(x for x in ids[i:j] if x is not None)
+            nch += mark
+            nids += [None] * len(mark)
+            i = j
+        ch, ids = nch + ch[i:], nids + ids[i:]
     return gone
 
 
@@ -436,7 +445,7 @@ class S4Counts(unittest.TestCase):
         r = random.Random(4)
         s50 = {rnd(r, 30, "ABCDEFGHIJKLMNOP") for _ in range(50)}
         s100 = s50 | {rnd(r, 30, "ABCDEFGHIJKLMNOP") for _ in range(50)}
-        t1, t2 = "z" * 20000, "z" * 40000
+        t1, t2 = "z" * 4000, "z" * 8000   # the counts are exact multiples of the size: no need for a long traced run
         cases = {"1": (t1, s50), "2": (t2, s50), "f": (t1, s100)}
         n = {k: line_hits(cw.scrub, cw._scrub_secrets.__code__, "for rank in get(", t, s, 10 ** 6) for k, (t, s) in cases.items()}
         o = {}
@@ -542,6 +551,7 @@ class S8Snapshot(unittest.TestCase):
                 while not stop.is_set():
                     known.add("added-%d-%d-form" % (rd, k))
                     k += 1
+                    time.sleep(0.0002)   # lets the scrub run between two additions: the race stays, the GIL fight does not cost seconds
             th = threading.Thread(target=adder, daemon=True)
             th.start()
             try:
