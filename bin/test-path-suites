@@ -73,10 +73,47 @@ def fixture():
     return root
 
 
+_SB_INPROC = []
+
+
+def _sb_mod():
+    if not _SB_INPROC:
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("sb_path_suites", str(SWITCHBOARD))
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("sb_path_suites", loader))
+        loader.exec_module(mod)
+        _SB_INPROC.append(mod)
+    return _SB_INPROC[0]
+
+
+def _inproc_runner(argv, **kw):
+    if len(argv) >= 2 and argv[0] == sys.executable and Path(argv[1]).resolve() == SWITCHBOARD.resolve() and "--" not in argv[2:]:
+        mod = _sb_mod()
+        out, err = io.StringIO(), io.StringIO()
+        here = os.getcwd()
+        cwd = kw.get("cwd")
+        env = kw.get("env")
+        with contextlib.ExitStack() as stack:
+            if env is not None:
+                stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            if cwd is not None:
+                os.chdir(str(cwd))
+                stack.callback(os.chdir, here)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = mod.main(list(argv[2:]), runner=_inproc_runner)
+                except SystemExit as stop:
+                    code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        return subprocess.CompletedProcess(argv, code or 0, out.getvalue(), err.getvalue())
+    return subprocess.run(argv, **kw)
+
+
 def run_switchboard(cwd, *args, env=None):
     home = tempfile.mkdtemp(prefix="ps-home-")
     e = dict(os.environ, HOME=home, XDG_STATE_HOME=home, XDG_CONFIG_HOME=home, FLEET_HEAVY="off", FLEET_SWITCHBOARD_NO_DAEMON="1")
     e.update(env or {})
+    if Path(SWITCHBOARD).resolve() == (REPO / "bin" / "fleet-switchboard").resolve():
+        return _inproc_runner([sys.executable, str(SWITCHBOARD)] + list(args), cwd=str(cwd), env=e)
     return subprocess.run([sys.executable, str(SWITCHBOARD)] + list(args), cwd=str(cwd), capture_output=True, text=True, env=e, timeout=120)
 
 
@@ -119,6 +156,15 @@ class TestDerivation(unittest.TestCase):
             derivation_test(self, imports_only)
 
 
+_REPO_CHECK = []
+
+
+def _repo_check_manual():
+    if not _REPO_CHECK:
+        _REPO_CHECK.append(ps.check_manual(str(REPO)))
+    return _REPO_CHECK[0]
+
+
 class TestHandKept(unittest.TestCase):
     def rows(self, rows):
         root = fixture()
@@ -142,7 +188,7 @@ class TestHandKept(unittest.TestCase):
         self.assertEqual(ps.check_manual(self.rows([{"glob": "lib/calc.py", "suites": ["bin/test-by-import", "bin/test-by-command"], "reason": "stated"}])), [])
 
     def test_the_rows_of_this_repository_agree_with_the_derivation(self):
-        self.assertEqual(ps.check_manual(str(REPO)), [])
+        self.assertEqual(_repo_check_manual(), [])
 
 
 def merged_fixture():
@@ -719,11 +765,7 @@ class TestPreflightGuardsNotRunMarker(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.machinery
-        import importlib.util
-        loader = importlib.machinery.SourceFileLoader("sb_guards_marker", str(SWITCHBOARD))
-        cls.sb = importlib.util.module_from_spec(importlib.util.spec_from_loader("sb_guards_marker", loader))
-        loader.exec_module(cls.sb)
+        cls.sb = _sb_mod()
 
     def verdicts(self, marker):
         def runner(argv, **kwargs):
@@ -797,7 +839,7 @@ class TestHandKeptRowMutant(unittest.TestCase):
         rows = [r for r in data["rows"] if r.get("glob") == "bin/path_suites.py"]
         self.assertEqual(len(rows), 1)
         self.assertIn(self.NAME, rows[0]["suites"])
-        self.assertEqual(ps.check_manual(str(REPO)), [])
+        self.assertEqual(_repo_check_manual(), [])
         mutant = [dict(r, suites=[x for x in r["suites"] if x != self.NAME]) if r is rows[0] else r for r in data["rows"]]
         with mock.patch.object(ps, "load_manual", lambda root: mutant):
             problems = ps.check_manual(str(REPO))
