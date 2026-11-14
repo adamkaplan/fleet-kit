@@ -1,13 +1,17 @@
 """Offline tests for cloud/launcher/app_token.py: a loopback stub for the GitHub API, a throwaway RSA key, real openssl."""
 import base64
+import contextlib
 import datetime as dt
 import http.server
+import io
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,11 +26,41 @@ def iso(seconds):
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def run_in_process(argv, env):
+    """The mint script run in this process (no interpreter start): the environment, argv, streams and temp dir are swapped and restored."""
+    out, err = io.StringIO(), io.StringIO()
+    old_env, old_argv, old_path, old_tmp = dict(os.environ), sys.argv, list(sys.path), tempfile.tempdir
+    os.environ.clear()
+    os.environ.update(env)
+    sys.argv, tempfile.tempdir = list(argv[1:]), None
+    sys.path.insert(0, os.path.dirname(argv[1]))
+    code = 0
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                runpy.run_path(argv[1], run_name="__main__")
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                if isinstance(e.code, str):
+                    err.write(e.code + "\n")
+            except Exception:   # what an uncaught error of a child is: the traceback on stderr and exit 1
+                traceback.print_exc()
+                code = 1
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+        sys.argv, sys.path[:], tempfile.tempdir = old_argv, old_path, old_tmp
+    return subprocess.CompletedProcess(argv, code, out.getvalue(), err.getvalue())
+
+
 def via_route(argv, env):
     """Run the mint with the named route (a pipe, --fd): the result's stdout is what came through the route (the token), and the real stdout must be empty."""
     r, w = os.pipe()
     try:
-        p = subprocess.run(argv + ["--fd", str(w)], env=env, capture_output=True, text=True, timeout=60, pass_fds=(w,))
+        if argv[0] == sys.executable and argv[1] != "-c":
+            p = run_in_process(argv + ["--fd", str(w)], env)
+        else:
+            p = subprocess.run(argv + ["--fd", str(w)], env=env, capture_output=True, text=True, timeout=60, pass_fds=(w,))
     finally:
         os.close(w)
     with os.fdopen(r) as f:
