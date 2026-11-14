@@ -33,8 +33,7 @@ _REAL_RUN = subprocess.run
 
 
 def _fast_run(args, *a, **kw):
-    """subprocess.run for the in-process mint: the three plain children of a copy run (echo of an id, cat of the key file, the stand-in openssl)
-    are answered here; anything else (a command with `;`, the real or spying openssl, other commands) is the real subprocess.run."""
+    """Fast path for the in-process mint: answers the three plain child commands (echo of an id, cat of the key file, stand-in openssl) in memory."""
     if isinstance(args, list) and len(args) == 3 and args[:2] == ["sh", "-c"] and isinstance(args[2], str):
         cmd = args[2]
         if cmd in ("echo 12345", "echo 678"):

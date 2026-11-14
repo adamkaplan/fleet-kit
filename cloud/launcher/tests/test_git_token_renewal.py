@@ -163,6 +163,10 @@ class Harness(base.Base):
         real_run = subprocess.run
 
         def run_in_process(cmd, *a, **kw):   # the fake mint run here, not in a new interpreter: the same (status, stdout, stderr)
+            if isinstance(cmd, list) and len(cmd) >= 2 and str(cmd[1]).endswith("/app_token.py"):   # the real mint, run here: its pipe end is this process's own
+                p = ta.run_in_process(list(cmd), kw.get("env") or os.environ)
+                subprocess.run = run_in_process   # the helper put the real one back
+                return subprocess.CompletedProcess(cmd, p.returncode, p.stdout, p.stderr)
             if not (isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == script):
                 return real_run(cmd, *a, **kw)
             out, err, code = io.StringIO(), io.StringIO(), 0
@@ -284,6 +288,10 @@ class RealMint(Harness):
         cls.keydir = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))
         cls.keyfile = os.path.join(cls.keydir.name, "k.pem")
         subprocess.run(["openssl", "genrsa", "-out", cls.keyfile, "2048"], check=True, capture_output=True)
+        cls.fast_openssl = os.path.join(cls.keydir.name, "openssl-fast")   # no signature is checked here: a stand-in that answers a fixed one
+        with open(cls.fast_openssl, "w") as f:
+            f.write("#!/bin/sh\ncat >/dev/null\nprintf fakesig\n")
+        os.chmod(cls.fast_openssl, 0o700)
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), ta.Stub)
         threading.Thread(target=cls.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
@@ -302,7 +310,7 @@ class RealMint(Harness):
         self.answer()
         del self.env["CW_GIT_TOKEN_CMD"]   # the default route: app_token.py OWNER/NAME
         self.env.update(CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile,
-                        CW_GITHUB_API_BASE="http://127.0.0.1:%d" % self.srv.server_port)
+                        CW_GITHUB_API_BASE="http://127.0.0.1:%d" % self.srv.server_port, CW_OPENSSL=self.fast_openssl)
 
     def answer(self, repos=None, perms=None, life=3500):
         ta.Stub.answer = {"token": NEW, "expires_at": ta.iso(life), "permissions": dict(perms if perms is not None else ta.PERMS),
