@@ -58,7 +58,9 @@ class TestGuardSet(unittest.TestCase):
         import importlib.util
         with tempfile.TemporaryDirectory() as d:
             tree = (Path(d) / "tree").resolve()   # macOS: /var is /private/var, and the module resolves its own __file__
-            shutil.copytree(REPO, tree, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            (tree / "bin").mkdir(parents=True)   # only what the copy's guard reads: the runner and the test directory
+            shutil.copy(REPO / "bin" / "test-switchboard", tree / "bin" / "test-switchboard")
+            shutil.copytree(REPO / "tests" / "switchboard", tree / "tests" / "switchboard", ignore=shutil.ignore_patterns("__pycache__"))
             spec = importlib.util.spec_from_file_location("guard_tree_wired", tree / "tests" / "switchboard" / "test_wired_tests.py")
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)

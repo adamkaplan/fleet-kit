@@ -24799,8 +24799,7 @@ class TestIdentityCheck(ReportBase):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, bindir, SAFE_PATH), "HOME": str(home),
                    "XDG_CONFIG_HOME": str(home / "xdg-config"), "FLEET_SWITCHBOARD_BIN": str(bindir / "sb"),
                    "FLEET_REAL_GH": str(bindir / "gh"), "GH_TOKEN": inherited}
-        if seconds is not None:
-            environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(seconds)
+        environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(0.2 if seconds is None and not wedge else (seconds or 5))
         environ.update(extra_env or {})
         if log.exists():
             log.unlink()
@@ -32934,13 +32933,12 @@ class TestRegistrarFloor(LedgerBase):
                         root = self.dc._root(x.func)
                         self.assertTrue(root in own or root in pure or (isinstance(x.func, ast.Attribute) and isinstance(x.func.value, ast.Call) and self.dc._root(x.func.value.func) == "super"), "a helper calls %s" % ast.unparse(x.func))
                         self.assertNotIn(root, self.FORBIDDEN_BUILTINS)
-                # protected: inside the closure (an edit is the owner's clear by the closure rule), or held by the lint when edited
+                if helper in self.names: continue   # protected: inside the closure (an edit is the owner's clear by the closure rule); the rest is held by the lint when edited
                 line = node.body[-1].end_lineno
                 lines = self.base_src.split("\n")
                 edited = "\n".join(lines[:line] + ["%sx_edit = 1" % (" " * node.body[-1].col_offset)] + lines[line:])
-                got, why = self.dc.registrar_findings(self.base_src, edited, self.rule)
-                self.assertIsNone(why)
-                self.assertTrue(helper in self.names or ("a named registration helper", "rebinds", helper) in got, "an unprotected helper: %s" % helper)
+                got, why = self.dc.registrar_findings(self.base_src, edited, self.rule); self.assertIsNone(why)
+                self.assertIn(("a named registration helper", "rebinds", helper), got, "an unprotected helper: %s" % helper)
 
     def test_every_daemon_file_callable_a_real_registrar_hands_to_its_parser_is_in_the_table(self):
         """Derived from the real registrars (never listed here): every module-level function or class they refer to, and what those call in turn, is a helper of the table."""
@@ -37847,7 +37845,8 @@ class TestImpactHold(LedgerBase):
             j += 1
         head = list(lines)
         head[j + 1] = head[j + 1] + "  # x"
-        diff = "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
+        lo, hi = max(0, j - 2), min(len(lines), j + 5)   # the one hunk, diffed alone: the file has tens of thousands of lines
+        diff = "\n".join(list(difflib.unified_diff(lines[lo:hi], head[lo:hi], lineterm="", n=3))[2:]).replace("@@ -1,", "@@ -%d," % (lo + 1), 1).replace(" +1,", " +%d," % (lo + 1), 1)
         head_source = "\n".join(head)
         cache = self._daemon_cache
         if cache and source is cache["source"]:   # the edited file's tree: the unchanged tree with the ONE edited definition parsed again at its own line numbers (the rest of the file is the same text)
@@ -80418,10 +80417,11 @@ class TestEveryTestClassIsolates(unittest.TestCase):
     """The ast of the suite (the entry, every test file, the support): every TestCase class derives (through any chain) from Base or is in NOT_ISOLATED_BY_BASE."""
 
     @staticmethod
-    def classes():
+    def classes(table={}):   # the table is filled once: the walk of every test file's ast is the cost
         import glob
+        if table:
+            return table
         root = Path(__file__).resolve().parents[1]
-        table = {}
         for pattern in ISOLATION_FILES:
             for path in sorted(glob.glob(str(root / pattern))):
                 for node in ast.parse(Path(path).read_text()).body:   # top level: a class nested in a test is that test's own fixture

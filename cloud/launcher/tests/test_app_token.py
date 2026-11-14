@@ -220,13 +220,13 @@ class Mint(unittest.TestCase):
 
     def run_mint(self, repo=REAL, runner=None, **env):
         e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_INSTALLATION_CMD="echo 678",
-                 CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
+                 CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.fast_openssl)
         e.update(env)
         argv = [sys.executable, "-c", runner, MINT, repo] if runner else [sys.executable, MINT, repo]
         return via_route(argv, e)
 
     def test_prints_only_the_token_and_signs_a_valid_short_jwt(self):
-        p = self.run_mint()
+        p = self.run_mint(CW_OPENSSL=self.wrap)
         self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)
         path, auth, body = Stub.seen[0]
         self.assertEqual((path, body), ("/app/installations/678/access_tokens", {"repositories": ["widget-service"], "permissions": PERMS}))
@@ -243,7 +243,7 @@ class Mint(unittest.TestCase):
         self.assertEqual(v.returncode, 0)
 
     def test_key_and_token_never_in_argv_env_files_or_stderr(self):
-        p = self.run_mint()
+        p = self.run_mint(CW_OPENSSL=self.wrap)
         self.assertEqual(p.returncode, 0)
         with open(self.argv_log) as f:
             spy = f.read()
@@ -328,7 +328,7 @@ class Mint(unittest.TestCase):
     def test_non_loopback_base_and_failing_vault_are_refused(self):
         for env in ({"CW_GITHUB_API_BASE": "http://example.com"}, {"CW_GITHUB_API_BASE": "https://127.0.0.1"},
                     {"CW_APP_KEY_CMD": "false"}, {"CW_APP_KEY_CMD": "echo not-a-key"}):
-            p = self.run_mint(**env)
+            p = self.run_mint(CW_OPENSSL=self.wrap, **env)
             self.assertNotEqual(p.returncode, 0, env)
             self.assertEqual(p.stdout, "")
         self.assertEqual(Stub.seen, [])

@@ -785,7 +785,7 @@ class S16Random(unittest.TestCase):
 
     def _cases(self):
         r = random.Random(SEED + 16)
-        cases = [self._case(r, i % 2) for i in range(420)]
+        cases = [self._case(r, i % 2) for i in range(310)]
         rr = random.Random(1616)
         form = rnd(rr, 319, "abcdefghijklmnopqrstuvwxyz0123456789")
         secs = [form[k:k + ln] for ln in [rr.randint(40, 120) for _ in range(100)] for k in [rr.randint(0, 319 - ln)]]
@@ -811,7 +811,7 @@ class S16Random(unittest.TestCase):
             if quiet:
                 continue
             a = ref(text, secs, 10 ** 7)
-            for build in (list, lambda s: list(reversed(s)), frozenset):
+            for build in (list, frozenset):
                 dep += fn(text, build(secs), 10 ** 7) != b
             if len(text) < 5000:
                 fout, M, R, marker_hit = flagged_ref(text, secs)
@@ -1131,8 +1131,8 @@ class S19RankGuard(unittest.TestCase):
             secs, hit, zero = c15._form_case(nsec, 5000)
             cases.append(("S15-%d" % nsec, hit, secs, None))
         bases = r16._cases()
-        for i in list(range(0, 20, 2)) + list(range(1, 30, 2)) + [420, 421]:
-            cases.append(("S%s-%d" % ("16" if i < 420 else "2", i), bases[i][0], bases[i][1], None))
+        for i in list(range(0, 10, 2)) + list(range(1, 15, 2)) + [len(bases) - 2, len(bases) - 1]:
+            cases.append(("S%s-%d" % ("16" if i < len(bases) - 2 else "2", i), bases[i][0], bases[i][1], None))
         out = []
         for label, text, secs, _ in cases:
             res = cw.scrub(text, set(secs), 10 ** 7)

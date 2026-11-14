@@ -140,13 +140,19 @@ def real_probe(server):
 STATE_KEYS = ("turn", "idle", "active_read", "session_updated", "turn_start")
 
 
+_PROBES = {}   # the probe answer per server shape: one loopback server and one probe process per distinct shape, not one per call
+
+
 def pod(server_kw=None, text="neutral last text", exists=True, ahead=2, runs=(), exits=(), **add):
     """A world with one pod whose probe answer carries the REAL structural fields read from a loopback server holding the fixtures' shapes."""
-    s = Server(**(server_kw or {}))
-    try:
-        data = real_probe(s)
-    finally:
-        s.close()
+    key = repr(sorted((server_kw or {}).items()))
+    if key not in _PROBES:
+        s = Server(**(server_kw or {}))
+        try:
+            _PROBES[key] = real_probe(s)
+        finally:
+            s.close()
+    data = json.loads(json.dumps(_PROBES[key]))
     w = World()
     w.add(runs=runs, exits=exits, **add)
     inner = w.pods["w1-pod"]["probe"]
