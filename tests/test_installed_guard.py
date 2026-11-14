@@ -76,7 +76,8 @@ class TreeCase(Base):
         template = self.template()
         shutil.copytree(str(template[0]), str(self.origin), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
         shutil.copytree(str(template[1]), str(self.tree), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
-        git(self.tree, "remote", "set-url", "origin", str(self.origin))   # the copy of the clone follows the copy of the origin
+        config = self.tree / ".git" / "config"   # the copy of the clone follows the copy of the origin: its url is changed in the file, not by a git child
+        config.write_text(config.read_text().replace("url = %s\n" % template[0], "url = %s\n" % self.origin))
         self.first, self.second, self.integration = template[2:]
         self.state = sb.ensure_state_dir()
         (self.state / "installed-tree").write_text("%s\nmain\n" % self.tree)
@@ -393,16 +394,14 @@ class TestTheEntryGuard(UnreadableTreeTests, TreeCase):
         script = other / ".git" / "hooks" / "pre-commit"
         script.write_text("#!/bin/sh\nexec \"%s\" -c 'import sys; sys.exit(0 if sys.argv[1] == \"feat\" else 1)' \"$(git rev-parse --abbrev-ref HEAD)\"\n" % sys.executable)
         script.chmod(0o755)
-        probe = self.home / "probe.py"
-        probe.write_text("import json, os, sys\nsys.path.insert(0, %r)\nimport installed_guard as g\nprint(json.dumps(g.problem(sys.argv[1], sys.argv[2])))\n" % str(BIN))
         env = dict(os.environ, **GIT_ENV)
         planted = {k: v for k, v in env.items()}
         planted.update({"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other), "GIT_INDEX_FILE": str(other / ".git" / "index")})
-        done = subprocess.run([sys.executable, str(probe), str(self.state), str(self.tree)], capture_output=True, text=True, env=planted)
-        self.assertEqual(json.loads(done.stdout), None, done.stderr)   # the installed tree is the clean default branch: good, whatever git was told
+        with mock.patch.dict(os.environ, planted):   # the guard's own git children inherit what git exports to a hook; no probe process
+            self.assertEqual(guard.problem(str(self.state), str(self.tree)), None)   # the installed tree is the clean default branch: good, whatever git was told
         git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
-        done = subprocess.run([sys.executable, str(probe), str(self.state), str(self.tree)], capture_output=True, text=True, env=planted)
-        self.assertIn("branch scratch", json.loads(done.stdout))
+        with mock.patch.dict(os.environ, planted):
+            self.assertIn("branch scratch", guard.problem(str(self.state), str(self.tree)))
 
     def rev_parse_fails(self, code=128, out=""):
         real = subprocess.run

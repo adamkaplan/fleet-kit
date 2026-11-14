@@ -54,6 +54,9 @@ def shim_plant(tmp, rel, source=PLAIN):
 
 
 def shim_run(tool, root, *paths):
+    if Path(tool) == TOOL:   # the real tool runs in this process (its own test file's loader and its once-run closure check); a planted copy keeps a child
+        import test_new_module_demands
+        return test_new_module_demands.run(TOOL, root, *paths)
     return subprocess.run([sys.executable, str(tool), "--root", str(root)] + list(paths), capture_output=True, text=True, cwd=str(root))
 
 
@@ -78,10 +81,16 @@ def shim_repo_adding(*rels):
     return root
 
 
+_LIVE_CLOSURE = []   # the line, once per process: derive-closure --check reads the live tree, which no test here changes
+
+
 def shim_live_closure():
+    if _LIVE_CLOSURE:
+        return _LIVE_CLOSURE[0]
     done = subprocess.run([sys.executable, str(REPO / "tools" / "derive-closure"), "--check"], capture_output=True, text=True, cwd=str(REPO))
     first = ((done.stdout or done.stderr).strip().splitlines() or ["(no output)"])[0]
-    return "derive-closure --check: %s (exit %d): %s" % ({0: "ok", 1: "differs"}.get(done.returncode, "could not run"), done.returncode, first)
+    _LIVE_CLOSURE.append("derive-closure --check: %s (exit %d): %s" % ({0: "ok", 1: "differs"}.get(done.returncode, "could not run"), done.returncode, first))
+    return _LIVE_CLOSURE[0]
 
 
 def shim_check_tool_accepts_shims(case, done, n=3):

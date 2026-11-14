@@ -319,25 +319,35 @@ class TestBatchCarry(unittest.TestCase):
     def test_s7_a_mutant_that_carries_without_the_line_check_or_for_another_member_head_or_skips_the_never_carried_check_fails(self):
         source = (BIN / "clear_carry.py").read_text()
 
-        def run(cc):
-            """The names of the checks that fail against this build of the module."""
-            failed = []
-            for label, build, expect in (("union carries", lambda w: None, True), ("extra line holds", lambda w: (w.main_moves("docs.md", "d1\nd2\nd3\nx\n", edit=("README.md", "widget api\nsneaked in\n"))), False),
-                                         ("amended member holds", lambda w: None, False), ("squash extra holds", lambda w: w.member(15, "c2.txt", "n\n", extra=("README.md", "widget api\nrode along\n")), False), ("table path holds", lambda w: w.member(15, "bin/impact_hold.py", "x = 2\n"), False)):
-                with tempfile.TemporaryDirectory() as tmp:
-                    world = TestBatchCarry("test_s3_the_exact_union_of_cleared_members_and_unheld_members_with_clean_merges_of_main_carries")
+        cases = (("union carries", lambda w: None, True), ("extra line holds", lambda w: (w.main_moves("docs.md", "d1\nd2\nd3\nx\n", edit=("README.md", "widget api\nsneaked in\n"))), False),
+                 ("amended member holds", lambda w: None, False), ("squash extra holds", lambda w: w.member(15, "c2.txt", "n\n", extra=("README.md", "widget api\nrode along\n")), False), ("table path holds", lambda w: w.member(15, "bin/impact_hold.py", "x = 2\n"), False))
+        worlds = []   # each scenario's repositories are built once; every build of the module is judged against the same ones
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, (label, build, expect) in enumerate(cases):
+                world = TestBatchCarry("test_s3_the_exact_union_of_cleared_members_and_unheld_members_with_clean_merges_of_main_carries")
+                world.api = world.make(Path(tmp) / ("r%d" % index))
+                world.dir = Path(tmp) / ("r%d" % index)
+                world.cc = self.cc
+                world.standard()
+                build(world)
+                worlds.append((label, expect, world))
+
+            def run(cc):
+                """The names of the checks that fail against this build of the module."""
+                failed = []
+                for label, expect, world in worlds:
                     world.cc = cc
-                    world.api = world.make(Path(tmp) / "r")
-                    world.dir = Path(tmp) / "r"
-                    world.standard()
-                    build(world)
+                    world.api.forget()
                     cleared = {11: "f" * 40, 12: world.api.rev("m12")} if label == "amended member holds" else None
                     held = (11, 12, 15) if label == "table path holds" else (11, 12)
                     if label == "table path holds":
                         cleared = {n: world.api.rev("m%d" % n) for n in (11, 12, 15)}
                     if world.decide(held=held, cleared=cleared)["carried"] is not expect:
                         failed.append(label)
-            return failed
+                return failed
+            self.run_mutants(source, run)
+
+    def run_mutants(self, source, run):
         self.assertEqual(run(self.cc), [], "the real module passes all four")
         for name, old, new, label in (("no line check", "extra = _excess(seen, expected)", "extra = {}", "extra line holds"),
                                       ("another member's head", "if held and cleared_head != own_head:", "if False:", "amended member holds"),

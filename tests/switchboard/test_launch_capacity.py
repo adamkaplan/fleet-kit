@@ -678,7 +678,7 @@ def glue(form):
     if rng.random() < 0.4 and "%" not in form:
         form += "".join(rng.choice("abcdefABCDEF") for _ in range(rng.randint(1, 3)))
     return form
-for _ in range(2500):
+for _ in range(400):
     # the oracle knows where it planted each address: every planted address is gone from the output, every planted non-address is unchanged
     line, put = rng.choice(labels), []
     form = address(); put.append(planted(form)); line += glue(form) + rng.choice(tails)

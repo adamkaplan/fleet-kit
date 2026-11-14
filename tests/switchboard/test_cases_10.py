@@ -50,7 +50,7 @@ from unittest import mock
 from support.core import Base, SAFE_PATH
 from support.fake_jev import GIT_SHIM, SHIM
 from support.installs_and_keys import GOOD_DONE_WHEN, GOOD_PLAN
-from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, sb, switchboard_source
+from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, captured, sb, switchboard_source
 from support.paths import BIN, REPO
 
 
@@ -1392,6 +1392,8 @@ class TestArchitectureSafetyNet(unittest.TestCase):
     TOOLS = REPO / "tools"
     BEFORE = "A = 1\n\n\ndef one():\n    return 1\n\n\ndef two():\n    return 2\n"
 
+    _TOOLS_LOADED = {}
+
     def load(self, name):
         loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(self.TOOLS / name))
         module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
@@ -1409,9 +1411,12 @@ class TestArchitectureSafetyNet(unittest.TestCase):
                 path.write_text(text)
                 paths.append(str(path))
             sides.append(paths)
-        proc = subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check"), "--before"] + sides[0] + ["--after"] + sides[1],
-                              capture_output=True, text=True)
-        return proc.returncode, proc.stdout
+        if "arch-split-check" not in self._TOOLS_LOADED:   # the tool is loaded once and its main runs in this process
+            self._TOOLS_LOADED["arch-split-check"] = self.load("arch-split-check")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self._TOOLS_LOADED["arch-split-check"].main(["--before"] + sides[0] + ["--after"] + sides[1])
+        return code or 0, out.getvalue()
 
     def test_a_move_across_files_and_a_reorder_pass(self):
         code, out = self.split_check([self.BEFORE], ["def two():\n    return 2\n", "A = 1\n\n\ndef one():\n    return 1\n"])
@@ -1686,6 +1691,7 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno <= line <= n.end_lineno]
         return min(spans)[1] if spans else None
 
+    _SITES_CACHE = {}   # (path, text) -> the bare gh sites found in it
     _AST_CACHE = {}   # (path, text) -> its tree: the scan only reads a tree, and the 26k-line daemon file is parsed once for every test of the class
 
     @classmethod
@@ -1707,17 +1713,22 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         config["gh"] (own_gh_path) and by the behaviour tests around it, which this scan does not replace."""
         found = []
         for path, text in sources.items():
-            tree = cls.parsed(path, text)
+            if (path, text) in cls._SITES_CACHE:   # a source the scan has already walked (the same text) gives the same sites: only a mutated file is walked again
+                found.extend(cls._SITES_CACHE[(path, text)])
+                continue
+            tree, here = cls.parsed(path, text), []
             for node in ast.walk(tree):
                 if isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == "gh":
                     if (path, cls.enclosing_function(tree, node.lineno)) in cls.ALLOWED_BARE_GH:
                         continue
-                    found.append((path, node.lineno))
+                    here.append((path, node.lineno))
                 elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     fn = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
                     first = node.args[0].value
                     if fn in cls.SUBPROCESS_CALLS and (first == "gh" or first.startswith("gh ")):
-                        found.append((path, node.lineno))
+                        here.append((path, node.lineno))
+            cls._SITES_CACHE[(path, text)] = here
+            found.extend(here)
         return found
 
     def test_no_bare_gh_argv_remains_in_the_switchboard_sources(self):
@@ -1806,10 +1817,14 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
                 sb.own_gh_path("gh", {"PATH": str(shimdir), "FLEET_REAL_GH": str(shimdir / "gh")})
             with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
                 sb.own_gh_path(str(shimdir / "gh"), {"PATH": str(shimdir)})
-            done = subprocess.run([sys.executable, str(SWITCHBOARD), "run", "--once"], capture_output=True, text=True, timeout=60,
-                                  env={"PATH": str(shimdir), "HOME": tmp, "XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp})
-            self.assertNotEqual(done.returncode, 0)
-            self.assertIn("no real gh behind the shim", done.stderr)
+            environ = {"PATH": str(shimdir), "HOME": tmp, "XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp}
+            with mock.patch.dict(os.environ, environ, clear=True), captured() as (out, err):   # the entry's main in this process: no interpreter start and import
+                try:
+                    code = sb.main(["run", "--once"])
+                except SystemExit as stop:
+                    code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+            self.assertNotEqual(code, 0)
+            self.assertIn("no real gh behind the shim", err.getvalue())
 
     def test_an_absolute_real_gh_is_used_as_it_is_and_a_real_gh_behind_the_shim_is_found(self):
         with tempfile.TemporaryDirectory() as tmp:

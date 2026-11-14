@@ -6,10 +6,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "bin"))
 import plan_check  # noqa: E402
+from support.loader import captured, sb  # noqa: E402
 
 DONE = "(1) the verb prints a summary"
 BASE = """## Plan (scenarios)
@@ -63,9 +65,14 @@ def run(text):
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "plan.md"
         path.write_text(text)
-        return subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "plan", "check", "--file", str(path), "--done-when", DONE],
-                              capture_output=True, text=True,
-                              env=dict(os.environ, HOME=tmp, XDG_STATE_HOME=tmp, XDG_CONFIG_HOME=tmp, FLEET_SWITCHBOARD_STATE=tmp))   # an isolated location, never the real one (#1322 guard)
+        argv = ["plan", "check", "--file", str(path), "--done-when", DONE]
+        isolated = dict(os.environ, HOME=tmp, XDG_STATE_HOME=tmp, XDG_CONFIG_HOME=tmp, FLEET_SWITCHBOARD_STATE=tmp)   # an isolated location, never the real one (#1322 guard)
+        with mock.patch.dict(os.environ, isolated), captured() as (out, err):   # the entry's main in this process: no interpreter start and import per run
+            try:
+                code = sb.main(argv)
+            except SystemExit as stop:
+                code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        return subprocess.CompletedProcess(argv, code or 0, out.getvalue(), err.getvalue())
 
 
 class TestNoFailureMode(unittest.TestCase):

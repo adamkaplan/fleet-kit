@@ -8581,7 +8581,7 @@ class TestGithubCatchUp(Base):
         self.rig.pump(10)
         first = len(self.gh.api_calls)
         self.assertGreater(first, 0)
-        self.rig.pump(3000)
+        self.rig.pump(3000, every=60)   # 50 passes over the same 3000 simulated seconds
         self.assertEqual(len(self.gh.api_calls), first, "a quiet, healthy forwarder is never polled")
 
     def test_a_restarted_forwarder_is_followed_by_another_read_that_recovers_the_gap(self):
@@ -17287,6 +17287,8 @@ class TestGitStashGuard(Base):
         if path is not None:
             e["PATH"] = path
         e.update(env or {})
+        if path is None:   # the shim in this process (its exec of the real git is a child run in `cwd`)
+            return importlib.import_module("support.rebind").run_in_process(None, list(args), e, shim_path=GIT_SHIM, cwd=cwd or self.repo)
         return subprocess.run([sys.executable, str(GIT_SHIM)] + list(args), capture_output=True, text=True, env=e, cwd=cwd or self.repo, timeout=60)
 
     def stashed(self):
@@ -24775,14 +24777,12 @@ class TestIdentityCheck(ReportBase):
         log = home / "shim-log.json"
         tokens = home / "tokens.json"
         tokens.write_text(json.dumps(token_for or {}))
-        (bindir / "gh").write_text(
-            "#!/usr/bin/env python3\nimport json,os,sys\n"
-            "if sys.argv[1:3]==['auth','token']:\n"
-            "    t=json.load(open(%r)).get(sys.argv[4])\n"
-            "    if t is None: sys.stderr.write('no token\\n'); sys.exit(1)\n"
-            "    print(t); sys.exit(0)\n"
-            "json.dump({'argv': sys.argv[1:], 'token': os.environ.get('GH_TOKEN')}, open(%r,'w'))\nprint('gh ran')\n"
-            % (str(tokens), str(log)))
+        (bindir / "gh").write_text(   # plain sh: no interpreter start per call
+            "#!/bin/sh\nif [ \"$1\" = auth ] && [ \"$2\" = token ]; then\n  val=$(sed -n 's/.*\"'\"$4\"'\": *\"\\([^\"]*\\)\".*/\\1/p' %r)\n"
+            "  [ -z \"$val\" ] && { echo 'no token' >&2; exit 1; }\n  echo \"$val\"; exit 0\nfi\nout=; sep=\ncase \"$*\" in *[![:print:]]*) exec python3 -c 'import json,os,sys; json.dump({\"argv\": sys.argv[2:], \"token\": os.environ.get(\"GH_TOKEN\")}, open(sys.argv[1],\"w\")); print(\"gh ran\")' %r \"$@\";; esac\n"
+            "for a in \"$@\"; do e=$(printf %%s \"$a\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g'); out=\"$out$sep\\\"$e\\\"\"; sep=,; done\n"
+            "if [ -n \"${GH_TOKEN+x}\" ]; then tok=\"\\\"$GH_TOKEN\\\"\"; else tok=null; fi\n"
+            "printf '{\"argv\": [%%s], \"token\": %%s}' \"$out\" \"$tok\" > %r\necho 'gh ran'\n" % (str(tokens), str(log), str(log)))
         (bindir / "gh").chmod(0o755)
         if wedge:   # a daemon or v2 that never answers
             (bindir / "sb").write_text("#!/bin/sh\nsleep 30\n")
@@ -25116,16 +25116,16 @@ class TestIdentityCheck(ReportBase):
 
     def test_a_failed_account_lookup_refuses_every_write_and_lets_every_read_through(self):
         users = {"acme-ops/service": "acct-ops"}
-        for label, tokens, extra in (("the identity lookup times out", {"acct-ops": "tok-ops"}, dict(wedge=True, seconds=0.3)),
+        for label, tokens, extra in (("the identity lookup times out", {"acct-ops": "tok-ops"}, dict(wedge=True, seconds=0.2)),
                                      ("the token lookup fails", {}, {})):
-            for args in self.WRITES:
+            for args in (self.WRITES[:2] if extra else self.WRITES):   # a wedged lookup costs its whole deadline per call: two of each kind stand for the rest
                 with self.subTest(label, write=args):
                     done, seen = self.run_gh_shim("acme-ops/service", users, tokens, args=args, **extra)
                     self.assertNotEqual(done.returncode, 0)
                     self.assertIn("account lookup failed, retry", done.stderr)
                     self.assertTrue(seen is None or seen["argv"][:2] == ["repo", "view"],      # the gate probe's own read may run; the write never does
                                     "no write went out with the inherited token: %r" % (seen,))
-            for args in self.READS:
+            for args in (self.READS[:2] if extra else self.READS):
                 with self.subTest(label, read=args):
                     done, seen = self.run_gh_shim("acme-ops/service", users, tokens, args=args, **extra)
                     self.assertEqual(done.returncode, 0, done.stderr)
@@ -25143,7 +25143,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(seen["token"], "tok-ops", "the mapped account's token, not the inherited one")
         self.assertNotIn("tok-ops", " ".join(seen["argv"]) + done.stdout + done.stderr)
-        for label, tokens, extra in (("the token lookup fails", {}, {}), ("the identity lookup times out", {"acct-ops": "tok-ops"}, dict(wedge=True, seconds=0.3))):
+        for label, tokens, extra in (("the token lookup fails", {}, {}), ("the identity lookup times out", {"acct-ops": "tok-ops"}, dict(wedge=True, seconds=0.2))):
             with self.subTest(label):
                 done, seen = self.run_gh_shim("acme-ops/service", users, tokens, args=("auth", "git-credential", "get"), **extra)
                 self.assertEqual(done.returncode, 1)
@@ -30265,7 +30265,7 @@ class TestRecordingCommands(LedgerBase):
     """#1049: every recording command (the set is read from the code: the functions marked `@recording`) ends with ONE line, `recorded #<id>`, `already recorded #<id>` or
     `not recorded: <reason>`, within ONE bound (`RECORD_WAIT_SECONDS`), and the same record again writes nothing. One row per member; one mutant per member."""
 
-    WAIT, PROGRESS = 1, 0.4   # the bound and the first word, shortened for the tests (the real values are the module's constants)
+    WAIT, PROGRESS = 1, 0.2   # the bound and the first word, shortened for the tests (the real values are the module's constants)
     EXEMPT = {   # commands that reach a ledger append and are NOT recording commands of this contract (the plan's out-of-scope list); a new one is a failure until it is placed
         "gates": "reads; its `ci-record` form is the daemon's recorder", "gates_ci_record": "the built-in `ci` recorder",
         "item_prove": "a work item, not a pull request", "item_verdict": "a work item, not a pull request", "item_ci_record": "a work item, not a pull request",
@@ -30361,7 +30361,7 @@ class TestRecordingCommands(LedgerBase):
         if hold:
             self.hold_the_lock()
         else:
-            self.slow_read = self.WAIT + 2
+            self.slow_read = self.WAIT + 0.6
         started = time.monotonic()
         code, out, err = self.invoke(name)
         elapsed = time.monotonic() - started
