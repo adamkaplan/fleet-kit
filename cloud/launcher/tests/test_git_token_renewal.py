@@ -189,6 +189,15 @@ class Harness(base.Base):
                         FAKE_KUBE_ECHO=OLD + " " + NEW, FAKE_KUBE_SEEN=os.path.join(d, "seen.jsonl"))
         self.outputs, self.expect_worker = [], WORKER
         self.install_worker()
+        self.initial_state = copy.deepcopy(self.st())
+        with open(os.path.join(self.records, WORKER + ".json"), "rb") as f:
+            self.initial_record = f.read()
+
+    def reset_worker(self):
+        """The default install_worker() again, from the copy taken in setUp: no pod is rendered a second time."""
+        self.write_state(copy.deepcopy(self.initial_state))
+        with open(os.path.join(self.records, WORKER + ".json"), "wb") as f:
+            f.write(self.initial_record)
 
     def set_mode(self, mode):
         with open(self.mode_file, "w") as f:
@@ -595,7 +604,7 @@ class Cases(Harness):
         }
 
     def run_case(self, name, setup, kind, text):
-        self.install_worker()
+        self.reset_worker()
         self.set_mode("ok")
         self.expect_worker = WORKER
         self.at(minutes=31)
@@ -659,13 +668,23 @@ class MutantTable(unittest.TestCase):
 
     def test_each_guard_mutant_is_killed(self):
         survivors, total = [], mutant_module(10 ** 6)[1]
+        c = Cases("test_every_case_of_the_table_ends_as_it_says")
+        c.setUp()
+        self.addCleanup(c.doCleanups)
+        self.addCleanup(c.tearDown)
+        env0 = dict(c.env)
         for i in range(total):
             mod, _ = mutant_module(i)
-            inner = type("Inner%d" % i, (Cases,), {"cwm": mod, "fail_fast": True})
-            result = unittest.TestResult()
-            unittest.TestSuite([inner("test_every_case_of_the_table_ends_as_it_says")]).run(result)
-            if result.wasSuccessful():
-                survivors.append(i)
+            c.env.clear()
+            c.env.update(env0)
+            c.cwm = mod
+            c.patch_kube(mod)
+            c.fail_fast = True
+            try:
+                c.test_every_case_of_the_table_ends_as_it_says()
+            except AssertionError:
+                continue
+            survivors.append(i)
         self.assertEqual(survivors, [], "guards whose removal no case notices (of %d)" % total)
 
 

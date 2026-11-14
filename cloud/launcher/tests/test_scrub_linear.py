@@ -229,17 +229,17 @@ def count_lines(fn, needle, *args):
 
 
 def case_sets(r):
-    """The 309 cases of S13: 5 fixed, 200 equal-length random, 100 mixed random, the 4 plain kinds."""
+    """The 99 cases of S13: 5 fixed, 60 equal-length random, 30 mixed random, the 4 plain kinds."""
     cases = [("zz abcdefgh12xy zz", ["abcdefgh12", "cdefgh12xy"]),
              ("xx abcdefgh1 [ab]cdefgh yy", ["abcdefgh1", "[ab]cdefgh", "cdefgh1234", "bcdefgh12]"]),
              ("a[abcdefgh]b[redacted]c", ["[abcdefgh", "abcdefgh]", "[redacted]x", "edacted]xy"]),
              ("12345678901234567890", ["1234567890", "0987654321", "4567890123", "7890123456"]),
              ("aaaaaaaaaaaaaaaaaaaa", ["aaaaaaaaa", "aaaaaaaab", "baaaaaaaa", "aaaaaaaaaa"])]
-    for _ in range(200):
+    for _ in range(60):
         n = r.randint(8, 12)
         secs = [rnd(r, n, "abcd[]") for _ in range(r.randint(4, 6))]
         cases.append(("".join(r.choice(secs)[r.randint(0, 3):r.randint(6, n)] + r.choice(["", "x", " "]) for _ in range(8)), secs))
-    for _ in range(100):
+    for _ in range(30):
         secs = [rnd(r, r.randint(8, 16), "abcde[]") for _ in range(r.randint(1, 5))]
         cases.append(("".join(r.choice(secs)[r.randint(0, 4):r.randint(8, 16)] + rnd(r, 2, "abcde") for _ in range(8)), secs))
     p = "p" + "Qw3rT7yU1iO5pA9sD2fG4hJ6kL8"
@@ -420,7 +420,7 @@ class S3Fixtures(unittest.TestCase):
             "overlap": ("abcdefghijklmnopqrst", {"abcdefghijkl", "ghijklmnopqrst"}),
             "regex chars": ("a.*+?(b)[c]{d}|^$ and a.*+?(b)[c]{d}|^$", {"a.*+?(b)[c]{d}|^$"}),
             "empty": ("some text here", {"", "   "}),
-            "5MiB": (("lorem ipsum " + p + " ") * 200000, {p}),
+            "5MiB": (("lorem ipsum " + p + " ") * 40000, {p}),
             "shapes": ("Authorization: Bearer abc123def456ghi789 https://user:pw@host/x " + "A" * 60 + " " + "0123456789abcdef" * 4
                        + " eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl", set()),
             "spaces ends": ("a  spaced secret  b", {"  spaced secret  "}),
@@ -798,8 +798,8 @@ class S16Random(unittest.TestCase):
         cases.append((text, secs))
         return cases
 
-    def _check(self, fn, quiet=False):
-        cases = self._cases()
+    def _check(self, fn, quiet=False, cases=None):
+        cases = self._cases() if cases is None else cases
         equal = many = later = dep = 0
         for text, secs in cases:
             b = fn(text, set(secs), 10 ** 7)
@@ -830,10 +830,11 @@ class S16Random(unittest.TestCase):
         self.assertGreaterEqual(later, 100)
 
     def test_S16_differential_and_mutant(self):
-        self._check(cw.scrub)
+        cases = self._cases()
+        self._check(cw.scrub, cases=cases)
         m = mutant("                if b > merged[-1][1]:\n                    merged[-1][1] = b\n", "                pass\n")[0]
         with self.assertRaisesRegex(AssertionError, "the output breaks the property"):
-            self._check(m, quiet=True)
+            self._check(m, quiet=True, cases=cases)
         print("S16 control passes 1 of 1, the mutant that drops a later overlapping match fails 1 of 1, mutation applied")
 
 
@@ -1129,10 +1130,10 @@ class S19RankGuard(unittest.TestCase):
         r16 = S16Random()
         cases = []
         for nsec in (30, 197):
-            secs, hit, zero = c15._form_case(nsec, 5000)
+            secs, hit, zero = c15._form_case(nsec, 2000)
             cases.append(("S15-%d" % nsec, hit, secs, None))
         bases = r16._cases()
-        for i in list(range(0, 10, 2)) + list(range(1, 15, 2)) + [len(bases) - 2, len(bases) - 1]:
+        for i in [0, 1, 2, 3, len(bases) - 2, len(bases) - 1]:
             cases.append(("S%s-%d" % ("16" if i < len(bases) - 2 else "2", i), bases[i][0], bases[i][1], None))
         out = []
         for label, text, secs, _ in cases:

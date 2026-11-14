@@ -7,6 +7,7 @@ import io
 import json
 import os
 import runpy
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,29 @@ def iso(seconds):
 
 
 _CODE_CACHE = {}
+_REAL_RUN = subprocess.run
+
+
+def _fast_run(args, *a, **kw):
+    """subprocess.run for the in-process mint: the three plain children of a copy run (echo of an id, cat of the key file, the stand-in openssl)
+    are answered here; anything else (a command with `;`, the real or spying openssl, other commands) is the real subprocess.run."""
+    if isinstance(args, list) and len(args) == 3 and args[:2] == ["sh", "-c"] and isinstance(args[2], str):
+        cmd = args[2]
+        if cmd in ("echo 12345", "echo 678"):
+            return subprocess.CompletedProcess(args, 0, cmd.split()[1] + "\n", "")
+        if cmd.startswith("cat '") and cmd.endswith("'") and cmd.count("'") == 2 and ";" not in cmd:
+            try:
+                with open(cmd.split("'")[1]) as f:
+                    return subprocess.CompletedProcess(args, 0, f.read(), "")
+            except (OSError, UnicodeDecodeError):
+                pass
+    elif (isinstance(args, list) and len(args) == 5 and str(args[0]).endswith("openssl-fast") and args[1:4] == ["dgst", "-sha256", "-sign"]
+          and str(args[4]).startswith("/dev/fd/")):
+        fd = int(args[4].rsplit("/", 1)[1])
+        while os.read(fd, 65536):   # the key written by the feeding thread: read to the end, so that thread finishes
+            pass
+        return subprocess.CompletedProcess(args, 0, b"fakesig", b"")
+    return _REAL_RUN(args, *a, **kw)
 
 
 def run_in_process(argv, env):
@@ -46,7 +70,13 @@ def run_in_process(argv, env):
                 with open(argv[1]) as sf:
                     src = sf.read()
                 code_obj = _CODE_CACHE.get(src) or _CODE_CACHE.setdefault(src, compile(src, argv[1], "exec"))
-                exec(code_obj, {"__name__": "__main__", "__file__": argv[1]})
+                subprocess.run = _fast_run
+                ssl.SSLContext.set_default_verify_paths = lambda self: None   # the stub server is plain http: loading the system CA files for each request is ~4 ms of nothing
+                try:
+                    exec(code_obj, {"__name__": "__main__", "__file__": argv[1]})
+                finally:
+                    subprocess.run = _REAL_RUN
+                    del ssl.SSLContext.set_default_verify_paths
             except SystemExit as e:
                 code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
                 if isinstance(e.code, str):

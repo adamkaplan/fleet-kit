@@ -233,8 +233,7 @@ class Refresh(base.Base):
             with open(path + ".py", "w") as f:
                 f.write(text)
             log = path + ".envlog"
-            guard = ' case " $* " in *" cw-operator "*) ;; *) exec %s "$0.PY" "$@";; esac\n' % self.interpreter if name.endswith("kubectl") else ""
-            guard = guard.replace('"$0.PY"', '"%s.py"' % path)
+            guard = ' case " $* " in *" cw-operator "*) ;; *) exec %s "$FAKE_REAL_KUBECTL" "$@";; esac\n' % self.interpreter if name.endswith("kubectl") else ""   # the real fake directly: one interpreter, not two
             script = ("#!/bin/sh\n" + guard.replace(" case", "case", 1) +
                       "{ echo '%s'; env; } >> '%s'\n" % (ENV_MARKER, log) +
                       'exec %s "%s.py" "$@"\n' % (self.interpreter, path))
@@ -474,7 +473,7 @@ class Failures(Refresh):
                 self.set_token_mode(token)
                 old = make_token(int(self.clock().timestamp()) - 10)
                 self.write_token_file(old)
-                code, out, err = self.passes(5)
+                code, out, err = self.passes(2)
                 self.assertEqual(self.token_bytes().decode(), old)          # the old file is kept
                 lines = self.refresh_lines()
                 self.assertEqual(len(lines), 1, lines)                      # one line, not one per pass

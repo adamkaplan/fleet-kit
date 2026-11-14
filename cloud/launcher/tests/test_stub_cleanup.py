@@ -1047,14 +1047,12 @@ def _case(s):
 
 def _mutant_case(s, how):
     def run(self):
+        tree = mutate(s["tree"], s, how, return_tree=True)
+        self.assertIsNotNone(tree, "no mutant for %s" % site_name(s))
         if how == "alias":
-            src = mutate(s["tree"], s, how)
-            self.assertIsNotNone(src, "no mutant for %s" % site_name(s))
-            self.assertIn(ALIAS, src, "the alias mutant of %s does not carry the alias" % site_name(s))
-            tree = ast.parse(src, filename=str(s["file"]))
-        else:
-            tree = mutate(s["tree"], s, how, return_tree=True)
-            self.assertIsNotNone(tree, "no mutant for %s" % site_name(s))
+            self.assertTrue(any(getattr(n, "id", None) == ALIAS or getattr(n, "asname", None) == ALIAS or getattr(n, "name", None) == ALIAS
+                                or getattr(n, "arg", None) == ALIAS for n in ast.walk(tree)),
+                            "the alias mutant of %s does not carry the alias" % site_name(s))
         bad = [x for x in scan_tree(s["file"], tree) if not x["ok"]]
         self.assertEqual(sorted({x["func"] for x in bad}), [s["func"] if s["kind"] != "embedded" else "<string>"], "the scan missed the %s mutant of %s" % (how, site_name(s)))
     return run
