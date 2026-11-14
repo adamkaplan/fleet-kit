@@ -106,10 +106,10 @@ class Base(unittest.TestCase):
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            for _ in range(100):
+            for _ in range(330):
                 if not alive(pid):
                     break
-                time.sleep(0.1)
+                time.sleep(0.03)
             else:
                 os.kill(pid, signal.SIGKILL)
 
@@ -149,7 +149,7 @@ class Foreground(Base):
 
 class Background(Base):
     def test_s3_s4_start_returns_at_once_and_the_run_finishes_after_the_starter_and_its_group_end(self):
-        repo = self.repo(0.5)
+        repo = self.repo(0.2)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "20"})
         path_printed = sum(1 for l in out.splitlines() if l.endswith("result.json") and os.path.join(result, "") in l)
         pid = self.wait(result, lambda d: d["pid"] > 0)["pid"]
@@ -163,7 +163,7 @@ class Background(Base):
             os.killpg(p.pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        d = self.wait(result, lambda d: d["status"] == "finished", 20)
+        d = self.wait(result, lambda d: d["status"] == "finished", 8)
         done = [f for f in d["files"] if f["branch"] != "not started" and f["base"] != "not started" and f["branch_seconds"] is not None]
         self.assertEqual(len(done), 3, d)
         tally("finished")
@@ -199,7 +199,7 @@ class Background(Base):
     def test_s7_a_run_in_progress_is_reported_as_running_and_never_as_passed(self):
         repo = self.repo(0.4)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "30"})
-        d = self.wait(result, lambda d: any(f["file"].endswith("test_b_slow.py") and "running" in (f["branch"], f["base"]) for f in d["files"]), 12)
+        d = self.wait(result, lambda d: any(f["file"].endswith("test_b_slow.py") and "running" in (f["branch"], f["base"]) for f in d["files"]), 8)
         r = self.read(installed, result, repo)
         running = [l for l in r.stdout.splitlines() if l.startswith("RUNNING ") and "test_b_slow" in l]
         d = self.doc(result)

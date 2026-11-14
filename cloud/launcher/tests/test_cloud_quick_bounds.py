@@ -75,12 +75,12 @@ class Mini(unittest.TestCase):
 
 class TestClamp(Mini):
     def setUp(self):
-        self.r = self.make({"lib.py": "x = 0\n", "cloud/launcher/tests/test_slow.py": "import time\n# reads lib.py\ntime.sleep(20)\n",
+        self.r = self.make({"lib.py": "x = 0\n", "cloud/launcher/tests/test_slow.py": "import time\n# reads lib.py\ntime.sleep(8)\n",
                             "bin/test-cloud-launcher": "tests/test_slow.py\n"}, "lib.py")
 
     def test_total_never_exceeds_bound_plus_grace(self):
-        p, secs = self.run_pre(self.r, PRE, 4)
-        self.assertLess(secs, 4 + 8, p.stdout)
+        p, secs = self.run_pre(self.r, PRE, 1)
+        self.assertLess(secs, 1 + 5, p.stdout)
         self.assertIn("NOT RUN (budget)", p.stdout)
         self.assertEqual(p.returncode, 3)
         self.assertNotIn("RESULT: PASS", p.stdout)
@@ -92,8 +92,8 @@ class TestClamp(Mini):
         m2 = m1.replace("tmo = min(timeout, max(1, int(QUICK_TOTAL - (clock() - t_start))))", "tmo = timeout")
         self.assertNotEqual(m2, m1)  # the second clamp is removed too
         write(m, m2)
-        p, secs = self.run_pre(self.r, m, 4)
-        self.assertGreaterEqual(secs, 4 + 8)
+        p, secs = self.run_pre(self.r, m, 1)
+        self.assertGreaterEqual(secs, 1 + 5)
 
 
 class TestNoReader(Mini):

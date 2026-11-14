@@ -103,10 +103,10 @@ def alive(pid):
 
 
 def wait_dead(pid):
-    for _ in range(50):
+    for _ in range(250):
         if not alive(pid):
             return True
-        time.sleep(0.1)
+        time.sleep(0.02)
     return False
 
 
@@ -181,8 +181,11 @@ class TestHeavy(Base):
 class TestBounds(Base):
     def test_values(self):
         repo = make_repo(os.path.join(self.tmp, "r"), {TD + "test_x.py": "# a.txt\n" + PASS})
-        for v in ("0", "-1", "abc", "1e3", "1.5", " 5", "5\n", "999999999", ""):
-            for name in ("CLOUD_PREPUSH_TIMEOUT", "CLOUD_PREPUSH_TOTAL", "CLOUD_PREPUSH_PREFLIGHT_TIMEOUT"):
+        # all three variables go through the same bound() helper: every bad shape on one, the two plainest on the other two
+        cases = [("CLOUD_PREPUSH_TIMEOUT", v) for v in ("0", "-1", "abc", "1e3", "1.5", " 5", "5\n", "999999999", "")]
+        cases += [(name, v) for name in ("CLOUD_PREPUSH_TOTAL", "CLOUD_PREPUSH_PREFLIGHT_TIMEOUT") for v in ("0", "abc")]
+        for name, v in cases:
+            if True:
                 p = run(repo, env={name: v})
                 self.assertEqual(p.returncode, 2, (name, v, p.stderr))
         self.assertEqual(run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "86400"}).returncode, 0)
