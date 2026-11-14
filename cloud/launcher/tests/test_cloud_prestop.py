@@ -2,6 +2,7 @@ import atexit
 """Ask #1142: the pod's pre-stop hook (cw-prestop / cw-end-hook --prestop). Fake cluster = run the rendered spec's own command."""
 import argparse, datetime as dt, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
 import pathlib
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -702,13 +703,23 @@ class Completeness(Base):
         cfg = os.path.join(self.work, ".git", "config")
         with open(cfg, "w") as f:
             f.write(self.plain)
+        plain = False
         try:
-            if not self.append_plain(key, value):
+            plain = self.append_plain(key, value)
+            if not plain:
                 sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
         except subprocess.CalledProcessError:
             return True   # git itself cannot store this name (a documentation pattern such as gitweb.remote_heads): it can never be in a repository
         try:
-            cw_end_hook.config_refusal(self.work, REPO, self.ctx)
+            if plain and not key.lower().startswith(("include.", "includeif.", "core.worktree", "extensions.")):
+                # what git would list for the one appended entry (names lower-cased but for a subsection), without a spawn of git per key
+                parts = key.split(".")
+                norm = "%s.%s" % (parts[0].lower(), parts[1].lower()) if len(parts) == 2 else "%s.%s.%s" % (parts[0].lower(), ".".join(parts[1:-1]), parts[-1].lower())
+                listed = subprocess.CompletedProcess(args=[], returncode=0, stdout=self._base_z + ("file:.git/config\0%s\n%s\0" % (norm, value)).encode(), stderr=b"")
+                with mock.patch.object(cw_end_hook.subprocess, "run", return_value=listed):
+                    cw_end_hook.config_refusal(self.work, REPO, self.ctx)
+            else:
+                cw_end_hook.config_refusal(self.work, REPO, self.ctx)
         except (cw_end_hook.ConfigRefused, RuntimeError):   # RuntimeError: git cannot read the repository (core.worktree, extensions.*): nothing is pushed either
             return True
         return False
@@ -719,6 +730,7 @@ class Completeness(Base):
         self.ctx = cw_end_hook.Ctx(self.helper)
         self.addCleanup(self.ctx.close)
         self.ctx.env["PATH"] = "/usr/bin:/bin"
+        self._base_z = subprocess.run([GIT, "-C", self.work, "config", "--local", "--includes", "--show-origin", "--list", "-z"], capture_output=True, env=self.ctx.env).stdout
 
     def doc_keys(self):
         keys = [l.strip() for l in pathlib.Path(KEYS_FIXTURE).read_text().splitlines(True) if l.strip() and not l.startswith("#")]

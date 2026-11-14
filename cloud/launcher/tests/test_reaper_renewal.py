@@ -159,32 +159,36 @@ def audit_lines(env):
 def stall_scenario(mod, all_due=False):
     """One pass while the stop of the idle pod takes 50 minutes of the fake clock. Returns the measurements."""
     clock = Clock()
-    go, done = threading.Semaphore(0), threading.Semaphore(0)
+    entered, go, done = threading.Semaphore(0), threading.Semaphore(0), threading.Semaphore(0)
+    first = [True]
 
-    ready = [False]
-
-    def wait():
-        if ready[0]:
-            done.release()   # only after the previous wakeup's due()/tick() has finished
+    def wait():   # the thread's pause: it reports that it is parked, then waits to be let go (one wakeup at a time, in lockstep with the stop)
+        if first[0]:
+            first[0] = False
         else:
-            ready[0] = True
+            done.release()   # only after the previous wakeup's due()/tick() has finished
+        entered.release()
         go.acquire()
 
     def stop(args, reason):
-        while not ready[0]:   # the thread is parked in its first wait
-            time.sleep(0.001)
         for _ in range(50):
+            entered.acquire()   # the thread is parked in a wait
             clock.now += MIN
             go.release()
             done.acquire()
         return {}
 
-    with tempfile.TemporaryDirectory() as tmp:
-        launcher, kube, refresher, ticker, renewed, attempts, env = build(mod, clock, tmp, stop, wait, True, all_due=all_due)
-        ticker.start()
-        launcher.reap()
-        ticker._stop.set()
-        go.release()
+    saved_limit, mod.REAP_STOP_SECONDS = mod.REAP_STOP_SECONDS, 10 ** 9   # the stop is meant to run its 50 fake minutes: the pass must not abandon it when its poll happens to see 7 of them
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher, kube, refresher, ticker, renewed, attempts, env = build(mod, clock, tmp, stop, wait, True, all_due=all_due)
+            ticker.start()
+            launcher.reap()
+            ticker._stop.set()
+            go.release()
+            ticker.thread.join(5)
+    finally:
+        mod.REAP_STOP_SECONDS = saved_limit
     due = {n: T0 + (0 if all_due or int(n[-2:]) < 6 else 10) * MIN for n in renewed}
     return {"renewed": renewed, "due": due, "refreshes": refresher.runs, "stop_ends": T0 + 50 * MIN}
 

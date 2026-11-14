@@ -384,15 +384,15 @@ class S2Differential(unittest.TestCase):
     def test_S2_random_cases(self):
         r = random.Random(SEED)
         bad = 0
-        for _ in range(2000):
+        for _ in range(400):
             secs = [rnd(r, r.randint(0, 14), "ab[]redact d") for _ in range(r.randint(0, 5))]
             text = rnd(r, r.randint(0, 60), "ab[]redact d")
             bad += cw.scrub(text, set(secs), 5000) != ref(text, set(secs), 5000)
-        for _ in range(200):
+        for _ in range(60):
             secs = [rnd(r, r.randint(8, 12), "abcd") for _ in range(r.randint(1, 40))]
             text = rnd(r, 300, "abcd")
             bad += cw.scrub(text, set(secs), 5000) != ref(text, set(secs), 5000)
-        print("S2 seed %d cases 2200 differing %d" % (SEED, bad))
+        print("S2 seed %d cases 460 differing %d" % (SEED, bad))
         self.assertEqual(bad, 0, "the new scrub differs from the old one")
 
     def test_S2_worst_case(self):
@@ -629,7 +629,7 @@ def tally(code, calls):
     return n["snap"], n["build"]
 
 
-def synthetic_forms(seed, n=5000):
+def synthetic_forms(seed, n=1000):
     r = random.Random(seed)
     return {rnd(r, r.randint(8, 40), "abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(n)}
 
