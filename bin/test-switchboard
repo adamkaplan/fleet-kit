@@ -37869,7 +37869,7 @@ class TestImpactHold(LedgerBase):
                 return getattr(real_ast, attr)
             def parse(self, src, *a, **k):
                 if not a and not k:
-                    return cache["tree"] if src is cache["source"] else cache["heads"].get(src) or real_ast.parse(src)
+                    return cache["tree"] if src is cache["source"] else cache["heads"].get(src) or importlib.import_module("support.rebind").spliced_head(cache, src, real_ast)
                 return real_ast.parse(src, *a, **k)
         def cached_closure(tree, roots, dyn=()):
             if tree is not cache["tree"] and id(tree) not in cache.get("same_closure_ids", ()):
