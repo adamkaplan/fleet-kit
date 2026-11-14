@@ -723,8 +723,13 @@ def mutate(tree, site, how="remove"):
     alias, how = how == "alias", ("remove" if how == "alias" else how)   # alias: the remove mutant, with the started call renamed through an alias
     if alias and site["kind"] not in ("popen", "process", "thread", "helper"):
         return None
-    t = copy.deepcopy(tree)   # a private copy; the same site is found again by its place among the sites of its kind in the file
-    ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"]].index(site["line"])
+    # a private copy of what the mutant needs: the top-level statements that are not definitions (imports, aliases) and the one statement that holds
+    # the site; the other definitions cannot change the verdict on this site, and copying, scanning and unparsing a whole file for each of ~250 mutants cost minutes
+    holder = [b for b in tree.body if getattr(b, "lineno", 0) <= site["line"] <= getattr(b, "end_lineno", 0)]
+    lo, hi = (holder[0].lineno, holder[0].end_lineno) if holder else (0, 10 ** 9)
+    keep = [b for b in tree.body if b in holder or not isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    t = copy.deepcopy(ast.Module(body=keep, type_ignores=[]))
+    ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"] and lo <= x["line"] <= hi].index(site["line"])
     target = sorted([x for x in scan_tree(site["file"], t) if x["kind"] == site["kind"]], key=lambda x: x["line"])[ordinal]
     par, node, kind = target["par"], target["node"], site["kind"]
     if kind == "helper" and how == "remove":
