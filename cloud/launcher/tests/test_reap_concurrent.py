@@ -433,11 +433,12 @@ class ScrubSnapshot(unittest.TestCase):
         planted = "PLANTED-known-secret-value-0001"
         known = {planted} | {"early-known-%07d-xx" % i for i in range(SCRUB_SET)}
         text = "log line with " + planted + " inside"
-        errors, removed, done = [], 0, threading.Event()
+        errors, removed, done, started = [], 0, threading.Event(), threading.Event()
 
         def adder():
             i = 0
-            while not done.is_set() and i < 20000:   # keeps growing the set for the whole run: the scrub keeps a built copy of an unchanged set
+            while not done.is_set() and i < 20000:
+                started.set()   # keeps growing the set for the whole run: the scrub keeps a built copy of an unchanged set
                 known.add("late-added-%07d-yy" % i)
                 i += 1
                 time.sleep(0)
@@ -446,6 +447,7 @@ class ScrubSnapshot(unittest.TestCase):
         sys.setswitchinterval(1e-6)   # the adder gets the interpreter inside a scrub, not only between two
         self.addCleanup(sys.setswitchinterval, old_interval)
         t.start()
+        started.wait(5)   # the adder runs while the scrubs do, also on a runner with few cores
         for _ in range(SCRUB_RUNS):
             try:
                 removed += planted not in mod.scrub(text, known)

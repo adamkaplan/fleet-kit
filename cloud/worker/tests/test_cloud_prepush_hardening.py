@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests of the hardening of bin/cloud-prepush (ask #1284): process-group kill on timeout, the memory-heavy
 list, the bound values. Throwaway repositories under the temporary directory only."""
+import atexit
 import os
 import shutil
 import subprocess
@@ -31,7 +32,24 @@ def put(repo, rel, text, mode=0o755):
     os.chmod(path, mode)
 
 
+_TEMPLATES = {}
+
+
 def make_repo(tmp, tests):
+    """The repository of these test files: built once per distinct set (git runs once), then copied."""
+    key = tuple(sorted(tests.items()))
+    template = _TEMPLATES.get(key)
+    if template is None:
+        holder = tempfile.mkdtemp(prefix="prepush-hard-tpl-")
+        atexit.register(shutil.rmtree, holder, True)
+        template = _TEMPLATES[key] = _build_repo(holder, tests)
+    repo = os.path.join(tmp, "repo")
+    os.makedirs(tmp, exist_ok=True)
+    shutil.copytree(template, repo, symlinks=True)
+    return repo
+
+
+def _build_repo(tmp, tests):
     repo = os.path.join(tmp, "repo")
     os.makedirs(repo)
     git(repo, "init", "-q", "-b", "trunk")
@@ -108,11 +126,11 @@ class TestGroupKill(Base):
         out = {}
         # preflight timeout
         repo = make_repo(os.path.join(self.tmp, "r1"), {TD + "test_x.py": "# a.txt\n" + PASS})
-        out["pf"] = run(repo, preflight=spawner(pf), env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "2"},
+        out["pf"] = run(repo, preflight=spawner(pf), env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "1"},
                         script_text=script_text)
         # per-test timeout
         repo = make_repo(os.path.join(self.tmp, "r2"), {TD + "test_x.py": "# a.txt\n" + spawner(tf)})
-        out["test"] = run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "2"}, script_text=script_text)
+        out["test"] = run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "1"}, script_text=script_text)
         return out, pf, tf
 
     def test_preflight_and_test_children_die(self):

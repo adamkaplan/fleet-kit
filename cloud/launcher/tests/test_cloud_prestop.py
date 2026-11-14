@@ -427,6 +427,7 @@ class Grammar(Base):
         self.inc = os.path.join(self.t, "included")
         pathlib.Path(self.inc).write_text('[url "%s"]\n\tinsteadOf = %s\n\tpushInsteadOf = %s\n' % (self.other, self.host, self.host))
         self.cfg = os.path.join(self.work, ".git", "config")
+        self._seam_hook = self.seam(HOOK)
         self.plain = pathlib.Path(self.cfg).read_text()
         self.base_head = sh("git", "-C", self.work, "rev-parse", "HEAD")
         self.fake_git('echo "$@" >> %s\n{ echo "ARGS $@"; env | sort; echo "HOMEFILES $(ls -A "$HOME" | wc -l | tr -d " ")"; echo; } >> %s\nexec REAL "$@"\n'
@@ -442,15 +443,18 @@ class Grammar(Base):
         return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True)] if os.path.exists(self.calls) else []
 
     def reset(self):
+        pushed = any("push" in c for c in self.calls_list())
         for f in (self.calls, self.envlog, self.marker, os.path.join(self.t, "helper.log")):
             if os.path.exists(f):
                 os.remove(f)
         pathlib.Path(self.cfg).write_text(self.plain)
+        if not pushed:   # nothing was pushed: the remote is as it was
+            return
         for r in sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)").split():
             if r != "refs/heads/main":
                 sh("git", "-C", self.origin, "update-ref", "-d", r)
         sh("git", "-C", self.work, "reset", "-q", "--hard", self.base_head)
-        sh("git", "-C", self.work, "clean", "-qfd")
+        sh("git", "-C", self.work, "clean", "-fdqx")
 
     def other_refs(self):
         return sh("git", "-C", self.evil, "for-each-ref", "--format=%(refname)")
@@ -461,10 +465,13 @@ class Grammar(Base):
         return self.run_hook(hook, **kw)
 
     def run_hook(self, hook, **kw):
-        return subprocess.run([self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+        return subprocess.run([self._seam_hook if hook == HOOK else self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
 
     def set_local(self, key, value):
-        sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
+        head, _, name = key.rpartition(".")
+        section, _, sub = head.partition(".")
+        header = '%s "%s"' % (section, sub) if sub else section
+        pathlib.Path(self.cfg).write_text(pathlib.Path(self.cfg).read_text() + "[%s]\n\t%s = %s\n" % (header, name, value))
 
     def global_files(self, key, value):
         """The same key in the home file, the global-override file, and the variables: returns environment overrides."""

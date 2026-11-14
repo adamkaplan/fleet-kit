@@ -304,8 +304,15 @@ class Mutants(unittest.TestCase):
                                   env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
             return done.returncode, done.stderr, applied
 
+    _control_cache = None   # the run of the unmutated copy, made once for the two tests that read it
+
+    def control_run(self):
+        if Mutants._control_cache is None:
+            Mutants._control_cache = self.run_tree()
+        return Mutants._control_cache
+
     def test_matches_the_unchanged_copy_passes(self):
-        code, output, _ = self.run_tree()
+        code, output, _ = self.control_run()
         self.assertEqual(code, 0, output[-1500:])
 
     @staticmethod
@@ -317,7 +324,7 @@ class Mutants(unittest.TestCase):
         return (int(ran.group(1)) if ran else 0), failed
 
     def test_matches_each_mutant_fails_with_the_check_named(self):
-        control_code, control_output, _ = self.run_tree()
+        control_code, control_output, _ = self.control_run()
         ran, control_failed = self.counts(control_output)
         control_passed = ran - control_failed if control_code == 0 else 0
         self.assertEqual(control_code, 0, "the control must pass first: " + control_output[-1500:])

@@ -2,10 +2,16 @@
 """A fake kubectl for the offline tests: state is one JSON file (FAKE_KUBE_STATE). Supports only what cloud-worker uses."""
 import fcntl, json, os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
+_OWN = []
 def parent_command(argv):   # the caller's command line, as `ps -o command=` shows it; in-process the caller is this very process (no `ps` to start)
     if argv is not None:
-        with open("/proc/%d/cmdline" % os.getpid(), "rb") as f:
-            return " ".join(f.read().decode("utf-8", "replace").split("\0")).strip() + "\n"
+        if not _OWN:
+            try:
+                with open("/proc/%d/cmdline" % os.getpid(), "rb") as f:
+                    _OWN.append(" ".join(f.read().decode("utf-8", "replace").split("\0")).strip() + "\n")
+            except FileNotFoundError:   # macOS has no /proc
+                _OWN.append(" ".join(subprocess.run(["ps", "-o", "command=", "-p", str(os.getpid())], capture_output=True, text=True).stdout.split()) + "\n")
+        return _OWN[0]
     return subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())], capture_output=True, text=True).stdout
 
 

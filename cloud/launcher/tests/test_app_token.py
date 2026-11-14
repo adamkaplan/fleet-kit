@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import warnings
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +37,8 @@ def run_in_process(argv, env):
     sys.path.insert(0, os.path.dirname(argv[1]))
     code = 0
     try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)   # a GC warning would be the last stderr line
             try:
                 runpy.run_path(argv[1], run_name="__main__")
             except SystemExit as e:

@@ -727,7 +727,7 @@ def mutate(tree, site, how="remove"):
     # the site; the other definitions cannot change the verdict on this site, and copying, scanning and unparsing a whole file for each of ~250 mutants cost minutes
     holder = [b for b in tree.body if getattr(b, "lineno", 0) <= site["line"] <= getattr(b, "end_lineno", 0)]
     lo, hi = (holder[0].lineno, holder[0].end_lineno) if holder else (0, 10 ** 9)
-    keep = [b for b in tree.body if b in holder or not isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    keep = [b for b in tree.body if isinstance(b, (ast.Import, ast.ImportFrom)) or b in holder]
     t = copy.deepcopy(ast.Module(body=keep, type_ignores=[]))
     ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"] and lo <= x["line"] <= hi].index(site["line"])
     target = sorted([x for x in scan_tree(site["file"], t) if x["kind"] == site["kind"]], key=lambda x: x["line"])[ordinal]
@@ -1051,15 +1051,7 @@ def _mutant_case(s, how):
         self.assertIsNotNone(src, "no mutant for %s" % site_name(s))
         if how == "alias":
             self.assertIn(ALIAS, src, "the alias mutant of %s does not carry the alias" % site_name(s))
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        dest = os.path.join(d, s["file"])
-        os.makedirs(os.path.dirname(dest))
-        with open(os.path.join(ROOT, s["file"])) as f:
-            first = f.readline()
-        with open(dest, "w") as f:
-            f.write((first if first.startswith("#!") else "") + src)   # unparse drops the shebang that tells the scan it is Python
-        bad = [x for x in scan_tree(s["file"], parse(dest)) if not x["ok"]]
+        bad = [x for x in scan_tree(s["file"], ast.parse(src, filename=str(s["file"]))) if not x["ok"]]
         self.assertEqual(sorted({x["func"] for x in bad}), [s["func"] if s["kind"] != "embedded" else "<string>"], "the scan missed the %s mutant of %s" % (how, site_name(s)))
     return run
 

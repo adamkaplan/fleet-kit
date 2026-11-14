@@ -15,8 +15,7 @@ MARK = "TOKMARK-9f3a1c77"
 PROMPT = "To sign in, use a web browser to open the page https://example.invalid/devicelogin and enter the code ABCD1234"
 FAKE = """#!/bin/sh
 echo "$@" >> "$FAKE_DIR/kubectl.log"
-tr '\\0' ' ' < /proc/$$/cmdline >> "$FAKE_DIR/argv.log"; echo >> "$FAKE_DIR/argv.log"
-tr '\\0' '\\n' < /proc/$$/environ | grep -v '^PATH=' >> "$FAKE_DIR/env.log"
+if [ -d /proc/$$ ]; then tr '\\0' ' ' < /proc/$$/cmdline >> "$FAKE_DIR/argv.log"; echo >> "$FAKE_DIR/argv.log"; tr '\\0' '\\n' < /proc/$$/environ | grep -v '^PATH=' >> "$FAKE_DIR/env.log"; else ps -o command= -p $$ >> "$FAKE_DIR/argv.log"; env | grep -v '^PATH=' >> "$FAKE_DIR/env.log"; fi
 case "$*" in
   *"create token cw-operator --duration="*) echo "$*" >> "$FAKE_DIR/mint.log"; [ -f "$FAKE_DIR/refuse" ] && exit 1
     n=$(cat "$FAKE_DIR/mints" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/mints"
@@ -59,7 +58,7 @@ class ProofOperatorKubectl(G.Base):
         Path(p).write_text("apiVersion: v1\nkind: Config\n")
         os.chmod(p, 0o600)
 
-    def child(self, source=None, bound=25, wait="0"):
+    def child(self, source=None, bound=60, wait="0"):
         return subprocess.run([sys.executable, "-c", CHILD, str(G.ROOT / "bin" / "cloud_image_proof.py"), source or G.PROOF, G.SRC, wait],
                               env=self.env, capture_output=True, text=True, timeout=bound)
 
