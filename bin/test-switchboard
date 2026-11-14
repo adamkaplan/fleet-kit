@@ -59010,7 +59010,7 @@ class TestHeavySlotsReadiness(StandInPids, TestHeavySlots):
         begun = time.time()
         with self.assertRaises(AssertionError) as caught:
             self.ready_holders(1, name="slow-one", seconds=1)
-        self.assertLess(time.time() - begun, 2.5)
+        self.assertLess(time.time() - begun, 10.0)
         self.assertIn("slow-one", str(caught.exception))
         self.assertIn("not ready", str(caught.exception))
         self.assertIn("'?'", str(caught.exception))

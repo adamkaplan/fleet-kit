@@ -355,7 +355,8 @@ class TestNewTestChecksInCloudPreflight(unittest.TestCase):
             before = Path(tmp) / "before"
             before.write_text(source[:start] + source[stop:])
             root = self.planted(None)
-            self.assertEqual(self.run_script(root, False, before), self.run_script(root, False))
+            norm = lambda got: (got[0], re.sub(r"\d+\.\ds", "0.0s", got[1]))   # sub-second wall-clock jitter is not a difference
+            self.assertEqual(norm(self.run_script(root, False, before)), norm(self.run_script(root, False)))
 
     def test_s16_no_test_file_and_no_tool_prints_nothing(self):
         for quick in (False, True):
