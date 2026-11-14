@@ -1,13 +1,19 @@
 """Offline tests for cloud/launcher/app_token.py: a loopback stub for the GitHub API, a throwaway RSA key, real openssl."""
 import base64
+import contextlib
 import datetime as dt
 import http.server
+import io
 import json
 import os
+import runpy
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
+import traceback
+import warnings
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,11 +28,76 @@ def iso(seconds):
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_CODE_CACHE = {}
+_REAL_RUN = subprocess.run
+
+
+def _fast_run(args, *a, **kw):
+    """Fast path for the in-process mint: answers the three plain child commands (echo of an id, cat of the key file, stand-in openssl) in memory."""
+    if isinstance(args, list) and len(args) == 3 and args[:2] == ["sh", "-c"] and isinstance(args[2], str):
+        cmd = args[2]
+        if cmd in ("echo 12345", "echo 678"):
+            return subprocess.CompletedProcess(args, 0, cmd.split()[1] + "\n", "")
+        if cmd.startswith("cat '") and cmd.endswith("'") and cmd.count("'") == 2 and ";" not in cmd:
+            try:
+                with open(cmd.split("'")[1]) as f:
+                    return subprocess.CompletedProcess(args, 0, f.read(), "")
+            except (OSError, UnicodeDecodeError):
+                pass
+    elif (isinstance(args, list) and len(args) == 5 and str(args[0]).endswith("openssl-fast") and args[1:4] == ["dgst", "-sha256", "-sign"]
+          and str(args[4]).startswith("/dev/fd/")):
+        fd = int(args[4].rsplit("/", 1)[1])
+        while os.read(fd, 65536):   # the key written by the feeding thread: read to the end, so that thread finishes
+            pass
+        return subprocess.CompletedProcess(args, 0, b"fakesig", b"")
+    return _REAL_RUN(args, *a, **kw)
+
+
+def run_in_process(argv, env):
+    """The mint script run in this process (no interpreter start): the environment, argv, streams and temp dir are swapped and restored."""
+    out, err = io.StringIO(), io.StringIO()
+    old_env, old_argv, old_path, old_tmp = dict(os.environ), sys.argv, list(sys.path), tempfile.tempdir
+    os.environ.clear()
+    os.environ.update(env)
+    sys.argv, tempfile.tempdir = list(argv[1:]), None
+    sys.path.insert(0, os.path.dirname(argv[1]))
+    code = 0
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)   # a GC warning would be the last stderr line
+            try:
+                with open(argv[1]) as sf:
+                    src = sf.read()
+                code_obj = _CODE_CACHE.get(src) or _CODE_CACHE.setdefault(src, compile(src, argv[1], "exec"))
+                subprocess.run = _fast_run
+                ssl.SSLContext.set_default_verify_paths = lambda self: None   # the stub server is plain http: loading the system CA files for each request is ~4 ms of nothing
+                try:
+                    exec(code_obj, {"__name__": "__main__", "__file__": argv[1]})
+                finally:
+                    subprocess.run = _REAL_RUN
+                    del ssl.SSLContext.set_default_verify_paths
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                if isinstance(e.code, str):
+                    err.write(e.code + "\n")
+            except Exception:   # what an uncaught error of a child is: the traceback on stderr and exit 1
+                traceback.print_exc()
+                code = 1
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+        sys.argv, sys.path[:], tempfile.tempdir = old_argv, old_path, old_tmp
+    return subprocess.CompletedProcess(argv, code, out.getvalue(), err.getvalue())
+
+
 def via_route(argv, env):
     """Run the mint with the named route (a pipe, --fd): the result's stdout is what came through the route (the token), and the real stdout must be empty."""
     r, w = os.pipe()
     try:
-        p = subprocess.run(argv + ["--fd", str(w)], env=env, capture_output=True, text=True, timeout=60, pass_fds=(w,))
+        if argv[0] == sys.executable and argv[1] != "-c":
+            p = run_in_process(argv + ["--fd", str(w)], env)
+        else:
+            p = subprocess.run(argv + ["--fd", str(w)], env=env, capture_output=True, text=True, timeout=60, pass_fds=(w,))
     finally:
         os.close(w)
     with os.fdopen(r) as f:
@@ -145,6 +216,12 @@ class Mint(unittest.TestCase):
             f.write('#!/bin/sh\n{ echo "ARGV $*"; env; } >> "%s"\nexec openssl "$@"\n' % cls.argv_log)
         os.chmod(wrap, 0o700)
         cls.wrap = wrap
+        cls.fast_openssl = os.path.join(d, "openssl-fast")   # no signature is checked by the copy runs: a stand-in that reads its input and answers a fixed signature
+        with open(cls.fast_openssl, "w") as f:
+            f.write("#!/bin/sh\ncat \"$4\" >/dev/null 2>&1 || true\ncat >/dev/null\nprintf 'fakesig'\n")
+        os.chmod(cls.fast_openssl, 0o700)
+        with open(os.path.join(os.path.dirname(MINT), "token_mint.py")) as f:
+            cls.token_mint_src = f.read()
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
         threading.Thread(target=cls.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
@@ -178,13 +255,13 @@ class Mint(unittest.TestCase):
 
     def run_mint(self, repo=REAL, runner=None, **env):
         e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_INSTALLATION_CMD="echo 678",
-                 CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
+                 CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.fast_openssl)
         e.update(env)
         argv = [sys.executable, "-c", runner, MINT, repo] if runner else [sys.executable, MINT, repo]
         return via_route(argv, e)
 
     def test_prints_only_the_token_and_signs_a_valid_short_jwt(self):
-        p = self.run_mint()
+        p = self.run_mint(CW_OPENSSL=self.wrap)
         self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)
         path, auth, body = Stub.seen[0]
         self.assertEqual((path, body), ("/app/installations/678/access_tokens", {"repositories": ["widget-service"], "permissions": PERMS}))
@@ -201,7 +278,7 @@ class Mint(unittest.TestCase):
         self.assertEqual(v.returncode, 0)
 
     def test_key_and_token_never_in_argv_env_files_or_stderr(self):
-        p = self.run_mint()
+        p = self.run_mint(CW_OPENSSL=self.wrap)
         self.assertEqual(p.returncode, 0)
         with open(self.argv_log) as f:
             spy = f.read()
@@ -286,7 +363,7 @@ class Mint(unittest.TestCase):
     def test_non_loopback_base_and_failing_vault_are_refused(self):
         for env in ({"CW_GITHUB_API_BASE": "http://example.com"}, {"CW_GITHUB_API_BASE": "https://127.0.0.1"},
                     {"CW_APP_KEY_CMD": "false"}, {"CW_APP_KEY_CMD": "echo not-a-key"}):
-            p = self.run_mint(**env)
+            p = self.run_mint(CW_OPENSSL=self.wrap, **env)
             self.assertNotEqual(p.returncode, 0, env)
             self.assertEqual(p.stdout, "")
         self.assertEqual(Stub.seen, [])
@@ -559,13 +636,12 @@ class Mint(unittest.TestCase):
 
     def run_copy(self, src_text, repo=REAL, runner=None):
         d = tempfile.mkdtemp(dir=self.tmp.name)
-        for n in ("token_mint.py",):
-            with open(os.path.join(os.path.dirname(MINT), n)) as f, open(os.path.join(d, n), "w") as g:
-                g.write(f.read())
+        with open(os.path.join(d, "token_mint.py"), "w") as g:
+            g.write(self.token_mint_src)
         path = os.path.join(d, "app_token.py")
         with open(path, "w") as f:
             f.write(src_text)
-        e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap, RAISE_CLASS="RecursionError")
+        e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.fast_openssl, RAISE_CLASS="RecursionError")
         argv = [sys.executable, "-c", runner, path, repo] if runner else [sys.executable, path, repo]
         return via_route(argv, e)
 

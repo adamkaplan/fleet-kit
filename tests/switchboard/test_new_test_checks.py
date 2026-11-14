@@ -205,7 +205,17 @@ class TestNewTestChecksFiles(unittest.TestCase):
     def test_s8_the_existing_test_files_and_this_one_give_no_finding(self):
         files = sorted((REPO / "tests" / "switchboard").glob("test_*.py"))
         self.assertGreater(len(files), 0)   # the walk found the test files (the set grows; no count is pinned)
-        done = subprocess.run([sys.executable, str(NTC_TOOL)] + [str(f) for f in files], capture_output=True, text=True, cwd=str(REPO))
+        loader = importlib.machinery.SourceFileLoader("ntc_in_process", str(NTC_TOOL))
+        tool = importlib.util.module_from_spec(importlib.util.spec_from_loader("ntc_in_process", loader))
+        loader.exec_module(tool)   # in this process: one interpreter start and one parse of the tool, not a child per call
+        out, here = io.StringIO(), os.getcwd()
+        os.chdir(str(REPO))
+        try:
+            with contextlib.redirect_stdout(out):
+                code = tool.main([str(f) for f in files])
+        finally:
+            os.chdir(here)
+        done = subprocess.CompletedProcess([], code or 0, out.getvalue(), "")
         findings = [l for l in done.stdout.splitlines() if not l.startswith(("table:", "run first:"))]
         self.assertEqual((done.returncode, findings), (0, []), done.stdout)
         done = subprocess.run([sys.executable, str(NTC_TOOL), str(Path(__file__).resolve())], capture_output=True, text=True, cwd=str(REPO))
@@ -355,7 +365,8 @@ class TestNewTestChecksInCloudPreflight(unittest.TestCase):
             before = Path(tmp) / "before"
             before.write_text(source[:start] + source[stop:])
             root = self.planted(None)
-            self.assertEqual(self.run_script(root, False, before), self.run_script(root, False))
+            norm = lambda got: (got[0], re.sub(r"\d+\.\ds", "0.0s", got[1]))   # sub-second wall-clock jitter is not a difference
+            self.assertEqual(norm(self.run_script(root, False, before)), norm(self.run_script(root, False)))
 
     def test_s16_no_test_file_and_no_tool_prints_nothing(self):
         for quick in (False, True):

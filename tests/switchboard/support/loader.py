@@ -1,10 +1,12 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): loader."""
 import ast
+import builtins
 import contextlib
 import hashlib
 import importlib.machinery
 import importlib.util
 import io
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -61,11 +63,30 @@ def copy_entry(directory):
     shutil.copytree(str(BIN / "switchboard"), str(directory / "switchboard"), dirs_exist_ok=True)
 
 
+_COMPILED = {}
+_REAL_COMPILE = builtins.compile
+
+
+def _cached_compile(source, filename, mode, flags=0, dont_inherit=False, optimize=-1, **kw):
+    """`compile` with a memo for source text: the same source compiled again (an unchanged part of bin/fleet-switchboard that `_load` reads once more) returns the code object it made before. A tree (PyCF_ONLY_AST) is mutable and is never shared."""
+    if kw or not isinstance(source, (str, bytes)) or flags & ast.PyCF_ONLY_AST:
+        return _REAL_COMPILE(source, filename, mode, flags, dont_inherit, optimize, **kw)
+    key = (source, os.path.basename(str(filename)), mode, flags, dont_inherit, optimize)
+    code = _COMPILED.get(key)
+    if code is None:
+        code = _COMPILED[key] = _REAL_COMPILE(source, filename, mode, flags, dont_inherit, optimize)
+    return code
+
+
 def _load(name, path):
     loader = importlib.machinery.SourceFileLoader(name, str(path))
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
+    builtins.compile = _cached_compile
+    try:
+        loader.exec_module(module)
+    finally:
+        builtins.compile = _REAL_COMPILE
     return module
 
 

@@ -768,7 +768,7 @@ def tunnel(cluster, record):
             if child.poll() is not None or time.monotonic() >= deadline:
                 why = said[:400].decode("utf-8", "replace")
                 raise D["CloudError"]("the tunnel to %s did not open%s" % (record.get("worker"), (": " + D["_one"](cluster.clean(why), 160)) if why.strip() else ""))
-            time.sleep(0.1)
+            time.sleep(0.005)
         yield dict(record, url="http://127.0.0.1:%d" % port)
     finally:
         _kill_group(child)

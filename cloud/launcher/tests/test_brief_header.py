@@ -40,7 +40,10 @@ def rules_of(path):
     return found
 
 
-def load_sb():
+_SB_CACHE = []
+
+
+def _load_sb():
     import importlib.machinery
     import importlib.util
     os.environ.setdefault("FL" + "EET_SWITCHBOARD_UNDER_TEST", "1")
@@ -50,6 +53,18 @@ def load_sb():
     sys.modules["cw_sb_1046"] = sb
     loader.exec_module(sb)
     return sb
+
+
+def load_sb():
+    """The switchboard (24,000 lines) loaded once for the tests that only read it."""
+    if not _SB_CACHE:
+        _SB_CACHE.append(_load_sb())
+    return _SB_CACHE[0]
+
+
+def load_fresh_sb():
+    """A module of its own, for a test that patches or replaces something in it."""
+    return _load_sb()
 
 
 def run_header(*extra, env=None):
@@ -335,7 +350,7 @@ class OverrideReasonScrub(LaunchHarness):
         return lines[0][2]["reason"] if lines else None
 
     def memory_audit(self, text, sb=None):
-        sb = sb or load_sb()
+        sb = sb or load_fresh_sb()
         seen = []
         eng = types.SimpleNamespace(actor="t", audit=types.SimpleNamespace(append=lambda actor, kind, name, data: seen.append((kind, data))))
         sb.memory_read = lambda runner: None
@@ -343,7 +358,7 @@ class OverrideReasonScrub(LaunchHarness):
         return [d for k, d in seen if k == "launch.memory_ok"][0]["reason"]
 
     def test_s12_two_flags_five_shapes(self):
-        sb = load_sb()
+        sb = load_fresh_sb()
         for name, text in _shapes().items():
             part = SECRET_PART[name]
             with self.subTest(flag="memory-ok", shape=name):
@@ -364,7 +379,7 @@ class OverrideReasonScrub(LaunchHarness):
         self.assertEqual(self.boss_audit("release fix"), "release fix")
 
     def test_the_helper_cuts_to_160_and_removes_controls(self):
-        sb = load_sb()
+        sb = load_fresh_sb()
         got = sb.scrubbed_flag_text("a\x00b\nc" + "x" * 300)
         self.assertLessEqual(len(got), sb.OVERRIDE_TEXT_LIMIT)   # cut to the limit
         self.assertGreaterEqual(len(got), sb.OVERRIDE_TEXT_LIMIT // 2)   # and not emptied
@@ -372,7 +387,7 @@ class OverrideReasonScrub(LaunchHarness):
 
     def test_both_flags_call_the_same_helper(self):
         from unittest import mock
-        sb = load_sb()
+        sb = load_fresh_sb()
         calls = []
         real = sb.scrubbed_flag_text
         sb.scrubbed_flag_text = lambda text, limit=160: calls.append(text) or real(text, limit)
@@ -383,14 +398,14 @@ class OverrideReasonScrub(LaunchHarness):
         self.assertEqual([a for a in audit if a[0] == "launch.boss_unregistered"][0][2]["reason"], "release fix")
 
     def test_mutant_cut_without_scrub_fails_every_shape_case(self):
-        sb = load_sb()
+        sb = load_fresh_sb()
         sb.scrubbed_flag_text = lambda text: sb._one_line(text, 160)   # the old behaviour: cut, no scrub
         leaked = [n for n, t in _shapes().items() if SECRET_PART[n] and SECRET_PART[n] in self.memory_audit("fix " + t, sb)]
         self.assertEqual(sorted(leaked), sorted(n for n in _shapes() if SECRET_PART[n]), "mutation applied: the unscrubbed cut keeps each secret shape")
 
     def test_mutant_only_the_new_flag_scrubs_fails_the_memory_ok_cases(self):
         from unittest import mock
-        sb = load_sb()
+        sb = load_fresh_sb()
         real = sb.scrubbed_flag_text
         # the memory-ok site calls the helper through the module global: a build that cuts there without scrub is this global replaced for that site only
         src = inspect.getsource(sb.launch_memory_check).replace("scrubbed_flag_text(reason)", "_one_line(reason, 200)")
@@ -426,7 +441,7 @@ class EveryFreeTextField(OverrideReasonScrub):
         return lines[0][2] if lines else None
 
     def test_s12_three_fields_five_shapes_leave_no_secret_part(self):
-        sb = load_sb()
+        sb = load_fresh_sb()
         for name, (text, part) in BOSS_SHAPES.items():
             with self.subTest(field="boss text", shape=name):
                 if name == "control":
@@ -449,7 +464,7 @@ class EveryFreeTextField(OverrideReasonScrub):
                     self.assertEqual(got.count(part), 0)
 
     def test_s12_a_plain_text_is_kept_as_typed_per_field(self):
-        sb = load_sb()
+        sb = load_fresh_sb()
         detail = self.boss_line(sb, "lane-nobody", "the lane starts later")
         self.assertEqual(detail, {"reports_to": "lane-nobody", "reason": "the lane starts later"})
         self.assertEqual(self.memory_audit("release fix", sb), "release fix")
@@ -461,7 +476,7 @@ class EveryFreeTextField(OverrideReasonScrub):
         self.assertIn("scrubbed_flag_text(reason)", inspect.getsource(load_sb().launch_memory_check))
 
     def test_s12_mutant_the_boss_text_cut_without_scrub_leaks(self):
-        sb = load_sb()
+        sb = load_fresh_sb()
         real = sb.scrubbed_flag_text
         sb.scrubbed_flag_text = lambda text, limit=160: sb._one_line(text, limit) if limit == 60 else real(text, limit)
         text, part = BOSS_SHAPES["token"]
@@ -470,7 +485,7 @@ class EveryFreeTextField(OverrideReasonScrub):
         self.assertEqual(self.boss_line(load_sb(), text)["reports_to"].count(part), 0, "the real helper does not")
 
     def test_s12_mutant_scrubbing_just_the_new_flag_reason_leaves_memory_ok_leaking(self):
-        sb = load_sb()
+        sb = load_fresh_sb()
         src = inspect.getsource(sb.launch_memory_check).replace("scrubbed_flag_text(reason)", "_one_line(reason, 200)")
         self.assertIn("_one_line(reason, 200)", src, "mutation applied")
         exec(compile(src.replace("def launch_memory_check", "def mutant_memory_check", 1), "<mutant>", "exec"), sb.__dict__)
@@ -543,10 +558,10 @@ class WholeKeyBlock(unittest.TestCase):
         self.assertIn(".*?", code, "mutation applied")
         start = time.monotonic()
         try:
-            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=3)
             slow = float(done.stdout.strip()) >= 2.0
         except subprocess.TimeoutExpired:
-            slow = True   # the 10 s guard: the mutant did not finish
+            slow = True   # the 3 s guard: the mutant did not finish
         self.assertTrue(slow, "the mutant is too slow for the 2.0 s bound, as the real pattern is not")
         self.assertLess(time.monotonic() - start, 15)
 
@@ -626,7 +641,7 @@ class KeyBlockOddShapes(unittest.TestCase):
                 "s=time.monotonic(); p.sub('[redacted]', t); print(time.monotonic()-s)\n")
         self.assertIn(".*?", code, "mutation applied")
         try:
-            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=3)
             slow = float(done.stdout.strip()) >= 2.0
         except subprocess.TimeoutExpired:
             slow = True

@@ -3,6 +3,7 @@ wip note know a persistent pod), S20 (the cost figure follows the orchestrator r
 create nothing, is further down). Every printed count is computed and asserted; each mutant is counted as applied and its control runs first.
 Offline; the temp trees live outside the repository and are removed."""
 import datetime as dt
+import concurrent.futures
 import os
 import re
 import shutil
@@ -50,12 +51,20 @@ class CopyRun(unittest.TestCase):
             if entry != "test-switchboard":
                 os.symlink(os.path.join(ROOT, "bin", entry), os.path.join(tmp, "bin", entry))
         target = os.path.join(tmp, "bin", "test-switchboard")
-        with open(target, "w") as f:
-            f.write(text)
+        load = "    suite = loader.loadTestsFromModule(sys.modules[__name__])\n"
+        self.assertEqual(text.count(load), 1)
+        with open(target, "w") as f:   # only the one class these checks run is turned into test cases (the other ~1,000 classes are defined, not instantiated)
+            f.write(text.replace(load, "    suite = unittest.TestSuite([loader.loadTestsFromTestCase(TestLaunchRefusedMessage)])\n"))
         os.chmod(target, 0o755)
-        p = stub_support.start(self, [sys.executable, target, "-k", k], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        p = stub_support.start(self, [sys.executable, target, "-k", "TestLaunchRefusedMessage." + k], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out, _ = p.communicate(timeout=90)
         return p.returncode, out
+
+    def run_both(self, control, mutant, k):
+        """The control and the mutant copy side by side (each loads the whole file): (control result, mutant result)."""
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            first, second = pool.submit(self.run_copy, control, k), pool.submit(self.run_copy, mutant, k)
+            return first.result(), second.result()
 
     def source(self):
         with open(BIN_SWITCHBOARD_TEST) as f:
@@ -66,11 +75,11 @@ class S18Row(CopyRun):
     def test_s18_the_control_with_the_row_passes_and_the_table_without_it_fails_with_the_anchored_text(self):
         src = self.source()
         self.assertEqual(src.count(ROW_LINE), 1)
-        code, out = self.run_copy(src, DERIVED)
-        self.assertEqual(code, 0, out[-600:])   # the control: 1 of 1
         mutated = src.replace(ROW_LINE, "")
         self.assertEqual(len(src) - len(mutated), len(ROW_LINE))   # the mutation applied, counted
-        code, out = self.run_copy(mutated, DERIVED)
+        (code, out), (mcode, mout) = self.run_both(src, mutated, DERIVED)
+        self.assertEqual(code, 0, out[-600:])   # the control: 1 of 1
+        code, out = mcode, mout
         self.assertNotEqual(code, 0)
         self.assertIn("a derived exit has no row, or a row no exit", out)
 
@@ -94,13 +103,13 @@ class S21Entries(CopyRun):
         for line in ENTRY_LINES:
             self.assertEqual(src.count(line), 1)
         src = self.with_integration_entries(src)
-        code, out = self.run_copy(src, CREATED)
-        self.assertEqual(code, 0, out[-600:])   # the control: 1 of 1
         mutated = src
         for line in ENTRY_LINES:
             mutated = mutated.replace(line, "")
         self.assertEqual(len(src) - len(mutated), sum(len(x) for x in ENTRY_LINES))   # both mutations applied
-        code, out = self.run_copy(mutated, CREATED)
+        (code, out), (mcode, mout) = self.run_both(src, mutated, CREATED)
+        self.assertEqual(code, 0, out[-600:])   # the control: 1 of 1
+        code, out = mcode, mout
         self.assertNotEqual(code, 0)
         self.assertIn("'--persistent is only for --age'", out)
         self.assertIn("'--persistent does not combine '", out)

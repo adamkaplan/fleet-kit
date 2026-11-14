@@ -5,15 +5,18 @@ commands, the real `run_daemon` loop for the daemon, and the real standalone scr
 (two small scripts that log their arguments), the engine of the daemon (a counter of its passes), and the clock.
 """
 import ast
+import atexit
 import contextlib
 import io
 import json
 import threading
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -44,21 +47,37 @@ def commit(tree, name):
 class TreeCase(Base):
     """An origin with two commits on main and one more on a branch `integration`; `self.tree` is a clone of it on main, recorded by the install."""
 
+    _template = None   # (origin, clone, first, second, integration): built once for the process, each test works on copies of it
+
+    @classmethod
+    def template(cls):
+        if TreeCase._template is None:
+            root = Path(tempfile.mkdtemp(prefix="guard-template-"))
+            origin, tree = root / "origin", root / "installed"
+            origin.mkdir()
+            git(origin, "init", "-q", "-b", "main")
+            first = commit(origin, "one.txt")
+            second = commit(origin, "two.txt")
+            git(origin, "switch", "-q", "-c", "integration")
+            integration = commit(origin, "three.txt")
+            git(origin, "switch", "-q", "main")
+            git(root, "clone", "-q", str(origin), str(tree))
+            git(tree, "fetch", "-q", "origin")
+            TreeCase._template = (origin, tree, first, second, integration)
+            atexit.register(shutil.rmtree, str(root), True)
+        return TreeCase._template
+
     def setUp(self):
         super().setUp()
         os.environ.update(GIT_ENV)
         os.environ["PATH"] = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
         self.origin = self.home / "origin"
-        self.origin.mkdir()
-        git(self.origin, "init", "-q", "-b", "main")
-        self.first = commit(self.origin, "one.txt")
-        self.second = commit(self.origin, "two.txt")
-        git(self.origin, "switch", "-q", "-c", "integration")
-        self.integration = commit(self.origin, "three.txt")
-        git(self.origin, "switch", "-q", "main")
         self.tree = self.home / "installed"
-        git(self.home, "clone", "-q", str(self.origin), str(self.tree))
-        git(self.tree, "fetch", "-q", "origin")
+        template = self.template()
+        shutil.copytree(str(template[0]), str(self.origin), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        shutil.copytree(str(template[1]), str(self.tree), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        git(self.tree, "remote", "set-url", "origin", str(self.origin))   # the copy of the clone follows the copy of the origin
+        self.first, self.second, self.integration = template[2:]
         self.state = sb.ensure_state_dir()
         (self.state / "installed-tree").write_text("%s\nmain\n" % self.tree)
         self.patch = mock.patch.object(sb, "KIT_ROOT", self.tree)

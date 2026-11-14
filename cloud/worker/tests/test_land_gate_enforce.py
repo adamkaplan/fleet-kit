@@ -31,6 +31,11 @@ class Gate(unittest.TestCase):
                     "CW_NOTES_LOG": os.path.join(self.d, "notes.log"), "CW_LAND_GATE_AUDIT": self.audit,
                     "CW_RUNS_DIR": os.path.join(self.d, "runs"), "CW_PROGRESS_FILE": os.path.join(self.d, "progress.txt"),
                     "CW_RUN_SERVER_PASSWORD_FILE": os.path.join(self.d, "no-server-password")}
+        fake = os.path.join(self.d, "timeout")   # macOS has no timeout: 'timeout [-k N] SECONDS cmd args' runs cmd args
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\nif [ "$1" = -k ]; then shift 2; fi\nshift\nexec "$@"\n')
+        os.chmod(fake, 0o755)
+        self.env["PATH"] = self.d + ":" + self.env["PATH"]
         self.git("init", "-q", "-b", "main", ".")
         self.git("remote", "add", "origin", URL)
         self.git("commit", "-q", "--allow-empty", "-m", "base")

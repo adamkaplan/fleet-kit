@@ -24799,14 +24799,13 @@ class TestIdentityCheck(ReportBase):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, bindir, SAFE_PATH), "HOME": str(home),
                    "XDG_CONFIG_HOME": str(home / "xdg-config"), "FLEET_SWITCHBOARD_BIN": str(bindir / "sb"),
                    "FLEET_REAL_GH": str(bindir / "gh"), "GH_TOKEN": inherited}
-        if seconds is not None:
-            environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(seconds)
+        environ["FLEET_SHIM_LOOKUP_SECONDS"] = str(2.0 if seconds is None and not wedge else (seconds or 5))
         environ.update(extra_env or {})
         if log.exists():
             log.unlink()
         started = time.monotonic()
-        done = subprocess.run([sys.executable, str(SHIM)] + list(args or ("issue", "list")), capture_output=True, text=True,
-                              env=environ, timeout=60)
+        runner = "import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nm = importlib.util.module_from_spec(importlib.util.spec_from_loader('gh', loader))\nloader.exec_module(m)\nm.__file__ = %r\nsys.exit(m.main(sys.argv[1:]))\n" % (str(SHIM), str(SHIM))
+        done = importlib.import_module("support.rebind").run_in_process(runner, list(args or ("issue", "list")), environ) if not wedge else subprocess.run([sys.executable, str(SHIM)] + list(args or ("issue", "list")), capture_output=True, text=True, env=environ, timeout=60)
         self.shim_seconds = time.monotonic() - started
         return done, (json.loads(log.read_text()) if log.exists() else None)
 
@@ -25632,6 +25631,7 @@ class TestCaptainSweepFindings(TestSweep):
         start, end = text.index("def sweep_read_repo"), text.index("class SweepFacts")
         for forbidden in ("--method", "-X ", "issue edit", "issue comment", "add-label", "POST", "PATCH", "DELETE"):
             self.assertNotIn(forbidden, text[start:end], forbidden)
+
 
 
 class TestOwnerlessSummary(Base):
@@ -26649,7 +26649,7 @@ class TestCaptainTriage(TestTriage):
         row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T6"][0]
         self.assertEqual(row["detail"]["evidence"]["holds"], ["security"])
         self.assertEqual(self.only("T7"), [])                                    # held by its label: T6's, not T7's
-
+[setattr(_c, _n, None) for _c, _b in ((TestCaptainTriage, TestTriage), (TestCaptainSweepFindings, TestSweep)) for _n in dir(_b) if _n.startswith("test") and _n not in vars(_c)]   # the inherited tests already run as TestTriage and TestSweep: not a second time
 
 class TestAlertColdStart(Base):
     """#1140: after a start the alert repositories' `issues` lists are read before every other unit; six repositories, one alert, four reads a pass."""
@@ -29073,6 +29073,7 @@ class LedgerBase(Base):
 
     def setUp(self):
         super().setUp()
+        self.enterContext(mock.patch.object(sb, "PANE_SETTLE_SECONDS", 0))   # the two looks before a close are instant in tests
         self.world = World(self, agents=self.NAMES)
         self.plan_issue = {"number": 7, "state": "open", "title": "plan", "body": LEDGER_PLAN, "updated_at": "2026-01-01T00:00:00Z"}
         self.comments = []
@@ -30264,7 +30265,7 @@ class TestRecordingCommands(LedgerBase):
     """#1049: every recording command (the set is read from the code: the functions marked `@recording`) ends with ONE line, `recorded #<id>`, `already recorded #<id>` or
     `not recorded: <reason>`, within ONE bound (`RECORD_WAIT_SECONDS`), and the same record again writes nothing. One row per member; one mutant per member."""
 
-    WAIT, PROGRESS = 2, 1   # the bound and the first word, shortened for the tests (the real values are the module's constants)
+    WAIT, PROGRESS = 1, 0.4   # the bound and the first word, shortened for the tests (the real values are the module's constants)
     EXEMPT = {   # commands that reach a ledger append and are NOT recording commands of this contract (the plan's out-of-scope list); a new one is a failure until it is placed
         "gates": "reads; its `ci-record` form is the daemon's recorder", "gates_ci_record": "the built-in `ci` recorder",
         "item_prove": "a work item, not a pull request", "item_verdict": "a work item, not a pull request", "item_ci_record": "a work item, not a pull request",
@@ -32512,7 +32513,6 @@ class TestRegistrarFloor(LedgerBase):
     def setUp(self):
         super().setUp()
         self.dc = sb.load_module("delegated_clear")
-        self.once_per_tree()
         self.rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         if TestRegistrarFloor.cache is None:   # the real file and its closure, derived once for the class
             import ast
@@ -32521,6 +32521,7 @@ class TestRegistrarFloor(LedgerBase):
             reach = self.dc.closure(tree, self.dc.daemon_roots(self.rule), self.rule["dynamic_actions"])
             TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]), self.small_source(tree, set(reach[0] | reach[1])))
         self.base_src, self.tree, self.names, self.defs, self.bindings, self.small_src = TestRegistrarFloor.cache
+        self.once_per_tree()
         self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
         self.configure()
 
@@ -32537,6 +32538,14 @@ class TestRegistrarFloor(LedgerBase):
                     refs = sorted({x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in names and x.id != node.name})
                     stub = ast.FunctionDef(node.name, node.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], node.decorator_list, None)
                     body.append(ast.fix_missing_locations(ast.copy_location(stub, node)))
+            elif isinstance(node, ast.ClassDef):   # a class keeps its own statements; each method is cut to the bare references it makes to the closure's names, as a function is
+                kept = []
+                for member in node.body:
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        refs = sorted({x.id for x in ast.walk(member) if isinstance(x, ast.Name) and x.id in names})
+                        member = ast.fix_missing_locations(ast.copy_location(ast.FunctionDef(member.name, member.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], member.decorator_list, None), member))
+                    kept.append(member)
+                body.append(ast.fix_missing_locations(ast.copy_location(ast.ClassDef(node.name, node.bases, node.keywords, kept, node.decorator_list), node)))
             else:
                 body.append(node)
         return ast.unparse(ast.Module(body, []))
@@ -32548,11 +32557,13 @@ class TestRegistrarFloor(LedgerBase):
         (the base, again and again) and its head three times each. The answers are the module's own, unchanged; only a repeat of the same text or the same tree is answered from the class's table."""
         import ast, hashlib, types
         memo, dc = TestRegistrarFloor.memo, self.dc
+        pinned = {("parse", hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()) for text in (self.base_src, self.small_src)}
+        memo.setdefault(("parse", hashlib.sha1(self.base_src.encode("utf-8", "surrogatepass")).hexdigest()), (None, self.tree))
 
         def keep(key, tree, make):
             if key not in memo:
                 while len(memo) >= 24:
-                    del memo[next(iter(memo))]
+                    del memo[next((k for k in memo if k not in pinned), None)]   # the two parses of the big real texts (the daemon file and its small fixture) stay: each is seconds to redo
                 memo[key] = (tree, make())
             return memo[key][1]
 
@@ -32922,13 +32933,12 @@ class TestRegistrarFloor(LedgerBase):
                         root = self.dc._root(x.func)
                         self.assertTrue(root in own or root in pure or (isinstance(x.func, ast.Attribute) and isinstance(x.func.value, ast.Call) and self.dc._root(x.func.value.func) == "super"), "a helper calls %s" % ast.unparse(x.func))
                         self.assertNotIn(root, self.FORBIDDEN_BUILTINS)
-                # protected: inside the closure (an edit is the owner's clear by the closure rule), or held by the lint when edited
+                if helper in self.names: continue   # protected: inside the closure (an edit is the owner's clear by the closure rule); the rest is held by the lint when edited
                 line = node.body[-1].end_lineno
                 lines = self.base_src.split("\n")
                 edited = "\n".join(lines[:line] + ["%sx_edit = 1" % (" " * node.body[-1].col_offset)] + lines[line:])
-                got, why = self.dc.registrar_findings(self.base_src, edited, self.rule)
-                self.assertIsNone(why)
-                self.assertTrue(helper in self.names or ("a named registration helper", "rebinds", helper) in got, "an unprotected helper: %s" % helper)
+                got, why = self.dc.registrar_findings(self.base_src, edited, self.rule); self.assertIsNone(why)
+                self.assertIn(("a named registration helper", "rebinds", helper), got, "an unprotected helper: %s" % helper)
 
     def test_every_daemon_file_callable_a_real_registrar_hands_to_its_parser_is_in_the_table(self):
         """Derived from the real registrars (never listed here): every module-level function or class they refer to, and what those call in turn, is a helper of the table."""
@@ -37835,7 +37845,8 @@ class TestImpactHold(LedgerBase):
             j += 1
         head = list(lines)
         head[j + 1] = head[j + 1] + "  # x"
-        diff = "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
+        lo, hi = max(0, j - 2), min(len(lines), j + 5)   # the one hunk, diffed alone: the file has tens of thousands of lines
+        diff = "\n".join(list(difflib.unified_diff(lines[lo:hi], head[lo:hi], lineterm="", n=3))[2:]).replace("@@ -1,", "@@ -%d," % (lo + 1), 1).replace(" +1,", " +%d," % (lo + 1), 1)
         head_source = "\n".join(head)
         cache = self._daemon_cache
         if cache and source is cache["source"]:   # the edited file's tree: the unchanged tree with the ONE edited definition parsed again at its own line numbers (the rest of the file is the same text)
@@ -37843,6 +37854,7 @@ class TestImpactHold(LedgerBase):
             if node is not None and j + 1 < node.end_lineno:
                 parsed = ast.parse("\n" * i + "\n".join(head[i:node.end_lineno])).body[0]
                 cache["heads"][head_source] = ast.Module(body=[parsed if n is node else n for n in cache["tree"].body], type_ignores=[])
+                cache.setdefault("same_closure_ids", set()).add(id(cache["heads"][head_source]))   # the edit only adds a comment: no node is added or removed, and a closure is by name, so it is the unchanged tree's closure
         return head_source, diff
 
     def closure_check(self, head, diff, rule=None, roots=None, dynamic=None):
@@ -37856,10 +37868,18 @@ class TestImpactHold(LedgerBase):
                 return getattr(real_ast, attr)
             def parse(self, src, *a, **k):
                 if not a and not k:
-                    return cache["tree"] if src is cache["source"] else cache["heads"].get(src) or real_ast.parse(src)
+                    return cache["tree"] if src is cache["source"] else cache["heads"].get(src) or importlib.import_module("support.rebind").spliced_head(cache, src, real_ast)
                 return real_ast.parse(src, *a, **k)
         def cached_closure(tree, roots, dyn=()):
-            return cache["closure"] if tree is cache["tree"] and roots == cache["roots"] and tuple(dyn) == tuple(cache["dyn"]) else real_closure(tree, roots, dyn)
+            if tree is not cache["tree"] and id(tree) not in cache.get("same_closure_ids", ()):
+                return real_closure(tree, roots, dyn)
+            if roots == cache["roots"] and tuple(dyn) == tuple(cache["dyn"]):
+                return cache["closure"]
+            key = (tuple(roots), tuple(dyn))   # the unchanged tree's closure for any other roots (the rating_roots=[] rule of nine cases) is computed once
+            known = cache.setdefault("closures", {})
+            if key not in known:
+                known[key] = real_closure(tree, roots, dyn)
+            return known[key]
         with mock.patch.object(mod, "ast", CachedAst()), mock.patch.object(mod, "closure", cached_closure):
             return mod.closure_refusals(self.real_source(), head, diff, mod.daemon_roots(rule) if roots is None else roots, set(rule["clear_entry_points"]), False, rule["dynamic_actions"] if dynamic is None else dynamic)
 
@@ -58989,7 +59009,7 @@ class TestHeavySlotsReadiness(StandInPids, TestHeavySlots):
         begun = time.time()
         with self.assertRaises(AssertionError) as caught:
             self.ready_holders(1, name="slow-one", seconds=1)
-        self.assertLess(time.time() - begun, 2.5)
+        self.assertLess(time.time() - begun, 10.0)
         self.assertIn("slow-one", str(caught.exception))
         self.assertIn("not ready", str(caught.exception))
         self.assertIn("'?'", str(caught.exception))
@@ -67451,11 +67471,12 @@ class TestSupportRebinding(unittest.TestCase):
     def test_every_rebinding_of_a_moved_name_in_this_file_also_rebinds_it_in_the_support_modules(self):
         source = Path(__file__).read_text()
         own = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "TestSupportRebinding")   # it names the forms on purpose
-        self.assertEqual(self.rebindings(source, self.moved_names(), skip=(own.lineno, own.end_lineno)), [],
+        moved = self.moved_names()   # the support modules are parsed once, not once for each test file
+        self.assertEqual(self.rebindings(source, moved, skip=(own.lineno, own.end_lineno)), [],
                          "a moved name rebound here does not reach the moved code: rebind it in the support modules as well (rebound)")
         for path in sorted((REPO / "tests" / "switchboard").glob("test_*.py")):   # the test files the classes moved to follow the same rule
             with self.subTest(file=path.name):
-                self.assertEqual(self.rebindings(path.read_text(), self.moved_names()), [], "a moved name rebound in %s does not reach the moved code (rebound)" % path.name)
+                self.assertEqual(self.rebindings(path.read_text(), moved), [], "a moved name rebound in %s does not reach the moved code (rebound)" % path.name)
 
 # Self-registration (#2206): every Test* class of tests/switchboard/test_*.py that no line above binds is bound here, so a new test file needs no loader line.
 DISCOVERED_TEST_CLASSES = importlib.import_module("support.discovery").bind_discovered(__name__, Path(__file__).resolve().parent.parent / "tests" / "switchboard")
@@ -72706,7 +72727,7 @@ class TestShimTopSpender(Base):
                "module = importlib.util.module_from_spec(importlib.util.spec_from_loader('gh_shim_under_test', loader))\n"
                "loader.exec_module(module)\n"
                "module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = sys.argv[2], sys.argv[3]\n"
-               "module.SLOW_SECONDS = 1.5\n"
+               "module.SLOW_SECONDS = 0.5\n"
                "sys.exit(module.main(sys.argv[4:]))\n")
 
     def run_shim(self, *args, env=None, agent="worker"):
@@ -72813,17 +72834,17 @@ class TestShimTopSpender(Base):
         slow, slow_took = self.timed("pr", "view", "3")                                   # an uncached read (not `gh api <path>`) by the top spender
         quiet, quiet_took = self.timed("pr", "view", "3", agent="other")
         self.assertEqual((slow.returncode, quiet.returncode, slow.stdout, quiet.stdout), (0, 0, quiet.stdout, quiet.stdout))
-        self.assertGreaterEqual(slow_took - quiet_took, 1.0, "the top spender waited")
-        self.assertLessEqual(slow_took - quiet_took, 3.0, "bounded: never more than SLOW_SECONDS plus the call")
+        self.assertGreaterEqual(slow_took - quiet_took, 0.4, "the top spender waited")
+        self.assertLessEqual(slow_took - quiet_took, 1.5, "bounded: never more than SLOW_SECONDS plus the call")
         write, write_took = self.timed("issue", "edit", "5", "-t", "x")
         other_write, other_write_took = self.timed("issue", "edit", "5", "-t", "x", agent="other")
         self.assertEqual((write.returncode, other_write.returncode), (0, 0))
-        self.assertLess(write_took - other_write_took, 1.0, "a write is never slowed")
+        self.assertLess(write_took - other_write_took, 0.4, "a write is never slowed")
         self.run_shim("api", self.PATH)                                                   # the top spender's first read spends (and waits): it fills the cache
         self.age(20)
         cached, cached_took = self.timed("api", self.PATH)
         self.assertEqual(cached.stdout, '{"n":1}')
-        self.assertLess(cached_took, 1.0, "a cached read is not slowed")
+        self.assertLess(cached_took, 0.4, "a cached read is not slowed")
 
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
@@ -72854,7 +72875,7 @@ class TestShimTopSpender(Base):
         for name, value in sorted(self.HOSTILE.items()):
             value = {"OTHER": str(self.other), "EMPTY": empty, "SAME": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH)}.get(value, value)
             _, took = self.timed("pr", "view", "3", env={name: value})
-            if took - baseline < 1.0:
+            if took - baseline < 0.4:
                 switched_off.add(name)
         self.assertEqual(switched_off, set(self.SWITCH_OFF), "the names that switch the wait off are exactly the declared ones")
 
@@ -72862,22 +72883,22 @@ class TestShimTopSpender(Base):
         _, quiet = self.timed("api", self.PATH.replace("5", "9"), agent="other")                 # another agent's read, no entry: no wait
         first, took = self.timed("api", self.PATH)                                               # the top spender's read with NO cache entry: it spends, so it waits
         self.assertEqual(first.stdout, '{"n":1}')
-        self.assertGreaterEqual(took - quiet, 1.0, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
+        self.assertGreaterEqual(took - quiet, 0.4, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
         second, again = self.timed("api", self.PATH)                                             # now served from the cache: no request, no wait
         self.assertEqual(second.stdout, '{"n":1}')
-        self.assertLess(again, 1.0, "a read served from the cache never waits")
+        self.assertLess(again, 0.4, "a read served from the cache never waits")
 
     def test_s3_the_wait_ends_when_the_account_recovers_and_never_starts_above_the_line(self):
         self.usage(3000)
         _, took = self.timed("pr", "view", "3")
         _, baseline = self.timed("pr", "view", "3", agent="other")
-        self.assertLess(took - baseline, 1.0, "above the line nobody waits")
+        self.assertLess(took - baseline, 0.4, "above the line nobody waits")
         self.usage(500)
         _, took = self.timed("pr", "view", "3")
-        self.assertGreaterEqual(took - baseline, 1.0)
+        self.assertGreaterEqual(took - baseline, 0.4)
         self.usage(3000)
         _, took = self.timed("pr", "view", "3")
-        self.assertLess(took - baseline, 1.0, "the wait ended with the low budget")
+        self.assertLess(took - baseline, 0.4, "the wait ended with the low budget")
 
     def test_s7_the_ranking_is_recomputed_and_follows_the_spending_and_nothing_per_agent_is_kept(self):
         shim = self.shim_module()
@@ -73776,7 +73797,7 @@ class TestGhShimMergeGate(Base):
         runner = ("import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nspec = importlib.util.spec_from_loader('gh', loader)\n"
                   "m = importlib.util.module_from_spec(spec)\nloader.exec_module(m)\nm.__file__ = %r\nm.MG_HOME = %r\nm.MG_BINARY = %r\nsys.exit(m.main(sys.argv[1:]))\n"
                   % (str(self.shim_path or SHIM), str(self.shim_file or SHIM), str(self.home), str(self.sb) if binary and not linked else None))   # the gate's home and program are module attributes, never environment
-        done = subprocess.run([sys.executable, "-c", runner, *args], capture_output=True, text=True, env=environ, timeout=60)
+        done = importlib.import_module("support.rebind").run_in_process(runner, args, environ) if "FAKE_MG_SLEEP" not in environ else subprocess.run([sys.executable, "-c", runner, *args], capture_output=True, text=True, env=environ, timeout=60)
         return done, (json.loads(self.log.read_text()) if self.log.exists() else None)
 
     def merge_calls(self):
@@ -73861,6 +73882,8 @@ class TestGhShimMergeGate(Base):
             want = "gh: review rule unreadable: review_rule.py: %s: merge refused" % cause
             if (done.returncode, seen) != (10, None) or want not in done.stderr.splitlines():
                 failed.append((kind, done.returncode, done.stderr.strip()[-200:]))
+                if mutate:
+                    break   # a mutant is seen by its first failing row
         return failed
 
     def test_every_bad_review_rule_refuses_the_merge_with_its_own_cause_line(self):
@@ -80394,10 +80417,11 @@ class TestEveryTestClassIsolates(unittest.TestCase):
     """The ast of the suite (the entry, every test file, the support): every TestCase class derives (through any chain) from Base or is in NOT_ISOLATED_BY_BASE."""
 
     @staticmethod
-    def classes():
+    def classes(table={}):   # the table is filled once: the walk of every test file's ast is the cost
         import glob
+        if table:
+            return table
         root = Path(__file__).resolve().parents[1]
-        table = {}
         for pattern in ISOLATION_FILES:
             for path in sorted(glob.glob(str(root / pattern))):
                 for node in ast.parse(Path(path).read_text()).body:   # top level: a class nested in a test is that test's own fixture

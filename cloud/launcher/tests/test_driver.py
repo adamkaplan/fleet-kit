@@ -1,6 +1,9 @@
 """Slice K2 (#563): the operator driver (run_task.py). Scenarios S5 (every end cleans up, no secret in a file) and the
 checklist cases of a secret-handling driver. Offline: the fake kubectl (it becomes a stub headless server on port-forward), no
 cluster. The planted values are synthetic, in several lengths and encodings."""
+import contextlib
+import importlib.util
+import io
 import pathlib
 import base64
 import json
@@ -9,6 +12,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import urllib.parse
@@ -31,6 +35,7 @@ ROW = {"id": "id-copilot", "integrationID": "github-copilot", "label": "lbl-x7q2
 OTHER_ROW = {"id": "id-other", "integrationID": "other-provider", "label": "lbl-o3k9", "active": True, "value": {"type": "api", "key": OTHER}}
 FAKE_EXPORT = os.path.join(HERE, "fake_opencode_export.sh")
 BRIEF = "Add a file named hello.txt."
+_fake_driver = None
 RUN = r"per-run secret %s-run (cleaned|REMAINS)"
 
 
@@ -62,14 +67,47 @@ class Driver(base.Base):
         self.denv = dict({"PATH": os.environ["PATH"], "HOME": d}, **self.env, TMPDIR=self.scratch, CW_TMPDIR=self.scratch, CW_OPENCODE_BIN=FAKE_EXPORT,
                          CW_GIT_TOKEN_CMD=self.gitcmd, FAKE_SCAN_DIR=self.scratch, FAKE_KUBE_SEEN=self.seen,
                          FAKE_SCAN_VALUES=",".join(MODEL_VALUES + [GIT, OTHER, json.dumps([ROW])]),
-                         STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.2", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60")
+                         STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.05", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60")
 
     def args(self, worker="coder7", repo=REPO, brief=None):
         return [sys.executable, FAKE_PREFLIGHT_DRIVER, worker, repo, "main", brief or self.brief, "--pull-secret", "cw-pull", "--image", "registry.example.internal/cw-worker:1"]
 
     def run_driver(self, **env):
-        p = subprocess.run(self.args(), env=dict(self.denv, **env), capture_output=True, text=True, timeout=120)
+        if env.pop("REAL_CHILDREN", None) or "CW_LAUNCHER" in env or "CW_LAUNCHER_BIN" in env:   # another program is the launcher, or the test looks at real children
+            p = subprocess.run(self.args(), env=dict(self.denv, **env), capture_output=True, text=True, timeout=120)
+            return p, p.stdout + p.stderr
+        p = self.run_in_process(dict(self.denv, **env))
         return p, p.stdout + p.stderr
+
+    def run_in_process(self, env):
+        """The driver (with the fake preflight) in this process: the environment, argv, streams and signal handlers are swapped and restored."""
+        global _fake_driver
+        if _fake_driver is None:
+            spec = importlib.util.spec_from_file_location("fake_preflight_run_task", FAKE_PREFLIGHT_DRIVER)
+            _fake_driver = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_fake_driver)
+            base.patch_kube_module(cw)
+        _fake_driver.run_task.cw.PREFLIGHT_ARGV = _fake_driver.FAKE_PREFLIGHT   # a test between two runs may have put the hook back
+        out, err = io.StringIO(), io.StringIO()
+        saved = dict(os.environ), sys.argv, {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+        os.environ.clear()
+        os.environ.update(env, CW_FAKE_INPROC="1")
+        old_tempdir, tempfile.tempdir = tempfile.tempdir, None   # TMPDIR is read afresh: a child would have
+        code = 0
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = _fake_driver.run_task.main(self.args()[2:])
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        finally:
+            tempfile.tempdir = old_tempdir
+            os.environ.clear()
+            os.environ.update(saved[0])
+            sys.argv = saved[1]
+            for sig, h in saved[2].items():
+                signal.signal(sig, h)
+        return subprocess.CompletedProcess(self.args(), code, out.getvalue(), err.getvalue())
 
     def spawn(self, **env):
         return stub_support.start(self, self.args(), env=dict(self.denv, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -128,9 +166,9 @@ class Driver(base.Base):
         proc = self.spawn(**env)
         end = time.time() + 40
         while time.time() < end and not ready():
-            time.sleep(0.1)
+            time.sleep(0.02)
         self.assertTrue(ready(), "the driver never reached the phase")
-        time.sleep(0.5)
+        time.sleep(0.02)
         proc.send_signal(sig)
         out, err = proc.communicate(timeout=120)
         return proc.returncode, out + err
@@ -191,7 +229,7 @@ class Driver(base.Base):
 
     # -- the secrets never travel anywhere else --
     def test_no_secret_is_in_an_argument_an_environment_or_a_file_of_any_child(self):
-        p, out = self.run_driver()
+        p, out = self.run_driver(REAL_CHILDREN="1")
         self.assertEqual(p.returncode, 0, out)
         seen = [json.loads(x) for x in self.read(self.seen).splitlines()]
         self.assertTrue(seen)
@@ -366,13 +404,13 @@ class Driver(base.Base):
         winner = self.spawn(STUB_MODE="busy-forever")
         end = time.time() + 40
         while time.time() < end and not self.pf_up():
-            time.sleep(0.1)
+            time.sleep(0.02)
         self.assertTrue(self.pf_up(), "the first run never got going")
         # the second run passed its own first check before the first made the pod (its token step is the slow one)
         loser_args = self.args()
         slow = os.path.join(self.tmp.name, "slow-token")
         with open(slow, "w") as f:
-            f.write("#!/bin/sh\nsleep 0.5\nprintf '%%s' '%s'\n" % GIT)
+            f.write("#!/bin/sh\nsleep 0.15\nprintf '%%s' '%s'\n" % GIT)
         os.chmod(slow, 0o700)
         st_mid, calls_mid = self.st(), len(self.calls())
         p = subprocess.run(loser_args, env=dict(self.denv, CW_GIT_TOKEN_CMD=slow), capture_output=True, text=True, timeout=120)
@@ -394,7 +432,7 @@ class Driver(base.Base):
         proc = self.spawn(STUB_MODE="busy-forever")
         end = time.time() + 40
         while time.time() < end and not self.pf_up():
-            time.sleep(0.1)
+            time.sleep(0.02)
         st = self.st()
         nonce = st["pods"][self.name]["metadata"]["annotations"]["cw/run-id"]
         self.assertRegex(nonce, r"^[0-9a-f]{16}$")

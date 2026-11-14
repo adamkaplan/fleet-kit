@@ -243,6 +243,10 @@ def _entry_copy(directory, relative, old, new, also=()):
     from support.loader import _load
     directory = Path(directory) / "bin"
     shutil.copytree(str(BIN), str(directory))
+    sb_copy = Path(directory) / "fleet-switchboard"   # its code_snapshot() must not walk sys.modules (a background thread of an earlier class mutates it)
+    sb_copy.write_text(sb_copy.read_text(encoding="utf-8").replace(
+        "for module_name, module in list(sys.modules.items()):",
+        "for module_name, module in ():", 1), encoding="utf-8")
     path = Path(directory) / relative
     source = path.read_text(encoding="utf-8")
     assert source.count(old) == 1, "the mutation target is not found exactly once: %r" % old
@@ -927,10 +931,15 @@ def build_late():
             def spawn(*args, **kwargs):   # the launch starts the copy's daemon for real (a detached `<copy>/bin/fleet-switchboard run`, which writes into the copy): keep the handle to end it
                 daemons.append(sp.Popen(*args, **kwargs))
                 return daemons[-1]
+            saved_pl = sys.modules.get("plan_ledger")
             try:
                 with captured() as (out, err), mock.patch.object(sys, "stdin", io.StringIO("Do the thing.\nPLAN: acme/app#7\n")):
                     code = module.main(argv, runner=self.route, now=self.world.clock.now, spawn=spawn, socket_call=self.world.herdr.socket)
             finally:
+                if saved_pl is None:
+                    sys.modules.pop("plan_ledger", None)
+                else:
+                    sys.modules["plan_ledger"] = saved_pl
                 for daemon in daemons:   # end and reap it before the caller's temp directory is removed (no sleep: wait() returns when it has exited)
                     daemon.terminate()
                     try:

@@ -82,7 +82,7 @@ done < "$LIST"
 if [ "$count" -eq 0 ]; then echo "NOT RUN: the chain list holds no entry"; echo "RESULT: FAIL"; exit 1; fi
 # Arguments ("$@") go only to the entries that took them in the old one-line chain; the others run without arguments.
 ARGS_ENTRIES=" test_cloud_worker.py test_cloud_stack.py test_cloud_stack_wait.py test_cw_names.py test_cloud_k1.py test_driver.py test_run_record.py test_cloud_allowlist.py test_cloud_settings.py test_cloud_preflight_wired.py "
-# The PARALLEL list ($PAR, entries also in $LIST) runs in 3 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes to its own output file, replayed whole after the run.
+# The PARALLEL list ($PAR, entries also in $LIST) runs in 8 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes to its own output file, replayed whole after the run.
 PAR=bin/test-cloud-launcher.parallel
 [ -f "$PAR" ] || PAR=/dev/null   # no parallel list: every entry runs serially
 OUT=$(mktemp -d) || exit 1
@@ -109,19 +109,19 @@ while IFS= read -r e; do
   [ -n "$e" ] || continue
   grep -qx "$e" "$LIST" || { echo "NOT RUN: parallel entry $e is not in $LIST"; echo "RESULT: FAIL"; exit 1; }
 done < "$PAR"
-lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, output in $OUT/<entry>.out, status in $OUT/<entry>.rc
+lane() { # $1 = lane number: every 8th entry of $PAR, one after the other, output in $OUT/<entry>.out, status in $OUT/<entry>.rc
   l=$1; shift; n=0
   while IFS= read -r e; do
     [ -n "$e" ] || continue
     n=$((n + 1))
-    [ $(( (n - 1) % 3 )) = "$l" ] || continue
+    [ $(( (n - 1) % 8 )) = "$l" ] || continue
     f=$(printf %s "$e" | tr / _)
     run_entry "$e" "$@" > "$OUT/$f.out" 2>&1
     echo $? > "$OUT/$f.rc"
   done < "$RUNPAR"
 }
 pids=""
-for l in 0 1 2; do lane "$l" "$@" & pids="$pids $!"; done
+for l in 0 1 2 3 4 5 6 7; do lane "$l" "$@" & pids="$pids $!"; done
 ran=0
 fail=0
 FAILED=""

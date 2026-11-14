@@ -138,12 +138,12 @@ def make_server(review, port=8080, host="0.0.0.0", log=None, env=None, mint_fn=N
 
         def _send(self, status, payload, reason):
             out = json.dumps(payload).encode() if payload is not None else (reason + "\n").encode()
+            emit("%s %d %s" % (self.command, status, reason))   # logged before the client can see the answer
             self.send_response(status)
             self.send_header("Content-Type", "application/json" if payload is not None else "text/plain")
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
             self.wfile.write(out)
-            emit("%s %d %s" % (self.command, status, reason))
 
         def do_POST(self):
             if self.path != "/mint":

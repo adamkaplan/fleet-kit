@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -142,10 +143,10 @@ class Preflight(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
-        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.srv.serve_forever, daemon=True, kwargs={"poll_interval": 0.01}).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
         cls.other = http.server.HTTPServer(("127.0.0.1", 0), Other)
-        threading.Thread(target=cls.other.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.other.serve_forever, daemon=True, kwargs={"poll_interval": 0.01}).start()
 
     @classmethod
     def tearDownClass(cls):
@@ -165,9 +166,8 @@ class Preflight(unittest.TestCase):
         # a private copy of the program: its repo-approvals.json is the only approvals file there is
         self.copy = os.path.join(self.dir, "launcher")
         os.makedirs(self.copy)
-        for n in ("preflight.py", "app_token.py", "token_mint.py", "repo-approvals.json"):
-            shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), n), self.copy)
-        self.prog = os.path.join(self.copy, "preflight.py")
+        shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), "repo-approvals.json"), self.copy)   # the program runs in this process on THIS file (run_pf)
+        self.prog = PREFLIGHT
 
     def approvals(self, content, raw=False):
         """Write the private copy's repo-approvals.json; returns its path."""
@@ -179,7 +179,19 @@ class Preflight(unittest.TestCase):
     def run_pf(self, *args, **env):
         e = dict(os.environ, CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
         e.update(env)
-        return subprocess.run([sys.executable, self.prog, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
+        if self.prog != PREFLIGHT or "PLANTED_SECRET" in env:   # a symlink to the program, or a secret in the environment: a real process
+            return subprocess.run([sys.executable, self.prog, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
+        out, err = io.StringIO(), io.StringIO()
+        quick = e.get("CW_PREFLIGHT_TOKEN_CMD") == "echo " + TOKEN   # the stand-in token command: answer it without a shell
+        real_get_token = pf.get_token
+        with mock.patch.dict(os.environ, e, clear=True), mock.patch.object(pf, "APPROVALS", os.path.join(self.copy, "repo-approvals.json")), \
+                mock.patch.object(pf, "get_token", (lambda target=None: TOKEN) if quick else real_get_token), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = pf.main([REPO, *args])
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else (0 if exit_.code is None else 1)
+        return subprocess.CompletedProcess([PREFLIGHT, REPO, *args], code, out.getvalue(), err.getvalue())
 
     def test_fully_protected_passes_and_only_reads(self):
         p = self.run_pf()
@@ -366,8 +378,10 @@ class Preflight(unittest.TestCase):
         os.makedirs(other)
         with open(os.path.join(other, "repo-approvals.json"), "w") as f:
             json.dump({self.KEY: self.ENTRY}, f)  # a grant beside the link
+        for n in ("preflight.py", "app_token.py", "token_mint.py", "repo-approvals.json"):
+            shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), n), self.copy)
         link = os.path.join(other, "preflight.py")
-        os.symlink(self.prog, link)
+        os.symlink(os.path.join(self.copy, "preflight.py"), link)
         self.prog = link
         p = self.run_pf()
         self.assertEqual(p.returncode, 1, p.stdout)
@@ -507,9 +521,14 @@ class Preflight(unittest.TestCase):
 
     def test_bad_targets_are_refused(self):
         for bad in ("a/..", "../b", ".", "a/b/c", "a/", "/b", "a/./b"):
-            p = subprocess.run([sys.executable, PREFLIGHT, bad], capture_output=True, text=True,
-                               env=dict(os.environ, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN))
-            self.assertEqual(p.returncode, 2, bad)
+            out, err = io.StringIO(), io.StringIO()   # in process: the target is refused before any network call
+            with mock.patch.dict(os.environ, {"CW_PREFLIGHT_TOKEN_CMD": "echo " + TOKEN}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = pf.main([bad])
+                except SystemExit as exit_:
+                    code = exit_.code
+            self.assertEqual(code, 2, bad)
         self.assertEqual(self.run_pf("--branch", "a/../b").returncode, 2)
 
     def test_unreadable_answers_exit_2(self):
@@ -617,7 +636,7 @@ class OpenActions(Preflight):
         os.environ.update(CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
         try:
             pf.CHECK_MODES[key] = mode
-            with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stdout(out), mock.patch.object(pf, "get_token", lambda target=None: TOKEN):
                 rc = pf.main([REPO])
         finally:
             pf.CHECK_MODES.clear()

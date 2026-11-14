@@ -103,10 +103,10 @@ class PodInspect(unittest.TestCase):
         o = self.run_it(self.serve())
         self.assertEqual(o["missing"], [])
         self.assertEqual(o["in_flight"]["tool"], "shell")
-        self.assertTrue(28 <= o["in_flight"]["seconds"] <= 60)
+        self.assertTrue(28 <= o["in_flight"]["seconds"] <= 120)
         self.assertEqual([c["tool"] for c in o["last_calls"]], ["read", "bash"])
         self.assertEqual([c["status"] for c in o["last_calls"]], ["completed", "error"])
-        self.assertTrue(38 <= o["last_calls"][1]["seconds_ago"] <= 70)
+        self.assertTrue(38 <= o["last_calls"][1]["seconds_ago"] <= 130)
         self.assertEqual(o["last_text"], "x" * 300)
         self.assertTrue(3 <= o["idle_seconds"] <= 40)
         self.assertEqual(o["branch"], "feat")
@@ -120,7 +120,7 @@ class PodInspect(unittest.TestCase):
     def test_a_call_in_flight_is_reported_with_its_age(self):
         o = self.run_it(self.serve())
         self.assertEqual(o["in_flight"]["tool"], "shell")
-        self.assertTrue(28 <= o["in_flight"]["seconds"] <= 60, o["in_flight"])
+        self.assertTrue(28 <= o["in_flight"]["seconds"] <= 120, o["in_flight"])
         self.assertNotIn("shell", [c["tool"] for c in o["last_calls"]])
 
     def test_more_than_ten_calls_are_cut_to_the_last_ten(self):

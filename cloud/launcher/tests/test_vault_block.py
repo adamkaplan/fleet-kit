@@ -18,8 +18,8 @@ SUB = "00000000-0000-0000-0000-000000000001"
 REFUSAL = "ERROR: (Forbidden) Client address is not authorized and caller is not a trusted service. Code: Forbidden Inner error: ForbiddenByFirewall"
 BEHAVIOURS = {
     "refuse": 'echo "%s" > /dev/stderr; exit 1' % REFUSAL,
-    "slow-refuse": 'sleep 1; echo "%s" > /dev/stderr; exit 1' % REFUSAL,
-    "slow-ok": 'sleep 1; echo "config-body"',
+    "slow-refuse": 'sleep 0.2; echo "%s" > /dev/stderr; exit 1' % REFUSAL,
+    "slow-ok": 'sleep 0.2; echo "config-body"',
     "ok": 'echo "config-body"',
     "missing": 'echo "ERROR: (SecretNotFound) A secret with (name/id) was not found in this key vault." > /dev/stderr; exit 1',
     "login": 'echo "ERROR: Please run az login to setup account." > /dev/stderr; exit 1',
@@ -555,12 +555,12 @@ class ProbeLock(Fake):
              "try:\n    m.cluster_token(dict(os.environ), '20m')\n    kind = 'ok'\nexcept m.ClusterLogin as e:\n    kind = e.kind\n"
              "print('%%s %%.2f' %% (kind, time.time() - t))\n")
 
-    def run_child(self, module_text=REAL):
+    def run_child(self, module_text=REAL, timeout=10):
         """Run one command in a child with a 10 second limit; return (seconds, stderr) or (None, ...) when it had to be killed."""
         code = self.CHILD % (LAUNCHER, REAL, module_text, REAL)
         proc = subprocess.Popen([sys.executable, "-c", code], env=dict(self.env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            out, err = proc.communicate(timeout=10)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             out, err = proc.communicate()
@@ -617,7 +617,7 @@ class ProbeLock(Fake):
         with open(path, "w") as f:
             f.write(mutated)
         self.make_lock("fifo")
-        seconds, _ = self.run_child(path)
+        seconds, _ = self.run_child(path, timeout=1.5)
         self.assertIsNone(seconds, "the blocking open hangs")
 
     def test_a_clock_set_back_a_year_never_lengthens_the_block(self):

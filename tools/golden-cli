@@ -105,9 +105,52 @@ def pool_map(fn, items):
         return list(pool.map(fn, items))
 
 
+WALKER = r"""
+import contextlib, io, json, os, re, runpy, sys, time
+_now = float(os.environ["GOLDEN_NOW"])
+time.time = lambda: _now
+entry = sys.argv[1]
+module = runpy.run_path(entry, run_name="golden_walk")
+main = module["main"]
+pattern = re.compile(r"\{([^}\s]+)\} \.\.\.")
+
+def names(text):
+    match = pattern.search(" ".join(text.split("positional arguments:")[0].split()))
+    return match.group(1).split(",") if match else []
+
+def help_of(argv):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        main(argv + ["--help"])
+    return out.getvalue()
+
+found = [["--help"]]
+level = [[name] for name in names(help_of([]))]
+while level:
+    found.extend(argv + ["--help"] for argv in level)
+    texts = [help_of(argv) for argv in level]
+    level = [argv + [name] for argv, text in zip(level, texts) for name in names(text)]
+sys.stdout.write(json.dumps(found))
+"""
+
+
+def walk_in_one_process(entry, root, env):
+    """The `--help` commands of the tree, found by one process that calls the entry's `main` for every help (None when the entry cannot be walked so)."""
+    try:
+        proc = subprocess.run([sys.executable, "-c", WALKER, entry], cwd=os.path.join(root, "home"), env=env,
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+        found = json.loads(proc.stdout.decode("utf-8")) if proc.returncode == 0 else None
+    except (subprocess.TimeoutExpired, ValueError):
+        return None
+    return found if isinstance(found, list) and len(found) > 1 else None
+
+
 def command_list(entry, root, env):
     """Every `--help` of the tree, then the offline commands."""
     out = []
+    walked = walk_in_one_process(entry, root, env)
+    if walked is not None:
+        return walked + OFFLINE
     top = run(entry, ["--help"], root, env)
     out.append(["--help"])
     level = [[name] for name in choices(top["stdout"])]

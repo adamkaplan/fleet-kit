@@ -1527,7 +1527,7 @@ class TestHeavySlots(Base):
 
     def waiter(self, tag):
         """A command that says it started and runs until its release file exists."""
-        script = 'touch "%s/started.%s"; while [ ! -e "%s/release.%s" ]; do sleep 0.05; done' % (self.home, tag, self.home, tag)
+        script = 'touch "%s/started.%s"; while [ ! -e "%s/release.%s" ]; do sleep 0.02; done' % (self.home, tag, self.home, tag)
         return ["sh", "-c", script]
 
     HOLD_CEILING_SECONDS = 300   # the integration test's preconditions: a bound that costs nothing when they hold, on the slowest runner
@@ -1556,14 +1556,14 @@ class TestHeavySlots(Base):
         while time.time() < end:
             if test():
                 return True
-            time.sleep(0.05)
+            time.sleep(0.02)
         return False
 
     def started(self):
         return sorted(p.name for p in self.home.glob("started.*"))
 
-    READY_TRIES = 600    # the readiness helper: 600 reads of the holder record, 0.1 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
-    READY_PAUSE = 0.1
+    READY_TRIES = 3000   # the readiness helper: 3000 reads of the holder record, 0.02 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
+    READY_PAUSE = 0.02
     START_DELAY = 0      # seconds a holder is made slow to start (the injected-delay class sets it)
 
     @staticmethod
@@ -1958,7 +1958,7 @@ class TestHeavySlots(Base):
 
 class TestHeavySlotsSlowStart(TestHeavySlots):
     """#688: the three tests that failed in CI, run again with every holder one second slow to write its record (its lock is held at once)."""
-    START_DELAY = 1
+    START_DELAY = 0.25
 
 
 class TestWeeklyJobRewrite(Base):

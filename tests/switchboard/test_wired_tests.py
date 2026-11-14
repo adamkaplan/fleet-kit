@@ -332,7 +332,7 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="wired-tests-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         for p in TESTS.glob("test_*.py"):
-            shutil.copy(p, self.tmp / p.name)
+            (self.tmp / p.name).symlink_to(p.resolve())
         self.source = runner_loader_source()
 
     def plant(self):

@@ -191,7 +191,8 @@ class TestScratch(unittest.TestCase):
             applied += 1
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
-        shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__", "test-switchboard"))   # the 5 MB switchboard suite is linked instead
+        os.symlink(ROOT / "bin" / "test-switchboard", os.path.join(d, "bin", "test-switchboard"))
         shutil.copytree(ROOT / "cloud" / "worker" / "tests", os.path.join(d, "cloud", "worker", "tests"), ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(ROOT / "cloud" / "launcher", os.path.join(d, "cloud", "launcher"), ignore=shutil.ignore_patterns("__pycache__", "tests"), dirs_exist_ok=True)
         os.makedirs(os.path.join(d, "cloud", "launcher", "tests"), exist_ok=True)

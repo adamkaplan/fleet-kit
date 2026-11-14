@@ -1686,6 +1686,15 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno <= line <= n.end_lineno]
         return min(spans)[1] if spans else None
 
+    _AST_CACHE = {}   # (path, text) -> its tree: the scan only reads a tree, and the 26k-line daemon file is parsed once for every test of the class
+
+    @classmethod
+    def parsed(cls, path, text):
+        key = (path, text)
+        if key not in cls._AST_CACHE:
+            cls._AST_CACHE[key] = ast.parse(text)
+        return cls._AST_CACHE[key]
+
     @classmethod
     def bare_gh_sites(cls, sources):
         """(path, line) of every place a command is built whose first argv element is the literal "gh". CLOSED rule, by AST over `sources` ({path: text}):
@@ -1698,7 +1707,7 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         config["gh"] (own_gh_path) and by the behaviour tests around it, which this scan does not replace."""
         found = []
         for path, text in sources.items():
-            tree = ast.parse(text)
+            tree = cls.parsed(path, text)
             for node in ast.walk(tree):
                 if isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == "gh":
                     if (path, cls.enclosing_function(tree, node.lineno)) in cls.ALLOWED_BARE_GH:
@@ -1723,7 +1732,7 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         for (path, name), (argv, reason) in sorted(self.ALLOWED_BARE_GH.items()):
             self.assertIn(path, self.BARE_GH_SOURCES)
             self.assertTrue(reason)
-            tree = ast.parse((REPO / path).read_text())
+            tree = self.parsed(path, (REPO / path).read_text())
             funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
             self.assertEqual(len(funcs), 1, "the allowed function %s is not in %s" % (name, path))
             lists = [n for n in ast.walk(funcs[0]) if isinstance(n, ast.List) and n.elts and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "gh"]

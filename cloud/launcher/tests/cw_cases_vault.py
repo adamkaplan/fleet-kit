@@ -338,7 +338,7 @@ class TestVaultCheckProcess(VaultBase):
 
     def test_a_check_past_its_limit_is_killed_and_is_a_stop(self):
         self.make_checkout(code=10, fixes=True, sleep=30)
-        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0.25), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
             code, out, err = self.launch()
         self.assertEqual(code, 2, err)
         self.assertIn("the owner of the vault access check", err)
@@ -375,7 +375,7 @@ class TestVaultCheckProcess(VaultBase):
 
     def test_a_grandchild_is_killed_with_a_check_that_timed_out(self):
         self.make_checkout(code=10, fixes=True, grandchild=True, sleep=30)
-        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0.25), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
             result = self.lib.run_vault_check(dict(os.environ))
         self.assertEqual((result.code, result.outcome), (None, "timed-out"))
         self.assertTrue(self.pid_gone(int((self.checkout / "grandchild.pid").read_text())), "the grandchild survived")
@@ -425,28 +425,28 @@ class TestVaultCheckProcess(VaultBase):
         return sorted(zip(starts, ends))
 
     def test_s8b_two_launches_run_the_check_once_and_the_second_reads_again_first(self):
-        self.make_checkout(code=10, fixes=True, sleep=1.5)
+        self.make_checkout(code=10, fixes=True, sleep=0.4)
         results = self.two_launches()
         self.assertEqual(len(self.check_runs()), 1)
         self.assertEqual([r[0] for r in results], [0, 0])
         self.assertEqual(self.az_reads(), 2 + 0)   # the second's re-read answered: no read after a check of its own
 
     def test_s8b_when_the_re_read_is_still_refused_the_second_runs_its_own_check_with_no_overlap(self):
-        self.make_checkout(code=0, fixes=False, sleep=1.0)
+        self.make_checkout(code=0, fixes=False, sleep=0.3)
         self.two_launches()
         spans = self.intervals()
         self.assertEqual(len(spans), 2)
         self.assertLessEqual(spans[0][1], spans[1][0], "the two checks overlapped")
 
     def test_a_lock_that_is_not_freed_in_time_refuses_naming_the_lock(self):
-        self.make_checkout(code=0, fixes=False, sleep=3)
+        self.make_checkout(code=0, fixes=False, sleep=0.8)
         env = dict(os.environ)
         results = [None]
         holder = threading.Thread(target=self.recover, args=(results, 0), daemon=True)
         holder.start()
         self.wait_started()
         recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)
-        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw.cloud_cluster, "VAULT_LOCK_GRACE", 0.3):
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw.cloud_cluster, "VAULT_LOCK_GRACE", 0.15):
             with self.assertRaises(self.cw.Refusal) as caught:
                 recovery(lambda: self.cw._capture(["az", "x"], env=env), env)
         self.assertIn("vault-check.lock", str(caught.exception))

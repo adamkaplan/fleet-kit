@@ -104,7 +104,8 @@ class TestNoFailureMode(unittest.TestCase):
         for word in plan_check.FAILURE_TRIGGER_WORDS:
             with self.subTest(trigger=word):
                 warned = quiet.replace("prints a summary line", "the verb will %s it" % word)
-                self.assertEqual(run(warned).stdout.count("no-failure-mode"), 1, word)
+                # in this process: the CLI of this check is run by the tests above and below
+                self.assertEqual(len([w for w in plan_check.check(warned, DONE)["warnings"] if w.get("code") == "no-failure-mode"]), 1, word)
                 for fw in failure_words:
                     with self.subTest(trigger=word, failure=fw):
                         self.assertIsNone(plan_check.failure_mode_warning([{"text": "an input that is %s" % fw}], "the verb will %s it" % word))

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Scenarios S2-S10 of ask #1616: the background run of bin/cloud-prepush and its result file, on throwaway repositories."""
+import atexit
+import concurrent.futures
 import importlib.machinery
 import importlib.util
 import json
@@ -23,6 +25,7 @@ SCRIPT = os.environ.get("PREPUSH_UNDER_TEST") or tp.SCRIPT
 UNDER_MUTANT = bool(os.environ.get("PREPUSH_UNDER_TEST"))
 TD = tp.TD
 RESULTS = {}
+_TEMPLATES = {}
 
 
 def tally(key):
@@ -59,8 +62,15 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="prepush-bg-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def repo(self, sleep_seconds=3):
-        return tp.make_repo(self.tmp, tests3(sleep_seconds))
+    def repo(self, sleep_seconds=0.3):
+        template = _TEMPLATES.get(sleep_seconds)
+        if template is None:   # one template per sleep: git runs once, every test copies it
+            holder = tempfile.mkdtemp(prefix="prepush-bg-tpl-")
+            atexit.register(shutil.rmtree, holder, True)
+            template = _TEMPLATES[sleep_seconds] = tp.make_repo(holder, tests3(sleep_seconds))
+        repo = os.path.join(self.tmp, "repo")
+        shutil.copytree(template, repo, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        return repo
 
     def install(self, script=None):
         d = os.path.join(self.tmp, "bin")
@@ -115,7 +125,7 @@ class Base(unittest.TestCase):
                 d = None
             if d and cond(d):
                 return d
-            time.sleep(0.2)
+            time.sleep(0.02)
         self.fail("the condition did not hold in %d s" % limit)
 
     def read(self, installed, result, cwd):
@@ -128,7 +138,7 @@ class Base(unittest.TestCase):
 @unittest.skipIf(UNDER_MUTANT, "run on the script under test only")
 class Foreground(Base):
     def test_s2_the_foreground_run_cannot_finish_a_file_longer_than_its_bound(self):
-        repo = self.repo(1.5)
+        repo = self.repo(1.2)
         p = tp.run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "1"})
         lines = [l for l in p.stdout.splitlines() if l.startswith("COULD NOT RUN")]
         self.assertEqual(len(lines), 1, p.stdout)
@@ -139,7 +149,7 @@ class Foreground(Base):
 
 class Background(Base):
     def test_s3_s4_start_returns_at_once_and_the_run_finishes_after_the_starter_and_its_group_end(self):
-        repo = self.repo(2)
+        repo = self.repo(0.5)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "20"})
         path_printed = sum(1 for l in out.splitlines() if l.endswith("result.json") and os.path.join(result, "") in l)
         pid = self.wait(result, lambda d: d["pid"] > 0)["pid"]
@@ -163,14 +173,14 @@ class Background(Base):
 
     @unittest.skipIf(UNDER_MUTANT, "S5 compares two runs")
     def test_s5_a_file_longer_than_the_foreground_bound_passes_in_the_background_run(self):
-        repo = self.repo(1.5)
+        repo = self.repo(1.2)
         fg = tp.run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "1"})
         nofg = sum(1 for l in fg.stdout.splitlines() if l.startswith("COULD NOT RUN") and "test_b_slow" in l)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "20"})
         d = self.finished(result)
         slow = [f for f in d["files"] if f["file"].endswith("test_b_slow.py")][0]
         self.assertEqual((slow["branch"], slow["base"]), ("pass", "pass"))
-        self.assertGreaterEqual(slow["branch_seconds"], 1.2)
+        self.assertGreaterEqual(slow["branch_seconds"], 1.1)
         print("S5: background passed 1, foreground could not run %d" % nofg, file=sys.stderr)
         self.assertEqual(nofg, 1)
 
@@ -187,7 +197,7 @@ class Background(Base):
         self.assertIn("cloud-prepush: run 3, identical: 2", r.stdout)
 
     def test_s7_a_run_in_progress_is_reported_as_running_and_never_as_passed(self):
-        repo = self.repo(2.5)
+        repo = self.repo(0.4)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "30"})
         d = self.wait(result, lambda d: any(f["file"].endswith("test_b_slow.py") and "running" in (f["branch"], f["base"]) for f in d["files"]), 12)
         r = self.read(installed, result, repo)
@@ -230,17 +240,17 @@ class Mutants(Base):
         return p.returncode
 
     def test_s8_the_mutants_fail_their_scenario(self):
-        failing = applied = 0
-        for name, old, new, test in (
+        cases = (
             ("running reported as passed", 'IN_PROGRESS = "running"', 'IN_PROGRESS = "pass"',
              "Background.test_s7_a_run_in_progress_is_reported_as_running_and_never_as_passed"),
             ("run kept in the starter's group", "stdin=nul, stdout=out, stderr=out, start_new_session=True, close_fds=True)",
              "stdin=nul, stdout=out, stderr=out, close_fds=True)",
              "Background.test_s3_s4_start_returns_at_once_and_the_run_finishes_after_the_starter_and_its_group_end"),
-        ):
-            rc = self.run_mutant(name, old, new, test)
-            applied += 1
-            failing += 1 if rc == 1 else 0
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:   # each mutant has its own scratch directory and script
+            codes = list(pool.map(lambda c: self.run_mutant(*c), cases))
+        applied = len(codes)
+        failing = sum(1 for rc in codes if rc == 1)
         print("S8: %d of 2 mutants fail, %d of 2 mutations applied" % (failing, applied), file=sys.stderr)
         self.assertEqual((failing, applied), (2, 2))
 

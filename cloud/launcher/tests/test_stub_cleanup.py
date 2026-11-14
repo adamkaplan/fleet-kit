@@ -13,6 +13,7 @@ importlib.import_module / __import__ of one (or of a name the scan cannot read).
 does not parse (a template with a placeholder) fails closed on any use of the primitive. A Python file the scan cannot parse is a site. Such a site passes only when
 it is listed in EMBEDDED_OK by its exact text, with a reason. What the scan cannot follow is LIMITS, below, and a test counts it."""
 import ast
+import copy
 import errno
 import http.client
 import io
@@ -43,7 +44,7 @@ def wait_until(fn, seconds=8.0):
     while time.time() < end:
         if fn():
             return True
-        time.sleep(0.05)
+        time.sleep(0.02)
     return fn()
 
 
@@ -182,7 +183,7 @@ class TestStubEndsByItself(unittest.TestCase):
         self.assertTrue(wait_until(lambda: not pid_alive(pid), 5), "the orphaned stub is still running")
 
     def test_s4_an_idle_stub_with_a_live_parent_ends_after_its_cap(self):
-        p = self.start_stub(env={"STUB_IDLE_SECONDS": "2"})
+        p = self.start_stub(env={"STUB_IDLE_SECONDS": "0.3"})
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the idle stub is still running")
 
 
@@ -223,7 +224,7 @@ class TestStubParentDiesDuringStartup(unittest.TestCase):
         # The "parent" starts the stub (which names it in STUB_PARENT_PID) and is killed at once: the stub's own getppid() at its start may already be 1.
         mid_code = ("import os,subprocess,sys\n"
                     "env=dict(os.environ,STUB_PARENT_PID=str(os.getpid()))\n"
-                    "p=subprocess.Popen(['sh','-c','sleep 1; exec \"$0\" \"$@\"',sys.executable,sys.argv[1],sys.argv[2]],env=env)\n"
+                    "p=subprocess.Popen(['sh','-c','sleep 0.2; exec \"$0\" \"$@\"',sys.executable,sys.argv[1],sys.argv[2]],env=env)\n"
                     "print(p.pid,flush=True)\nos._exit(0)\n")
         mid = stub_support.spawn([sys.executable, "-c", mid_code, STUB, str(port)], stdout=subprocess.PIPE, text=True)
         self.addCleanup(stub_support.stop_group, mid, port)
@@ -258,7 +259,7 @@ class TestSpawnPassesWhatTheStubNeeds(unittest.TestCase):
         # The parent starts the stub THROUGH spawn (a delayed exec, so the parent is gone before the stub looks) and exits: only the
         # STUB_PARENT_PID that spawn passes lets the stub see that its parent is gone (its getppid() is already 1 or a reaper).
         mid_code = ("import os,sys\nsys.path.insert(0,sys.argv[1])\nimport stub_support\n"
-                    "p=stub_support.spawn(['sh','-c','sleep 1; exec \"$0\" \"$@\"',sys.executable,sys.argv[2],sys.argv[3]])\n"
+                    "p=stub_support.spawn(['sh','-c','sleep 0.2; exec \"$0\" \"$@\"',sys.executable,sys.argv[2],sys.argv[3]])\n"
                     "print(p.pid,flush=True)\nos._exit(0)\n")
         mid = stub_support.spawn([sys.executable, "-c", mid_code, os.path.dirname(STUB), STUB, str(port)], stdout=subprocess.PIPE, text=True)
         self.addCleanup(stub_support.stop_group, mid, port)
@@ -334,16 +335,16 @@ class TestStopGroupPins(unittest.TestCase):
 
     def test_low_the_idle_timer_is_refreshed_by_requests(self):
         port = stub_support.free_port()
-        p = stub_support.start(self, [sys.executable, STUB, str(port)], port=port, env=dict(os.environ, STUB_IDLE_SECONDS="2"))
+        p = stub_support.start(self, [sys.executable, STUB, str(port)], port=port, env=dict(os.environ, STUB_IDLE_SECONDS="0.5"))
         self.assertTrue(wait_until(lambda: not stub_support.port_is_free(port)))
-        end = time.time() + 5   # longer than the 2 s cap, with a request every half second
+        end = time.time() + 1.1   # longer than the 0.5 s cap, with a request every 0.15 s
         while time.time() < end:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
             c.request("GET", "/api/info")
             c.getresponse().read()
             c.close()
             self.assertIsNone(p.poll(), "the stub ended while it was being asked")
-            time.sleep(0.5)
+            time.sleep(0.15)
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the stub did not end once the requests stopped")
 
 
@@ -717,13 +718,18 @@ def _remove_stmt(parent, stmt):
     raise AssertionError("statement not found")
 
 
-def mutate(tree, site, how="remove"):
+def mutate(tree, site, how="remove", return_tree=False):
     """The source of a copy of the tree with this site's cleanup removed (how=remove), or reduced to a wait (how=wait). None: no such mutant."""
     alias, how = how == "alias", ("remove" if how == "alias" else how)   # alias: the remove mutant, with the started call renamed through an alias
     if alias and site["kind"] not in ("popen", "process", "thread", "helper"):
         return None
-    t = ast.parse(ast.unparse(tree))   # a private copy; the same site is found again by its place among the sites of its kind in the file
-    ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"]].index(site["line"])
+    # a private copy of what the mutant needs: the top-level statements that are not definitions (imports, aliases) and the one statement that holds
+    # the site; the other definitions cannot change the verdict on this site, and copying, scanning and unparsing a whole file for each of ~250 mutants cost minutes
+    holder = [b for b in tree.body if getattr(b, "lineno", 0) <= site["line"] <= getattr(b, "end_lineno", 0)]
+    lo, hi = (holder[0].lineno, holder[0].end_lineno) if holder else (0, 10 ** 9)
+    keep = [b for b in tree.body if isinstance(b, (ast.Import, ast.ImportFrom)) or b in holder]
+    t = copy.deepcopy(ast.Module(body=keep, type_ignores=[]))
+    ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"] and lo <= x["line"] <= hi].index(site["line"])
     target = sorted([x for x in scan_tree(site["file"], t) if x["kind"] == site["kind"]], key=lambda x: x["line"])[ordinal]
     par, node, kind = target["par"], target["node"], site["kind"]
     if kind == "helper" and how == "remove":
@@ -766,7 +772,7 @@ def mutate(tree, site, how="remove"):
     else:
         return None
     ast.fix_missing_locations(t)
-    return ast.unparse(t)
+    return t if return_tree else ast.unparse(t)
 
 
 ALIAS = "_alias_start"
@@ -1041,19 +1047,13 @@ def _case(s):
 
 def _mutant_case(s, how):
     def run(self):
-        src = mutate(s["tree"], s, how)
-        self.assertIsNotNone(src, "no mutant for %s" % site_name(s))
+        tree = mutate(s["tree"], s, how, return_tree=True)
+        self.assertIsNotNone(tree, "no mutant for %s" % site_name(s))
         if how == "alias":
-            self.assertIn(ALIAS, src, "the alias mutant of %s does not carry the alias" % site_name(s))
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        dest = os.path.join(d, s["file"])
-        os.makedirs(os.path.dirname(dest))
-        with open(os.path.join(ROOT, s["file"])) as f:
-            first = f.readline()
-        with open(dest, "w") as f:
-            f.write((first if first.startswith("#!") else "") + src)   # unparse drops the shebang that tells the scan it is Python
-        bad = [x for x in find_sites(d) if not x["ok"]]
+            self.assertTrue(any(getattr(n, "id", None) == ALIAS or getattr(n, "asname", None) == ALIAS or getattr(n, "name", None) == ALIAS
+                                or getattr(n, "arg", None) == ALIAS for n in ast.walk(tree)),
+                            "the alias mutant of %s does not carry the alias" % site_name(s))
+        bad = [x for x in scan_tree(s["file"], tree) if not x["ok"]]
         self.assertEqual(sorted({x["func"] for x in bad}), [s["func"] if s["kind"] != "embedded" else "<string>"], "the scan missed the %s mutant of %s" % (how, site_name(s)))
     return run
 

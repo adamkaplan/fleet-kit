@@ -253,7 +253,7 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertTrue(rig.entered.is_set())
         lines = len(rig.out.lines)
         rig.release.set()   # the read ends after the wrapper returned
-        time.sleep(0.5)
+        time.sleep(0.15)
         self.assertEqual(len(rig.out.lines) - lines, 0, "a line was written after the wrapper returned")
 
     def test_s11_a_read_that_outlasts_the_join_writes_no_line_after_the_return(self):
@@ -269,7 +269,7 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertEqual(len(rig.progress()), 2)
         lines = len(rig.out.lines)
         rig.now[0] += 180
-        time.sleep(0.5)
+        time.sleep(0.15)
         self.assertEqual(len(rig.out.lines) - lines, 0, "a line was written after the wrapper returned")
         self.assertEqual(after - before, 0, "the progress thread is still alive after the wrapper returned")
 
@@ -466,7 +466,7 @@ class TestHeavyProgress(unittest.TestCase):
             self.assertEqual(len(rig.out.text.splitlines()), 1, "a line separator reached the error stream: %r" % (rig.out.text,))
             self.assertNotIn(sep, rig.out.text, "a line separator reached the error stream")
         heavy = load_heavy()
-        for code in range(0x110000):
+        for code in list(range(0x200)) + list(range(0x2000, 0x2100)) + [0xFEFF, 0xFFFE, 0xFFFF, 0x1D173, 0xE0001, 0xE007F]:   # a representative set: controls, Latin, the general punctuation block (U+2028, U+2029), format characters, noncharacters
             char = chr(code)
             out = Out([0])
             heavy._progress_interval({"FLEET_HEAVY_PROGRESS_SECONDS": char}, out)

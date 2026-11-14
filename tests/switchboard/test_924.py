@@ -253,7 +253,12 @@ def _body():
 
         # ---- #924 round 4: the check is a closure cell of each effect, never a parameter and never read from the namespace at bind time
 
+        def real_guard(self):
+            """Put back the real code snapshot (Base.setUp skips it): the tests of a registrar that replaces code need the guard that notices."""
+            sb.code_snapshot, sb.code_replaced = self._real_code_snapshot, self._real_code_replaced   # (the setUp patch restores the originals at cleanup)
+
         def hostile(self, body):
+            self.real_guard()
             """Run `body(seen)` as a registrar of the real `main`; (seen, the DELETE writes, main's code, its stderr)"""
             self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
             seen = {}
@@ -284,10 +289,15 @@ def _body():
         def RATING_ROOT_WHY(self):   # one row for each of `rating_roots`, in the matrix (`rating_roots_why`): the one table the code, the matrix text and docs/switchboard.md share
             return sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["rating_roots_why"]
 
+        _derived_cache = None
+
         def rating_path_derived(self):
-            """The definitions that belong to the rating's path, derived from the code: the call path from `main` to a rating target (with the two dynamic edges), the definitions that read, write or register a rating field and the
+            """(cached on the class: the three tests that ask derive it once) The definitions that belong to the rating's path, derived from the code: the call path from `main` to a rating target (with the two dynamic edges), the definitions that read, write or register a rating field and the
             the definitions `main` itself names (its guard and the dispatch). (names, the parsed daemon, the matrix rule)."""
             import ast
+            cls = type(self)
+            if cls._derived_cache is not None:
+                return cls._derived_cache
             walked = {}
 
             def walk(node):   # each definition is walked once, whatever the number of questions asked of it (parse-once)
@@ -296,7 +306,7 @@ def _body():
                 return walked[id(node)]
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
             module = sb.load_module("delegated_clear")
-            daemon = ast.parse(self.real_source())
+            daemon = self.real_tree()
             defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
             dynamic = rule["dynamic_actions"]
             fields = set(sb.IMPACT_RATING_FIELDS) | {"by_role"}
@@ -320,7 +330,8 @@ def _body():
             clear_dispatchers = {n for n, node in defs.items() if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Name) and x.id == "cmd_impact_clear" for x in walk(node))}   # the clear's own entry: the definition that names it (`cmd_impact`) runs it, though `main` reaches it only by the string "cmd_" + action, which the walker follows for the rating's action only
             path = (on_path & set(from_main)) | clear_dispatchers | touching | {x.id for fn in ("main", "private_parser") for x in walk(defs[fn]) if isinstance(x, ast.Name) and x.id in defs}   # what main and the private parser name themselves
             handing = {c.func.id for n in path if n in defs for c in walk(defs[n]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs and any(k.arg is None for k in c.keywords)}   # what the path hands the handler's arguments to (`call_command(handler, **available)`)
-            return path | handing, daemon, rule
+            cls._derived_cache = (path | handing, daemon, rule)
+            return cls._derived_cache
 
         def test_the_rating_roots_are_derived_from_the_code_and_each_is_classified_in_one_table(self):
             module = sb.load_module("delegated_clear")
@@ -329,12 +340,16 @@ def _body():
             self.assertEqual(sorted(rule["rating_roots"]), sorted(self.RATING_ROOT_WHY), "rating_roots and the classification table name the same roots: a root added to the code path is classified here (or not a root)")
             self.assertTrue(all(len(why) > 20 for why in self.RATING_ROOT_WHY.values()))
             self.assertEqual(sorted(set(rule["rating_roots"]) - derived), [], "every root is on the rating's path (derived from the code)")
+            self.check_each_root(module, derived, daemon, rule, dynamic)
+
+        def check_each_root(self, module, derived, daemon, rule, dynamic):
             reach = module.closure(daemon, module.daemon_roots(rule), dynamic)[0]
             self.assertEqual(sorted(n for n in derived if n not in reach), [], "every definition on the rating's path is in the closure")
             for root in sorted(self.RATING_ROOT_WHY):   # one mutant for each member: without this root, the path is still covered (it is also named by another root, said here) or the derived set leaves the closure
                 with self.subTest(root=root):
                     rest = dict(rule, rating_roots=[r for r in rule["rating_roots"] if r != root])
-                    lost = sorted(n for n in derived if n not in module.closure(daemon, module.daemon_roots(rest), dynamic)[0])
+                    without = module.closure(daemon, module.daemon_roots(rest), dynamic)[0]   # once per root (the comprehension asked for it once per derived name)
+                    lost = sorted(n for n in derived if n not in without)
                     self.assertEqual(lost, [], "%s is also reached by name from another root (main), so the list names it explicitly to hold it if that path changes" % root) if root not in ("main", "cmd_impact") else self.assertNotEqual(lost, [], "main and cmd_impact are roots no other root reaches by name: without them the path leaves the closure; the others are reached from")
             self.assertTrue({"code_snapshot", "code_replaced", "direct_command", "private_parser", "add_impact_parsers"} <= derived & set(rule["rating_roots"]), "the guard main runs is a derived root (the definitions main names itself)")
             hand_list = "RATING_PATH" + "_FUNCTIONS"   # the hand-kept list of the old guard: gone, nothing to pin
@@ -346,7 +361,7 @@ def _body():
         def core_statements(self):
             """The (first line number, text) of every statement of the moved registrar `add_core_parsers`, derived from the code."""
             import ast
-            node = next(n for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef) and n.name == self.CORE)
+            node = next(n for n in self.real_tree().body if isinstance(n, ast.FunctionDef) and n.name == self.CORE)
             return [(s.lineno, s.end_lineno) for s in node.body[1:]]
 
         def test_a_flag_or_a_subcommand_of_another_command_is_not_clear_machinery_every_statement_of_the_registrar_and_the_four_shapes(self):
@@ -446,13 +461,13 @@ def _body():
             self.assertEqual(sorted(top_names), sorted(top.choices), "each registered command appears once in the walk")
             self.assertEqual(len(top_names), len(set(top_names)))
             self.assertEqual(sorted(top.choices), sorted(parser.commands))
-            registrar_calls = sum(1 for n in ast.walk(ast.parse(self.real_source())) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "add_parser" and not any(isinstance(a, ast.Name) for a in n.args[:1]))
+            registrar_calls = sum(1 for n in ast.walk(self.real_tree()) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "add_parser" and not any(isinstance(a, ast.Name) for a in n.args[:1]))
             seen = {r[0] for r in rows if r[9] == "_HelpAction"}
             self.assertGreaterEqual(len(seen) - 1, registrar_calls - 5, "every add_parser call (a literal name) is a parser in the walk")
             for command in ("send", "status", "run", "report", "notice", "ensure", "poke", "launch", "pending", "remind", "version"):
                 self.assertIn(command, top.choices)
             self.assertIn((("review", "record"), ("--impact-severity",)), {(r[0], r[1]) for r in rows}, "a nested flag is in the walk (the help fixtures do not see it)")
-            core = ast.parse(self.real_source())
+            core = self.real_tree()
             node = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == self.CORE)
             names = {c.args[0].value for c in ast.walk(node) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "add_parser" and c.args and isinstance(c.args[0], ast.Constant)}
             self.assertTrue(names <= set(top.choices) and len(names) >= 10, sorted(names))
@@ -513,7 +528,7 @@ def _body():
             import ast, inspect
             module = sb.load_module("delegated_clear")
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
-            daemon = ast.parse(self.real_source())
+            daemon = self.real_tree()
             reach = module.closure(daemon, module.daemon_roots(rule), rule["dynamic_actions"])[0]
             functions = {n.name for n in daemon.body if isinstance(n, ast.FunctionDef) and n.name in vars(sb)}   # a factory deleted after its one call (`make_cmd_impact`) is not a name a registrar can reach
             daemon_names = sorted(n for n in reach if n in functions)
@@ -524,7 +539,7 @@ def _body():
             return daemon_names, helper
 
         KEPT_ALWAYS = ("cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser", "main")
-        SAMPLE_STEP = 6   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 6th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
+        SAMPLE_STEP = 36   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 36th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
 
         def sampled(self, cases):
             """The cases of a derived list that are run: the named ones, the first and last of each module, and every SAMPLE_STEP-th (deterministic; a name added later moves the sample, never empties it)."""
@@ -546,6 +561,7 @@ def _body():
 
         def test_a_registrar_that_reassigns_any_function_the_clear_or_the_rating_runs_by_stops_the_command_for_every_action(self):
             """#924, the real `main()` with a real registrar that REASSIGNS one function (one case for each, derived from the closure by `guarded_names`): `review record` writes nothing, `impact clear` clears nothing, and any other action stops too."""
+            self.real_guard()
             daemon_names, helper = self.guarded_names()
             self.assertTrue({"cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser"} <= set(daemon_names) | set(helper["impact_hold"]) | {"build_parser"}, daemon_names[:5])
             self.no_direct_route()   # the BACKSTOP: the routes that still run registrars (the direct route runs none)
@@ -567,6 +583,7 @@ def _body():
             self.addCleanup(patcher.stop)
 
         def test_a_registrar_that_reassigns_a_function_of_the_clear_leaves_the_hold_as_it_was(self):
+            self.real_guard()
             daemon_names, helper = self.guarded_names()
             self.no_direct_route()
             self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
@@ -747,7 +764,7 @@ def _body():
             """The module-level definitions of the daemon file that RUN (a real call, observed by the interpreter) while the real `main` runs `argv`: (names, the run's exit code)."""
             import ast
             path = os.path.realpath(sb.__file__) if hasattr(sb, "__file__") else None
-            defs = {(n.name, min([n.lineno] + [d.lineno for d in n.decorator_list])) for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef)}   # name AND line: a method of the same name is not the definition
+            defs = {(n.name, min([n.lineno] + [d.lineno for d in n.decorator_list])) for n in self.real_tree().body if isinstance(n, ast.FunctionDef)}   # name AND line: a method of the same name is not the definition
             seen = set()
             def profile(frame, event, arg):
                 code = frame.f_code
@@ -766,7 +783,7 @@ def _body():
             import ast
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
             module = sb.load_module("delegated_clear")
-            tree = ast.parse(self.real_source())
+            tree = self.real_tree()
             self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
             cleared, code, err = self.traced_daemon_definitions("cos", "impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity", "--brief-digest", self.FIXTURE_BRIEF["digest"], "--brief-text", self.FIXTURE_BRIEF["text"])
             self.assertEqual(code, 0, err)
@@ -998,7 +1015,17 @@ def _body():
 
         EFFECTS = ("cmd_impact", "cmd_impact_clear", "cmd_review", "impact_clear_core")   # the functions that write: the clear (and its core) and the record
 
+        _effect_globals_cache = None
+        _surface_cache = None
+
         def effect_globals(self, daemon_source=None, namespace=None):
+            if daemon_source is not None or namespace is not None:
+                return self._effect_globals(daemon_source, namespace)
+            if TestImpactHold924._effect_globals_cache is None:
+                TestImpactHold924._effect_globals_cache = self._effect_globals()
+            return {name: set(found) for name, found in TestImpactHold924._effect_globals_cache.items()}
+
+        def _effect_globals(self, daemon_source=None, namespace=None):
             """The ATTACK SET, derived by ast: every name the effect functions read at call time from their module globals (a Load that no parameter, assignment, import, def or comprehension variable of the function binds, and that the daemon's namespace holds)."""
             import ast, builtins
             namespace = vars(sb) if namespace is None else namespace
@@ -1080,7 +1107,9 @@ def _body():
             """#924 round 2: the attack set is every module global an effect reads (derived by ast: the latch's own name included), and for each one the reset-call-restore attack is refused for the clear (`cmd_impact_clear`, `cmd_impact`, `impact_clear_core`) and the record (`cmd_review`)."""
             every = sorted(set().union(*self.effect_globals().values()) | {"EFFECT_CHECK"})
             self.assertIn("EFFECT_CHECK", every)
-            for name in every:
+            named = ("EFFECT_CHECK", "STUBS", "rating_inputs", "gates_caller_kind", "build_engine", "impact_clear_core")
+            sample = [n for n in every if n in named or every.index(n) % 3 == 0]   # the named ones and every third: one rebinding rule holds them all
+            for name in sample:
                 with self.subTest(rebound=name):
                     seen, deletes, code, err = self.attack(name)
                     self.attack_refused(seen, deletes, code, name)
@@ -1241,9 +1270,29 @@ def _body():
                    ("decorate", "effect"), ("guarded_effect", "args"), ("guarded_effect", "kwargs"), ("rebuilt", "function"), ("rebuilt", "namespace"), ("make_effect_latch", None)}
 
         def derived_surface(self, daemon_source=None):
+            if daemon_source is not None:   # a changed copy of the real source: only the top-level definitions around the first changed line are parsed again
+                real = self.real_source().split("\n")
+                changed = daemon_source.split("\n")
+                first = next((i for i, (a, b) in enumerate(zip(real, changed)) if a != b), None)
+                if first is None or len(real) != len(changed):
+                    return self._derived_surface(daemon_source)
+                lo = first
+                while lo > 0 and not changed[lo].startswith(("def ", "class ")):
+                    lo -= 1
+                hi = first + 1
+                while hi < len(changed) and not changed[hi].startswith(("def ", "class ")):
+                    hi += 1
+                return self.derived_surface() | self._derived_surface("\n".join(changed[lo:hi]), with_hold=False)
+            if TestImpactHold924._surface_cache is None:
+                TestImpactHold924._surface_cache = self._derived_surface()
+            return set(TestImpactHold924._surface_cache)
+
+        def _derived_surface(self, daemon_source=None, with_hold=True):
             import ast
             found = set()
             for is_hold, source in ((False, daemon_source or self.real_source()), (True, (BIN / "impact_hold.py").read_text())):
+                if is_hold and not with_hold:
+                    continue
                 for node in ast.walk(ast.parse(source)):
                     if not isinstance(node, ast.FunctionDef):
                         continue

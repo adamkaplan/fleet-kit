@@ -114,6 +114,13 @@ class Base(unittest.TestCase):
         ample = mock.patch.object(shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(1000 * 10 ** 9, 500 * 10 ** 9, 500 * 10 ** 9))
         ample.start()
         self.addCleanup(ample.stop)
+        # `main` takes a snapshot of every module global twice per call; only the registrar-replacement tests look at it, so every other test skips the walk.
+        # (the tests that tamper with a registrar's code put the real ones back: _real_code_snapshot, _real_code_replaced)
+        self._real_code_snapshot, self._real_code_replaced = sb.code_snapshot, sb.code_replaced
+        for name, value in (("code_snapshot", lambda: {}), ("code_replaced", lambda before, after: [])):
+            fast = mock.patch.object(sb, name, value)
+            fast.start()
+            self.addCleanup(fast.stop)
         (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)

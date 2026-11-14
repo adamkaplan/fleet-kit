@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,9 +46,8 @@ def write(root, rel, text, mode=None):
         path.chmod(mode)
 
 
-def fixture():
+def _build_fixture(root):
     """A repository with one module `lib/calc.py` that two suites run: one by import, one by its command name `calc-cli`."""
-    root = tempfile.mkdtemp(prefix="ps-fixture-")
     git(root, "init", "-q", "-b", "main")
     write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return a + b\n")
     write(root, "bin/calc-cli", "#!/usr/bin/env python3\nimport sys; sys.path.insert(0, 'lib')\nimport calc\nprint(calc.add(1, 2))\n", 0o755)
@@ -56,6 +56,20 @@ def fixture():
     write(root, "docs/notes.md", "nothing\n")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "base")
+
+
+_FIXTURE_TEMPLATE = []
+
+
+def fixture():
+    """A fresh copy of the base repository, built once for this process (a git init and commit each time cost most of a fixture)."""
+    if not _FIXTURE_TEMPLATE:
+        template = tempfile.mkdtemp(prefix="ps-template-")
+        _build_fixture(template)
+        _FIXTURE_TEMPLATE.append(template)
+    root = tempfile.mkdtemp(prefix="ps-fixture-")
+    shutil.rmtree(root)
+    shutil.copytree(_FIXTURE_TEMPLATE[0], root, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
     return root
 
 
@@ -778,22 +792,16 @@ class TestHandKeptRowMutant(unittest.TestCase):
     NAME = "tests/switchboard/test_cases_10.py"
 
     def test_removing_the_name_from_the_row_is_named_by_check_manual(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = os.path.join(tmp, "copy")
-            done = sh(tmp, "git", "clone", "-q", "--no-hardlinks", str(REPO), root)
-            self.assertEqual(done.returncode, 0, done.stderr)
-            table = os.path.join(root, ps.MANUAL)
-            with open(table, encoding="utf-8") as handle:
-                data = json.load(handle)
-            rows = [r for r in data["rows"] if r.get("glob") == "bin/path_suites.py"]
-            self.assertEqual(len(rows), 1)
-            self.assertIn(self.NAME, rows[0]["suites"])
-            self.assertEqual(ps.check_manual(root), [])
-            rows[0]["suites"].remove(self.NAME)
-            with open(table, "w", encoding="utf-8") as handle:
-                json.dump(data, handle)
-            problems = ps.check_manual(root)
-            self.assertIn("bin/path_suites.py: misses %s, which the derivation finds for bin/path_suites.py" % self.NAME, problems)
+        # the table is read through load_manual: the mutant hands check_manual the real rows with the name removed (no clone of the repository: the derivation reads this checkout)
+        data = {"rows": ps.load_manual(str(REPO))}
+        rows = [r for r in data["rows"] if r.get("glob") == "bin/path_suites.py"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn(self.NAME, rows[0]["suites"])
+        self.assertEqual(ps.check_manual(str(REPO)), [])
+        mutant = [dict(r, suites=[x for x in r["suites"] if x != self.NAME]) if r is rows[0] else r for r in data["rows"]]
+        with mock.patch.object(ps, "load_manual", lambda root: mutant):
+            problems = ps.check_manual(str(REPO))
+        self.assertIn("bin/path_suites.py: misses %s, which the derivation finds for bin/path_suites.py" % self.NAME, problems)
 
 
 def table_stub():
@@ -829,32 +837,39 @@ def table_lines(text):
     return [l for l in text.splitlines() if l.split(" ")[0] in ("PASS", "FAIL") and any(l.split(" ", 1)[1].startswith(n + " (") for n in names)]
 
 
+_TABLE_RUNS = {}
+
+
+def table_run(*args, add=True):
+    """`run_switchboard` of preflight-pr on the table fixture, run ONCE for each (add, args) for this process: the tests below read the same real run (it takes about ten seconds) and none of them writes to it."""
+    key = (add, args)
+    if key not in _TABLE_RUNS:
+        _TABLE_RUNS[key] = run_switchboard(table_fixture(add=add), "preflight-pr", *args)
+    return _TABLE_RUNS[key]
+
+
 class TestOneTableOfTheBinSetClasses(unittest.TestCase):
     """#1457 (S2, S3, S5, U1): preflight-pr runs the one table NEW_BIN_GUARDS when the change adds a file under bin/, with and without --merged."""
 
     def test_s2_without_merged_one_pass_or_fail_line_per_row_of_the_table(self):
-        root = table_fixture()
-        done = run_switchboard(root, "preflight-pr")
+        done = table_run()
         lines = table_lines(done.stdout)
         self.assertEqual(len(lines), len(ps.NEW_BIN_GUARDS), done.stdout + done.stderr)
         self.assertEqual(done.returncode, 1)
 
     def test_s3_with_merged_the_same_one_line_per_row(self):
-        root = table_fixture()
-        done = run_switchboard(root, "preflight-pr", "--merged")
+        done = table_run("--merged")
         self.assertEqual(len(table_lines(done.stdout)), len(ps.NEW_BIN_GUARDS), done.stdout + done.stderr)
         names = lambda text: [(l.split(" ")[0], l.split(" ")[1]) for l in table_lines(text)]
-        self.assertEqual(names(done.stdout), names(run_switchboard(root, "preflight-pr").stdout))
+        self.assertEqual(names(done.stdout), names(table_run().stdout))
 
     def test_s5_the_class_the_new_file_breaks_prints_fail_and_the_others_pass(self):
-        root = table_fixture()
-        lines = table_lines(run_switchboard(root, "preflight-pr").stdout)
+        lines = table_lines(table_run().stdout)
         self.assertEqual([l.split(" ")[1] for l in lines if l.startswith("FAIL")], ["TestArchitectureDocument"], lines)
         self.assertEqual(sum(1 for l in lines if l.startswith("PASS")), len(ps.NEW_BIN_GUARDS) - 1)
 
     def test_u1_a_change_that_adds_no_bin_file_prints_no_table_line_and_the_lines_are_the_same_as_without_the_table(self):
-        root = table_fixture(add=False)
-        done = run_switchboard(root, "preflight-pr")
+        done = table_run(add=False)
         self.assertEqual(table_lines(done.stdout), [])
         self.assertNotIn("new file under bin/", done.stdout)
         self.assertNotIn("CANNOT RUN", done.stdout)

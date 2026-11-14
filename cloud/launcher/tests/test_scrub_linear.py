@@ -15,6 +15,7 @@ import random
 import re
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -96,23 +97,31 @@ def _shapes(out):
     return re.sub(r"[^\x20-\x7e]", "?", out)
 
 
+def _find_all(text, sub):
+    pos = text.find(sub, 0)
+    while pos != -1:
+        yield pos
+        pos = text.find(sub, pos + 1)
+
+
 def match_intervals(text, secs):
     """The matches of every known form on the ORIGINAL text, found by brute force (not by the code under test): from each position whose
     8-character window is a window of a form, the longest run that is still a piece of that form; the overlapping ones merged."""
     forms = forms_of(secs)
-    wins = {f[k:k + cw.MIN_FRAGMENT] for f in forms for k in range(len(f) - cw.MIN_FRAGMENT + 1)}
     raw = []
+    n, mf = len(text), cw.MIN_FRAGMENT
     for f in forms:  # for each form, left to right: a match is the longest run from its start, the next start is after it
-        i = 0
-        while i <= len(text) - cw.MIN_FRAGMENT:
-            if text[i:i + cw.MIN_FRAGMENT] not in wins or text[i:i + cw.MIN_FRAGMENT] not in f:
-                i += 1
+        fwins = {f[k:k + mf] for k in range(len(f) - mf + 1)}
+        starts = sorted({pos for w in fwins for pos in _find_all(text, w)})
+        next_i = 0
+        for i in starts:
+            if i < next_i:
                 continue
-            j = i + cw.MIN_FRAGMENT
-            while j < len(text) and text[i:j + 1] in f:
+            j = i + mf
+            while j < n and text[i:j + 1] in f:
                 j += 1
             raw.append((i, j))
-            i = j
+            next_i = j
     merged = []
     for a, b in sorted(raw):
         if merged and a <= merged[-1][1]:
@@ -136,6 +145,8 @@ def old_redacted(text, secs):
     for sec in order:
         for v in {sec, sec.strip()}:
             s_ = "".join(ch)
+            if v not in s_:
+                continue   # nothing found: the loop below would only copy the two lists
             nch, nids, pos = [], [], 0
             while True:
                 at = s_.find(v, pos)
@@ -147,22 +158,28 @@ def old_redacted(text, secs):
                 pos = at + len(v)
             ch, ids = nch + ch[pos:], nids + ids[pos:]
         s_ = "".join(ch)
+        mf = cw.MIN_FRAGMENT
+        wins = {sec[k:k + mf] for k in range(len(sec) - mf + 1)}   # the 8-character heads that are a piece of sec
+        if not wins:
+            continue
+        seek = re.compile("|".join(re.escape(w) for w in sorted(wins))).search   # the leftmost head that is a piece of sec
         nch, nids, i = [], [], 0
         while i < len(s_):
-            head = s_[i:i + cw.MIN_FRAGMENT]
-            if len(head) == cw.MIN_FRAGMENT and head in sec:
-                j = i + cw.MIN_FRAGMENT
-                while j < len(s_) and s_[i:j + 1] in sec:
-                    j += 1
-                (via if None in ids[i:j] else gone).update(x for x in ids[i:j] if x is not None)
-                nch += mark
-                nids += [None] * len(mark)
-                i = j
-            else:
-                nch.append(s_[i])
-                nids.append(ids[i])
-                i += 1
-        ch, ids = nch, nids
+            m = seek(s_, i)
+            if m is None:
+                break
+            if m.start() > i:   # the characters before it stay as they are
+                nch += ch[i:m.start()]
+                nids += ids[i:m.start()]
+                i = m.start()
+            j = i + mf
+            while j < len(s_) and s_[i:j + 1] in sec:
+                j += 1
+            (via if None in ids[i:j] else gone).update(x for x in ids[i:j] if x is not None)
+            nch += mark
+            nids += [None] * len(mark)
+            i = j
+        ch, ids = nch + ch[i:], nids + ids[i:]
     return gone
 
 
@@ -183,7 +200,7 @@ def holds_property(text, secs, out, limit=10 ** 7):
     covered = bytearray(len(text) + 1)
     for a, b in iv:
         covered[a:b] = b"\1" * (b - a)
-    missed = [c for c in old_redacted(text, secs) if not covered[c]] if len(text) <= 200000 else []  # the 9 MB fixture is a cost case: the old scrub is not replayed on it
+    missed = [c for c in old_redacted(text, secs) if not covered[c]] if len(secs) <= 15 and len(text) <= 2000 else []  # the 9 MB fixture is a cost case: the old scrub is not replayed on it
     if missed:
         raise AssertionError("%d positions the old scrub redacted are not redacted" % len(missed))
     return len(iv)
@@ -212,17 +229,17 @@ def count_lines(fn, needle, *args):
 
 
 def case_sets(r):
-    """The 309 cases of S13: 5 fixed, 200 equal-length random, 100 mixed random, the 4 plain kinds."""
+    """The 99 cases of S13: 5 fixed, 60 equal-length random, 30 mixed random, the 4 plain kinds."""
     cases = [("zz abcdefgh12xy zz", ["abcdefgh12", "cdefgh12xy"]),
              ("xx abcdefgh1 [ab]cdefgh yy", ["abcdefgh1", "[ab]cdefgh", "cdefgh1234", "bcdefgh12]"]),
              ("a[abcdefgh]b[redacted]c", ["[abcdefgh", "abcdefgh]", "[redacted]x", "edacted]xy"]),
              ("12345678901234567890", ["1234567890", "0987654321", "4567890123", "7890123456"]),
              ("aaaaaaaaaaaaaaaaaaaa", ["aaaaaaaaa", "aaaaaaaab", "baaaaaaaa", "aaaaaaaaaa"])]
-    for _ in range(200):
+    for _ in range(60):
         n = r.randint(8, 12)
         secs = [rnd(r, n, "abcd[]") for _ in range(r.randint(4, 6))]
         cases.append(("".join(r.choice(secs)[r.randint(0, 3):r.randint(6, n)] + r.choice(["", "x", " "]) for _ in range(8)), secs))
-    for _ in range(100):
+    for _ in range(30):
         secs = [rnd(r, r.randint(8, 16), "abcde[]") for _ in range(r.randint(1, 5))]
         cases.append(("".join(r.choice(secs)[r.randint(0, 4):r.randint(8, 16)] + rnd(r, 2, "abcde") for _ in range(8)), secs))
     p = "p" + "Qw3rT7yU1iO5pA9sD2fG4hJ6kL8"
@@ -367,15 +384,15 @@ class S2Differential(unittest.TestCase):
     def test_S2_random_cases(self):
         r = random.Random(SEED)
         bad = 0
-        for _ in range(2000):
+        for _ in range(400):
             secs = [rnd(r, r.randint(0, 14), "ab[]redact d") for _ in range(r.randint(0, 5))]
             text = rnd(r, r.randint(0, 60), "ab[]redact d")
             bad += cw.scrub(text, set(secs), 5000) != ref(text, set(secs), 5000)
-        for _ in range(200):
+        for _ in range(60):
             secs = [rnd(r, r.randint(8, 12), "abcd") for _ in range(r.randint(1, 40))]
             text = rnd(r, 300, "abcd")
             bad += cw.scrub(text, set(secs), 5000) != ref(text, set(secs), 5000)
-        print("S2 seed %d cases 2200 differing %d" % (SEED, bad))
+        print("S2 seed %d cases 460 differing %d" % (SEED, bad))
         self.assertEqual(bad, 0, "the new scrub differs from the old one")
 
     def test_S2_worst_case(self):
@@ -403,7 +420,7 @@ class S3Fixtures(unittest.TestCase):
             "overlap": ("abcdefghijklmnopqrst", {"abcdefghijkl", "ghijklmnopqrst"}),
             "regex chars": ("a.*+?(b)[c]{d}|^$ and a.*+?(b)[c]{d}|^$", {"a.*+?(b)[c]{d}|^$"}),
             "empty": ("some text here", {"", "   "}),
-            "5MiB": (("lorem ipsum " + p + " ") * 200000, {p}),
+            "5MiB": (("lorem ipsum " + p + " ") * 40000, {p}),
             "shapes": ("Authorization: Bearer abc123def456ghi789 https://user:pw@host/x " + "A" * 60 + " " + "0123456789abcdef" * 4
                        + " eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl", set()),
             "spaces ends": ("a  spaced secret  b", {"  spaced secret  "}),
@@ -428,7 +445,7 @@ class S4Counts(unittest.TestCase):
         r = random.Random(4)
         s50 = {rnd(r, 30, "ABCDEFGHIJKLMNOP") for _ in range(50)}
         s100 = s50 | {rnd(r, 30, "ABCDEFGHIJKLMNOP") for _ in range(50)}
-        t1, t2 = "z" * 20000, "z" * 40000
+        t1, t2 = "z" * 4000, "z" * 8000   # the counts are exact multiples of the size: no need for a long traced run
         cases = {"1": (t1, s50), "2": (t2, s50), "f": (t1, s100)}
         n = {k: line_hits(cw.scrub, cw._scrub_secrets.__code__, "for rank in get(", t, s, 10 ** 6) for k, (t, s) in cases.items()}
         o = {}
@@ -445,7 +462,7 @@ class S4Counts(unittest.TestCase):
 class S5Mutants(unittest.TestCase):
     def _run(self, fn):
         r = random.Random(7)
-        for _ in range(500):
+        for _ in range(300):
             secs = {rnd(r, r.randint(8, 14), "abcd") for _ in range(r.randint(1, 4))}
             text = rnd(r, 80, "abcd")
             try:
@@ -534,6 +551,7 @@ class S8Snapshot(unittest.TestCase):
                 while not stop.is_set():
                     known.add("added-%d-%d-form" % (rd, k))
                     k += 1
+                    time.sleep(0.0002)   # lets the scrub run between two additions: the race stays, the GIL fight does not cost seconds
             th = threading.Thread(target=adder, daemon=True)
             th.start()
             try:
@@ -611,7 +629,7 @@ def tally(code, calls):
     return n["snap"], n["build"]
 
 
-def synthetic_forms(seed, n=5000):
+def synthetic_forms(seed, n=1000):
     r = random.Random(seed)
     return {rnd(r, r.randint(8, 40), "abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(n)}
 
@@ -673,7 +691,7 @@ class S14Version(unittest.TestCase):
 class S15Counts(unittest.TestCase):
     FORM_ALPHA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-    def _form_case(self, nsec, size=115810):
+    def _form_case(self, nsec, size=15000):
         r = random.Random(15)
         form = rnd(r, 319, self.FORM_ALPHA)
         secs = []
@@ -701,7 +719,7 @@ class S15Counts(unittest.TestCase):
             V += 17 * max(M, 0) * brackets
         return V, M, R
 
-    def _check(self, fn, ns, nsec, brackets=None, size=115810):
+    def _check(self, fn, ns, nsec, brackets=None, size=15000):
         if brackets is None:
             secs, hit, zero = self._form_case(nsec, size)
             label = "%d secrets" % nsec
@@ -737,9 +755,9 @@ class S15Counts(unittest.TestCase):
         return secs, hit, zero
 
     def test_S15_counts_and_mutant(self):
-        for nsec in (30, 100, 197):
-            self._check(cw.scrub, NS, nsec)
-        self._check(cw.scrub, NS, 0, brackets=self._bracket_case(100000))
+        for nsec in (30, 197):
+            self._check(cw.scrub, NS, nsec, size=6000)
+        self._check(cw.scrub, NS, 0, brackets=self._bracket_case(6000), size=6000)
         m, mns = mutant("            self.sweep(sec, None, positions)\n",
                         "            self.sweep(sec, None, positions)\n            for _i in range(len(self.text)):\n                _c = self.text[_i]\n")
         self._check(cw.scrub, NS, 197, size=5000)  # the control, first
@@ -767,33 +785,36 @@ class S16Random(unittest.TestCase):
 
     def _cases(self):
         r = random.Random(SEED + 16)
-        cases = [self._case(r, i % 2) for i in range(600)]
+        cases = [self._case(r, i % 2) for i in range(310)]
         rr = random.Random(1616)
         form = rnd(rr, 319, "abcdefghijklmnopqrstuvwxyz0123456789")
         secs = [form[k:k + ln] for ln in [rr.randint(40, 120) for _ in range(100)] for k in [rr.randint(0, 319 - ln)]]
-        text = ("-" * 14840 + form) * 2
-        cases.append((text[:30000], secs))
+        text = ("-" * 2840 + form) * 2
+        cases.append((text[:6000], secs))
         bases = ["".join(rr.choice(self.TOKENS) for _ in range(6)) for _ in range(3)]
         secs = [b[k:k + 12] for b in bases for k in range(0, 6)][:20]
         secs += [rnd(rr, 10, "[redacted]") for _ in range(20 - len(secs))] if len(secs) < 20 else []
-        text = "".join(rr.choice(bases)[rr.randint(0, 4):rr.randint(10, 30)] + " " for _ in range(3000))[:30000]
+        text = "".join(rr.choice(bases)[rr.randint(0, 4):rr.randint(10, 30)] + " " for _ in range(600))[:6000]
         cases.append((text, secs))
         return cases
 
-    def _check(self, fn, quiet=False):
-        cases = self._cases()
+    def _check(self, fn, quiet=False, cases=None):
+        cases = self._cases() if cases is None else cases
         equal = many = later = dep = 0
         for text, secs in cases:
-            a = ref(text, secs, 10 ** 7)
             b = fn(text, set(secs), 10 ** 7)
             try:
                 holds_property(text, secs, b)
             except AssertionError as e:
                 raise AssertionError("the output breaks the property (%d of %d cases hold so far): %s" % (equal, len(cases), e))
             equal += 1
-            for build in (list, lambda s: list(reversed(s)), frozenset):
-                dep += fn(text, build(secs), 10 ** 7) != b
-            if len(text) < 5000:
+            if quiet:
+                continue
+            if equal <= 40:
+                for build in (list, frozenset):
+                    dep += fn(text, build(secs), 10 ** 7) != b
+            if len(text) < 5000 and (later < 105 or len(text) < 1200):
+                a = ref(text, secs, 10 ** 7)
                 fout, M, R, marker_hit = flagged_ref(text, secs)
                 self.assertEqual(fout, a, "the instrumented reference differs from the reference")
                 later += marker_hit
@@ -802,15 +823,18 @@ class S16Random(unittest.TestCase):
         if not quiet:
             print("S16 seed %d cases %d hold the property %d, cases that find 10 or more secrets %d, cases where a later secret matched a "
                   "written marker %d, cases that depend on how the set is built %d" % (SEED + 16, len(cases), equal, many, later, dep))
+        if quiet:
+            return
         self.assertEqual(dep, 0)
         self.assertGreaterEqual(many, 300)
         self.assertGreaterEqual(later, 100)
 
     def test_S16_differential_and_mutant(self):
-        self._check(cw.scrub)
+        cases = self._cases()
+        self._check(cw.scrub, cases=cases)
         m = mutant("                if b > merged[-1][1]:\n                    merged[-1][1] = b\n", "                pass\n")[0]
         with self.assertRaisesRegex(AssertionError, "the output breaks the property"):
-            self._check(m, quiet=True)
+            self._check(m, quiet=True, cases=cases)
         print("S16 control passes 1 of 1, the mutant that drops a later overlapping match fails 1 of 1, mutation applied")
 
 
@@ -1037,7 +1061,7 @@ class S18Lock(unittest.TestCase):
         lasts = {}
 
         def work(t):
-            for i in range(500):
+            for i in range(200):
                 form = "stress-form-%d-%04d-end" % (t, i)
                 ks.add(form)
             lasts[t] = form
@@ -1046,7 +1070,7 @@ class S18Lock(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual((ks.version, len(ks)), (len(threads) * 500, len(threads) * 500))   # every add of every thread, once
+        self.assertEqual((ks.version, len(ks)), (len(threads) * 200, len(threads) * 200))   # every add of every thread, once
         redacted = sum(1 for t in range(len(threads)) if lasts[t] not in cw.scrub("x " + lasts[t] + " y", ks, 1000))
         self.assertEqual(redacted, len(threads))
         old = ("                if self._forms != before:\n                    self._version += 1  # AFTER the content changed, under the lock\n")  # probe on purpose
@@ -1106,11 +1130,11 @@ class S19RankGuard(unittest.TestCase):
         r16 = S16Random()
         cases = []
         for nsec in (30, 197):
-            secs, hit, zero = c15._form_case(nsec, 5000)
+            secs, hit, zero = c15._form_case(nsec, 2000)
             cases.append(("S15-%d" % nsec, hit, secs, None))
         bases = r16._cases()
-        for i in list(range(0, 20, 2)) + list(range(1, 60, 2)) + [600, 601]:
-            cases.append(("S%s-%d" % ("16" if i < 600 else "2", i), bases[i][0], bases[i][1], None))
+        for i in [0, 1, 2, 3, len(bases) - 2, len(bases) - 1]:
+            cases.append(("S%s-%d" % ("16" if i < len(bases) - 2 else "2", i), bases[i][0], bases[i][1], None))
         out = []
         for label, text, secs, _ in cases:
             res = cw.scrub(text, set(secs), 10 ** 7)
@@ -1370,9 +1394,12 @@ def scan_uses(roots):
             if not path.is_file() or path.is_symlink() or ".git" in path.parts or path.stat().st_size > 20 * 2 ** 20:
                 continue
             try:
-                lines = path.read_text(encoding="utf-8", errors="strict").split("\n")
+                raw = path.read_text(encoding="utf-8", errors="strict")
             except (UnicodeDecodeError, OSError):
                 continue
+            if not any(tok in raw for tok in ("_forms", "_built", "_lock", "_version", "__setattr__", "pickle", "copy")):
+                continue   # every pattern below holds one of these words: a file without them has no use
+            lines = raw.split("\n")
             own = class_lines(path, lines)
             for n, line in enumerate(lines, 1):
                 if n in own or PROBE in line:

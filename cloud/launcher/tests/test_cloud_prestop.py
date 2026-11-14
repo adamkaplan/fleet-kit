@@ -1,6 +1,8 @@
+import atexit
 """Ask #1142: the pod's pre-stop hook (cw-prestop / cw-end-hook --prestop). Fake cluster = run the rendered spec's own command."""
-import argparse, datetime as dt, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
+import argparse, contextlib, datetime as dt, io, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
 import pathlib
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -29,6 +31,29 @@ def sh(*a, cwd=None, env=None):
     return subprocess.run(a, cwd=cwd, env=env, capture_output=True, text=True, check=True).stdout.strip()
 
 
+_TEMPLATE = []
+
+
+def _template():
+    """origin, evil and repo as the old setUp built them with git init / clone / commit / push (nothing in them names the temp directory)."""
+    if not _TEMPLATE:
+        t = tempfile.mkdtemp()
+        atexit.register(shutil.rmtree, t, True)
+        origin, evil, work = (os.path.join(t, n) for n in ("origin", "evil", "repo"))
+        sh("git", "init", "-q", "--bare", "-b", "main", evil)
+        sh("git", "init", "-q", "--bare", "-b", "main", origin)
+        sh("git", "clone", "-q", origin, work)
+        for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
+            sh("git", "-C", work, "config", k, v)
+        pathlib.Path(os.path.join(work, "a.txt")).write_text("a")
+        sh("git", "-C", work, "add", "-A")
+        sh("git", "-C", work, "commit", "-qm", "base")
+        sh("git", "-C", work, "push", "-q", "origin", "HEAD:main")
+        sh("git", "-C", work, "remote", "set-url", "origin", URL)   # origin is named like the pod's repository; the hook never uses it
+        _TEMPLATE.append(t)
+    return _TEMPLATE[0]
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp()
@@ -49,18 +74,10 @@ class Base(unittest.TestCase):
         self.opts = " ".join(cw_end_hook.safe_opts(self.helper))
         self.push_url = "file://%s/%s.git" % (self.t, REPO)
         self.refspec = "--no-verify %s HEAD:refs/heads/w1/wip" % self.push_url
-        sh("git", "init", "-q", "--bare", "-b", "main", self.evil)
-        sh("git", "init", "-q", "--bare", "-b", "main", self.origin)
-        sh("git", "clone", "-q", self.origin, self.work)
-        for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
-            sh("git", "-C", self.work, "config", k, v)
-        pathlib.Path(os.path.join(self.work, "a.txt")).write_text("a")
-        sh("git", "-C", self.work, "add", "-A")
-        sh("git", "-C", self.work, "commit", "-qm", "base")
-        sh("git", "-C", self.work, "push", "-q", "origin", "HEAD:main")
-        # the hook is installed under the names the image gives it
-        # origin is named like the pod's repository; the hook never uses it (it pushes to the explicit address, which the seam points at the bare repo)
-        sh("git", "-C", self.work, "remote", "set-url", "origin", URL)
+        template = _template()   # the two bare remotes and the clone, made once by real git and copied here
+        shutil.copytree(os.path.join(template, "evil"), self.evil, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        shutil.copytree(os.path.join(template, "origin"), self.origin, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        shutil.copytree(os.path.join(template, "repo"), self.work, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
         shutil.copy(self.seam(HOOK), os.path.join(self.bin, "cw-end-hook"))
         self.out = os.path.join(self.t, "out")
         # macOS has no GNU timeout: a small stand-in at the front of PATH ('timeout [-k N] SECONDS cmd args' runs cmd args).
@@ -411,6 +428,7 @@ class Grammar(Base):
         self.inc = os.path.join(self.t, "included")
         pathlib.Path(self.inc).write_text('[url "%s"]\n\tinsteadOf = %s\n\tpushInsteadOf = %s\n' % (self.other, self.host, self.host))
         self.cfg = os.path.join(self.work, ".git", "config")
+        self._seam_hook = self.seam(HOOK)
         self.plain = pathlib.Path(self.cfg).read_text()
         self.base_head = sh("git", "-C", self.work, "rev-parse", "HEAD")
         self.fake_git('echo "$@" >> %s\n{ echo "ARGS $@"; env | sort; echo "HOMEFILES $(ls -A "$HOME" | wc -l | tr -d " ")"; echo; } >> %s\nexec REAL "$@"\n'
@@ -426,15 +444,18 @@ class Grammar(Base):
         return [l.strip() for l in pathlib.Path(self.calls).read_text().splitlines(True)] if os.path.exists(self.calls) else []
 
     def reset(self):
+        pushed = any("push" in c for c in self.calls_list())
         for f in (self.calls, self.envlog, self.marker, os.path.join(self.t, "helper.log")):
             if os.path.exists(f):
                 os.remove(f)
         pathlib.Path(self.cfg).write_text(self.plain)
+        if not pushed:   # nothing was pushed: the remote is as it was
+            return
         for r in sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)").split():
             if r != "refs/heads/main":
                 sh("git", "-C", self.origin, "update-ref", "-d", r)
         sh("git", "-C", self.work, "reset", "-q", "--hard", self.base_head)
-        sh("git", "-C", self.work, "clean", "-qfd")
+        sh("git", "-C", self.work, "clean", "-fdqx")
 
     def other_refs(self):
         return sh("git", "-C", self.evil, "for-each-ref", "--format=%(refname)")
@@ -445,22 +466,47 @@ class Grammar(Base):
         return self.run_hook(hook, **kw)
 
     def run_hook(self, hook, **kw):
-        return subprocess.run([self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+        if hook != HOOK:   # a mutated copy of the hook is a file of its own: it runs as a process
+            return subprocess.run([self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+        # the real hook runs in this process (84 interpreter starts cost most of the time), with the same seam values the launcher script sets
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        git_bin = os.path.join(self.bin, "git")
+        with mock.patch.multiple(cw_end_hook, HOST_URL="file://%s/" % self.t, HELPER_DIR=self.helper_dir,
+                                 GIT_BIN=git_bin if os.path.exists(git_bin) else cw_end_hook.GIT_BIN), \
+                mock.patch.dict(os.environ, self.env(**kw), clear=True), \
+                mock.patch.object(sys, "argv", [HOOK, "--prestop"]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cw_end_hook.main()
+            except SystemExit as e:
+                code = e.code or 0
+        return subprocess.CompletedProcess([self._seam_hook, "--prestop"], code or 0, out.getvalue(), err.getvalue())
 
     def set_local(self, key, value):
-        sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
+        head, _, name = key.rpartition(".")
+        section, _, sub = head.partition(".")
+        header = '%s "%s"' % (section, sub) if sub else section
+        pathlib.Path(self.cfg).write_text(pathlib.Path(self.cfg).read_text() + "[%s]\n\t%s = %s\n" % (header, name, value))
 
-    def global_files(self, key, value):
-        """The same key in the home file, the global-override file, and the variables: returns environment overrides."""
+    def global_files(self, key, value, *more):
+        """The same keys in the home file, the global-override file, and the variables: returns environment overrides."""
         home = os.path.join(self.t, "hostile-home")
         os.makedirs(home, exist_ok=True)
         gfile = os.path.join(home, ".git" + "config")
+        pairs = [(key, value)] + list(more)
+        entry = ""
+        for k, v in pairs:
+            head, _, name = k.rpartition(".")
+            section, _, sub = head.partition(".")
+            entry += "[%s]\n\t%s = %s\n" % ('%s "%s"' % (section, sub) if sub else section, name, v)
         for f in (gfile, os.path.join(home, "other")):
-            open(f, "w").close()
-            sh("git", "config", "-f", f, "--" + "add", key, value)
-        return {"HOME": home, CFG_G: os.path.join(home, "other"), CFG_S: os.path.join(home, "other"),
-                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": value,
-                "GIT_CONFIG_PARAMETERS": "'%s'='%s'" % (key, value)}
+            pathlib.Path(f).write_text(entry)
+        env = {"HOME": home, CFG_G: os.path.join(home, "other"), CFG_S: os.path.join(home, "other"),
+               "GIT_CONFIG_COUNT": str(len(pairs)),
+               "GIT_CONFIG_PARAMETERS": " ".join("'%s'='%s'" % kv for kv in pairs)}
+        for i, (k, v) in enumerate(pairs):
+            env["GIT_CONFIG_KEY_%d" % i], env["GIT_CONFIG_VALUE_%d" % i] = k, v
+        return env
 
     def non_config_calls(self):
         # reading the configuration and listing the untracked file names (ls-files --others: no filter, no hook) are the only calls of a refusal
@@ -496,11 +542,12 @@ class Grammar(Base):
         p = self.go(HOOK)
         self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"), p.stdout + p.stderr)
         base_argv, base_env = self.snapshot()
-        for cls, key, value in self.table():
-            with self.subTest(cls=cls, key=key):
+        for cls in GRAMMAR:   # all the keys of one class together: one run for each class
+            rows = [(self.fill(k), self.fill(v)) for k, v in GRAMMAR[cls]]
+            with self.subTest(cls=cls):
                 self.reset()
                 self.dirty()
-                p = self.run_hook(HOOK, **self.global_files(key, value))
+                p = self.run_hook(HOOK, **self.global_files(*rows[0], *rows[1:]))
                 self.assertFalse(os.path.exists(self.marker), "a program ran")
                 self.assertEqual(self.other_refs(), "", "the push landed in the other remote")
                 self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"), p.stdout + p.stderr)
@@ -664,16 +711,53 @@ def instantiate(name):
 class Completeness(Base):
     """The allow-list is CLOSED: every key git documents that is not in the inert table is refused, so a key added later is refused too."""
 
+    def append_plain(self, key, value):
+        """The entry written as git would write it, for the plain names and values (a spawn of git per key is most of the time of this class). False: not plain, ask git."""
+        parts = key.split(".")
+        if len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9._/:@+-]*", value) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", parts[-1]) \
+                or not re.fullmatch(r"[A-Za-z0-9-]+", parts[0]) or (len(parts) > 2 and not re.fullmatch(r"[A-Za-z0-9._/:@+ -]+", ".".join(parts[1:-1]))):
+            return False
+        head = '[%s]' % parts[0] if len(parts) == 2 else '[%s "%s"]' % (parts[0], ".".join(parts[1:-1]))
+        with open(os.path.join(self.work, ".git", "config"), "a") as f:
+            f.write("%s\n\t%s = %s\n" % (head, parts[-1], value))
+        return True
+
+    def is_plain(self, key, value):
+        parts = key.split(".")
+        return not (len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9._/:@+-]*", value) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", parts[-1])
+                    or not re.fullmatch(r"[A-Za-z0-9-]+", parts[0]) or (len(parts) > 2 and not re.fullmatch(r"[A-Za-z0-9._/:@+ -]+", ".".join(parts[1:-1]))))
+
     def refusal(self, key, value):
         cfg = os.path.join(self.work, ".git", "config")
+        if self.is_plain(key, value) and not key.lower().startswith(("include.", "includeif.", "core.worktree", "extensions.")):
+            parts = key.split(".")   # the listing git would give for the one entry, answered in memory: the file is never read
+            norm = "%s.%s" % (parts[0].lower(), parts[1].lower()) if len(parts) == 2 else "%s.%s.%s" % (parts[0].lower(), ".".join(parts[1:-1]), parts[-1].lower())
+            listed = subprocess.CompletedProcess(args=[], returncode=0, stdout=self._base_z + ("file:.git/config\0%s\n%s\0" % (norm, value)).encode(), stderr=b"")
+            try:
+                with mock.patch.object(cw_end_hook.subprocess, "run", return_value=listed):
+                    cw_end_hook.config_refusal(self.work, REPO, self.ctx)
+            except (cw_end_hook.ConfigRefused, RuntimeError):
+                return True
+            return False
         with open(cfg, "w") as f:
             f.write(self.plain)
+        plain = False
         try:
-            sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
+            plain = self.append_plain(key, value)
+            if not plain:
+                sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
         except subprocess.CalledProcessError:
             return True   # git itself cannot store this name (a documentation pattern such as gitweb.remote_heads): it can never be in a repository
         try:
-            cw_end_hook.config_refusal(self.work, REPO, self.ctx)
+            if plain and not key.lower().startswith(("include.", "includeif.", "core.worktree", "extensions.")):
+                # what git would list for the one appended entry (names lower-cased but for a subsection), without a spawn of git per key
+                parts = key.split(".")
+                norm = "%s.%s" % (parts[0].lower(), parts[1].lower()) if len(parts) == 2 else "%s.%s.%s" % (parts[0].lower(), ".".join(parts[1:-1]), parts[-1].lower())
+                listed = subprocess.CompletedProcess(args=[], returncode=0, stdout=self._base_z + ("file:.git/config\0%s\n%s\0" % (norm, value)).encode(), stderr=b"")
+                with mock.patch.object(cw_end_hook.subprocess, "run", return_value=listed):
+                    cw_end_hook.config_refusal(self.work, REPO, self.ctx)
+            else:
+                cw_end_hook.config_refusal(self.work, REPO, self.ctx)
         except (cw_end_hook.ConfigRefused, RuntimeError):   # RuntimeError: git cannot read the repository (core.worktree, extensions.*): nothing is pushed either
             return True
         return False
@@ -684,6 +768,7 @@ class Completeness(Base):
         self.ctx = cw_end_hook.Ctx(self.helper)
         self.addCleanup(self.ctx.close)
         self.ctx.env["PATH"] = "/usr/bin:/bin"
+        self._base_z = subprocess.run([GIT, "-C", self.work, "config", "--local", "--includes", "--show-origin", "--list", "-z"], capture_output=True, env=self.ctx.env).stdout
 
     def doc_keys(self):
         keys = [l.strip() for l in pathlib.Path(KEYS_FIXTURE).read_text().splitlines(True) if l.strip() and not l.startswith("#")]
@@ -758,7 +843,19 @@ class EarlyReturns(Base):
         self.assertEqual(self.wip(), "")
 
     def run_main(self, helper_dir=None, **kw):
-        return subprocess.run([self.seam(HOOK, helper_dir=helper_dir), "--prestop"], env=self.env(**kw), capture_output=True, text=True)
+        # the real hook runs in this process, with the same seam values the launcher script sets
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        git_bin = os.path.join(self.bin, "git")
+        with mock.patch.multiple(cw_end_hook, HOST_URL="file://%s/" % self.t, HELPER_DIR=helper_dir or self.helper_dir,
+                                 GIT_BIN=git_bin if os.path.exists(git_bin) else cw_end_hook.GIT_BIN), \
+                mock.patch.dict(os.environ, self.env(**kw), clear=True), \
+                mock.patch.object(sys, "argv", [HOOK, "--prestop"]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cw_end_hook.main()
+            except SystemExit as e:
+                code = e.code or 0
+        return subprocess.CompletedProcess([HOOK, "--prestop"], code or 0, out.getvalue(), err.getvalue())
 
     def test_each_early_return_prints_one_line(self):
         self.dirty()

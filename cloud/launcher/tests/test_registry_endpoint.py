@@ -4,6 +4,7 @@ These tests RUN the launch, the stop and the clear (bin/test-cloud-worker's fake
 the registry's own file. The mutants copy the source tree to a scratch directory, assert the change was applied, and run the behaviour tests there:
 a mutant is caught when that run exits 1.
 """
+import concurrent.futures
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -268,27 +269,56 @@ class Mutants(unittest.TestCase):
          "    _registry_note(engine, \"retire\", state, args.name, reason)\n    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, extra, STOP_SECONDS, cluster=cluster)", "^(FAIL|ERROR): test_matches_a_failed_stop_leaves_the_row "),
     )
 
+    @staticmethod
+    def link_tree(copy, real):
+        """A scratch tree of ROOT: the paths in `real` are copied (the mutation and the test run touch only those), everything else is a symlink."""
+        def build(src, dst, rels):
+            dst.mkdir(parents=True, exist_ok=True)
+            for entry in sorted(src.iterdir()):
+                if entry.name in (".git", "__pycache__"):
+                    continue
+                here = [r for r in rels if r == entry.name or r.startswith(entry.name + "/")]
+                if not here:
+                    (dst / entry.name).symlink_to(entry)
+                elif entry.name in here:
+                    if entry.is_dir():
+                        shutil.copytree(entry, dst / entry.name, ignore=shutil.ignore_patterns(".git", "__pycache__", "test-switchboard"))   # the 5 MB switchboard suite is not copied
+                        if (entry / "test-switchboard").exists():
+                            (dst / entry.name / "test-switchboard").symlink_to(entry / "test-switchboard")
+                    else:
+                        shutil.copy2(entry, dst / entry.name)
+                else:
+                    build(entry, dst / entry.name, [r[len(entry.name) + 1:] for r in here])
+        build(ROOT, copy, list(real))
+
     def run_tree(self, rel=None, old=None, new=None, only=None):
         """Run Behaviour in a scratch copy; with a mutation, it is asserted applied (counted). Returns (exit code, output, applied)."""
         with tempfile.TemporaryDirectory() as tmp:
             copy = Path(tmp) / "tree"
-            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            self.link_tree(copy, ("cloud/launcher", "bin"))
             applied = False
-            self.occurrences = 0
+            occurrences = 0
             if rel:
                 target = copy / rel
                 text = target.read_text()
-                self.occurrences = text.count(old)
-                self.assertEqual(self.occurrences, 1, "the mutation does not apply once")
+                occurrences = text.count(old)
+                self.assertEqual(occurrences, 1, "the mutation does not apply once")
                 target.write_text(text.replace(old, new))
-                applied = target.read_text() != text and self.occurrences == 1
+                applied = target.read_text() != text and occurrences == 1
                 self.assertTrue(applied, "the mutation was not applied")
             done = subprocess.run([sys.executable, "-m", "unittest"] + (["-f", "test_registry_endpoint.Behaviour." + only] if only else ["-f", "test_registry_endpoint.Behaviour"]), cwd=str(copy / "cloud/launcher/tests"),
                                   env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
             return done.returncode, done.stderr, applied
 
+    _control_cache = None   # the run of the unmutated copy, made once for the two tests that read it
+
+    def control_run(self):
+        if Mutants._control_cache is None:
+            Mutants._control_cache = self.run_tree()
+        return Mutants._control_cache
+
     def test_matches_the_unchanged_copy_passes(self):
-        code, output, _ = self.run_tree()
+        code, output, _ = self.control_run()
         self.assertEqual(code, 0, output[-1500:])
 
     @staticmethod
@@ -300,19 +330,23 @@ class Mutants(unittest.TestCase):
         return (int(ran.group(1)) if ran else 0), failed
 
     def test_matches_each_mutant_fails_with_the_check_named(self):
-        control_code, control_output, _ = self.run_tree()
+        control_code, control_output, _ = self.control_run()
         ran, control_failed = self.counts(control_output)
         control_passed = ran - control_failed if control_code == 0 else 0
         self.assertEqual(control_code, 0, "the control must pass first: " + control_output[-1500:])
-        for label, rel, old, new, anchor in self.CASES:
+        def one(case):
+            label, rel, old, new, anchor = case
+            names = re.search(r"\(FAIL\|ERROR\): (test_\w+)", anchor)
+            return self.run_tree(rel, old, new, only=names.group(1) if names else None)
+        # a mutant is killed by its first failing check: run only the anchored test when the anchor names one, else stop at the first failure
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(one, self.CASES))
+        for (label, rel, old, new, anchor), (code, output, applied) in zip(self.CASES, results):
             with self.subTest(label):
-                # a mutant is killed by its first failing check: run only the anchored test when the anchor names one, else stop at the first failure
-                names = re.search(r"\(FAIL\|ERROR\): (test_\w+)", anchor)
-                code, output, applied = self.run_tree(rel, old, new, only=names.group(1) if names else None)
                 named = bool(re.search(anchor, output, re.M))
                 _, mutant_failed = self.counts(output)
-                print("mutant %s: control passes %d of %d, mutant fails %d checks (exit %d), anchored check named %s, mutation applied %s (fragment occurs %d time in the original)"
-                      % (label, control_passed, ran, mutant_failed, code, named, applied, self.occurrences))
+                print("mutant %s: control passes %d of %d, mutant fails %d checks (exit %d), anchored check named %s, mutation applied %s"
+                      % (label, control_passed, ran, mutant_failed, code, named, applied))
                 self.assertEqual(code, 1, label)
                 self.assertTrue(named, "%s: the anchored text %r is missing" % (label, anchor))
 
