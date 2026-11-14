@@ -680,12 +680,24 @@ def instantiate(name):
 class Completeness(Base):
     """The allow-list is CLOSED: every key git documents that is not in the inert table is refused, so a key added later is refused too."""
 
+    def append_plain(self, key, value):
+        """The entry written as git would write it, for the plain names and values (a spawn of git per key is most of the time of this class). False: not plain, ask git."""
+        parts = key.split(".")
+        if len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9._/:@+-]*", value) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", parts[-1]) \
+                or not re.fullmatch(r"[A-Za-z0-9-]+", parts[0]) or (len(parts) > 2 and not re.fullmatch(r"[A-Za-z0-9._/:@+ -]+", ".".join(parts[1:-1]))):
+            return False
+        head = '[%s]' % parts[0] if len(parts) == 2 else '[%s "%s"]' % (parts[0], ".".join(parts[1:-1]))
+        with open(os.path.join(self.work, ".git", "config"), "a") as f:
+            f.write("%s\n\t%s = %s\n" % (head, parts[-1], value))
+        return True
+
     def refusal(self, key, value):
         cfg = os.path.join(self.work, ".git", "config")
         with open(cfg, "w") as f:
             f.write(self.plain)
         try:
-            sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
+            if not self.append_plain(key, value):
+                sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
         except subprocess.CalledProcessError:
             return True   # git itself cannot store this name (a documentation pattern such as gitweb.remote_heads): it can never be in a repository
         try:
