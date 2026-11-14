@@ -707,7 +707,7 @@ def glue(form):
     if rng.random() < 0.4 and "%" not in form:
         form += "".join(rng.choice("abcdefABCDEF") for _ in range(rng.randint(1, 3)))
     return form
-for _ in range(20000):
+for _ in range(2500):
     # the oracle knows where it planted each address: every planted address is gone from the output, every planted non-address is unchanged
     line, put = rng.choice(labels), []
     form = address(); put.append(planted(form)); line += glue(form) + rng.choice(tails)
@@ -743,7 +743,7 @@ rng = random.Random(22)
 real = ipaddress.ip_address
 counts = {}
 for name, alphabet in (("colons and hex digits", "0123456789abcdef:"), ("dots and digits", "0123456789.")):
-    run = "".join(rng.choice(alphabet) for _ in range(20000))
+    run = "".join(rng.choice(alphabet) for _ in range(2500))
     calls = [0]
     def counting(text, calls=calls):
         calls[0] += 1

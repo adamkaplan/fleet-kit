@@ -25634,6 +25634,11 @@ class TestCaptainSweepFindings(TestSweep):
             self.assertNotIn(forbidden, text[start:end], forbidden)
 
 
+
+for _name in dir(TestSweep):   # the inherited tests already run as TestSweep: not a second time
+    if _name.startswith("test") and _name not in vars(TestCaptainSweepFindings):
+        setattr(TestCaptainSweepFindings, _name, None)
+
 class TestOwnerlessSummary(Base):
     """#605: ownerless, quiet issues of a team repository are one daily line to the Chief of Staff and the repository's orchestrators; nothing is written to any issue."""
 
@@ -26650,6 +26655,11 @@ class TestCaptainTriage(TestTriage):
         self.assertEqual(row["detail"]["evidence"]["holds"], ["security"])
         self.assertEqual(self.only("T7"), [])                                    # held by its label: T6's, not T7's
 
+
+
+for _name in dir(TestTriage):   # the inherited tests already run as TestTriage: not a second time
+    if _name.startswith("test") and _name not in vars(TestCaptainTriage):
+        setattr(TestCaptainTriage, _name, None)
 
 class TestAlertColdStart(Base):
     """#1140: after a start the alert repositories' `issues` lists are read before every other unit; six repositories, one alert, four reads a pass."""
