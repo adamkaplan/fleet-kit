@@ -438,11 +438,11 @@ class ScrubSnapshot(unittest.TestCase):
 
         def adder():
             i = 0
-            while not done.is_set() and i < 20000:
-                started.set()   # keeps growing the set for the whole run: the scrub keeps a built copy of an unchanged set
-                known.add("late-added-%07d-yy" % i)
+            while not done.is_set():
+                started.set()   # keeps changing the set for the whole run: the scrub keeps a built copy of an unchanged set
+                known.add("late-added-%07d-yy" % (i % 4000))
+                known.discard("late-added-%07d-yy" % ((i - 2000) % 4000))
                 i += 1
-                time.sleep(0)
         t = threading.Thread(target=adder, daemon=True)
         old_interval = sys.getswitchinterval()
         sys.setswitchinterval(1e-6)   # the adder gets the interpreter inside a scrub, not only between two
