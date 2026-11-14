@@ -493,9 +493,11 @@ class Grammar(Base):
         home = os.path.join(self.t, "hostile-home")
         os.makedirs(home, exist_ok=True)
         gfile = os.path.join(home, ".git" + "config")
+        head, _, name = key.rpartition(".")
+        section, _, sub = head.partition(".")
+        entry = "[%s]\n\t%s = %s\n" % ('%s "%s"' % (section, sub) if sub else section, name, value)
         for f in (gfile, os.path.join(home, "other")):
-            open(f, "w").close()
-            sh("git", "config", "-f", f, "--" + "add", key, value)
+            pathlib.Path(f).write_text(entry)
         return {"HOME": home, CFG_G: os.path.join(home, "other"), CFG_S: os.path.join(home, "other"),
                 "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": value,
                 "GIT_CONFIG_PARAMETERS": "'%s'='%s'" % (key, value)}

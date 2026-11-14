@@ -33,6 +33,7 @@ import json
 import re
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cloud_channel
@@ -102,6 +103,7 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None, *, namespace
             timer.daemon = True
             timer.start()
             # a loopback read blocked in recv() is not always woken by shutdown(SHUT_RD) (macOS), so the socket timeout also ends at the deadline (a little after the timer, which sets expired first)
+            self._deadline_at = time.monotonic() + timer.interval
             wake = timer.interval + 0.05
             if self.timeout is None or wake < self.timeout:
                 self.connection.settimeout(wake)
@@ -148,7 +150,7 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None, *, namespace
                 return self._refuse_early(413, "body too large", "body too large")
             try:
                 raw = self.rfile.read(declared)
-                if len(raw) < declared and self.expired:
+                if len(raw) < declared and (self.expired or time.monotonic() >= self._deadline_at):
                     raise TimeoutError("deadline")
                 if len(raw) < declared:
                     raise TimeoutError("short body")

@@ -718,7 +718,7 @@ def _remove_stmt(parent, stmt):
     raise AssertionError("statement not found")
 
 
-def mutate(tree, site, how="remove"):
+def mutate(tree, site, how="remove", return_tree=False):
     """The source of a copy of the tree with this site's cleanup removed (how=remove), or reduced to a wait (how=wait). None: no such mutant."""
     alias, how = how == "alias", ("remove" if how == "alias" else how)   # alias: the remove mutant, with the started call renamed through an alias
     if alias and site["kind"] not in ("popen", "process", "thread", "helper"):
@@ -772,7 +772,7 @@ def mutate(tree, site, how="remove"):
     else:
         return None
     ast.fix_missing_locations(t)
-    return ast.unparse(t)
+    return t if return_tree else ast.unparse(t)
 
 
 ALIAS = "_alias_start"
@@ -1047,11 +1047,15 @@ def _case(s):
 
 def _mutant_case(s, how):
     def run(self):
-        src = mutate(s["tree"], s, how)
-        self.assertIsNotNone(src, "no mutant for %s" % site_name(s))
         if how == "alias":
+            src = mutate(s["tree"], s, how)
+            self.assertIsNotNone(src, "no mutant for %s" % site_name(s))
             self.assertIn(ALIAS, src, "the alias mutant of %s does not carry the alias" % site_name(s))
-        bad = [x for x in scan_tree(s["file"], ast.parse(src, filename=str(s["file"]))) if not x["ok"]]
+            tree = ast.parse(src, filename=str(s["file"]))
+        else:
+            tree = mutate(s["tree"], s, how, return_tree=True)
+            self.assertIsNotNone(tree, "no mutant for %s" % site_name(s))
+        bad = [x for x in scan_tree(s["file"], tree) if not x["ok"]]
         self.assertEqual(sorted({x["func"] for x in bad}), [s["func"] if s["kind"] != "embedded" else "<string>"], "the scan missed the %s mutant of %s" % (how, site_name(s)))
     return run
 

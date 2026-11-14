@@ -223,9 +223,9 @@ class TestSummary(Base):
         os.environ["FAKE_KUBE_HANG_MARK"] = str(self.home / "hang")
         self.addCleanup(os.environ.pop, "FAKE_KUBE_HANG", None)
         self.addCleanup(os.environ.pop, "FAKE_KUBE_HANG_MARK", None)
-        self.cloud().SNAPSHOT_SECONDS = 2   # the bound of the whole read, shortened for the test
         started = time.monotonic()
-        lines, _ = self.status()
+        with mock.patch.object(self.cloud(), "SNAPSHOT_SECONDS", 2):   # the bound of the whole read, shortened for the test
+            lines, _ = self.status()
         self.assertLess(time.monotonic() - started, 30)
         failed = [line.strip() for line in lines if line.strip().startswith("cloud: cluster not read (")]
         self.assertEqual(len(failed), 1, lines)
@@ -382,18 +382,18 @@ class TestWholeRun(Base):
         os.environ["CW_CLUSTER_ADMIN_CMD"] = "sleep 1.5; echo kubeconfig"   # the vault read: 1.5 s
         os.environ["CW_KUBECTL"] = self.slow_script("slow-kubectl", "0", 'case " $* " in *" create "*) sleep 1.5;; esac; exec "%s" "$@"' % os.path.join(HERE, "fake_kubectl"))
         self.hang_get()   # and the launcher's read never ends
-        self.cloud().SNAPSHOT_SECONDS = 2
         started = time.monotonic()
-        lines, _ = self.status()
+        with mock.patch.object(self.cloud(), "SNAPSHOT_SECONDS", 2):
+            lines, _ = self.status()
         took = time.monotonic() - started
         self.assertLess(took, 2.9, took)   # per-step caps would allow 1.5 + 1.5 and then the launcher's own second: over 3 s
         self.assertEqual(len([l for l in lines if l.strip().startswith("cloud: cluster not read (")]), 1, lines)
 
     def bounded_slow_token(self):
         os.environ["CW_CLUSTER_TOKEN_CMD"] = self.slow_script("slow-token", "20", "echo synthetic-cluster-token")
-        self.cloud().SNAPSHOT_SECONDS = 1
         started = time.monotonic()
-        lines, _ = self.status()
+        with mock.patch.object(self.cloud(), "SNAPSHOT_SECONDS", 1):
+            lines, _ = self.status()
         took = time.monotonic() - started
         self.assertLess(took, 4, took)
         return lines
