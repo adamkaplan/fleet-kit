@@ -148,6 +148,32 @@ class Harness(base.Base):
                     "    j.dump(st, open(p, 'w'))\n"
                     "sys.stdout.write('two words' if mode == 'space' else %r)\n" % (self.mode_file, self.minted, OLD, self.name + "-run", self.name, self.name, self.name, OTHER_TOKEN, NEW))
         self.set_mode("ok")
+        with open(script) as f:
+            mint_src = f.read()
+        real_run = subprocess.run
+        self.addCleanup(setattr, subprocess, "run", real_run)
+
+        def run_in_process(cmd, *a, **kw):   # the fake mint run here, not in a new interpreter: the same (status, stdout, stderr)
+            if not (isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == script):
+                return real_run(cmd, *a, **kw)
+            out, err, code = io.StringIO(), io.StringIO(), 0
+            with base._inproc_lock:
+                old = dict(os.environ)
+                os.environ.clear()
+                os.environ.update(kw.get("env") or old)
+                try:
+                    with redirect_stdout(out), redirect_stderr(err):
+                        try:
+                            exec(compile(mint_src, script, "exec"), {"__name__": "__main__"})
+                        except SystemExit as e:
+                            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                finally:
+                    os.environ.clear()
+                    os.environ.update(old)
+            return subprocess.CompletedProcess(cmd, code, out.getvalue(), err.getvalue())
+        subprocess.run = run_in_process
+        if self.cwm is not cw:
+            self.patch_kube(self.cwm)
         self.env.update(CW_CLOUD_RECORD_DIR=self.records, CW_GIT_TOKEN_CMD="%s %s" % (sys.executable, script),
                         FAKE_KUBE_ECHO=OLD + " " + NEW, FAKE_KUBE_SEEN=os.path.join(d, "seen.jsonl"))
         self.outputs, self.expect_worker = [], WORKER
@@ -249,6 +275,8 @@ class RealMint(Harness):
 
     def setUp(self):
         super().setUp()
+        self.addCleanup(setattr, cw, "git_token_sleep", cw.git_token_sleep)
+        cw.git_token_sleep = lambda seconds: None   # a passing failure is tried again at once: the waits (2, 5, 10 s) are not what is tested
         ta.Stub.seen, ta.Stub.redirect, ta.Stub.pad_to, ta.Stub.lookup = [], None, None, None
         ta.Stub.gets, ta.Stub.installs = [], {"acme-org": 678}
         self.answer()
