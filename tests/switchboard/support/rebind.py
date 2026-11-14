@@ -45,3 +45,26 @@ def spliced_head(cache, src, real_ast):
         return real_ast.parse(src)
     cache["heads"][src] = tree
     return tree
+
+
+def run_in_process(runner, args, environ):
+    """The runner text of a shim test run in this process (no interpreter start) as `python -c runner *args` in `environ`: the CompletedProcess it
+    would have given. The shim's exec of the real gh becomes a child run whose output is kept."""
+    import contextlib, io, os, subprocess, sys
+    from unittest import mock
+    out, err, code = io.StringIO(), io.StringIO(), 0
+
+    def child(path, argv, env=None):
+        done = subprocess.run([path] + list(argv[1:]), capture_output=True, text=True, env=env if env is not None else os.environ)
+        out.write(done.stdout)
+        err.write(done.stderr)
+        raise SystemExit(done.returncode)
+    with mock.patch.dict(os.environ, environ, clear=True), mock.patch.object(sys, "argv", ["-c"] + list(args)), mock.patch.object(os, "execv", child), \
+            mock.patch.object(os, "execve", lambda path, argv, env: child(path, argv, env)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            exec(compile(runner, "<runner>", "exec"), {"__name__": "__main__"})
+        except SystemExit as stop:
+            code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+            if isinstance(stop.code, str):
+                err.write(stop.code + "\n")
+    return subprocess.CompletedProcess(["gh"] + list(args), code, out.getvalue(), err.getvalue())
