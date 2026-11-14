@@ -72737,7 +72737,7 @@ class TestShimTopSpender(Base):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
                    "FLEET_SWITCHBOARD_BIN": program, "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS, "FAKE_LOG": str(self.log), "FAKE_SB_LOG": str(self.sblog)}
         environ.update(env or {})
-        return subprocess.run([sys.executable, "-c", self.WRAPPER, str(SHIM), str(self.state), program, *args], capture_output=True, text=True, env=environ, timeout=60)
+        return importlib.import_module("support.rebind").run_in_process(None, list(args), environ, setup=lambda ns: (ns["FIXED_STATE"].__setitem__(0, str(self.state)), ns["FIXED_PROGRAM"].__setitem__(0, program), ns.__setitem__("SLOW_SECONDS", 0.5))) if "FAKE_SB_SLEEP" not in environ else subprocess.run([sys.executable, "-c", self.WRAPPER, str(SHIM), str(self.state), program, *args], capture_output=True, text=True, env=environ, timeout=60)
 
     def notices(self):
         return self.sblog.read_text().splitlines() if self.sblog.exists() else []

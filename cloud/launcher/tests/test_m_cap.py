@@ -6,12 +6,14 @@ Run directly: python3 cloud/launcher/tests/test_m_cap.py
 """
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -177,6 +179,26 @@ class TestDocs(unittest.TestCase):
 class TestScratch(unittest.TestCase):
     """Scratch copies OUTSIDE the repository (a temporary directory), each run in a child process by stub_support.start."""
 
+    def in_process(self, source, test):
+        """Run one scenario in this process with `source` standing in for the cloud_worker module (the real file is never edited)."""
+        sb = tcw.sb
+        path = ROOT / "bin" / "cloud_worker.py"
+        saved = (sys.modules.get("cloud_worker"), sb._MODULES_DONE.get("cloud_worker"))
+        buf = io.StringIO()
+        try:
+            mutant = types.ModuleType("cloud_worker")
+            mutant.__file__ = str(path)
+            sys.modules["cloud_worker"] = sb._MODULES_DONE["cloud_worker"] = mutant
+            exec(compile(source, str(path), "exec"), mutant.__dict__)
+            res = unittest.TextTestRunner(stream=buf, verbosity=2).run(unittest.TestSuite([TestScenarios(test)]))
+        finally:
+            for table, old in ((sys.modules, saved[0]), (sb._MODULES_DONE, saved[1])):
+                if old is None:
+                    table.pop("cloud_worker", None)
+                else:
+                    table["cloud_worker"] = old
+        return (0 if res.wasSuccessful() else 1), buf.getvalue()
+
     def child(self, edits, test, old=False):
         src = (ROOT / "bin" / "cloud_worker.py").read_text()
         part = (ROOT / "bin" / "cloud_lane_cap.py").read_text()   # the count moved here (ask #2259)
@@ -189,6 +211,8 @@ class TestScratch(unittest.TestCase):
             self.assertEqual(src.count(old_text), 1, "the line to change is not as expected: " + old_text)
             src = src.replace(old_text, new_text, 1)
             applied += 1
+        if not old and part == (ROOT / "bin" / "cloud_lane_cap.py").read_text():   # only the worker text changed: run it in this process
+            return (applied,) + self.in_process(src, test)
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__", "test-switchboard"))   # the 5 MB switchboard suite is linked instead

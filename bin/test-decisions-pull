@@ -212,7 +212,7 @@ def check_output_is_bounded_and_process_killed(module):
 
 
 def check_real_source_that_prints_more_is_cut(module):
-    code = "import sys; sys.stdout.write('x' * %d); sys.stdout.flush()" % (module.MAX_BYTES * 2)
+    code = "import os; os.write(1, b'x' * %d)" % (module.MAX_BYTES + 4096)
     data = module.command_fetch([sys.executable, "-c", code])
     assert len(data) == module.MAX_BYTES + 1, len(data)
 
@@ -605,7 +605,7 @@ def check_age_command_unreachable_is_stale(module):
 def check_cli_age_command(module):
     import contextlib
     with tempfile.TemporaryDirectory() as state:
-        src = ["--", sys.executable, "-c", "import json,sys; print(json.dumps(%r))" % (BODY,)]
+        src = ["--", "echo", json.dumps(BODY)]
 
         def run(*extra):
             out = io.StringIO()
@@ -613,8 +613,8 @@ def check_cli_age_command(module):
                 module.main(["--state", state] + list(extra) + src)
             return out.getvalue().strip()
         assert run() == "untouched"      # no age command = a missing age, and there is no file yet to age: exactly "untouched", never "wrote"
-        assert run("--age-command", "%s -c 'print(30)'" % sys.executable) == "wrote"
-        assert run("--age-command", "%s -c 'print(500)'" % sys.executable) == "marked-stale"
+        assert run("--age-command", "echo 30") == "wrote"
+        assert run("--age-command", "echo 500") == "marked-stale"
 
 
 _DAEMON_KEYS = None
@@ -897,11 +897,17 @@ class RealCode(unittest.TestCase):
             self.assertEqual(plugin(state, NOW + 10)[:2], ["stale", 1])
 
 
+_SB_CACHE = []
+
+
 def load_switchboard():
+    if _SB_CACHE:
+        return _SB_CACHE[0]
     loader = importlib.machinery.SourceFileLoader("fleet_switchboard_under_test", str(BIN / "fleet-switchboard"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    _SB_CACHE.append(module)
     return module
 
 

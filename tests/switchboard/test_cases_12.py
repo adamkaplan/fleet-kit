@@ -353,7 +353,7 @@ class TestAgentShellCalls(Base):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
                    "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS}
         environ.update(env or {})
-        return subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        return importlib.import_module("support.rebind").run_in_process(None, list(args), environ)
 
     def test_s1_calls_are_counted_per_account(self):
         for _ in range(5):
@@ -1490,7 +1490,8 @@ class TestGhShimGateProbe(Base):
         if self.log.exists():
             self.log.unlink()
         started = time.time()
-        done = subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        done = importlib.import_module("support.rebind").run_in_process(None, list(args), environ, shim_path=SHIM) if "FAKE_GATE_SLEEP" not in environ else subprocess.run(
+            [sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
         self.elapsed = time.time() - started
         seen = json.loads(self.log.read_text()) if self.log.exists() else None
         return done, seen

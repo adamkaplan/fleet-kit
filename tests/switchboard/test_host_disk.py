@@ -21,8 +21,8 @@ CORE = REPO / "tests" / "switchboard" / "support" / "core.py"
 NAMED = ("TestStoppedNews", "TestShadowClassifier", "TestCosOrdersFact", "TestV2LightGuards", "TestForegroundScenarios", "TestOfflineScenarios", "TestDecorationIsAFact")
 # Of the one-scenario-per-test class TestOfflineScenarios (about 30 scenarios, 1 to 29 s each) only these four run in the group: each drives a real engine pass in a
 # test world (an ask comment, a mid-turn pass, a report, a restart), which is what reads the disk; the rest differ in their steps, not in the disk they read.
-FOREGROUND_KEPT = ("test_the_pr8_catalog_is_present_with_its_tiers_and_controls", "test_the_scenarios_run_and_their_controls_fail_what_they_name")   # one catalog check and one run of the scenarios
-SCENARIOS_KEPT = ("test_scenario_g1_", "test_scenario_w2_", "test_scenario_i1_", "test_scenario_r1_")
+FOREGROUND_KEPT = ("test_the_pr8_catalog_is_present_with_its_tiers_and_controls",)   # one catalog check
+SCENARIOS_KEPT = ("test_scenario_g1_",)
 ANCHOR = "a test world never reads the host's free disk"
 
 

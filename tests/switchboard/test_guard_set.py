@@ -2,7 +2,12 @@
 
 Run with `python3 bin/test-switchboard TestGuardSet`. Standard library only.
 """
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -18,7 +23,32 @@ NAMED = ["TestHygiene", "TestSupportRebinding", "TestArchitectureDocument", "Tes
          "TestV2LightGuards", "TestImpactHold", "TestEveryTestFileIsWired"]
 
 
+_MOD = []
+
+
+def _tool():   # tools/guard-set, loaded once
+    if not _MOD:
+        loader = importlib.machinery.SourceFileLoader("guard_set_under_test", str(TOOL))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        _MOD.append(module)
+    return _MOD[0]
+
+
 def run(*args):
+    if "--run" not in args:   # the listing and the check run in this process; --run starts the classes it lists, so it keeps a child
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        before = os.getcwd()
+        os.chdir(REPO)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = _tool().main(list(args))
+                except SystemExit as stop:
+                    code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        finally:
+            os.chdir(before)
+        return subprocess.CompletedProcess([sys.executable, str(TOOL), *args], code or 0, out.getvalue(), err.getvalue())
     return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True, cwd=REPO)
 
 

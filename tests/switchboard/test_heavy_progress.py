@@ -1,6 +1,7 @@
 """#1762: the heavy wrapper prints one progress line a minute while its command runs. A fake clock, a fake slot lock and a fake child: nothing waits for a real minute."""
 import faulthandler
 import importlib.util
+import io
 import os
 import signal
 import subprocess
@@ -52,6 +53,15 @@ def load_heavy():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _inner_run(path, inner, extra_env=None):
+    """The inner test, run in this process against the scratch copy `path` (what a child process started on this file would do): a CompletedProcess."""
+    env = dict(FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", **(extra_env or {}))
+    buf = io.StringIO()
+    with mock.patch.dict(os.environ, env), mock.patch.object(sys.modules[__name__], "START_WAIT", float(env.get("FLEET_TEST_START_WAIT", START_WAIT))):
+        res = unittest.TextTestRunner(stream=buf, verbosity=2).run(TestHeavyProgress(inner))
+    return subprocess.CompletedProcess([], 0 if res.wasSuccessful() else 1, buf.getvalue(), "")
 
 
 class Out:
@@ -230,9 +240,7 @@ class TestHeavyProgress(unittest.TestCase):
                 self.assertFalse(os.path.abspath(path).startswith(os.path.abspath(os.path.join(here, "..", ".."))))
                 with open(path, "w") as handle:
                     handle.write(body)
-                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", **(extra_env or {}))
-                results[kind] = subprocess.run([sys.executable, __file__, "TestHeavyProgress." + inner], cwd=here, env=env,
-                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+                results[kind] = _inner_run(path, inner, extra_env)
         return results
 
     def test_s12_inner_s4_on_a_copy_without_the_progress_thread(self):
@@ -292,9 +300,7 @@ class TestHeavyProgress(unittest.TestCase):
                 open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 with open(path, "w") as handle:
                     handle.write(copies[kind])
-                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", FLEET_TEST_START_WAIT="1.5")
-                results[kind] = subprocess.run([sys.executable, __file__, "TestHeavyProgress.test_s10_inner_s4_with_the_thread_start_awaited"], cwd=here, env=env,
-                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+                results[kind] = _inner_run(path, "test_s10_inner_s4_with_the_thread_start_awaited", {"FLEET_TEST_START_WAIT": "1.5"})
         self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
         self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
         self.assertIn("the progress thread did not start within 1.5 s", results["mutant"].stdout)

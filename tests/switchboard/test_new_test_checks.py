@@ -218,8 +218,7 @@ class TestNewTestChecksFiles(unittest.TestCase):
         done = subprocess.CompletedProcess([], code or 0, out.getvalue(), "")
         findings = [l for l in done.stdout.splitlines() if not l.startswith(("table:", "run first:"))]
         self.assertEqual((done.returncode, findings), (0, []), done.stdout)
-        done = subprocess.run([sys.executable, str(NTC_TOOL), str(Path(__file__).resolve())], capture_output=True, text=True, cwd=str(REPO))
-        self.assertEqual((done.returncode, done.stdout), (0, ""))
+        self.assertIn(Path(__file__).resolve(), files)   # this file is among the files the call above checked
 
     def test_u1_it_writes_nothing_and_exits_0_1_or_2(self):
         with tempfile.TemporaryDirectory(prefix="ntc-") as tmp:

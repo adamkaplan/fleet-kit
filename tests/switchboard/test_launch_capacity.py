@@ -866,7 +866,6 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
             return PC11_RUNS[key]
 
         def pc11_warm(self):
-            from concurrent.futures import ThreadPoolExecutor
             f = "cloud/launcher/cloud_worker.py"
             jobs = [(x, None) for x in (self.PC11_U24, self.PC11_U25, self.PC11_U26, self.PC11_U26B, self.PC11_U21, self.PC11_U22, self.PC11_U23)]
             jobs += [(self.PC11_U24, (f, "        text = done\n", "        return done\n")),
@@ -875,9 +874,8 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
                      (self.PC11_U26B, (f, "    GLUE_PASS = True\n", "    GLUE_PASS = False\n")),
                      (self.PC11_U21, (f, "ipaddress.ip_address(run[i:j])", r"ipaddress.ip_address(run[i:j]) if re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}', run[i:j]) else int('x')")),
                      (self.PC11_U23, (f, "WINDOW_OVERLAP = 64", "WINDOW_OVERLAP = 0"))]
-            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 2)) as pool:
-                for job, result in zip(jobs, pool.map(lambda j: self.pc11_run_uncached(*j), jobs)):
-                    PC11_RUNS[job] = result
+            for job in jobs:   # one after the other: U22 patches ipaddress.ip_address for the length of its run
+                PC11_RUNS[job] = self.pc11_run_uncached(*job)
 
         def pc11_run_uncached(self, script, mutate=None):
             import shutil, subprocess, tempfile
@@ -892,9 +890,40 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
                     text = (Path(tmp) / rel).read_text()
                     self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
                     (Path(tmp) / rel).write_text(text.replace(old, new))
-                done = subprocess.run([sys.executable, "-c", self.PC11_LOAD + script, tmp], capture_output=True, text=True, timeout=600,
-                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
-            return done.returncode, done.stderr, done.stdout
+                code, out, err = self.pc11_exec(script, tmp)
+            return code, err, out
+
+        def pc11_exec(self, script, tmp):
+            """The check script, run in this process against the launcher copy in `tmp` (what a child started on PC11_LOAD + script would do)."""
+            import contextlib, io, ipaddress, random, traceback
+            path = Path(tmp) / "cloud" / "launcher" / "cloud_worker.py"
+            out, err, code = io.StringIO(), io.StringIO(), 0
+            sys.path.insert(0, str(Path(tmp) / "bin"))
+            try:
+                spec = importlib.util.spec_from_file_location("launcher_pc11", str(path))
+                lib = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(lib)
+
+                def accepted(text):
+                    try:
+                        ipaddress.ip_address(text)
+                        return True
+                    except ValueError:
+                        return False
+                ns = {"__name__": "__main__", "lib": lib, "ipaddress": ipaddress, "random": random, "re": re, "sys": sys, "accepted": accepted}
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    try:
+                        exec(compile(script, "<pc11>", "exec"), ns)
+                    except SystemExit as stop:
+                        code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+                        if isinstance(stop.code, str):
+                            err.write(stop.code + "\n")
+                    except Exception:
+                        code = 1
+                        err.write(traceback.format_exc())
+            finally:
+                sys.path.remove(str(Path(tmp) / "bin"))
+            return code, out.getvalue(), err.getvalue()
 
         def test_u21_generated_lines_leak_nothing_and_the_fixed_cases_hold(self):
             code, err, out = self.pc11_run(self.PC11_U21)

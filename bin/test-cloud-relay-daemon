@@ -837,7 +837,7 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        [(self.addCleanup(setattr, plan_ledger, n, getattr(plan_ledger, n)), setattr(plan_ledger, n, v)) for n, v in (("RECORD_WAIT_SECONDS", 0.5), ("RECORD_PROGRESS_SECONDS", 0.2))]   # a writer behind a lock a mutant holds gives up fast
+        [(self.addCleanup(setattr, plan_ledger, n, getattr(plan_ledger, n)), setattr(plan_ledger, n, v)) for n, v in (("RECORD_WAIT_SECONDS", 0.15), ("RECORD_PROGRESS_SECONDS", 0.05))]   # a writer behind a lock a mutant holds gives up fast
         calls, free = [], []
         first_in, settled = threading.Event(), threading.Event()
         release = [threading.Event(), threading.Event()]   # one per call: the TEST releases them
@@ -1022,7 +1022,7 @@ class HubReadAndTransport(unittest.TestCase):
         import threading
         before = threading.active_count()
         self._hang_connect(mod)
-        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.3
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.1
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, _ = mod.http_transport("http://127.0.0.1:9", "tok")
         for _ in range(4):
@@ -1124,7 +1124,7 @@ class HubReadAndTransport(unittest.TestCase):
     def test_a_trickling_hub_is_cut_at_the_total_deadline(self):
         import time
         old = relay.READ_DEADLINE
-        relay.READ_DEADLINE = 0.3
+        relay.READ_DEADLINE = 0.12
         self.addCleanup(setattr, relay, "READ_DEADLINE", old)
         finished = threading.Event()
         written = [0]
@@ -1137,7 +1137,7 @@ class HubReadAndTransport(unittest.TestCase):
                 h.wfile.write(b" ")
                 h.wfile.flush()
                 written[0] += 1
-                time.sleep(0.05)
+                time.sleep(0.03)
             finished.set()
         fetch, _ = relay.http_transport(self._serve(trickle), "tok")
         with self.assertRaises(TimeoutError) as caught:
@@ -1152,7 +1152,7 @@ class HubReadAndTransport(unittest.TestCase):
     # and that the cause is not found, so the test no longer depends on any measured duration.
     def test_mutant_without_the_total_deadline_is_caught(self):
         mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
-        old, mod.READ_DEADLINE = relay.READ_DEADLINE, 0.3
+        old, mod.READ_DEADLINE = relay.READ_DEADLINE, 0.1
         import time
         finished = threading.Event()
         written = [0]
@@ -1165,7 +1165,7 @@ class HubReadAndTransport(unittest.TestCase):
                 h.wfile.write(b" ")
                 h.wfile.flush()
                 written[0] += 1
-                time.sleep(0.05)
+                time.sleep(0.03)
             finished.set()
         fetch, _ = mod.http_transport(self._serve(trickle), "tok")
         with self.assertRaises(Exception) as caught:
@@ -1177,7 +1177,7 @@ class HubReadAndTransport(unittest.TestCase):
         mutant test on it and return the message of the AssertionError."""
         import time
         old = relay.READ_DEADLINE
-        relay.READ_DEADLINE = 0.3
+        relay.READ_DEADLINE = 0.12
         self.addCleanup(setattr, relay, "READ_DEADLINE", old)
         finished = threading.Event()
         written = [0]
@@ -1190,7 +1190,7 @@ class HubReadAndTransport(unittest.TestCase):
                 h.wfile.write(b" ")
                 h.wfile.flush()
                 written[0] += 1
-                time.sleep(0.05)
+                time.sleep(0.03)
             finished.set()
         fetch, _ = relay.http_transport(self._serve(trickle), "tok")
         with self.assertRaises(TimeoutError) as caught:
@@ -1361,13 +1361,13 @@ class Round2(Fixture):
             for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 30:   # one byte per 0.03 s: every socket read succeeds
                 h.wfile.write(bytes([byte]))
                 h.wfile.flush()
-                time.sleep(0.03)
+                time.sleep(0.01)
         finally:
             self.trickle_finished.set()   # #1521: what the tests observe: had the handler finished when the fetch answered?
 
     def timed_fetch(self, mod):
         self.trickle_finished = threading.Event()
-        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.3
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.1
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, _ = mod.http_transport(self.serve(self.header_trickle), "tok")
         t0 = time.monotonic()
@@ -1553,7 +1553,7 @@ class OneWallClock(unittest.TestCase):
             return self.real_gai(*a, **k)
         self.socket.getaddrinfo = gai
         out = []
-        t = threading.Thread(target=lambda: out.append(self.timed(mod, "http://127.0.0.1:9", 0.3)), daemon=True)
+        t = threading.Thread(target=lambda: out.append(self.timed(mod, "http://127.0.0.1:9", 0.1)), daemon=True)
         t.start()
         t.join(1.5)   # hang guard, never a verdict: the real fetch has answered (at 0.3 s), the mutant one is still blocked on the lookup
         returned, answered = self.lookup_returned.is_set(), bool(out)   # both taken BEFORE the release
@@ -1570,7 +1570,7 @@ class OneWallClock(unittest.TestCase):
 
         def dead(address, timeout=None, *a, **k):
             for _ in range(n):
-                time.sleep(min(timeout if timeout is not None else 0.3, 0.25))
+                time.sleep(min(timeout if timeout is not None else 0.3, 0.08))
                 self.finished_attempts.append(True)
             raise TimeoutError("timed out")
         socket.create_connection = dead
@@ -1587,14 +1587,14 @@ class OneWallClock(unittest.TestCase):
         self.assertFalse(answered, "the mutant fetch answered before the name lookup had returned"); self.assertTrue(out, "it never answered")
 
     def test_four_dead_addresses_share_one_deadline(self):
-        _, err = self.timed(relay, self.full_backlog(), 0.3)
+        _, err = self.timed(relay, self.full_backlog(), 0.1)
         finished = len(self.finished_attempts)   # the four attempts need about 8 s together: the cut comes before they have all ended
         self.assertIsInstance(err, TimeoutError)
         self.assertLess(finished, 4, "the fetch was cut only after all four attempts had finished")
 
     def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        self.timed(mod, self.full_backlog(), 0.3)
+        self.timed(mod, self.full_backlog(), 0.1)
         # the mutant joins without the deadline: it waits for the whole loop, so all four attempts have finished
         self.assertEqual(len(self.finished_attempts), 4, "the mutant fetch returned before all four attempts had finished")
 

@@ -4,6 +4,7 @@ A moved fake or helper reads `sb` (or another moved global) from its own module,
 module (`mock.patch.dict(globals(), {"sb": module})`) must rebind it in the support modules too, or the moved code keeps reading the old object."""
 import contextlib
 import sys
+from pathlib import Path
 from unittest import mock
 
 
@@ -47,22 +48,79 @@ def spliced_head(cache, src, real_ast):
     return tree
 
 
-def run_in_process(runner, args, environ):
+_REAL_SHIM = Path(__file__).resolve().parents[3] / "shims" / "gh"
+SHIM = _REAL_SHIM
+_REAL_SHIM_CODE = []   # the compiled real shim, once per process
+
+
+def _shim_code(shim_path=None):
+    path = Path(shim_path or SHIM)
+    if path.resolve() != _REAL_SHIM:   # a planted mutant of the shim
+        return compile(path.read_text(), str(path), "exec")
+    if not _REAL_SHIM_CODE:
+        _REAL_SHIM_CODE.append(compile(_REAL_SHIM.read_text(), str(_REAL_SHIM), "exec"))
+    return _REAL_SHIM_CODE[0]
+
+
+def run_in_process(runner, args, environ, stdin="", shim_path=None, setup=None):
     """The runner text of a shim test run in this process (no interpreter start) as `python -c runner *args` in `environ`: the CompletedProcess it
-    would have given. The shim's exec of the real gh becomes a child run whose output is kept."""
-    import contextlib, io, os, subprocess, sys
+    would have given. The shim's exec of the real gh becomes a child run whose output is kept. With `runner` None the shim file itself is run:
+    its code is executed as a module that is not __main__, `setup(namespace)` may set its test seams, and its `main(args)` is called."""
+    import contextlib, io, os, subprocess, sys, types
     from unittest import mock
-    out, err, code = io.StringIO(), io.StringIO(), 0
+    class Stream(io.StringIO):   # text and bytes written to one stream, in order (the shim writes bodies to sys.stdout.buffer)
+        @property
+        def buffer(self):
+            return types.SimpleNamespace(write=lambda data: self.write(bytes(data).decode("utf-8", "replace")), flush=lambda: None)
+    out, err, code = Stream(), Stream(), 0
 
     def child(path, argv, env=None):
-        done = subprocess.run([path] + list(argv[1:]), capture_output=True, text=True, env=env if env is not None else os.environ)
+        done = subprocess.run([path] + list(argv[1:]), capture_output=True, text=True, env=env if env is not None else os.environ,
+                              input=sys.stdin.read() if stdin else None)
         out.write(done.stdout)
         err.write(done.stderr)
         raise SystemExit(done.returncode)
+    real_run, real_popen = subprocess.run, subprocess.Popen
+
+    def text_of(value):
+        return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+
+    def run(a, *rest, **kw):   # a child that would inherit this process's output: its output is kept here
+        if "stdout" in kw or kw.get("capture_output"):
+            return real_run(a, *rest, **kw)
+        kw.setdefault("stderr", subprocess.PIPE)
+        res = real_run(a, *rest, stdout=subprocess.PIPE, **kw)
+        out.write(text_of(res.stdout))
+        err.write(text_of(res.stderr))
+        return res
+
+    def popen(a, *rest, **kw):
+        if "stdout" in kw or "stderr" in kw:
+            return real_popen(a, *rest, **kw)
+        p = real_popen(a, *rest, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+        real_wait = p.wait
+
+        def wait(*w, **k):
+            result = real_wait(*w, **k)
+            out.write(text_of(p.stdout.read()))
+            err.write(text_of(p.stderr.read()))
+            return result
+        p.wait = wait
+        return p
     with mock.patch.dict(os.environ, environ, clear=True), mock.patch.object(sys, "argv", ["-c"] + list(args)), mock.patch.object(os, "execv", child), \
-            mock.patch.object(os, "execve", lambda path, argv, env: child(path, argv, env)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mock.patch.object(os, "execve", lambda path, argv, env: child(path, argv, env)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+            mock.patch.object(sys, "stdin", io.StringIO(stdin)), mock.patch.object(subprocess, "run", run), mock.patch.object(subprocess, "Popen", popen):
         try:
-            exec(compile(runner, "<runner>", "exec"), {"__name__": "__main__"})
+            if runner is None:
+                ns = {"__name__": "__mp_main__", "__file__": str(shim_path or SHIM)}
+                exec(_shim_code(shim_path), ns)
+                if setup is not None:
+                    setup(ns)
+                result = ns["main"](list(args))
+                if result:
+                    raise SystemExit(result)
+            else:
+                exec(compile(runner, "<runner>", "exec"), {"__name__": "__main__"})
         except SystemExit as stop:
             code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
             if isinstance(stop.code, str):
