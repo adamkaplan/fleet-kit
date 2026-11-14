@@ -182,7 +182,10 @@ class Preflight(unittest.TestCase):
         if self.prog != PREFLIGHT or "PLANTED_SECRET" in env:   # a symlink to the program, or a secret in the environment: a real process
             return subprocess.run([sys.executable, self.prog, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
         out, err = io.StringIO(), io.StringIO()
+        quick = e.get("CW_PREFLIGHT_TOKEN_CMD") == "echo " + TOKEN   # the stand-in token command: answer it without a shell
+        real_get_token = pf.get_token
         with mock.patch.dict(os.environ, e, clear=True), mock.patch.object(pf, "APPROVALS", os.path.join(self.copy, "repo-approvals.json")), \
+                mock.patch.object(pf, "get_token", (lambda target=None: TOKEN) if quick else real_get_token), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = pf.main([REPO, *args])
@@ -628,7 +631,7 @@ class OpenActions(Preflight):
         os.environ.update(CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
         try:
             pf.CHECK_MODES[key] = mode
-            with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stdout(out), mock.patch.object(pf, "get_token", lambda target=None: TOKEN):
                 rc = pf.main([REPO])
         finally:
             pf.CHECK_MODES.clear()

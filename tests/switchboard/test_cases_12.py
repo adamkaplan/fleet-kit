@@ -98,9 +98,22 @@ class WorkflowPlanPins(unittest.TestCase):
         summary = Path(tmp) / "summary.txt"
         summary.write_text("")
         env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary))
-        done = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
-        if done.returncode:
-            raise AssertionError("the plan script failed: " + done.stderr[-400:])
+        body = script.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        out_io, here = io.StringIO(), os.getcwd()   # the script's python body runs in this process, in the temporary directory, with its own environment
+        failure = None
+        os.chdir(tmp)
+        try:
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "argv", ["-"]), contextlib.redirect_stdout(out_io):
+                exec(compile(body, "plan-script", "exec"), {"__name__": "__main__"})
+        except SystemExit as e:
+            failure = e.code if e.code not in (None, 0) else None
+        except Exception as e:
+            failure = repr(e)
+        finally:
+            os.chdir(here)
+        done = subprocess.CompletedProcess([], 0, out_io.getvalue(), "")
+        if failure:
+            raise AssertionError("the plan script failed: " + str(failure)[-400:])
         self.log, self.summary = done.stdout, summary.read_text()
         line = [l for l in out.read_text().splitlines() if l.startswith("matrix=")][-1]
         return json.loads(line[len("matrix="):])

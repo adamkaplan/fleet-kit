@@ -133,13 +133,20 @@ def read_env_log(path):
     return out
 
 
+_INSTALLER = None
+
+
 def load_installer():
-    """The installer (bin/<the kit's own program>) by path: it renders the reaper's service file."""
+    """The installer (bin/<the kit's own program>) by path: it renders the reaper's service file. Loaded once per process."""
+    global _INSTALLER
+    if _INSTALLER is not None:
+        return _INSTALLER
     path = os.path.join(ROOT, "bin", "fl" + "eet-switchboard")   # the name is written in two parts: the neutral-names test bans it under cloud/
     loader = importlib.machinery.SourceFileLoader("t_installer_for_refresh", path)
     spec = importlib.util.spec_from_loader("t_installer_for_refresh", loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    _INSTALLER = module
     return module
 
 

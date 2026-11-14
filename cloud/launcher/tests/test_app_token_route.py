@@ -31,7 +31,7 @@ class Route(unittest.TestCase):
     setUp = ta.Mint.setUp
 
     def env(self):
-        return dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
+        return dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.fast_openssl)
 
     def run_it(self, args, path=MINT, fds=()):
         """(completed process with its real stdout and stderr, nothing else): the mint run with args and the descriptors in fds inherited."""

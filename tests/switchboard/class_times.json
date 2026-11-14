@@ -316,7 +316,7 @@
   "TestEveryKindDelayedMark": 0.0,
   "TestEveryPathOrdersTakeToTheJudge": 0.42,
   "TestEveryReaderOfAPullRequestsFileList": 0.02,
-  "TestEveryTestClassIsolates": 16.7,
+  "TestEveryTestClassIsolates": 9.0,
   "TestEveryTestFileIsWired": 8.19,
   "TestEveryViewDerivesFromTheRegistry": 11.39,
   "TestEvidenceLimitCounting": 0.09,
@@ -813,7 +813,7 @@
   "TestReminderWaiting": 4.23,
   "TestReminders": 5.49,
   "TestRender": 0.43,
-  "TestReplay": 13.46,
+  "TestReplay": 5.0,
   "TestReplayJev": 0.0,
   "TestRepoCommissioningRule": 1.48,
   "TestRepoInKeysAndListings": 0.07,
@@ -1028,5 +1028,5 @@
   "TrickleHub": 1.01,
   "TwoLoopsTrace": 0.28,
   "Words": 0.02,
-  "WorkflowPlanPins": 14.2
+  "WorkflowPlanPins": 6.0
 }

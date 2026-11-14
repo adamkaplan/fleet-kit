@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests of the preflight step, the bounds, the identical-failure count and the child environment of
 bin/cloud-prepush (ask #1284). Throwaway repositories under the temporary directory only."""
+import atexit
 import os
 import shutil
 import subprocess
@@ -31,8 +32,23 @@ def put(repo, rel, text, mode=0o755):
     os.chmod(path, mode)
 
 
+_TEMPLATE = None
+
+
 def make_repo(tmp, tests):
+    global _TEMPLATE
     repo = os.path.join(tmp, "repo")
+    if tests == TESTS:
+        if _TEMPLATE is None or not os.path.exists(_TEMPLATE):
+            _TEMPLATE = tempfile.mkdtemp(prefix="prepush-tpl-")
+            atexit.register(shutil.rmtree, _TEMPLATE, True)
+            _build_repo(os.path.join(_TEMPLATE, "repo"), tests)
+        shutil.copytree(os.path.join(_TEMPLATE, "repo"), repo)
+        return repo
+    return _build_repo(repo, tests)
+
+
+def _build_repo(repo, tests):
     os.makedirs(repo)
     git(repo, "init", "-q", "-b", "trunk")
     put(repo, "a.txt", "one\n", 0o644)

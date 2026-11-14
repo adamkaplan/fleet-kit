@@ -821,7 +821,19 @@ class EarlyReturns(Base):
         self.assertEqual(self.wip(), "")
 
     def run_main(self, helper_dir=None, **kw):
-        return subprocess.run([self.seam(HOOK, helper_dir=helper_dir), "--prestop"], env=self.env(**kw), capture_output=True, text=True)
+        # the real hook runs in this process, with the same seam values the launcher script sets
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        git_bin = os.path.join(self.bin, "git")
+        with mock.patch.multiple(cw_end_hook, HOST_URL="file://%s/" % self.t, HELPER_DIR=helper_dir or self.helper_dir,
+                                 GIT_BIN=git_bin if os.path.exists(git_bin) else cw_end_hook.GIT_BIN), \
+                mock.patch.dict(os.environ, self.env(**kw), clear=True), \
+                mock.patch.object(sys, "argv", [HOOK, "--prestop"]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = cw_end_hook.main()
+            except SystemExit as e:
+                code = e.code or 0
+        return subprocess.CompletedProcess([HOOK, "--prestop"], code or 0, out.getvalue(), err.getvalue())
 
     def test_each_early_return_prints_one_line(self):
         self.dirty()
