@@ -69,7 +69,7 @@ def fixture():
         _FIXTURE_TEMPLATE.append(template)
     root = tempfile.mkdtemp(prefix="ps-fixture-")
     shutil.rmtree(root)
-    shutil.copytree(_FIXTURE_TEMPLATE[0], root, symlinks=True)
+    shutil.copytree(_FIXTURE_TEMPLATE[0], root, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
     return root
 
 

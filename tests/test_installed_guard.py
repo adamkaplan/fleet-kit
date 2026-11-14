@@ -74,8 +74,8 @@ class TreeCase(Base):
         self.origin = self.home / "origin"
         self.tree = self.home / "installed"
         template = self.template()
-        shutil.copytree(str(template[0]), str(self.origin), symlinks=True)
-        shutil.copytree(str(template[1]), str(self.tree), symlinks=True)
+        shutil.copytree(str(template[0]), str(self.origin), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        shutil.copytree(str(template[1]), str(self.tree), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
         git(self.tree, "remote", "set-url", "origin", str(self.origin))   # the copy of the clone follows the copy of the origin
         self.first, self.second, self.integration = template[2:]
         self.state = sb.ensure_state_dir()

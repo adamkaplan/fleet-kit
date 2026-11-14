@@ -68,7 +68,7 @@ class Base(unittest.TestCase):
             atexit.register(shutil.rmtree, holder, True)
             template = _TEMPLATES[sleep_seconds] = tp.make_repo(holder, tests3(sleep_seconds))
         repo = os.path.join(self.tmp, "repo")
-        shutil.copytree(template, repo, symlinks=True)
+        shutil.copytree(template, repo, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
         return repo
 
     def install(self, script=None):
