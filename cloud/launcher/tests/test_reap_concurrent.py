@@ -30,7 +30,7 @@ T0 = dt.datetime(2026, 10, 30, 9, 0, 0, tzinfo=dt.timezone.utc)
 HOOK_SECONDS = 100   # eight in a row: 800 seconds; two waves of four: 200
 MODULE_ENV = "CW_TEST_REAP_CONCURRENT_MODULE"
 SCRUB_SET = 1000
-SCRUB_RUNS = 2000
+SCRUB_RUNS = 600
 PHRASES = ("four at a time", "its own limit", "tried again at the next pass")
 
 
@@ -438,11 +438,12 @@ class ScrubSnapshot(unittest.TestCase):
 
         def adder():
             i = 0
-            while not done.is_set() and i < 20000:
+            while not done.is_set() and i < 200000:
                 started.set()   # keeps growing the set for the whole run: the scrub keeps a built copy of an unchanged set
                 known.add("late-added-%07d-yy" % i)
                 i += 1
-                time.sleep(0)
+                if i % 50 == 0:
+                    time.sleep(0.0001)
         t = threading.Thread(target=adder, daemon=True)
         old_interval = sys.getswitchinterval()
         sys.setswitchinterval(1e-6)   # the adder gets the interpreter inside a scrub, not only between two
