@@ -722,8 +722,23 @@ class Completeness(Base):
             f.write("%s\n\t%s = %s\n" % (head, parts[-1], value))
         return True
 
+    def is_plain(self, key, value):
+        parts = key.split(".")
+        return not (len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9._/:@+-]*", value) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", parts[-1])
+                    or not re.fullmatch(r"[A-Za-z0-9-]+", parts[0]) or (len(parts) > 2 and not re.fullmatch(r"[A-Za-z0-9._/:@+ -]+", ".".join(parts[1:-1]))))
+
     def refusal(self, key, value):
         cfg = os.path.join(self.work, ".git", "config")
+        if self.is_plain(key, value) and not key.lower().startswith(("include.", "includeif.", "core.worktree", "extensions.")):
+            parts = key.split(".")   # the listing git would give for the one entry, answered in memory: the file is never read
+            norm = "%s.%s" % (parts[0].lower(), parts[1].lower()) if len(parts) == 2 else "%s.%s.%s" % (parts[0].lower(), ".".join(parts[1:-1]), parts[-1].lower())
+            listed = subprocess.CompletedProcess(args=[], returncode=0, stdout=self._base_z + ("file:.git/config\0%s\n%s\0" % (norm, value)).encode(), stderr=b"")
+            try:
+                with mock.patch.object(cw_end_hook.subprocess, "run", return_value=listed):
+                    cw_end_hook.config_refusal(self.work, REPO, self.ctx)
+            except (cw_end_hook.ConfigRefused, RuntimeError):
+                return True
+            return False
         with open(cfg, "w") as f:
             f.write(self.plain)
         plain = False

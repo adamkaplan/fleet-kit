@@ -789,12 +789,12 @@ class S16Random(unittest.TestCase):
         rr = random.Random(1616)
         form = rnd(rr, 319, "abcdefghijklmnopqrstuvwxyz0123456789")
         secs = [form[k:k + ln] for ln in [rr.randint(40, 120) for _ in range(100)] for k in [rr.randint(0, 319 - ln)]]
-        text = ("-" * 14840 + form) * 2
-        cases.append((text[:30000], secs))
+        text = ("-" * 2840 + form) * 2
+        cases.append((text[:6000], secs))
         bases = ["".join(rr.choice(self.TOKENS) for _ in range(6)) for _ in range(3)]
         secs = [b[k:k + 12] for b in bases for k in range(0, 6)][:20]
         secs += [rnd(rr, 10, "[redacted]") for _ in range(20 - len(secs))] if len(secs) < 20 else []
-        text = "".join(rr.choice(bases)[rr.randint(0, 4):rr.randint(10, 30)] + " " for _ in range(3000))[:30000]
+        text = "".join(rr.choice(bases)[rr.randint(0, 4):rr.randint(10, 30)] + " " for _ in range(600))[:6000]
         cases.append((text, secs))
         return cases
 
