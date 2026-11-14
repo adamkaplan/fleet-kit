@@ -405,22 +405,22 @@ def _body():
             loop = next(k for k, l in enumerate(lines) if l.startswith("    for registrar in command_registrars():"))
             # the mutant: build_parser names the registrar again (the removed root back on the path). The flag edit that passes on the real file is refused on it
             mutant = list(lines)
-            mutant.insert(loop, "    add_core_parsers(sub)")
+            mutant[loop - 1] = "    add_core_parsers(sub)"   # replaces the comment line above the loop: the line numbers stay, so only build_parser is parsed again, not the whole file
             mutant_flag = next(k for k, l in enumerate(mutant) if l.startswith('    send.add_argument("--from"'))
             head = list(mutant)
             head[mutant_flag] = head[mutant_flag] + "  # x"
             diff = "\n".join(list(difflib.unified_diff(mutant, head, lineterm="", n=3))[2:])
-            refused = module.closure_refusals("\n".join(mutant), "\n".join(head), diff, module.daemon_roots(rule), set(rule["clear_entry_points"]), False, rule["dynamic_actions"])
+            refused = self.closure_check("\n".join(head), diff, base="\n".join(mutant))
             self.assertTrue(refused, "with build_parser naming the registrar, a flag of send is on the clear's path again")
             real_head = list(lines)
             real_head[flag] = real_head[flag] + "  # x"
             self.assertEqual(self.closure_check("\n".join(real_head), edit(real_head)), [], "and on the real file it is not")
-            reach = module.closure(__import__("ast").parse("\n".join(mutant)), module.daemon_roots(rule), rule["dynamic_actions"])[0]
+            reach = module.closure(importlib.import_module("support.rebind").spliced_head(self._daemon_cache, "\n".join(mutant), __import__("ast")), module.daemon_roots(rule), rule["dynamic_actions"])[0]
             self.assertIn(self.CORE, reach)
             # an edit of the same line, left in build_parser instead of the registrar (the rebase mistake): refused as wiring
             in_build = list(lines)
             j = next(k for k, l in enumerate(in_build) if l.startswith("    for registrar in command_registrars():"))
-            in_build.insert(j, '    sub.add_parser("zzz", help="x")')
+            in_build[j - 1] = '    sub.add_parser("zzz", help="x")'
             self.assertTrue(self.closure_check("\n".join(in_build), edit(in_build)), "a subcommand added in build_parser is refused: it belongs in the registrar")
 
         def test_the_docs_and_the_matrix_say_the_same_roots_with_the_same_reasons_and_the_clear_holds_no_root_name(self):
@@ -901,7 +901,7 @@ def _body():
             self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "nothing was cleared")
             self.assertFalse(sb.EFFECT_CHECK(), "the window is closed again after main")
 
-        def guard_readers(self, daemon_source, hold_source, name):
+        def guard_readers(self, daemon_source, hold_source, name, daemon_tree=None):
             """The functions of the daemon file and of impact_hold.py that REFUSE on the guard `name`, read as a FREE variable (not a parameter of their own): an `if` of the function itself (not of a function nested in it) whose test reads it and whose body returns or raises. Derived by walking the code."""
             import ast
             def own(node):
@@ -911,8 +911,8 @@ def _body():
                     yield child
                     yield from own(child)
             found = set()
-            for source in (daemon_source, hold_source):
-                for node in ast.walk(ast.parse(source)):
+            for source, tree in ((daemon_source, daemon_tree), (hold_source, None)):
+                for node in ast.walk(tree or ast.parse(source)):
                     if not isinstance(node, ast.FunctionDef) or name in {x.arg for x in ast.walk(node.args) if isinstance(x, ast.arg)} or any(isinstance(x, ast.Name) and x.id == name and isinstance(x.ctx, ast.Store) for x in ast.walk(node)):
                         continue
                     for x in own(node):
@@ -924,18 +924,19 @@ def _body():
             """Derived (the review of c77a44d4): `main` writes no module-level name (no `global` statement), and the refusing functions read the latch, a closure, not a flag. A build that brings back a module flag `main` sets is caught."""
             import ast, re as regex
             daemon = self.real_source()
-            main = next(n for n in ast.parse(daemon).body if isinstance(n, ast.FunctionDef) and n.name == "main")
+            real_tree = self.real_tree()
+            main = next(n for n in real_tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
             self.assertEqual({name for g in ast.walk(main) if isinstance(g, ast.Global) for name in g.names}, set(), "main holds no global a registrar can write around")
             self.assertNotIn("REGISTRARS_RAN", daemon + (BIN / "impact_hold.py").read_text())
-            readers = self.guard_readers(daemon, (BIN / "impact_hold.py").read_text(), "check")   # #924 round 4: the refusal is the guard's first statement, on the closure cell `check`, in `guarded_effect` (the daemon's and the module's)
+            readers = self.guard_readers(daemon, (BIN / "impact_hold.py").read_text(), "check", real_tree)   # #924 round 4: the refusal is the guard's first statement, on the closure cell `check`, in `guarded_effect` (the daemon's and the module's)
             self.assertEqual(readers, {"guarded_effect"}, sorted(readers))
-            for tree, names, guard in ((ast.parse(daemon), ("cmd_impact", "cmd_review"), "effect_guard"), (ast.parse((BIN / "impact_hold.py").read_text()), ("cmd_impact_clear", "impact_clear_core"), "_unbound")):
+            for tree, names, guard in ((real_tree, ("cmd_impact", "cmd_review"), "effect_guard"), (ast.parse((BIN / "impact_hold.py").read_text()), ("cmd_impact_clear", "impact_clear_core"), "_unbound")):
                 for name in names:   # every effect is built by the guard
                     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
                     self.assertTrue(any(getattr(d.func, "id", "") == guard for d in node.decorator_list if isinstance(d, ast.Call)), name)
-            reset_mutant = regex.sub(r"\n                if when\(arguments\) and check\(\):[^\n]*\n(?:                    [^\n]*\n)+", "\n", daemon)
+            reset_mutant = regex.sub(r"\n                if when\(arguments\) and check\(\):[^\n]*\n(?:                    [^\n]*\n)+", lambda m: "\n" * m.group(0).count("\n"), daemon)   # the removed lines become blank lines: the line numbers stay, so only the changed definition is parsed again
             self.assertNotEqual(reset_mutant, daemon)
-            self.assertNotIn("guarded_effect", self.guard_readers(reset_mutant, "", "check"), "with the read deleted no effect has a refusal: this test sees it")
+            self.assertNotIn("guarded_effect", self.guard_readers(reset_mutant, "", "check", importlib.import_module("support.rebind").spliced_head(self._daemon_cache, reset_mutant, ast)), "with the read deleted no effect has a refusal: this test sees it")
 
         @staticmethod
         def guard_layer(effect):
