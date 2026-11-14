@@ -435,11 +435,12 @@ class ScrubSnapshot(unittest.TestCase):
         known = {planted} | {"early-known-%07d-xx" % i for i in range(SCRUB_SET)}
         text = "log line with " + planted + " inside"
         errors, removed, done, started = [], 0, threading.Event(), threading.Event()
+        BURST = 50   # the scrubs that run while the set changes, each one building the index afresh
 
         def adder():
             i = 0
             while not done.is_set():
-                started.set()   # keeps changing the set for the whole run: the scrub keeps a built copy of an unchanged set
+                started.set()   # keeps changing the set for the burst: every scrub of it builds the index from a changing set
                 known.add("late-added-%07d-yy" % (i % 4000))
                 known.discard("late-added-%07d-yy" % ((i - 2000) % 4000))
                 i += 1
@@ -449,7 +450,12 @@ class ScrubSnapshot(unittest.TestCase):
         self.addCleanup(sys.setswitchinterval, old_interval)
         t.start()
         started.wait(5)   # the adder runs while the scrubs do, also on a runner with few cores
-        for _ in range(SCRUB_RUNS):
+        for n in range(SCRUB_RUNS):
+            if n == BURST:
+                done.set()   # the set stops changing: the rest of the scrubs use the kept index
+                t.join()
+            if n < BURST:
+                mod._SCRUB_SLOT[0] = None   # forces a build from the changing set on each of the burst scrubs
             try:
                 removed += planted not in mod.scrub(text, known)
             except RuntimeError as e:

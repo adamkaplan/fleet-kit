@@ -488,19 +488,25 @@ class Grammar(Base):
         header = '%s "%s"' % (section, sub) if sub else section
         pathlib.Path(self.cfg).write_text(pathlib.Path(self.cfg).read_text() + "[%s]\n\t%s = %s\n" % (header, name, value))
 
-    def global_files(self, key, value):
-        """The same key in the home file, the global-override file, and the variables: returns environment overrides."""
+    def global_files(self, key, value, *more):
+        """The same keys in the home file, the global-override file, and the variables: returns environment overrides."""
         home = os.path.join(self.t, "hostile-home")
         os.makedirs(home, exist_ok=True)
         gfile = os.path.join(home, ".git" + "config")
-        head, _, name = key.rpartition(".")
-        section, _, sub = head.partition(".")
-        entry = "[%s]\n\t%s = %s\n" % ('%s "%s"' % (section, sub) if sub else section, name, value)
+        pairs = [(key, value)] + list(more)
+        entry = ""
+        for k, v in pairs:
+            head, _, name = k.rpartition(".")
+            section, _, sub = head.partition(".")
+            entry += "[%s]\n\t%s = %s\n" % ('%s "%s"' % (section, sub) if sub else section, name, v)
         for f in (gfile, os.path.join(home, "other")):
             pathlib.Path(f).write_text(entry)
-        return {"HOME": home, CFG_G: os.path.join(home, "other"), CFG_S: os.path.join(home, "other"),
-                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": value,
-                "GIT_CONFIG_PARAMETERS": "'%s'='%s'" % (key, value)}
+        env = {"HOME": home, CFG_G: os.path.join(home, "other"), CFG_S: os.path.join(home, "other"),
+               "GIT_CONFIG_COUNT": str(len(pairs)),
+               "GIT_CONFIG_PARAMETERS": " ".join("'%s'='%s'" % kv for kv in pairs)}
+        for i, (k, v) in enumerate(pairs):
+            env["GIT_CONFIG_KEY_%d" % i], env["GIT_CONFIG_VALUE_%d" % i] = k, v
+        return env
 
     def non_config_calls(self):
         # reading the configuration and listing the untracked file names (ls-files --others: no filter, no hook) are the only calls of a refusal
@@ -536,11 +542,12 @@ class Grammar(Base):
         p = self.go(HOOK)
         self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"), p.stdout + p.stderr)
         base_argv, base_env = self.snapshot()
-        for cls, key, value in self.table():
-            with self.subTest(cls=cls, key=key):
+        for cls in GRAMMAR:   # all the keys of one class together: one run for each class
+            rows = [(self.fill(k), self.fill(v)) for k, v in GRAMMAR[cls]]
+            with self.subTest(cls=cls):
                 self.reset()
                 self.dirty()
-                p = self.run_hook(HOOK, **self.global_files(key, value))
+                p = self.run_hook(HOOK, **self.global_files(*rows[0], *rows[1:]))
                 self.assertFalse(os.path.exists(self.marker), "a program ran")
                 self.assertEqual(self.other_refs(), "", "the push landed in the other remote")
                 self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"), p.stdout + p.stderr)

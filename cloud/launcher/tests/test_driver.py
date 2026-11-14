@@ -404,13 +404,13 @@ class Driver(base.Base):
         winner = self.spawn(STUB_MODE="busy-forever")
         end = time.time() + 40
         while time.time() < end and not self.pf_up():
-            time.sleep(0.1)
+            time.sleep(0.02)
         self.assertTrue(self.pf_up(), "the first run never got going")
         # the second run passed its own first check before the first made the pod (its token step is the slow one)
         loser_args = self.args()
         slow = os.path.join(self.tmp.name, "slow-token")
         with open(slow, "w") as f:
-            f.write("#!/bin/sh\nsleep 0.5\nprintf '%%s' '%s'\n" % GIT)
+            f.write("#!/bin/sh\nsleep 0.15\nprintf '%%s' '%s'\n" % GIT)
         os.chmod(slow, 0o700)
         st_mid, calls_mid = self.st(), len(self.calls())
         p = subprocess.run(loser_args, env=dict(self.denv, CW_GIT_TOKEN_CMD=slow), capture_output=True, text=True, timeout=120)
@@ -432,7 +432,7 @@ class Driver(base.Base):
         proc = self.spawn(STUB_MODE="busy-forever")
         end = time.time() + 40
         while time.time() < end and not self.pf_up():
-            time.sleep(0.1)
+            time.sleep(0.02)
         st = self.st()
         nonce = st["pods"][self.name]["metadata"]["annotations"]["cw/run-id"]
         self.assertRegex(nonce, r"^[0-9a-f]{16}$")
