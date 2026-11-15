@@ -413,7 +413,6 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_load_part.py` | 1 | parallel |
 | `cloud/launcher/tests/test_long_run_setting.py` | 1 | parallel |
 | `cloud/launcher/tests/test_no_commit_mark.py` | 1 | parallel |
-| `cloud/launcher/tests/test_pod_requests.py` | 1 | parallel |
 | `cloud/launcher/tests/test_reaper_renewal.py` | 1 | parallel |
 | `cloud/launcher/tests/test_reaper_row.py` | 1 | parallel |
 | `cloud/launcher/tests/test_secret_dir.py` | 1 | parallel |
@@ -594,7 +593,6 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_load_part.py` | 1 | parallel |
 | `cloud/launcher/tests/test_long_run_setting.py` | 1 | parallel |
 | `cloud/launcher/tests/test_no_commit_mark.py` | 1 | parallel |
-| `cloud/launcher/tests/test_pod_requests.py` | 1 | parallel |
 | `cloud/launcher/tests/test_reaper_renewal.py` | 1 | parallel |
 | `cloud/launcher/tests/test_reaper_row.py` | 1 | parallel |
 | `cloud/launcher/tests/test_secret_dir.py` | 1 | parallel |

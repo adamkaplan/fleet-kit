@@ -87,7 +87,7 @@ class OfflineRun:
             if ticks:
                 with contextlib.ExitStack() as stack:
                     for name in ticks:
-                        stack.enter_context(mock.patch.object(sb, name, lambda *a, **k: None))
+                        stack.enter_context(mock.patch.object(sb, name, (lambda _e, d, *_a, **_k: d) if name == "sweep_decisions" else (lambda *a, **k: None)))
                     self._outer_patched = True
                     try:
                         return self._play()
@@ -105,8 +105,9 @@ class OfflineRun:
 
     OPTIONAL_TICKS = (("impact_would_hold_pass", ("impact", "would_hold", "would-hold")), ("pane_health_pass", ("pane_health", "detach", "fleetpane", "close-agent", "adopt", "exit")),
                       ("chat_clear_pass", ("chat", "clear")), ("health_write", ("health",)), ("record_v2_calls", ("call", "budget")),
-                      ("early_decisions", ("decision", "awaiting", "escalate", "resolve", "answer", "supersede", "question")),
-                      ("publish_decisions", ("decision", "awaiting", "escalate", "resolve", "answer", "supersede", "question")),
+                      ("sweep_decisions", ("sweep", "awaiting", "decision", "decisions", "escalate", "resolve", "answer", "supersede", "question")),
+                      ("triage_pass", ("triage",)), ("pr_events_pass", ("pr_state", "pr-state", "pull", "webhook", "merge")),
+                      ("ci_record_pass", ("ci_record", "verdict", "gates", "plan")), ("clear_notice_pass", ("clear_notice", "cleared", "clear")),
                       ("publish_cockpit", ("cockpit", "panel", "tui")), ("write_catching_up", ("catching_up", "catching-up", "catch")),
                       ("schedule_judge_warm", ("judge", "jev", "warm")), ("friction_tick", ("friction",)),
                       ("load_tick", ("load_tick", "load", "overload")), ("blocked_tick", ("blocked",)),
@@ -280,7 +281,7 @@ class OfflineRun:
             else:
                 with contextlib.ExitStack() as stack:   # a pass run alone (a step) is quieted the same way
                     for name in self.quiet_ticks():
-                        stack.enter_context(mock.patch.object(sb, name, lambda *a, **k: None))
+                        stack.enter_context(mock.patch.object(sb, name, (lambda _e, d, *_a, **_k: d) if name == "sweep_decisions" else (lambda *a, **k: None)))
                     self.world.engine.run_pass()
         except sb.SimulatedCrash:
             self.crashed_writes.update(range(first, len(self.world.v2.writes)))

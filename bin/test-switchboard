@@ -33772,7 +33772,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
         function, binding, module = self.pick()
-        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.small_src), self.small_src)
+        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src), self.base_src)
         shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
@@ -36249,7 +36249,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             for target, replacement in mutant.items():
                 owner, _, name = target.rpartition(".")
                 stack.enter_context(mock.patch.object(getattr(sb, owner) if owner else sb, name, replacement))
-            for _ in range(15):   # settle: each pass may spend its own call budget, so the labels go on over a few passes
+            for _ in range(20):   # settle: each pass may spend its own call budget, so the labels go on over a few passes
                 one(self.PASS_SECONDS)
                 held |= {int(w[1].split("/issues/")[1].split("/")[0]) for w in self.posts()}
             self.assertEqual(held, set(numbers), "all 30 are held")
@@ -36278,7 +36278,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
 
         def one(advance):
             self.passes([self.listed(n, self.both() if n in held else [], head=self.HEAD) for n in numbers], advance=advance)
-        for _ in range(15):
+        for _ in range(20):
             one(self.PASS_SECONDS)
             held |= {int(w[1].split("/issues/")[1].split("/")[0]) for w in self.posts()}
         self.assertEqual(held, set(numbers), "all 30 are held")

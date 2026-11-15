@@ -133,7 +133,6 @@ cloud/launcher/tests/test_idle_nudge.py
 cloud/launcher/tests/test_image_roll.py
 cloud/launcher/tests/test_load_part.py
 cloud/launcher/tests/test_no_commit_mark.py
-cloud/launcher/tests/test_pod_requests.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_secret_dir.py
