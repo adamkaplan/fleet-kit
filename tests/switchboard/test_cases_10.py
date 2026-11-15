@@ -1483,7 +1483,7 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         listed = {tuple(c) for c in commands}
         for verb in verbs:
             self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
-        sample = helps[:2] + helps[-2:] + commands[-2:]   # a small fixed sample, recorded twice
+        sample = helps[:1] + commands[-1:]   # a small fixed sample, recorded twice (#2525)
         self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):

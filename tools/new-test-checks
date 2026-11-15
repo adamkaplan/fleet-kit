@@ -243,27 +243,28 @@ def doc_strings(tree):
 def table_lines(source, tree, root, rel):
     patterns = read_patterns(root)
     lines, first = [], []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and any(p.search(ast.get_source_segment(source, node) or "") for p in patterns):
-            lines.append((node.lineno, "table: class %s lists bin/: it is a row of NEW_BIN_GUARDS or exempt in tests/switchboard/test_bin_set_table.py" % node.name))
-            first.append(BIN_GUARD_CMD)
+    if "bin" in source:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and any(p.search(ast.get_source_segment(source, node) or "") for p in patterns):
+                lines.append((node.lineno, "table: class %s lists bin/: it is a row of NEW_BIN_GUARDS or exempt in tests/switchboard/test_bin_set_table.py" % node.name))
+                first.append(BIN_GUARD_CMD)
     def load_rows():
         try:
             return json.loads((root / "tools" / "path-suites.json").read_text())["rows"]
         except (OSError, ValueError, KeyError):
             return []
-    rows = cached_by_file(root / "tools" / "path-suites.json", "rows", load_rows)
-    rows = [row for row in rows if rel not in row.get("suites", [])]   # a row that names this file never fires for it
-    docs, seen, globs = doc_strings(tree), set(), {row.get("glob", "") for row in rows}
+    def load_compiled():
+        return [(row, row.get("glob", ""), re.compile(fnmatch.translate(row.get("glob", "")))) for row in load_rows()]
+    compiled = [(row, g, rx) for row, g, rx in cached_by_file(root / "tools" / "path-suites.json", "compiled", load_compiled) if rel not in row.get("suites", [])]
+    docs, seen, globs = doc_strings(tree), set(), {g for _, g, _ in compiled}
     for node in ast.walk(tree):
         if len(seen) >= len(globs):
             break
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs and len(node.value) < 200:
-            for row in rows:
-                glob = row.get("glob", "")
-                if glob in seen:
-                    continue
-                if fnmatch.fnmatchcase(node.value, glob) or ("/" not in node.value and node.value.endswith(".py") and fnmatch.fnmatchcase("bin/" + node.value, glob)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs and 0 < len(node.value) < 200:
+            val = node.value
+            bin_val = ("bin/" + val) if ("/" not in val and val.endswith(".py")) else None
+            for _row, glob, rx in compiled:
+                if glob not in seen and (rx.match(val) or (bin_val and rx.match(bin_val))):
                     seen.add(glob)
                     lines.append((node.lineno, "table: tools/path-suites.json row %s does not name this file" % glob))
                     first.append(PATH_SUITES_CMD)

@@ -104,7 +104,13 @@ class OfflineRun:
         return ticks
 
     OPTIONAL_TICKS = (("impact_would_hold_pass", ("impact", "would_hold", "would-hold")), ("pane_health_pass", ("pane_health", "detach", "fleetpane", "close-agent", "adopt", "exit")),
-                      ("chat_clear_pass", ("chat", "clear")), ("health_write", ("health",)), ("record_v2_calls", ("call", "budget")))
+                      ("chat_clear_pass", ("chat", "clear")), ("health_write", ("health",)), ("record_v2_calls", ("call", "budget")),
+                      ("early_decisions", ("decision", "awaiting", "escalate", "resolve", "answer", "supersede", "question")),
+                      ("publish_decisions", ("decision", "awaiting", "escalate", "resolve", "answer", "supersede", "question")),
+                      ("publish_cockpit", ("cockpit", "panel", "tui")), ("write_catching_up", ("catching_up", "catching-up", "catch")),
+                      ("schedule_judge_warm", ("judge", "jev", "warm")), ("friction_tick", ("friction",)),
+                      ("load_tick", ("load_tick", "load", "overload")), ("blocked_tick", ("blocked",)),
+                      ("held_sends_tick", ("held", "hold")), ("undelivered_wake_tick", ("undelivered", "overdue")), ("feed_tick", ("feed",)))
     CLOUD_TICKS = ("lost_worker_tick", "push_watch_tick", "pod_silence_tick", "cloud_watch_tick", "cloud_end_tick", "cloud_stall_tick", "cloud_turn_tick")
 
     def _play(self):

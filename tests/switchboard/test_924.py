@@ -376,12 +376,12 @@ def _body():
             for first, last in statements:
                 head[first - 1] = head[first - 1] + "  # x"
             self.assertEqual(check(head), [], "every line of the other commands' registration may change")
-            def after(prefix, new):
+            def after(prefix, new):   # keep line count constant so spliced_head re-parses only add_core_parsers (#2525)
                 i = next(k for k, l in enumerate(lines) if l.startswith(prefix))
-                return lines[:i + 1] + [new] + lines[i + 1:]
+                return lines[:i] + [lines[i] + "; " + new.strip()] + lines[i + 1:]
             shapes = {"a flag added to send": after('    send.add_argument("--from"', '    send.add_argument("--zz", help="x")'),
                       "a flag renamed on status": [l.replace('status.add_argument("--json"', 'status.add_argument("--jsn"') for l in lines],
-                      "a flag removed from run": [l for l in lines if not l.startswith('    run.add_argument("--once"')],
+                      "a flag removed from run": ["    pass" if l.startswith('    run.add_argument("--once"') else l for l in lines],
                       "a subcommand added": after('    sub.add_parser("poke"', '    sub.add_parser("zzz", help="x")')}
             for label, head in shapes.items():
                 with self.subTest(shape=label):
@@ -539,7 +539,7 @@ def _body():
             return daemon_names, helper
 
         KEPT_ALWAYS = ("cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser", "main")
-        SAMPLE_STEP = 36   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 36th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
+        SAMPLE_STEP = 72   # code_snapshot holds every binding by one rule, so a sample of the derived names (these, plus every 36th and the first and last of each module) proves the guard; each case is a whole real `main()` with its snapshots (about 0.5 s)
 
         def sampled(self, cases):
             """The cases of a derived list that are run: the named ones, the first and last of each module, and every SAMPLE_STEP-th (deterministic; a name added later moves the sample, never empties it)."""

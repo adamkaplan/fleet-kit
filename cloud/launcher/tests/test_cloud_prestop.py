@@ -155,7 +155,7 @@ class Hook(Base):
         self.dirty()
         self.fake_git('case "$*" in *" push "*|"push "*) exec sleep 300;; esac\nexec REAL "$@"\n')
         t0 = time.time()
-        p = self.hook(budget="2")
+        p = self.hook(budget="1")
         self.assertLess(time.time() - t0, 6)
         out = (p.stdout + p.stderr).strip().splitlines()
         self.assertEqual((p.returncode, len(out)), (0, 1))
@@ -466,18 +466,22 @@ class Grammar(Base):
         return self.run_hook(hook, **kw)
 
     def run_hook(self, hook, **kw):
-        if hook != HOOK:   # a mutated copy of the hook is a file of its own: it runs as a process
-            return subprocess.run([self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
-        # the real hook runs in this process (84 interpreter starts cost most of the time), with the same seam values the launcher script sets
+        if hook != HOOK:   # a mutated copy of the hook is loaded in-process (#2525: avoids 10 subprocess spawns across scenario_transport_keys and the other mutants)
+            spec = importlib.util.spec_from_loader("mut_hook", importlib.machinery.SourceFileLoader("mut_hook", hook))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        else:
+            mod = cw_end_hook
+        # runs in this process with the same seam values the launcher script sets
         out, err, code = io.StringIO(), io.StringIO(), 0
         git_bin = os.path.join(self.bin, "git")
-        with mock.patch.multiple(cw_end_hook, HOST_URL="file://%s/" % self.t, HELPER_DIR=self.helper_dir,
-                                 GIT_BIN=git_bin if os.path.exists(git_bin) else cw_end_hook.GIT_BIN), \
+        with mock.patch.multiple(mod, HOST_URL="file://%s/" % self.t, HELPER_DIR=self.helper_dir,
+                                 GIT_BIN=git_bin if os.path.exists(git_bin) else mod.GIT_BIN), \
                 mock.patch.dict(os.environ, self.env(**kw), clear=True), \
-                mock.patch.object(sys, "argv", [HOOK, "--prestop"]), \
+                mock.patch.object(sys, "argv", [hook, "--prestop"]), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
-                code = cw_end_hook.main()
+                code = mod.main()
             except SystemExit as e:
                 code = e.code or 0
         return subprocess.CompletedProcess([self._seam_hook, "--prestop"], code or 0, out.getvalue(), err.getvalue())

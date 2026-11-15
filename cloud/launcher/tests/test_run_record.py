@@ -141,7 +141,7 @@ class Record(td.Driver):
         self.assertEqual(json.loads(self.read(os.path.join(self.the_record(), "run.json")))["head_sha"], "a" * 40)
 
     def test_s5_a_transcript_that_cannot_be_read_still_stops_the_pod_and_says_unavailable(self):
-        p, out = self.run_driver(STUB_MODE="messages-down", CW_RECORD_TIMEOUT="3")
+        p, out = self.run_driver(STUB_MODE="messages-down", CW_RECORD_TIMEOUT="1")
         self.assertEqual(p.returncode, 0, out)
         self.assertEqual(self.st()["pods"], {})
         d = self.the_record()
@@ -223,7 +223,7 @@ class Record(td.Driver):
 
     # -- M3: the record is the launcher's stop's: retire and a person get it too --
     def stub_env(self, **extra):
-        self.env.update(CW_RUN_RECORD_DIR=self.records, STUB_MESSAGES=self.msgfile, STUB_LOG=self.stub_log, CW_RECORD_TIMEOUT="5")
+        self.env.update(CW_RUN_RECORD_DIR=self.records, STUB_MESSAGES=self.msgfile, STUB_LOG=self.stub_log, CW_RECORD_TIMEOUT="1")
         self.env.update(extra)
 
     def create_with_secrets(self):

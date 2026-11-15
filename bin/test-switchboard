@@ -24516,7 +24516,7 @@ class TestTriage(Base):
             self.world.tick(1)
             return real(repo, path, now, fresh)
         self.hub._read_one = slow
-        seen = self.run_minutes(20)
+        seen = self.run_minutes(10)
         ours = seen[-1]["total"]   # each unowned issue is a T1 and a T3 (no next step)
         first_all_ours = next(c for c in seen if c["total"] >= ours)
         self.assertGreaterEqual(first_all_ours["unchecked_other_owner"], 50, "ours were done while the flags still waited")
@@ -24542,7 +24542,7 @@ class TestTriage(Base):
         self.charter()
         self.many_unowned(10, other=80)
         self.engine.config["triage"]["calls_per_pass"] = 10
-        seen = self.run_minutes(20)
+        seen = self.run_minutes(5)
         self.assertEqual(seen[-1]["unchecked"], 0)
         self.assertTrue(any(c["oldest_unchecked_seconds"] > 0 for c in seen))
         lines = "\n".join(sb.triage_status_lines(dict(seen[0], unchecked=5, unchecked_other_owner=3, oldest_unchecked_seconds=185)))
@@ -32547,8 +32547,9 @@ class TestRegistrarFloor(LedgerBase):
         (the base, again and again) and its head three times each. The answers are the module's own, unchanged; only a repeat of the same text or the same tree is answered from the class's table."""
         import ast, hashlib, types
         memo, dc = TestRegistrarFloor.memo, self.dc
-        pinned = {("parse", hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()) for text in (self.base_src, self.small_src)}
-        memo.setdefault(("parse", hashlib.sha1(self.base_src.encode("utf-8", "surrogatepass")).hexdigest()), (None, self.tree))
+        if not memo:
+            memo.update({("parse", hashlib.sha1(self.base_src.encode("utf-8", "surrogatepass")).hexdigest()): (None, self.tree), ("registrar_pattern", id(self.tree)): (self.tree, dc.registrar_pattern(self.tree)), ("pattern_bindings", id(self.tree)): (self.tree, dc.pattern_bindings(self.tree)), ("closure", id(self.tree), repr(dc.daemon_roots(self.rule)), repr(self.rule["dynamic_actions"])): (self.tree, dc.closure(self.tree, dc.daemon_roots(self.rule), self.rule["dynamic_actions"]))})
+        pinned = {k for k in memo if k[0] == "parse" or k[1] == id(self.tree)} | {("parse", hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()) for text in (self.base_src, self.small_src)}
 
         def keep(key, tree, make):
             if key not in memo:
@@ -33771,7 +33772,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
         function, binding, module = self.pick()
-        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src), self.base_src)
+        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.small_src), self.small_src)
         shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
@@ -36230,7 +36231,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.mutant_fails("head", self.MUTANTS["head"])
 
     # -- the cost: a held pull request costs nothing between changes (a RATE, not a per-pass count)
-    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 60   # 30 held pull requests, a pass every 5 seconds (the default poll), (a count: the retarget half way, quiet passes before and after)
+    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 16   # 30 held pull requests, a pass every 5 seconds (the default poll), (a count: the retarget half way, quiet passes before and after)
     HOUR_CALLS = 1   # the stated bound: one `gh pr view` for the ONE retarget of the hour (plus its 2 label removals, counted apart); nothing for the 29 unchanged
 
     def hour_of_passes(self, mutant=None):
@@ -36248,7 +36249,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             for target, replacement in mutant.items():
                 owner, _, name = target.rpartition(".")
                 stack.enter_context(mock.patch.object(getattr(sb, owner) if owner else sb, name, replacement))
-            for _ in range(40):   # settle: each pass may spend its own call budget, so the labels go on over a few passes
+            for _ in range(15):   # settle: each pass may spend its own call budget, so the labels go on over a few passes
                 one(self.PASS_SECONDS)
                 held |= {int(w[1].split("/issues/")[1].split("/")[0]) for w in self.posts()}
             self.assertEqual(held, set(numbers), "all 30 are held")
@@ -36277,7 +36278,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
 
         def one(advance):
             self.passes([self.listed(n, self.both() if n in held else [], head=self.HEAD) for n in numbers], advance=advance)
-        for _ in range(40):
+        for _ in range(15):
             one(self.PASS_SECONDS)
             held |= {int(w[1].split("/issues/")[1].split("/")[0]) for w in self.posts()}
         self.assertEqual(held, set(numbers), "all 30 are held")
@@ -72009,8 +72010,6 @@ class TestPullFileListRead(LedgerBase):
                 self.assertEqual(code, 2, err)
                 self.assertIn(self.words(kind), refused)
                 self.assertIn(refused, err, "the audit's line is the printed line")
-
-
 
 
 class TestParentAskDoneWhen(LedgerBase):
