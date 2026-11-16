@@ -45,6 +45,105 @@ def hold_reason(observation, missing=None):
     return None
 
 
+# ---- #2545: an orchestrator's non-urgent events are batched onto synchronized UTC buckets (the Chief of Staff, workers and testers keep `batch_seconds`).
+# Tier 0: at once. Tier 1: the next :00/:30 UTC. Tier 2: the next :00 UTC. Tier 3: a rider, never the reason for a message.
+# Every wake carries everything pending (Tier 0 to 3). A deterministic per-agent jitter (sha256 of the name, 0 to 45 s) spreads the lanes.
+ORCH_BUCKET_SECONDS = {1: 1800, 2: 3600}
+ORCH_JITTER_MAX = 45
+_ISSUE_TIER1 = re.compile(r"^issue #\d+ (?:closed|reopened|label \S*awaiting-)")
+
+
+def orchestrator_jitter(recipient):
+    """0 to ORCH_JITTER_MAX seconds, the same for one name on every pass and every machine."""
+    return int(hashlib.sha256(str(recipient).encode("utf-8")).hexdigest(), 16) % (ORCH_JITTER_MAX + 1)
+
+
+def bucket_target(recipient, tier, since):
+    """The first bucket boundary (plus the recipient's jitter) at or after `since`: :00/:30 UTC for tier 1, :00 UTC for tier 2."""
+    period, jitter = ORCH_BUCKET_SECONDS[tier], orchestrator_jitter(recipient)
+    return math.ceil((since - jitter) / period) * period + jitter
+
+
+def fact_tier(fact):
+    """0, 1, 2 or 3 for a fact bound for an orchestrator, or None for a kind this rule does not tier (it keeps `batch_seconds`)."""
+    if not fact.batch or fact.kind in ("send", "report", "reminder", "intent.edit"):
+        return 0
+    if fact.rider:
+        return 3
+    kind, key = fact.kind, fact.key
+    if kind in ("github.pr", "github.subissue"):
+        return 3
+    if kind == "github.issue":
+        return 1 if _ISSUE_TIER1.match(fact.summary or "") else 3
+    if kind == "github.stage" or key.startswith("github.botreview:"):
+        return 2
+    if kind == "github.comment":
+        return 2 if key.startswith("github.reviewcomment:") and str(fact.sender or "").lower().endswith("[bot]") else 1
+    if kind in ("github.review", "github.check", "github.conflict", "github.pr_green"):
+        return 1
+    return None
+
+
+def is_orchestrator(observation):
+    return observation is not None and (getattr(observation, "fleet", None) or {}).get("role") == "orchestrator"
+
+
+def orchestrator_ready_at(recipient, chosen, batch_seconds):
+    """When the first of `chosen` (facts that are not riders) may start a message to an orchestrator; sets `bucket_target` on each bucket-held fact
+    (DELAYED_AFTER is measured from it: a fact held to its bucket is not late before then)."""
+    ready = []
+    for fact in chosen:
+        tier = fact_tier(fact)
+        if tier in ORCH_BUCKET_SECONDS:
+            fact.bucket_target = bucket_target(recipient, tier, fact.created)
+            ready.append(fact.bucket_target)
+        else:
+            ready.append(fact.created + (0 if tier == 0 else batch_seconds))
+    return min(ready)
+
+
+def jobs_active_for(name, root=None):
+    """True when a detached `job` that `name` started is still alive (its quiet is the job's, not a stall)."""
+    try:
+        base = Path(root or jobs_dir())
+        return any(r.get("starter") == name and job_state(r, base)[0] == "alive"
+                   for r in (job_read(e.name, base) for e in sorted(base.iterdir())[:JOB_SCAN_MAX] if JOB_NAME_RE.match(e.name)) if r)
+    except (OSError, ValueError):
+        return False
+
+
+def lane_gate(discovery, recipient, tier, now, since, worker=None, root=None):
+    """"go", "wait" or "drop" for a message the daemon itself would send to `recipient` (push_watch, pod_silence). Only an orchestrator is gated:
+    tier 3 is dropped, tier 2 and 1 wait for their bucket (tier 2 also while the worker has a detached job alive), tier 0 goes."""
+    agents = discovery.agents if discovery is not None and not discovery.problems else {}
+    if not is_orchestrator(agents.get(recipient)) or tier == 0:
+        return "go"
+    if tier == 3:
+        return "drop"
+    if tier == 2 and worker and jobs_active_for(worker, root):
+        return "wait"
+    return "go" if now >= bucket_target(recipient, tier, since) else "wait"
+
+
+def _chief_lanes(agents):
+    """The names of the Chief of Staff lanes in `agents` ({name: observation}): the role `chief-of-staff` and no other (an orchestrator is not one)."""
+    return sorted(name for name, seen in agents.items() if (getattr(seen, "fleet", None) or {}).get("role") == "chief-of-staff")
+
+
+def pr_green_notes(held, told):
+    """[(repo, number, head)] for each held PR read that is open and whose checks all finished green, once per (repo, pr, head) (`told` is the set)."""
+    found = []
+    for key, entry in sorted((held or {}).items()):
+        facts = entry.get("facts") if isinstance(entry, dict) else None
+        repo, _, number = key.rpartition("#")
+        head = facts.get("head") if facts else None
+        if not facts or facts.get("state") != "open" or facts.get("ci") != "green" or not isinstance(head, str) or not head or not number.isdigit():
+            continue
+        if (repo, int(number), head) not in told:
+            found.append((repo, int(number), head))
+    return found
+
+
 def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds, missing=None):
     """The delivery rule for one recipient's pending facts. Reads nothing; writes nothing.
 
@@ -66,11 +165,12 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
             return Plan(recipient, "hold", reason, standing, observation)
     # PR 13: riders are carried, never the reason for a message. Only the others choose the action
     # and start the batch clock; when there is any other, every rider goes with it.
-    chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider]
+    orchestrator = is_orchestrator(observation)
+    chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider and not (orchestrator and fact_tier(fact) == 3)]   # #2545: tier 3 never starts a message
     if not chosen:
         return None
     if not fault("no-batch") and all(fact.batch for fact in chosen):
-        ready_at = chosen[0].created + batch_seconds
+        ready_at = orchestrator_ready_at(recipient, chosen, batch_seconds) if orchestrator else chosen[0].created + batch_seconds
         if now < ready_at:
             return Plan(recipient, "wait", "batching until %s" % iso(ready_at), pending, observation, ready_at)
     reason = hold_reason(observation, missing)
@@ -162,7 +262,7 @@ def in_late_scope(fact):
 
 def delayed_since(facts, delivered):
     """The oldest sent time among the alerts and digests older than DELAYED_AFTER at `delivered`, or None."""
-    late = [sent_at(f) for f in facts if in_late_scope(f) and delivered - sent_at(f) > DELAYED_AFTER]
+    late = [sent_at(f) for f in facts if in_late_scope(f) and delivered - (getattr(f, "bucket_target", None) or sent_at(f)) > DELAYED_AFTER]   # #2545: a fact held to its bucket is late from the bucket target
     return min(late) if late else None
 
 

@@ -498,7 +498,7 @@ class TestPushWatch(Case):
 
     def test_fix3_pc4_a_failed_quiet_send_is_retried_at_the_next_pass(self):
         self.assertEqual(len(self._quiet_send()), 1)
-        mutant = self.mutant('                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"', '                b["quiet"] = True\n                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"')
+        mutant = self.mutant('                told = tell(lane, item_text(name, branch, b["sha"], {}, "quiet"', '                b["quiet"] = True\n                told = tell(lane, item_text(name, branch, b["sha"], {}, "quiet"')
         self._fails(lambda: self.assertEqual(len(self._quiet_send(mutant)), 1, "the quiet item was marked before a failed send"), "the quiet item was marked before a failed send")
 
     def _both_fail(self, module=None, recover=False):

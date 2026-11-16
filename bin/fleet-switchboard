@@ -8583,6 +8583,7 @@ def pod_silence_tick(engine, discovery, summary=None):
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
     return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
                                            summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"),
+                                           gate=lambda lane, since, worker: lane_gate(discovery, lane, 2, now, since, worker),   # #2545
                                            audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail))
 
 
@@ -8612,7 +8613,8 @@ def push_watch_tick(engine, discovery):
     spec = importlib.util.spec_from_file_location("push_watch", os.path.join(os.path.dirname(os.path.realpath(__file__)), "push_watch.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded,
+                               gate=lambda lane, tier, since, worker=None: lane_gate(discovery, lane, tier, engine.now(), since, worker))   # #2545
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is not None:   # #2186: only a record the one liveness test accepts is read (as pod_silence_tick reads it)
         retired, reports = registry_retired(state_dir), _read_small(state_dir, LAST_REPORT_FILE)
@@ -10246,7 +10248,7 @@ class GitHubHub:
         self._unrouted, self._snapshot = set(), None
         self._route_until, self._unrouted_batch, self._read_backoff = None, [], {}
         self._notices, self._filtered, self._filtered_batch = {}, set(), []   # PR 52
-        self._routed_batch, self._conflicts = [], set()
+        self._routed_batch, self._conflicts, self._green = [], set(), set()
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
         self._cursors, self.last_incomplete, self.last_failed_primary = {}, False, False   # #494: per repo, the steps of an unfinished catch-up window
         self.engine = None
@@ -10563,7 +10565,7 @@ class GitHubHub:
     def _chiefs_of_staff(self):
         discovery = self.discover()
         agents = discovery.agents if discovery is not None and not discovery.problems else {}
-        return sorted(name for name, seen in agents.items() if (seen.fleet or {}).get("role") == "chief-of-staff")
+        return _chief_lanes(agents)
 
     def intent_edit_wakes(self, fact):
         """(wakes, note): does this Intent edit reach the Chief of Staff? Decided once per edit (the key), then
@@ -10694,6 +10696,7 @@ class GitHubHub:
             for key in [k for k, i in self.queue.items() if i.created < now - self.lookback]:
                 del self.queue[key]
         self.note_conflicts(now)
+        self.note_pr_green(now)
         with self.lock:
             waiting = [item for item in self.queue.values() if item.recipient is None]
         if waiting:
@@ -10839,6 +10842,17 @@ class GitHubHub:
                 if len(self._conflicts) > 20000:
                     self._conflicts.clear()
                 self._conflicts.add(item.key)
+                self.queue.setdefault(item.key, item)
+
+    def note_pr_green(self, now):
+        """#2545: `github.pr_green` for an open PR whose checks all finished green, once per (repo, pr, head sha); from the notice reads already held (no read of its own)."""
+        for repo, number, head in pr_green_notes(getattr(self.engine, "notice_facts", None), self._green):
+            item = GitHubItem("github.pr_green:%s#%d:%s" % (repo, number, head), "github.pr_green", "PR #%d: all checks finished green at head %s" % (number, head[:7]),
+                              repo, [], [("pr", number)], None, now, [number], True)
+            with self.lock:
+                if len(self._green) > 20000:
+                    self._green.clear()
+                self._green.add((repo, number, head))
                 self.queue.setdefault(item.key, item)
 
     def _load_notices(self):
