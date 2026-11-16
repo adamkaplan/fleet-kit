@@ -28,7 +28,8 @@ def spliced_head(cache, src, real_ast):
     tree = None
     if len(base) == len(head):
         changed = [k + 1 for k, (a, b) in enumerate(zip(base, head)) if a != b]
-        if all(head[k - 1].endswith("  # x") and head[k - 1][:-5] == base[k - 1] for k in changed):
+        if all((head[k - 1].endswith("  # x") and head[k - 1][:-5] == base[k - 1])
+               or (not base[k - 1].strip() and head[k - 1].lstrip().startswith("#")) for k in changed):
             cache.setdefault("same_closure_ids", set()).add(id(cache["tree"]))
             tree = cache["tree"]
         else:
@@ -42,6 +43,13 @@ def spliced_head(cache, src, real_ast):
                     tree = real_ast.Module(body=body[:hit[0]] + parsed + body[hit[-1] + 1:], type_ignores=[])
                 except SyntaxError:
                     tree = None
+    elif len(head) > len(base) and head[:len(base)] == base:
+        try:
+            tail = real_ast.parse("\n" * len(base) + "\n".join(head[len(base):])).body
+            tree = real_ast.Module(body=list(cache["tree"].body) + tail, type_ignores=[])
+            cache.setdefault("same_closure_ids", set()).add(id(tree))
+        except SyntaxError:
+            tree = None
     if tree is None:
         return real_ast.parse(src)
     cache["heads"][src] = tree

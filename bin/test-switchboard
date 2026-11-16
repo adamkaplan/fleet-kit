@@ -33772,7 +33772,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
         function, binding, module = self.pick()
-        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src), self.base_src)
+        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.small_src), self.small_src)
         shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
@@ -37487,12 +37487,12 @@ class TestImpactHold(LedgerBase):
         self.assertEqual([k for k, v in counts.items() if v > 1], [], "each function of the moved clear code is defined once (a later copy would silently replace the first)")
         for pinned in ("impact_carry_get", "fetch_orders", "read_pr_json", "HELPER_MODULES", "_make_loader"):
             self.assertIn(pinned, rule["closure_roots"])
-        table = switchboard_source().split("\n")
+        table = self.real_source().split("\n")
         k = next(i for i, l in enumerate(table) if l.strip().startswith('"load_agent_presence":'))
         mutated = list(table)
         mutated[k] = mutated[k].replace('"agent_presence"', '"lanes"')
-        diff = "\n".join(list(difflib.unified_diff(table, mutated, lineterm="", n=1))[2:])
-        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(table), "\n".join(mutated), diff, rule["closure_roots"], set(rule["clear_entry_points"])), "a HELPER_MODULES value changed")
+        diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (k + 1, k + 1, table[k], mutated[k])
+        self.assertTrue(self.closure_check("\n".join(mutated), diff, roots=rule["closure_roots"], dynamic=()), "a HELPER_MODULES value changed")
         self.assertTrue(rule["closure_files"] and "bin/lanes.py" not in rule["closure_files"], "lanes.py is not judged, so the same edit to it is not refused")
         # the way in a strict review found: the notice path runs agent_presence through a generated loader; a change to it is refused, and to a module the clear does not load it is not
         import difflib
@@ -37896,35 +37896,33 @@ class TestImpactHold(LedgerBase):
         while not lines[j].rstrip().endswith(":"):
             j += 1
         head = list(lines)
-        head[j + 1] = "    impact_clear_core(None, None, 'a/b', 1, 'someone', 'a long enough reason')\n" + head[j + 1]
-        diff = "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
+        head[j + 1] = "    impact_clear_core(None, None, 'a/b', 1, 'someone', 'a long enough reason'); " + head[j + 1].lstrip()
+        diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (j + 2, j + 2, lines[j + 1], head[j + 1])
         reasons = self.closure_check("\n".join(head), diff)
         self.assertTrue(reasons and "clear entry point" in " ".join(reasons), reasons)
 
     def test_a_global_the_clear_reads_a_top_level_statement_a_syntax_error_and_a_cut_patch_are_refused(self):
-        import difflib
         source = self.real_source()
         lines = source.split("\n")
-        def refuse(new_lines):
-            diff = "\n".join(list(difflib.unified_diff(lines, new_lines, lineterm="", n=3))[2:])
+        def refuse_at(idx, new_line):
+            new_lines = list(lines); new_lines[idx] = new_line
+            diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (idx + 1, idx + 1, lines[idx], new_line)
             return self.closure_check("\n".join(new_lines), diff)
         k = next(i for i, l in enumerate(lines) if l.startswith("PROG = "))
-        changed = list(lines); changed[k] = 'PROG = "other"'
-        self.assertTrue(refuse(changed), "a module-level binding the clear reads")
-        self.assertTrue(refuse(lines + ["if True:", "    pass"]), "a new top-level statement")
-        self.assertTrue(refuse(lines[:k] + ["def broken(:"] + lines[k:]), "a syntax error after the change")
+        self.assertTrue(refuse_at(k, 'PROG = "other"'), "a module-level binding the clear reads")
+        self.assertTrue(self.closure_check(source + "\nif True:\n    pass", "@@ -%d,0 +%d,2 @@\n+if True:\n+    pass" % (len(lines), len(lines) + 1)), "a new top-level statement")
+        self.assertTrue(self.closure_check("def broken(:", "@@ -1,1 +1,1 @@\n-x\n+def broken(:"), "a syntax error after the change")
         self.assertTrue(self.closure_check(source, None), "no patch")
         self.assertTrue(self.closure_check(source, "@@ garbage @@"), "a hunk header that cannot be read")
         blank = next(i for i in range(k - 1, -1, -1) if not lines[i].strip())
-        comment = list(lines); comment[blank] = "# a comment between the definitions"   # replaces a blank line: line numbers stay put, so the cached tree is spliced rather than the whole file re-parsed
-        self.assertEqual(refuse(comment), [], "a comment between top-level statements changes nothing")
+        self.assertEqual(refuse_at(blank, "# a comment between the definitions"), [], "a comment between top-level statements changes nothing")
 
     def test_a_name_read_through_a_binding_is_followed_to_what_it_runs(self):
         source = self.real_source()
         lines = source.split("\n")
-        import difflib
         def refuse(new_lines):
-            diff = "\n".join(list(difflib.unified_diff(lines, new_lines, lineterm="", n=1))[2:])
+            idx = next(i for i, (a, b) in enumerate(zip(lines, new_lines)) if a != b)
+            diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (idx + 1, idx + 1, lines[idx], new_lines[idx])
             return self.closure_check("\n".join(new_lines), diff)
         k = next(i for i, l in enumerate(lines) if l.strip() == '"load_impact_floor": "impact_floor",')
         mutant = list(lines)

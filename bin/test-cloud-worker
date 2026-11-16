@@ -408,7 +408,6 @@ class Base(unittest.TestCase):
                                 open(d + "/received-" + k, "w").write(secret_map[k])
                         if password_fd is not None:
                             os.write(password_fd, (env["STUB_PASSWORD"] + "\n").encode())
-                            os.close(password_fd)
                         ans = {"worker": name, "url": env["STUB_URL"], "auth_ref": "file:/etc/passwd", "runtime_id": "pod/%s-7f9c" % name,
                                "idle_deadline": "2099-10-14T12:10:00Z", "hard_deadline": "2099-10-14T14:00:00Z"}
                         if "idle_seconds" in STUB:
