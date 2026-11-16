@@ -452,6 +452,8 @@
 "TestOneCharter": 3.2,
 "TestOneRepoIsUnchanged": 0.0,
 "TestOneVocabulary": 0.0,
+"TestGatedDaemonSends": 0.0,
+"TestJobsActiveFor": 0.0,
 "TestOrchestratorLaneGate": 0.0,
 "TestOrchestratorUtcBatching": 0.0,
 "TestOrdersBodyEdits": 0.0,

@@ -790,7 +790,7 @@ class TestPushWatch(Case):
             audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
             lines = []
             engine = types.SimpleNamespace(audit=audit, actor="daemon", now=lambda: NOW, hub=types.SimpleNamespace(gh_api=lambda *a, **k: []))
-            result = module.push_watch_tick(engine, None)
+            result = module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={}))
             self.assertEqual((result, lines, list(Path(tmp).iterdir())), ([], [], []))
 
     def test_fix1_an_engine_without_config_runs_the_pass_with_no_audit_line(self):
@@ -818,7 +818,7 @@ class TestPushWatch(Case):
         module, engine = self._hub_tick(hub)
         os.environ["CW_CLOUD_AUDIT"] = self.launcher
         self.addCleanup(os.environ.pop, "CW_CLOUD_AUDIT", None)
-        module.push_watch_tick(engine, None)
+        module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={}))
         self.assertTrue(self.world.requests)
         self.assertFalse([l for l in engine.audit.lines if "read_failed" in l[0]], engine.audit.lines)
 
@@ -835,14 +835,14 @@ class TestPushWatch(Case):
         Path(self.tmp.name, module.RETIRED_FILE).write_text(json.dumps({"w-b": {"at": 1, "reason": "finished", "session": "s"}}))
         os.environ["CW_CLOUD_AUDIT"] = self.launcher
         self.addCleanup(os.environ.pop, "CW_CLOUD_AUDIT", None)
-        module.push_watch_tick(engine, None)
+        module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={}))
         told = {to for to, _ in engine.sent}
         self.assertNotIn("lane-b", told)
         self.assertIn("lane-a", told)
 
     def test_fix2_no_hub_skips_with_one_line(self):
         module, engine = self._hub_tick(None)
-        self.assertEqual(module.push_watch_tick(engine, None), [])
+        self.assertEqual(module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={})), [])
         self.assertEqual([l[0] for l in engine.audit.lines], ["push_watch.skipped"])
 
     def _world(self, made_before_launch):

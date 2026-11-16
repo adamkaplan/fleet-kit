@@ -130,9 +130,13 @@ def orchestrator_ready_at(recipient, chosen, batch_seconds):
 
 def lane_gate(discovery, recipient, tier, now, since, worker=None, root=None, pod_jobs=None, jobs_alive=None):
     """"go", "wait" or "drop" for a message the daemon itself would send to `recipient` (push_watch, pod_silence). Only an orchestrator is gated:
-    tier 3 is dropped, tier 2 and 1 wait for their bucket (tier 2 also while the worker has a detached `job` alive here, or a cw-run job its pod record names in `pod_jobs`), tier 0 goes."""
-    agents = discovery.agents if discovery is not None and not discovery.problems else {}
-    if not is_orchestrator(agents.get(recipient)) or tier == 0:
+    tier 3 is dropped, tier 2 and 1 wait for their bucket (tier 2 also while the worker has a detached `job` alive here, or a cw-run job its pod record names
+    in `pod_jobs`), tier 0 goes. A fleet that was not read (no discovery, or one with problems) waits: a role that is not known is never taken for not an orchestrator."""
+    if tier == 0:
+        return "go"
+    if discovery is None or getattr(discovery, "problems", None):
+        return "wait"
+    if not is_orchestrator(discovery.agents.get(recipient)):
         return "go"
     if tier == 3:
         return "drop"
@@ -520,11 +524,14 @@ def describe_items(recipient, facts, repos=None):
 
 
 def queue_pr_green(hub, now, item_class):
-    """#2545: `github.pr_green` for an open PR whose checks all finished green, once per (repo, pr, head sha); from the notice reads already held (no read of its own)."""
-    for repo, number, head in pr_green_notes(getattr(hub.engine, "notice_facts", None), hub._green):
+    """#2545: `github.pr_green` for an open PR whose checks all finished green (`pr_green_notes`), once per (repo, pr, head sha): the check and the record are one step under the lock,
+    from the notice reads already held (no read of its own)."""
+    for repo, number, head in pr_green_notes(getattr(hub.engine, "notice_facts", None), ()):
         item = item_class("github.pr_green:%s#%d:%s" % (repo, number, head), "github.pr_green", "PR #%d: all checks finished green at head %s" % (number, head[:7]),
                           repo, [], [("pr", number)], None, now, [number], True)
         with hub.lock:
+            if (repo, number, head) in hub._green:
+                continue
             if len(hub._green) > 20000:
                 hub._green.clear()
             hub._green.add((repo, number, head))

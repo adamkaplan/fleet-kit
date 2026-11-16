@@ -1,12 +1,18 @@
 """#2543 / #2545: an orchestrator's non-urgent events ride synchronized :00/:30 UTC buckets; github.pr_green; _chief_lanes picks only the Chief of Staff.
 
 Pure functions and stubs: no world, no state path."""
+import json
+import os
+import tempfile
 import time
 import types
 import unittest
+from pathlib import Path
 
 from support.loader import sb
 from support.wire_fakes import EPOCH
+import test_push_watch as tpw
+import test_pod_silence as tps
 
 # five minutes past a full hour (08:05:00 UTC), a time that is in no bucket (EPOCH, 1_800_000_000, is itself a multiple of 1800 and of 3600)
 BASE = EPOCH - EPOCH % 3600 + 300
@@ -190,7 +196,7 @@ class TestOrchestratorLaneGate(unittest.TestCase):
     def test_a_lane_that_is_not_an_orchestrator_is_never_gated(self):
         for role in ("chief-of-staff", "coder"):
             self.assertEqual(sb.lane_gate(lanes(role), "widget-lead", 3, BASE, BASE), "go")
-        self.assertEqual(sb.lane_gate(None, "widget-lead", 3, BASE, BASE), "go")
+        self.assertEqual(sb.lane_gate(lanes("coder"), "widget-lead", 0, BASE, BASE), "go")
 
     def test_a_quiet_pod_whose_record_names_a_cw_run_job_is_not_told(self):
         d = lanes()
@@ -202,6 +208,131 @@ class TestOrchestratorLaneGate(unittest.TestCase):
         alive = lambda name, root=None: name == "w-1"
         self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-1", jobs_alive=alive), "wait")
         self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-2", jobs_alive=alive), "go")
+
+    def test_a_fleet_that_was_not_read_waits_whatever_the_lane(self):
+        for d in (None, types.SimpleNamespace(problems=["herdr is down"], agents={})):
+            self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE), "wait")
+            self.assertEqual(sb.lane_gate(d, "widget-lead", 1, BASE + 99999, BASE), "wait")
+            self.assertEqual(sb.lane_gate(d, "widget-lead", 3, BASE, BASE), "wait")
+            self.assertEqual(sb.lane_gate(d, "widget-lead", 0, BASE, BASE), "go")
+
+
+class TestJobsActiveFor(unittest.TestCase):
+    """jobs_active_for on a real temporary directory: a live job of the worker, a finished one, another worker's, and a directory that is not private."""
+
+    def plant(self, root, name, starter, pid=None, code=None):
+        d = Path(root) / name
+        d.mkdir(mode=0o700)
+        (d / "job.json").write_text(json.dumps({"name": name, "starter": starter, "pid": pid}))
+        if code is not None:
+            (d / "exit").write_text("%d\n" % code)
+
+    def make(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "jobs"
+        root.mkdir(mode=0o700)
+        os.chmod(str(root), 0o700)
+        return root
+
+    def test_only_a_live_job_of_that_worker_counts(self):
+        root = self.make()
+        self.plant(root, "build-live", "w-1", pid=os.getpid())
+        self.plant(root, "build-done", "w-2", pid=os.getpid(), code=0)   # finished: the exit file says so
+        self.plant(root, "other", "w-3", pid=os.getpid())
+        self.assertTrue(sb.jobs_active_for("w-1", root))
+        self.assertFalse(sb.jobs_active_for("w-2", root))
+        self.assertTrue(sb.jobs_active_for("w-3", root))
+        self.assertFalse(sb.jobs_active_for("w-4", root))
+
+    def test_a_job_whose_process_is_gone_is_not_live(self):
+        root = self.make()
+        self.plant(root, "gone", "w-1", pid=2 ** 22 + 12345)
+        self.assertFalse(sb.jobs_active_for("w-1", root))
+
+    def test_a_directory_others_can_write_or_no_directory_is_not_believed(self):
+        root = self.make()
+        self.plant(root, "build-live", "w-1", pid=os.getpid())
+        os.chmod(str(root), 0o777)
+        self.assertFalse(sb.jobs_active_for("w-1", root))
+        self.assertFalse(sb.jobs_active_for("w-1", root / "missing"))
+
+
+class TestGatedDaemonSends(unittest.TestCase):
+    """pod_silence.scan and push_watch.run_pass with an orchestrator recipient and the real gate."""
+
+    def gate(self, now, role="orchestrator"):
+        d = types.SimpleNamespace(problems=[], agents={"lane-a": seen(role, "lane-a")})
+        return lambda lane, tier, since, worker=None, jobs=None: sb.lane_gate(d, lane, tier, now[0], since, worker, pod_jobs=jobs)
+
+    def scan_gate(self, now, role="orchestrator"):
+        """The gate pod_silence_tick hands to scan: a quiet pod is tier 2."""
+        gate = self.gate(now, role)
+        return lambda lane, since, worker, jobs=None: gate(lane, 2, since, worker, jobs)
+
+    def test_a_quiet_pod_is_told_to_an_orchestrator_at_its_hour_and_not_before(self):
+        module, _ = tps.load()
+        now, sent = [tps.NOW], []
+        gate = self.scan_gate(now)
+        jit = sb.orchestrator_jitter("lane-a")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "s.json")
+            pods = [tps.pod("silent")]
+            module.scan([dict(p) for p in pods], tps.NOW - 30 * 60, state, lambda to, t: None, lambda n: "x", json.loads, gate=lambda *a: "go")   # first seen 30 minutes ago
+            hour = tps.NOW + jit   # NOW is on the hour: a pod quiet since before it is held to that hour plus the jitter
+            for at, told in ((tps.NOW - 1, 0), (hour - 1, 0), (hour, 1), (hour + 60, 1)):
+                now[0] = at
+                module.scan(pods, at, state, lambda to, t: sent.append(to), lambda n: "stub summary", json.loads, gate=gate)
+                self.assertEqual(len(sent), told, at)
+            self.assertEqual(sent, ["lane-a"])
+
+    def test_a_quiet_pod_with_a_cw_run_job_waits_and_a_chief_of_staff_lane_is_told_at_once(self):
+        module, _ = tps.load()
+        for role, jobs, want in (("orchestrator", ["build"], 0), ("chief-of-staff", ["build"], 1), ("orchestrator", [], 0)):
+            now, sent = [tps.NOW + 5 * 3600], []
+            with tempfile.TemporaryDirectory() as tmp:
+                state = str(Path(tmp) / "s.json")
+                pods = [dict(tps.pod("silent"), jobs=jobs)]
+                module.scan([dict(p) for p in pods], tps.NOW, state, lambda to, t: None, lambda n: "x", json.loads, gate=lambda *a: "go")
+                gate = self.scan_gate(now, role)
+                if role == "orchestrator" and not jobs:   # no job, an hour long past: told
+                    want = 1
+                module.scan(pods, now[0], state, lambda to, t: sent.append(to), lambda n: "stub", json.loads, gate=gate)
+                self.assertEqual(len(sent), want, (role, jobs))
+
+    def run_push(self, role, steps):
+        pw = tpw.load()
+        world = tpw.PushWorld()
+        world.commits = {tpw.SHA_A: tpw.commit()}
+        world.refs = {"w-a/wip": tpw.SHA_A}
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = str(Path(tmp) / "launcher.jsonl")
+            Path(launcher).touch()
+            engine = tpw.Engine(tmp, [tpw.record("w-a", "lane-a")])
+            now = [steps[0][0]]
+            ns = types.SimpleNamespace(parse_iso=tpw.parse_iso, _one_line=lambda t, n=200: str(t)[:n], parse_bounded=json.loads, gate=self.gate(now, role))
+            sent_after = []
+            for at in [t for t, _ in steps]:
+                now[0] = at
+                pw.run_pass(ns, engine, at, world, {"interval": 0, "quiet_minutes": 10}, launcher)
+                sent_after.append(len(engine.sent))
+            return sent_after, [e for e, _, _ in engine.audit.lines], engine.sent
+
+    def test_a_feature_branch_push_is_dropped_for_an_orchestrator_and_its_quiet_item_waits_for_the_hour(self):
+        jit = sb.orchestrator_jitter("lane-a")
+        hour = tps.NOW - tps.NOW % 3600 + 3600 + jit
+        counts, events, sent = self.run_push("orchestrator", [(tps.NOW, 0), (tps.NOW + 700, 0), (hour - 1, 0), (hour, 0)])
+        self.assertEqual(counts, [0, 0, 0, 1])   # the push item is dropped (told to nobody); the quiet item goes at the hour
+        self.assertEqual(events.count("push_watch.dropped"), 1)
+        self.assertNotIn("push_watch.sent", events)
+        self.assertEqual(events.count("push_watch.quiet"), 1)
+        self.assertIn("quiet", sent[0][1].lower())
+
+    def test_the_same_push_is_told_at_once_to_a_chief_of_staff_lane(self):
+        counts, events, _ = self.run_push("chief-of-staff", [(tps.NOW, 0)])
+        self.assertEqual(counts, [1])
+        self.assertIn("push_watch.sent", events)
+        self.assertNotIn("push_watch.dropped", events)
 
 
 class TestPrGreenEvent(unittest.TestCase):
@@ -253,11 +384,18 @@ class TestChiefLanesRoleFilter(unittest.TestCase):
                 "w-1": seen_in("coder", "w-1"), "t-1": seen_in("tester", "t-1")}
 
     def lanes(self, agents, repo="acme-org/widget-service"):
-        return sb.GitHubHub._chief_lanes(None, types.SimpleNamespace(repo=repo), agents)
+        hub = types.SimpleNamespace()
+        return sb.GitHubHub._chief_lanes(hub, types.SimpleNamespace(repo=repo), agents)
 
     def test_only_the_chief_of_staff_is_returned(self):
         self.assertEqual(self.lanes(self.agents()), ["cos"])
         self.assertEqual(self.lanes({"widget-lead": seen("orchestrator")}), [])
+
+    def test_an_orchestrator_bound_to_this_repository_is_still_excluded(self):
+        agents = self.agents(cos="acme-org/widget-service", lead="acme-org/widget-service")
+        self.assertNotIn("widget-lead", self.lanes(agents))
+        self.assertEqual(self.lanes({"widget-lead": agents["widget-lead"]}), [])
+        self.assertEqual(self.lanes(agents), ["cos"])
 
     def test_a_lane_bound_to_this_repository_comes_first_and_another_repository_is_left_out(self):
         agents = self.agents(cos="acme-org/widget-service")

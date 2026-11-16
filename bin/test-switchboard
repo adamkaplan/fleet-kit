@@ -25738,13 +25738,13 @@ class TestOwnerlessSummary(Base):
         self.assertEqual(len(self.lines("cos")), 1, "no second line the same day")
         self.assertEqual([a for a in self.world.admissions("orch-api")], [], "a repository with no such issue gets none")
 
-    def test_s5_the_orchestrators_of_the_repository_and_the_chief_of_staff_get_it_and_a_repository_with_none_only_the_chief(self):
+    def test_s5_only_the_chief_of_staff_gets_it_and_an_orchestrator_none_a_digest_is_tier_3(self):
         self.add(1, created=10, author="alice")
         self.add(2, repo="acme/api", created=10, author="alice")
         self.go()
-        self.assertEqual((len(self.lines("orch-web-1")), len(self.lines("orch-web-2"))), (1, 1))
+        self.assertEqual((len(self.lines("orch-web-1")), len(self.lines("orch-web-2"))), (0, 0), "#2545: a digest never wakes an orchestrator on its own")
         self.assertEqual(len(self.lines("cos")), 2, "one line per repository")
-        self.assertEqual(len(self.lines("orch-api")), 1, "acme/api's own orchestrator gets acme/api's line only")
+        self.assertEqual(len(self.lines("orch-api")), 0, "acme/api's own orchestrator gets none either")
 
     def test_s7_the_line_holds_links_and_no_title_text(self):
         self.add(1, created=10, author="alice", body="a body with @mention and https://example.test/x")
@@ -67096,7 +67096,7 @@ TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorke
 TestChiefOnlyWhenNeeded = _lost_worker.TestChiefOnlyWhenNeeded
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
 _batching2543 = importlib.import_module("test_orchestrator_utc_batching_2543")   # #2543
-TestOrchestratorUtcBatching, TestOrchestratorLaneGate, TestPrGreenEvent, TestChiefLanesRoleFilter = _batching2543.TestOrchestratorUtcBatching, _batching2543.TestOrchestratorLaneGate, _batching2543.TestPrGreenEvent, _batching2543.TestChiefLanesRoleFilter
+TestOrchestratorUtcBatching, TestOrchestratorLaneGate, TestJobsActiveFor, TestGatedDaemonSends, TestPrGreenEvent, TestChiefLanesRoleFilter = _batching2543.TestOrchestratorUtcBatching, _batching2543.TestOrchestratorLaneGate, _batching2543.TestJobsActiveFor, _batching2543.TestGatedDaemonSends, _batching2543.TestPrGreenEvent, _batching2543.TestChiefLanesRoleFilter
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
 TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
 TestSummaryCluster = importlib.import_module("test_pod_silence").TestSummaryCluster   # the summary cluster session of #2173
@@ -80373,7 +80373,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestReviewerBlockLines", "TestReviewerBlockLinesControl",   # (#2512) read text files of the repository and strings in memory: no World, rig or state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
-    "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
+    "TestEveryTestClassIsolates", "TestGatedDaemonSends", "TestJobsActiveFor", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
     "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
     "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile", "TestTheProductionWiring",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392
