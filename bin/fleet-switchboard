@@ -2018,6 +2018,9 @@ class Switchboard:
         read_mark(self, "agents", not problems, "the fleet could not be read whole: %s" % _one_line(problems[0], 80) if problems else "", now)
         return found
 
+    def lane_gate(self, lane, tier, since, worker=None):   # #2545: push_watch asks it (bin/push_watch.py)
+        return lane_gate(self.discovery, lane, tier, self.now(), since, worker, jobs_alive=jobs_active_for)
+
     def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
@@ -8649,10 +8652,10 @@ def pod_silence_tick(engine, discovery, summary=None):
         said = reports.get(name) if isinstance(reports.get(name), dict) else {}
         branches = ((pushes or {}).get(name) or {}).get("branches")
         at = [b.get("at") for b in branches.values() if isinstance(b, dict)] if isinstance(branches, dict) else []
-        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done", "jobs": rec.get("jobs") if isinstance(rec.get("jobs"), list) else None,
+        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done",
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
     return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
-                                           summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"), gate=lambda lane, since, worker, jobs=None: lane_gate(discovery, lane, 2, now, since, worker, pod_jobs=jobs, jobs_alive=jobs_active_for),   # #2545
+                                           summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"),
                                            audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail))
 
 
@@ -8682,7 +8685,7 @@ def push_watch_tick(engine, discovery):
     spec = importlib.util.spec_from_file_location("push_watch", os.path.join(os.path.dirname(os.path.realpath(__file__)), "push_watch.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded, is_land_repo=is_land_repo, gate=lambda lane, tier, since, worker=None: lane_gate(discovery, lane, tier, engine.now(), since, worker, jobs_alive=jobs_active_for))   # #2320, #2545
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded, is_land_repo=is_land_repo)   # #2320
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is not None:   # #2186: only a record the one liveness test accepts is read (as pod_silence_tick reads it)
         retired, reports = registry_retired(state_dir), _read_small(state_dir, LAST_REPORT_FILE)
@@ -10084,9 +10087,7 @@ def _wh_issues(repo, payload, now):
     label = (payload.get("label") or {}).get("name") if isinstance(payload.get("label"), dict) else None
     if action in ("labeled", "unlabeled") and label:
         what = "label %s %s" % (label, "added" if action == "labeled" else "removed")
-    item = _issue_item(repo, issue, now, what)
-    if item: item.action, item.label, item.actor = action, label, _login(payload.get("sender"))   # #2545: the tier reads these, never the summary text
-    return [item] if item else []
+    return issue_item_list(_issue_item(repo, issue, now, what), action, label, _login(payload.get("sender")))   # #2545: the tier reads these, never the summary text
 
 
 def _wh_issue_comment(repo, payload, now):
@@ -10402,7 +10403,7 @@ class GitHubHub:
         self._unrouted, self._snapshot = set(), None
         self._route_until, self._unrouted_batch, self._read_backoff = None, [], {}
         self._notices, self._filtered, self._filtered_batch = {}, set(), []   # PR 52
-        self._routed_batch, self._conflicts, self._green = [], set(), set()
+        self._routed_batch, self._conflicts = [], set()
         self._chief_audited = set()   # ask #2445: comment keys whose chief-of-staff routing was audited (once per comment)
         self._hook_audited = set()   # repos whose hook-cleanup failure is already in the audit
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}

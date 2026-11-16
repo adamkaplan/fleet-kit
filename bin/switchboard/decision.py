@@ -92,6 +92,14 @@ def github_tier(item, hub):
     return None
 
 
+def issue_item_list(item, action, label, actor):
+    """[item] with the fields `github_tier` reads (the webhook's action, the label and who did it), or [] for no item."""
+    if item is None:
+        return []
+    item.action, item.label, item.actor = action, label, actor
+    return [item]
+
+
 def tiered_fact(item, fact_class, hub):
     """The Fact of a routed GitHub item, with its `tier` (the one decision.fact_tier reads)."""
     fact = fact_class(item.key, item.recipient, item.kind, item.summary, item.created, issue=item.issue, sender=item.sender, repo=item.repo)
@@ -136,7 +144,7 @@ def lane_gate(discovery, recipient, tier, now, since, worker=None, root=None, po
         return "go"
     if discovery is None or getattr(discovery, "problems", None):
         return "wait"
-    if not is_orchestrator(discovery.agents.get(recipient)):
+    if not is_orchestrator((getattr(discovery, "agents", None) or {}).get(recipient)):
         return "go"
     if tier == 3:
         return "drop"
@@ -530,9 +538,10 @@ def queue_pr_green(hub, now, item_class):
         item = item_class("github.pr_green:%s#%d:%s" % (repo, number, head), "github.pr_green", "PR #%d: all checks finished green at head %s" % (number, head[:7]),
                           repo, [], [("pr", number)], None, now, [number], True)
         with hub.lock:
-            if (repo, number, head) in hub._green:
+            green = hub.__dict__.setdefault("_green", set())   # kept on the hub, made at the first pass
+            if (repo, number, head) in green:
                 continue
-            if len(hub._green) > 20000:
-                hub._green.clear()
-            hub._green.add((repo, number, head))
+            if len(green) > 20000:
+                green.clear()
+            green.add((repo, number, head))
             hub.queue.setdefault(item.key, item)

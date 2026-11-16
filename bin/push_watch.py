@@ -382,7 +382,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
         if isinstance(b_, str) and b_:
             claimed.setdefault(b_, set()).add(n)
 
-    gate = getattr(sb, "gate", None)   # #2545: an orchestrator's lane gets a quiet item at its :00 UTC bucket and no feature-branch push of its own
+    gate = getattr(engine, "lane_gate", None)   # #2545: an orchestrator's lane gets a quiet item at its :00 UTC bucket and no feature-branch push of its own
 
     def tell(lane, text, worker, tier=0, since=None):
         """"sent", "dropped" (a tier 3 item for an orchestrator: told to nobody, never retried) or None (not sent: retried at the next pass)."""

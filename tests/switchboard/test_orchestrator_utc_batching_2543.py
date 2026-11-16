@@ -310,7 +310,8 @@ class TestGatedDaemonSends(unittest.TestCase):
             Path(launcher).touch()
             engine = tpw.Engine(tmp, [tpw.record("w-a", "lane-a")])
             now = [steps[0][0]]
-            ns = types.SimpleNamespace(parse_iso=tpw.parse_iso, _one_line=lambda t, n=200: str(t)[:n], parse_bounded=json.loads, gate=self.gate(now, role))
+            ns = types.SimpleNamespace(parse_iso=tpw.parse_iso, _one_line=lambda t, n=200: str(t)[:n], parse_bounded=json.loads)
+            engine.lane_gate = self.gate(now, role)   # the daemon's Switchboard.lane_gate
             sent_after = []
             for at in [t for t, _ in steps]:
                 now[0] = at

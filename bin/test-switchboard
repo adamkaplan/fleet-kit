@@ -41242,7 +41242,7 @@ class TestForwarderFallback(Base):
         rig.repo(ACME_WEB).webhook_ok = False
         rig.pump(20)
         rig.repo(ACME_WEB).comment(2, "please look", 5001, forward=False)
-        rig.pump(260)
+        rig.pump(1900)
         keys = [k for a in rig.world.admissions("web-orch") for k in a["keys"]]
         self.assertEqual(keys, ["github.comment:5001"])
 
@@ -80164,7 +80164,7 @@ class ReviewCommentEndToEndTests(Base):
             self.gh.send("issue_comment", p, "d-%d" % cid)
 
     def after(self):
-        self.rig.pump(120)
+        self.rig.pump(1900)   # a tier 1 item waits for the next :00/:30 UTC bucket
         return [k for k in self.rig.delivered() if k.startswith("github.reviewcomment:")]
 
     def test_delivered_to_the_owners_orchestrator_as_one_line(self):
