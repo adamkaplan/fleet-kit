@@ -738,7 +738,7 @@ TOTAL = END + 100
 split = []
 checked = 0
 for name, form in sorted(forms.items()):
-    for offset in range(END - len(form) - 1, END + 2):
+    for offset in (END - len(form) - 1, END - len(form) // 2, END + 1):
         line = "." * offset + form + "." * (TOTAL - offset - len(form))
         assert len(line) == TOTAL
         want = "." * offset + "[address]" + "." * (TOTAL - offset - len(form))

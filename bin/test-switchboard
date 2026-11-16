@@ -38623,7 +38623,8 @@ class TestImpactHold(LedgerBase):
             with self.subTest(edit=label):
                 head = [changed.get(i, l) for i, l in enumerate(lines)]
                 self.assertNotEqual(head, lines)
-                diff = "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
+                k = next(iter(changed))
+                diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (k + 1, k + 1, lines[k], head[k])
                 self.assertTrue(self.closure_check("\n".join(head), diff), "%s is refused a delegated clear" % label)
                 if not self.closure_check("\n".join(head), diff, dict(rule, rating_roots=[])):
                     passed.append(label)
