@@ -9717,7 +9717,7 @@ class TestReminders(PR4Base):
 
     def test_key_is_cut_at_80_characters(self):
         import argparse, io
-        args = argparse.Namespace(name="platform", when="10m", text=["x"], issue=None, until_closed=None, until_merged=None,
+        args = argparse.Namespace(name="platform", when="15m", text=["x"], issue=None, until_closed=None, until_merged=None,
                                   keep_if_closed=True, key="k" * 90, sender="a", list_mine=False, cancel=None)
         with mock.patch.object(sb, "build_engine", return_value=(self.world.engine, self.world.state, None)), \
                 mock.patch.dict(os.environ, {sb.LAB_ENV: "1"}), mock.patch.object(sb, "resolve_for_sender", return_value=(None, None)), \
@@ -13106,6 +13106,7 @@ class TestOneCharter(CharterRig, Base):
     READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
         ("bin/switchboard/work_moves.py", "guard"): "registry: the charter set guard, on the registry lock's own read",
+        ("bin/switchboard/reminders.py", "retired_orphans"): "registry: a retired record that carries a charter is never pruned as a worker orphan",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
         ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/switchboard/plan_notice.py", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
@@ -67127,6 +67128,7 @@ TestNewTestChecksRules, TestNewTestChecksFiles, TestNewTestChecksInPreflightPr, 
 
 TestShimGuardsTool, TestShimGuardRows, TestShimHygienePlanted, TestShimGuardMutants, TestShimGuardDocs = (_sg := importlib.import_module("test_shim_guards")).TestShimGuardsTool, _sg.TestShimGuardRows, _sg.TestShimHygienePlanted, _sg.TestShimGuardMutants, _sg.TestShimGuardDocs   # #1909
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+_rg = importlib.import_module("test_reminders_grid_2543"); TestReminderGridAndRecurring, TestDeadWorkerReminderPrune = _rg.TestReminderGridAndRecurring, _rg.build(PR4Base, captured, FAKE_OPENCODE, FAKE_HERDR)   # #2544: `remind --every` ('--every ') is tested there
 _ph = importlib.import_module("test_plan_hash_marker"); _ph.HOST = sys.modules[__name__]; TestPlanHashMarkerPure, TestPlanHashMarkerStored, TestPlanHashMarkerTally, TestPlanHashMarkerMutants, TestPlanHashMarkerDocumentation, TestPlanHashMarkerNoSizeTest = _ph.TestPlanHashMarkerPure, _ph.TestPlanHashMarkerStored, _ph.TestPlanHashMarkerTally, _ph.TestPlanHashMarkerMutants, _ph.TestPlanHashMarkerDocumentation, _ph.TestPlanHashMarkerNoSizeTest; TestPlanHashMarkerWake, TestPlanHashMarkerRounds = _ph.build()   # #1713
 TestCiStateDecision, TestCiFreshReaders, TestCiFreshUnreadable, TestCiFreshOptOut, TestCiFreshReads, TestCiFreshRefusalAndEvidence, TestCiFreshDocs, TestCiFreshReadMutants, TestCiFreshSeamMutants = (_cf := importlib.import_module("test_ci_fresh")).TestCiStateDecision, _cf.TestCiFreshReaders, _cf.TestCiFreshUnreadable, _cf.TestCiFreshOptOut, _cf.TestCiFreshReads, _cf.TestCiFreshRefusalAndEvidence, _cf.TestCiFreshDocs, _cf.TestCiFreshReadMutants, _cf.TestCiFreshSeamMutants   # #1755
 _el = importlib.import_module("test_evidence_limit"); _el.HOST = sys.modules[__name__]; TestEvidenceLimitLocal, TestEvidenceLimitItems, TestEvidenceLimitCounting, TestEvidenceLimitRelay, TestEvidenceLimitMutants, TestEvidenceLimitUnchanged, TestEvidenceLimitItemCi, TestEvidenceLimitDocsAndCode = _el.build()   # #1901
@@ -80300,7 +80302,7 @@ NOT_ISOLATED_BY_BASE = {
     "builds no World, rig or state path: it reads source text, parses strings or runs pure functions": (
     "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
     "Fixture", "HubFilesUnchanged", "JanitorIdentity", "Launcher", "OneWorkerAndCancel", "PendingJobs", "RelayLoopCadence", "RelayObeysTheTreeGuard",
-    "ReviewCommentIsolationTests", "Rig", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
+    "ReviewCommentIsolationTests", "Rig", "TestReminderGridAndRecurring", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
     "TestAgentsVerify", "TestAges", "TestAlertConfig", "TestApprovalExemptionGuard", "TestApprovalReadsFresh", "TestArchTools",
     "TestArchitectureDocument", "TestArchitectureDocumentFailurePaths", "TestArchitectureSafetyNet", "TestAskIssueSubject", "TestAskWaive",
     "TestAssembler", "TestAuditRotation", "TestAuthorityModulesGuard", "TestBatchingDocs", "TestBellMigration", "TestBigRegistrarFile",
