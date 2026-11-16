@@ -209,6 +209,27 @@ _read_ancestors, _recording_run, daemon_text, made_up_pid = (_support_herdr_worl
 set_retired, = (_support_herdr_world.set_retired,)   # support import
 
 
+
+
+# ------------------------------------------------------- made-up process numbers (#886)
+
+
+
+
+
+
+# --------------------------------------------------------------------- fakes
+
+
+# ------------------------------------------------------------------ the config
+
+
+# ------------------------------------------------------------------- the state
+
+
+# ------------------------------------------------------------- OpenCode v2
+
+
 # ------------------------------------------------------------------- herdr
 
 
@@ -17991,18 +18012,6 @@ _policy_extend_offline_run()
 STEP_EXAMPLES["tool-call"] = {"tool": "shell", "arguments": "git push --force", "configured": "ask"}
 EXPECT_EXAMPLES["policy_outcome"] = {"agent": "coder", "step": 0, "outcome": "ask", "reason": "hard to reverse",
                                      "judged": True, "cached": False, "jev_calls": 1}
-
-
-# ------------------------------------------------------------------- config
-
-
-# ------------------------------------------------------------------ request
-
-
-# ------------------------------------------------------- standing authority
-
-
-# ------------------------------------------------------------------- caches
 
 
 # ---------------------------------------------------------- the judge itself
