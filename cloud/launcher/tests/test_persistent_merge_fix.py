@@ -52,16 +52,23 @@ class CopyRun(unittest.TestCase):
                 os.symlink(os.path.join(ROOT, "bin", entry), os.path.join(tmp, "bin", entry))
         target = os.path.join(tmp, "bin", "test-switchboard")
         lines = text.splitlines()
-        i1 = next(i for i, l in enumerate(lines) if l.startswith("class TwoRepoCase("))
+        i1 = next(i for i, l in enumerate(lines) if l.startswith("class TwoRepoGH:"))
         i2 = next(i for i, l in enumerate(lines) if l.startswith("class TestLaunchRefusedMessage("))
         i3 = next(i for i in range(i2 + 1, len(lines)) if lines[i].startswith("class "))
         i4 = next(i for i, l in enumerate(lines) if l.startswith("def main(argv):"))
-        head = [l for l in lines[:120] if not any(f"_support_test_cases_{k:02d}" in l for k in range(1, 14))]
-        tail = "\n".join(lines[i4:]).replace(
+        i5 = next(i for i in range(i4 + 1, len(lines)) if lines[i].startswith("class "))
+        i6 = next(i for i, l in enumerate(lines) if l.startswith('if __name__ == "__main__":'))
+        head = [l for l in lines[:235] if not any(f"_support_test_cases_{k:02d}" in l for k in range(1, 14))]
+        tail = "\n".join(lines[i4:i5] + lines[i6:]).replace(
             "    suite = loader.loadTestsFromModule(sys.modules[__name__])",
             "    suite = unittest.TestSuite([loader.loadTestsFromTestCase(TestLaunchRefusedMessage)])")
+        body = "\n".join(head + ["SCENARIO_REPORTS = []"] + lines[i1:i3]) + "\n" + tail + "\n"
+        body = body.replace(
+            'mock.patch.object(sb.V2Client, "session_get", lambda self, sid:',
+            'mock.patch.object(sb.V2Client, "session_get", lambda v2_self, sid, _real=sb.V2Client.session_get: _real(v2_self, sid) if sid != "ses_x" else'
+        )
         with open(target, "w") as f:
-            f.write("\n".join(head + lines[i1:i3]) + "\n" + tail + "\n")
+            f.write(body)
         os.chmod(target, 0o755)
         p = stub_support.start(self, [sys.executable, target, "-k", "TestLaunchRefusedMessage." + k], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out, _ = p.communicate(timeout=90)

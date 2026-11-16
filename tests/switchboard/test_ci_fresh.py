@@ -205,7 +205,7 @@ class TestCiFreshReaders(FreshCase):
         self.assertIn("CI green", pr_state_text(facts))
 
 
-class TestCiFreshUnreadable(unittest.TestCase):
+class TestCiFreshUnreadable(FreshCase):
     """S4: none of four unreadable states is green."""
 
     CASES = (("runs", dict(runs="fail"), "unknown", "unknown: the base of the last run is not recorded"),
