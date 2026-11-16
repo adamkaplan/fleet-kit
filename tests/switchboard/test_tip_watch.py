@@ -1,4 +1,4 @@
-"""#2247 S3: the integration tip watch. A merge that turns the tip's CI red raises ONE notice naming the merge, its pull request and the failed jobs, to the Chief of Staff and the
+"""#2247 S3: the main tip watch. A merge that turns the tip's CI red raises ONE notice naming the merge, its pull request and the failed jobs, to the Chief of Staff and the
 merging lane; the same red on the next head raises none; a new failing job on a red tip raises one. The class borrows the host file's Base, World and fakes (build())."""
 import json
 import subprocess
@@ -165,10 +165,10 @@ def build(Base, World, FAKE_GH, EjectionHub, sb):
             self.assertIn("not known", self.sent[0][1])
 
         def test_history_a_cancelled_run_a_run_still_going_and_another_branch_tell_nobody(self):
+            self.add(4, "d" * 40, 14, ["x"], branch="integration", age=250)
             self.add(1, "a" * 40, 11, ["unit tests"], age=self.module.WAKE_WINDOW + 500)
             self.add(2, "b" * 40, 12, conclusion="cancelled", age=200)
             self.add(3, "c" * 40, 13, ["x"], status="in_progress", conclusion="failure", age=100)
-            self.add(4, "d" * 40, 14, ["x"], branch="main", age=50)
             self.go()
             self.assertEqual(self.sent, [])
 

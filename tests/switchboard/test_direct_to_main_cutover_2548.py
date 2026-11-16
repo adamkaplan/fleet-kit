@@ -3,7 +3,6 @@
 Derived from the repository: every skill and agent file, and the switchboard document, is read from disk. Run with `python3 bin/test-switchboard TestDirectToMainCutover`.
 Standard library only.
 """
-import copy
 import json
 import re
 import sys
@@ -12,14 +11,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[1]
-sys.path.insert(0, str(HERE / "support"))
-from loader import sb  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
+import loader  # noqa: E402
+from paths import REPO  # noqa: E402
 
 STALE = (re.compile(r"gh\s+pr\s+create[^\n]*--base[ =]+integration\b"),
          re.compile(r"--base[ =]+integration\b"),
          re.compile(r"--tip\s+origin/integration\b"),
+         re.compile(r"Where a repository has an `?integration`? branch"),
          re.compile(r"\b(?:open|target|merge)\w*\s+(?:a\s+)?(?:pull request|PR)s?\s+(?:in)?to\s+`?(?:origin/)?integration\b", re.I))
 
 
@@ -46,7 +45,8 @@ class TestDirectToMainCutover(unittest.TestCase):
 
     def test_the_stale_pattern_catches_the_old_instructions(self):
         for line in ("gh pr create --draft --base integration --title x", "run merge-drops --tip origin/integration --branch HEAD",
-                     "Open a pull request into `integration` first"):
+                     "Open a pull request into `integration` first",
+                     "Where a repository has an `integration` branch, typical changes merge into it"):
             with self.subTest(line=line):
                 self.assertEqual(stale_lines(line), [line])
         self.assertEqual(stale_lines("gh pr create --base main"), [])
@@ -71,29 +71,38 @@ class TestDirectToMainCutover(unittest.TestCase):
         self.assertEqual(tip_watch.BRANCH, "main")
 
     def test_an_unset_integration_branch_is_the_default_and_an_invalid_one_is_refused(self):
-        self.assertIsNone(sb.TRIAGE_DEFAULTS["integration_branch"])
-        sb.validate_triage_config({"triage": {}}, "cfg")
+        self.assertIsNone(loader.sb.TRIAGE_DEFAULTS["integration_branch"])
+        loader.sb.validate_triage_config({"triage": {}}, "cfg")
         self.refuses_every_bad_value()
 
     def refuses_every_bad_value(self):
         for bad in (7, ["stage"], "", True):
-            with self.assertRaises(sb.ConfigError, msg=repr(bad)):
-                sb.validate_triage_config({"triage": {"integration_branch": bad}}, "cfg")
+            with self.assertRaises(loader.sb.ConfigError, msg=repr(bad)):
+                loader.sb.validate_triage_config({"triage": {"integration_branch": bad}}, "cfg")
 
     def test_a_refused_config_keeps_the_last_good_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(json.dumps({"triage": {"integration_branch": None}}))
-            good = sb.load_config(str(path))
-            kept = copy.deepcopy(good)
+            path.write_text(json.dumps({"triage": {"integration_branch": "stage"}}))
+            state = {"config": loader.sb.load_config(str(path))}
+
+            def reload():
+                try:
+                    state["config"] = loader.sb.load_config(str(path))
+                except loader.sb.ConfigError:
+                    return False
+                return True
+
             path.write_text(json.dumps({"triage": {"integration_branch": 7}}))
-            with self.assertRaises(sb.ConfigError):
-                sb.load_config(str(path))
-            self.assertEqual(good, kept)
-            self.assertIsNone(good["triage"]["integration_branch"])
+            self.assertFalse(reload())
+            self.assertEqual(state["config"]["triage"]["integration_branch"], "stage")
+            path.write_text(json.dumps({"triage": {"integration_branch": "next"}}))
+            self.assertTrue(reload())
+            self.assertEqual(state["config"]["triage"]["integration_branch"], "next")
 
     def test_a_mutant_that_accepts_any_integration_branch_is_caught(self):
-        with mock.patch.object(sb, "validate_triage_config", lambda config, source: None):
+        with mock.patch.object(loader.sb, "validate_triage_config", lambda config, source: None):
             with self.assertRaises(AssertionError):
                 self.refuses_every_bad_value()
 
