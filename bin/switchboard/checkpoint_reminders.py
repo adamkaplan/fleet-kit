@@ -271,9 +271,24 @@ def cmd_remind(args, runner, now):
             return EXIT_USAGE
         warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
                    "use --keep-if-closed to keep it\n" % (PROG, repo, number))
-    item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        text, number, sender, repo, condition=condition or None,
-                        key=_one_line(args.key, 80) if args.key else None, ttl=ttl)
+    every = getattr(args, "every", None)
+    at = parse_when(args.when, moment)   # a one-off stays exact (a bad time is the usual error)
+    try:
+        if every and not args.key:
+            raise ReminderError("--every needs --key (the chain's name, for --cancel-key)")
+        every = parse_every(every) if every else None
+        if args.key or every:
+            at = grid_when(args.when, moment)   # #2544: a recurring one is on the 15-minute UTC grid
+    except ReminderError as err:
+        sys.stderr.write("%s: remind: %s; nothing armed\n" % (PROG, err))
+        return EXIT_USAGE
+    try:
+        item = add_reminder(state, args.name, at, moment,
+                            text, number, sender, repo, condition=condition or None,
+                            key=_one_line(args.key, 80) if args.key else None, ttl=ttl, every=every, check_chain=True)
+    except ReminderError as err:
+        sys.stderr.write("%s: remind: %s; nothing armed\n" % (PROG, err))
+        return EXIT_USAGE
     if len(item["text"]) > TEXT_CAP:
         sys.stderr.write("%s: the text is %d characters: it is delivered in parts, each under %d, the last one closing it\n" % (PROG, len(item["text"]), TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
