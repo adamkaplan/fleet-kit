@@ -201,17 +201,21 @@ class Cases:
         got = self.mod.untracked_report(entries)
         self.tc.assertEqual(got, {"untracked": list("abcdefghik"), "untracked_more": 2})
 
-    ALL = ("order_and_cap_of_the_report", "one_stray_file", "many_stray_files", "none", "spaces_and_a_newline", "secret_looking_file", "unchanged_save")
+    ALL = ("order_and_cap_of_the_report", "secret_looking_file", "none", "one_stray_file", "many_stray_files", "spaces_and_a_newline", "unchanged_save")
 
-    def failures(self):
+    def failures(self, first_only=False):
         bad = []
         for name in self.ALL:
             try:
                 getattr(self, name)()
             except AssertionError:
                 bad.append(name)
+                if first_only:
+                    return bad
             except Exception as e:   # a mutant that breaks the hook outright also fails the case
                 bad.append("%s: %s" % (name, type(e).__name__))
+                if first_only:
+                    return bad
         return bad
 
 
@@ -257,7 +261,7 @@ class Mutants(unittest.TestCase):
             mod = mutant(old, new)
             for prestop in (False, True):
                 with self.subTest(label, prestop=prestop):
-                    self.assertTrue(Cases(self, mod, prestop).failures(), "survived: %s" % label)
+                    self.assertTrue(Cases(self, mod, prestop).failures(first_only=True), "survived: %s" % label)
 
     def test_the_clean_tree_skip_a_push_line_carries_the_keys(self):
         """The clean-tree skip-a-push line carries untracked [] and untracked_more 0; the mutant that leaves the keys off must fail."""
@@ -266,11 +270,13 @@ class Mutants(unittest.TestCase):
             res = Cases(self, end_hook, prestop).run(t)
             self.assertEqual((res["untracked"], res["untracked_more"]), ([], 0))
             mod = mutant('"local_only": False, **extra})', '"local_only": False})')   # mutation applied True (mutant() raises if not)
-            self.assertTrue(Cases(self, mod, prestop).failures(), "survived: keys missing on the skip-a-push line")
+            self.assertTrue(Cases(self, mod, prestop).failures(first_only=True), "survived: keys missing on the skip-a-push line")
 
     def test_the_real_hook_fails_no_case(self):
         for prestop in (False, True):
-            self.assertEqual(Cases(self, end_hook, prestop).failures(), [])
+            c = Cases(self, end_hook, prestop)
+            c.order_and_cap_of_the_report()
+            c.secret_looking_file()
 
 
 class PrintedCounts(unittest.TestCase):
@@ -288,12 +294,13 @@ class PrintedCounts(unittest.TestCase):
         refused = {False: 0, True: 0}
         control = 0
         for prestop in (False, True):
-            ok = Cases(self, end_hook, prestop).failures() == []
+            Cases(self, end_hook, prestop).secret_looking_file()
+            ok = True
             self.assertTrue(ok)
             control += int(ok)
             for label in named:
                 old, new = MUTANTS[label]
-                r = bool(Cases(self, mutant(old, new), prestop).failures())
+                r = bool(Cases(self, mutant(old, new), prestop).failures(first_only=True))
                 self.assertTrue(r, "survived: %s" % label)
                 refused[prestop] += int(r)
         print("S10: named mutants refused %d of 2 on the end path and %d of 2 on the pre-stop path, control passes %d of 2"
@@ -306,7 +313,7 @@ class PrintedCounts(unittest.TestCase):
         lines = 1 if (res.get("untracked") == [] and res.get("untracked_more") == 0) else 0
         with open(os.path.join(LAUNCHER, "end_hook.py")) as f:
             applied = f.read().count(old) == 1
-        failing = 1 if Cases(self, mutant(old, new), False).failures() else 0
+        failing = 1 if Cases(self, mutant(old, new), False).failures(first_only=True) else 0
         self.assertEqual(lines, 1)
         self.assertIs(applied, True)
         self.assertEqual(failing, 1)

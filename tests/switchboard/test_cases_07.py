@@ -1934,10 +1934,12 @@ class TestHeavySlots(Base):
 
     def test_a_missing_command_and_misuse_are_said_plainly(self):
         self.assertEqual(self.start("no-such-command-here").wait(timeout=90), 127)
-        for words in ([], ["--slots", "0", "--", "true"], ["--slots", "x", "--", "true"], ["--wait-max", "-1", "--", "true"]):
-            proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy"] + words, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            proc.communicate(timeout=90)
-            self.assertEqual(proc.returncode, sb.EXIT_USAGE, words)
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy"], env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc.communicate(timeout=90)
+        self.assertEqual(proc.returncode, sb.EXIT_USAGE)
+        for words in (["--slots", "0", "--", "true"], ["--slots", "x", "--", "true"], ["--wait-max", "-1", "--", "true"]):
+            with captured() as (_, err):
+                self.assertEqual(sb.main(["heavy"] + words), sb.EXIT_USAGE, words)
 
     def test_the_config_key_is_validated(self):
         for ok in (None, {}, {"slots": 1}, {"slots": 8}):

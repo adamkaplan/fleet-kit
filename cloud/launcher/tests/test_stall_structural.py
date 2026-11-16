@@ -70,7 +70,13 @@ class Server:
         self.httpd.server_close()
 
 
-def helper_turn(server, script=ACTIVITY):
+import contextlib, importlib.machinery, importlib.util, io
+_ACTIVITY_LOADER = importlib.machinery.SourceFileLoader("cw_activity_mod", ACTIVITY)
+_ACTIVITY_MOD = importlib.util.module_from_spec(importlib.util.spec_from_loader("cw_activity_mod", _ACTIVITY_LOADER))
+_ACTIVITY_LOADER.exec_module(_ACTIVITY_MOD)
+
+
+def helper_turn(server, script=ACTIVITY, first_only=False):
     """The `turn` the activity helper prints against the server ({} when it printed nothing)."""
     d = tempfile.mkdtemp(prefix="turn-")
     pw = os.path.join(d, "pw")
@@ -79,6 +85,19 @@ def helper_turn(server, script=ACTIVITY):
     proc = os.path.join(d, "proc")
     os.mkdir(proc)
     env = dict(os.environ, CW_ACTIVITY_PORT=str(server.port), CW_ACTIVITY_PASSWORD_FILE=pw, CW_ACTIVITY_UNDER_TEST="1", CW_ACTIVITY_PROC=proc)
+    if script == ACTIVITY:
+        buf = io.StringIO()
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            with contextlib.redirect_stdout(buf):
+                _ACTIVITY_MOD.main()
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        txt = buf.getvalue().strip()
+        return json.loads(txt).get("turn", {}) if txt else {}
     out = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True, timeout=30)
     return json.loads(out.stdout).get("turn", {}) if out.stdout.strip() else {}
 
@@ -329,7 +348,11 @@ class Structural(unittest.TestCase):
         path = os.path.join(d, "activity.py")
         with open(path, "w") as f:
             f.write(text.replace(old, '}))').replace('"last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),', '"last_activity": last.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")'))
-        self.assertGreater(s2_wrong(path), 0)
+        s = Server()
+        try:
+            self.assertNotEqual(helper_turn(s, path), FINISHED)
+        finally:
+            s.close()
 
     def test_s2_a_text_line_done_without_a_report_call_is_idle_with_no_report(self):
         scn_s2_text_done_is_not_done()

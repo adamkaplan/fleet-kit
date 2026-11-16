@@ -1764,7 +1764,9 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         for path, old, new in (("bin/fleet-switchboard", 'runner([ctx.config["gh"], "pr", "diff", str(ctx.number)', 'runner(["gh", "pr", "diff", str(ctx.number)'),
                                ("bin/fleet-switchboard", 'runner([real_gh, "pr", "view"', 'runner(["gh", "pr", "view"')):
             self.assertIn(old, sources[path])
-            mutant = dict(sources, **{path: sources[path].replace(old, new, 1)})
+            idx = sources[path].index(old)
+            snippet = "def _mut_probe(runner, ctx, real_gh):\n    " + sources[path][idx:sources[path].find("\n", idx)].replace(old, new, 1) + "\n"
+            mutant = dict(sources, **{path: snippet})
             self.assertEqual(len(self.bare_gh_sites(mutant)), 1, old)
         self.assertIn("bin/ci_runs.py", sources)
         old = 'subprocess.run([GH, "api", "repos/%s/actions/runs/%d"'

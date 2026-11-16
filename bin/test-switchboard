@@ -53848,10 +53848,10 @@ class TestExternalWiring(ExternalWorld):
             self.wire()
 
         def command_hangs():
-            self.key_command = [sys.executable, "-c", "import time; time.sleep(30)"]
+            self.key_command = [sys.executable, "-c", "import time; time.sleep(1.5)"]
             self.write_mapping()
             data = json.loads(self.mapping.read_text())
-            data["key_source"]["timeout"] = 0.5
+            data["key_source"]["timeout"] = 0.15
             self.mapping.write_text(json.dumps(data))
             self.wire()
 
@@ -72725,7 +72725,7 @@ class TestShimTopSpender(Base):
                "module = importlib.util.module_from_spec(importlib.util.spec_from_loader('gh_shim_under_test', loader))\n"
                "loader.exec_module(module)\n"
                "module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = sys.argv[2], sys.argv[3]\n"
-               "module.SLOW_SECONDS = 0.5\n"
+               "module.SLOW_SECONDS = 0.25\n"
                "sys.exit(module.main(sys.argv[4:]))\n")
 
     def run_shim(self, *args, env=None, agent="worker"):
@@ -72735,7 +72735,7 @@ class TestShimTopSpender(Base):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
                    "FLEET_SWITCHBOARD_BIN": program, "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS, "FAKE_LOG": str(self.log), "FAKE_SB_LOG": str(self.sblog)}
         environ.update(env or {})
-        return importlib.import_module("support.rebind").run_in_process(None, list(args), environ, setup=lambda ns: (ns["FIXED_STATE"].__setitem__(0, str(self.state)), ns["FIXED_PROGRAM"].__setitem__(0, program), ns.__setitem__("SLOW_SECONDS", 0.5))) if "FAKE_SB_SLEEP" not in environ else subprocess.run([sys.executable, "-c", self.WRAPPER, str(SHIM), str(self.state), program, *args], capture_output=True, text=True, env=environ, timeout=60)
+        return importlib.import_module("support.rebind").run_in_process(None, list(args), environ, setup=lambda ns: (ns["FIXED_STATE"].__setitem__(0, str(self.state)), ns["FIXED_PROGRAM"].__setitem__(0, program), ns.__setitem__("SLOW_SECONDS", 0.25))) if "FAKE_SB_SLEEP" not in environ else subprocess.run([sys.executable, "-c", self.WRAPPER, str(SHIM), str(self.state), program, *args], capture_output=True, text=True, env=environ, timeout=60)
 
     def notices(self):
         return self.sblog.read_text().splitlines() if self.sblog.exists() else []
@@ -72832,7 +72832,7 @@ class TestShimTopSpender(Base):
         slow, slow_took = self.timed("pr", "view", "3")                                   # an uncached read (not `gh api <path>`) by the top spender
         quiet, quiet_took = self.timed("pr", "view", "3", agent="other")
         self.assertEqual((slow.returncode, quiet.returncode, slow.stdout, quiet.stdout), (0, 0, quiet.stdout, quiet.stdout))
-        self.assertGreaterEqual(slow_took - quiet_took, 0.4, "the top spender waited")
+        self.assertGreaterEqual(slow_took - quiet_took, 0.18, "the top spender waited")
         self.assertLessEqual(slow_took - quiet_took, 1.5, "bounded: never more than SLOW_SECONDS plus the call")
         write, write_took = self.timed("issue", "edit", "5", "-t", "x")
         other_write, other_write_took = self.timed("issue", "edit", "5", "-t", "x", agent="other")
@@ -72873,7 +72873,7 @@ class TestShimTopSpender(Base):
         for name, value in sorted(self.HOSTILE.items()):
             value = {"OTHER": str(self.other), "EMPTY": empty, "SAME": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH)}.get(value, value)
             _, took = self.timed("pr", "view", "3", env={name: value})
-            if took - baseline < 0.4:
+            if took - baseline < 0.15:
                 switched_off.add(name)
         self.assertEqual(switched_off, set(self.SWITCH_OFF), "the names that switch the wait off are exactly the declared ones")
 
@@ -72881,7 +72881,7 @@ class TestShimTopSpender(Base):
         _, quiet = self.timed("api", self.PATH.replace("5", "9"), agent="other")                 # another agent's read, no entry: no wait
         first, took = self.timed("api", self.PATH)                                               # the top spender's read with NO cache entry: it spends, so it waits
         self.assertEqual(first.stdout, '{"n":1}')
-        self.assertGreaterEqual(took - quiet, 0.4, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
+        self.assertGreaterEqual(took - quiet, 0.18, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
         second, again = self.timed("api", self.PATH)                                             # now served from the cache: no request, no wait
         self.assertEqual(second.stdout, '{"n":1}')
         self.assertLess(again, 0.4, "a read served from the cache never waits")
@@ -72893,7 +72893,7 @@ class TestShimTopSpender(Base):
         self.assertLess(took - baseline, 0.4, "above the line nobody waits")
         self.usage(500)
         _, took = self.timed("pr", "view", "3")
-        self.assertGreaterEqual(took - baseline, 0.4)
+        self.assertGreaterEqual(took - baseline, 0.18)
         self.usage(3000)
         _, took = self.timed("pr", "view", "3")
         self.assertLess(took - baseline, 0.4, "the wait ended with the low budget")

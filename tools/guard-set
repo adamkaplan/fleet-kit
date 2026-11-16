@@ -33,9 +33,7 @@ def defined_classes():   # parsed once per process: the sources do not change un
     out = set()
     files = sorted((REPO / "tests" / "switchboard").glob("*.py")) + [REPO / "bin" / "test-switchboard", REPO / "tests" / "test_installed_guard.py"]
     for f in files:
-        for node in ast.parse(f.read_text()).body:
-            if isinstance(node, ast.ClassDef):
-                out.add(node.name)
+        out.update(re.findall(r"(?m)^class\s+([A-Za-z_][A-Za-z0-9_]*)\b", f.read_text()))
     return out
 
 
