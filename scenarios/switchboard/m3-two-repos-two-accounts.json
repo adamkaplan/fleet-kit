@@ -26,7 +26,7 @@
      "why": "Each repo answers only to its own account's token; the same number 2 is a different ask in each"},
     {"at": "40s", "actor": "world", "do": "comment", "repo": "acme/web", "issue": 2, "id": 1002,
      "body": "web: please look"},
-    {"at": "3m", "actor": "world", "do": "wait"}
+    {"at": "32m", "actor": "world", "do": "wait"}
   ],
   "expect": [
     {"name": "api-sees-its-own", "that": "delivered", "to": "api-orch", "key": "github.comment:1001", "count": 1,

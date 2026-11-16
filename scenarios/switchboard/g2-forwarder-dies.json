@@ -17,7 +17,7 @@
     {"at": "122s", "actor": "world", "do": "comment", "issue": 12, "id": 5002, "body": "Second, while it is down",
      "why": "Lost to the webhook path: nobody is forwarding"},
     {"at": "124s", "actor": "world", "do": "comment", "issue": 12, "id": 5003, "body": "Third, while it is down"},
-    {"at": "8m", "actor": "world", "do": "wait"}
+    {"at": "32m", "actor": "world", "do": "wait"}
   ],
   "expect": [
     {"name": "first-once", "that": "delivered", "to": "platform", "key": "github.comment:5001", "count": 1,

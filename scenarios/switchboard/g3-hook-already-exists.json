@@ -8,8 +8,8 @@
   ],
   "cast": {
     "platform": {
-      "role": "orchestrator",
-      "charter": 1
+      "role": "coder",
+      "issue": 12
     }
   },
   "issues": {

@@ -51,7 +51,7 @@
       "why": "With the dedupe off, the repeat of 5001 rides with this new key: a new message id, so v2 admits it"
     },
     {
-      "at": "8m",
+      "at": "32m",
       "actor": "world",
       "do": "wait"
     }

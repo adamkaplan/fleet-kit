@@ -20,7 +20,7 @@
     {"at": "40s", "actor": "world", "do": "comment", "repo": "acme/web", "issue": 2, "id": 2001,
      "body": "please look",
      "why": "No forwarder can run for the repo: the comment is found by the catch-up read on a poll"},
-    {"at": "6m", "actor": "world", "do": "wait"}
+    {"at": "32m", "actor": "world", "do": "wait"}
   ],
   "expect": [
     {"name": "polled", "that": "repo_watch", "repo": "acme/web", "how": "polling"},

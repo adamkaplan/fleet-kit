@@ -157,6 +157,7 @@ def build(Base, GithubRig):
             rig.gh.issue(1)
             rig.gh.issue(12, parent=1)
             rig.hub.tick()
+            rig.world.tick(100)   # past the :00 UTC boundary: an orchestrator's comments wait in the queue for the next bucket
             values = []
             for i, name in enumerate(LINK_SCRUB_NAMES):
                 values.append(_planted(i))
@@ -165,8 +166,9 @@ def build(Base, GithubRig):
             values.append(_planted(90))
             rig.pump(60)
             rig.hub.tick()
-            everything = rig.state_text() + json.dumps(rig.world.admissions("platform")) + json.dumps(rig.world.audit())
             self.assertEqual(sum("[query removed]" in i.summary for i in rig.hub.queue.values()), 26)   # the 27th is cut inside the words
+            rig.pump(1800)   # the bucket: the message goes out, and what it holds is checked below
+            everything = rig.state_text() + json.dumps(rig.world.admissions("platform")) + json.dumps(rig.world.audit())
             self.assertEqual(sum(everything.count(v) for v in values), 0)
             self.assertEqual(everything.count(_planted(90)[:6]), 0)
 
