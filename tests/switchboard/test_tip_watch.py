@@ -13,7 +13,7 @@ class TipGh:
         self.sb, self.runs, self.jobs, self.calls, self.fault = sb, [], {}, [], False
         self.fail, self.total, self.between, self.files, self.logs = [], None, {}, {}, {}   # head -> [(sha, pr)] merged since the run before it; pr -> [file names]; job id -> log text
 
-    def add(self, now, run_id, head, pr, jobs=(), conclusion=None, age=60, status="completed", branch="integration", done=None, kind="failure"):
+    def add(self, now, run_id, head, pr, jobs=(), conclusion=None, age=60, status="completed", branch="main", done=None, kind="failure"):
         failed = [j for j in jobs]
         self.runs.append({"id": run_id, "head_sha": head, "head_branch": branch, "status": status, "event": "workflow_dispatch",
                           "conclusion": conclusion or ("failure" if failed else "success"), "created_at": self.sb.iso(now - age), "updated_at": self.sb.iso(now - (age if done is None else done)),
@@ -28,7 +28,7 @@ class TipGh:
             return done("", 1)
         if self.fault and "/jobs" in path:
             return done("", 1)
-        if path.startswith("repos/acme/widget/actions/runs?branch=integration"):
+        if path.startswith("repos/acme/widget/actions/runs?branch=main"):
             return done(json.dumps({"workflow_runs": self.runs}))
         if path.startswith("repos/acme/widget/compare/"):
             head = path.split("...")[1].split("?")[0]

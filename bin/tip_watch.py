@@ -18,7 +18,7 @@ import re
 import subprocess
 import time
 
-BRANCH = "integration"   # the branch whose tip is watched
+BRANCH = "main"   # the branch whose tip is watched
 STATE_FILE = "tip-watch.json"
 LIST_SECONDS = 300       # a repository's runs are listed no oftener than this
 LIST_PAGE = 30

@@ -203,6 +203,7 @@
 "TestDeployFromMainSentence": 0.0,
 "TestDerive": 0.0,
 "TestDerivedClosure": 34.9,
+"TestDirectToMainCutover": 0.5,
 "TestDiscovery": 0.1,
 "TestDiskGuard": 0.9,
 "TestDiskReport": 1.2,
