@@ -2887,6 +2887,8 @@ but not yet delivered is not delivered either. A reminder without `--ttl` behave
 minutes stays), and the rule reads only the reminder's own ttl, so another owner's or another key's reminder is never
 dropped by it. Re-arming with `--key` stores the new ttl (or none). Tests: `TestReminderTtl`.
 
+
+**Recurring reminders on the 15-minute UTC grid (#2544).** A one-off `remind <name> <when>` (no `--key`, no `--every`) stays exact: `3m`, `5m`, `30m` and an ISO time fire as asked (upfront one-shot soak wakes `+5m`, `+15m`, `+30m` included). `--key` and `--every <interval>` pin to `:00/:15/:30/:45` UTC: a delay under `15m` is refused, a longer one is snapped up onto the grid, an ISO time must be on the grid with `:00` seconds. `--every` (needs `--key`; a multiple of `15m`: `15m`, `30m`, `1h`, `2h`, `1d`) makes the daemon arm the next tick from the scheduled time (no drift) when one is delivered; `--until-closed` / `--until-merged` end the chain and `--cancel-key` cancels it. An unkeyed reminder under `15m` that an agent sets for itself within 15m of waking from a self-reminder is refused (a self-polling chain); launch checkpoint reminders do not count. The reminder pass also prunes the reminders of retired workers (never a registered, live or chartered lane). Tests: `TestReminderGridAndRecurring`, `TestDeadWorkerReminderPrune`.
 `remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
 owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
 reminder is dropped when a newer one of the same owner and key is due and will be delivered (one `reminder.drop_superseded` audit line names both ids). A
