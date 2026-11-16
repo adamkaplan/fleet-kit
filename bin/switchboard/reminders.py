@@ -117,10 +117,9 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
         item["every"] = int(every)   # #2544: seconds; the daemon arms the next tick on the 15-minute UTC grid when this one is delivered
     with reminders_lock(state_dir):
         items = read_reminders(state_dir)
-        if check_chain:   # #2544: the self-polling check and the write are one critical section
-            refusal = self_poll_chain(state_dir, sender, to, at, created, bool(key or every))
-            if refusal:
-                raise ReminderError(refusal)
+        refusal = self_poll_chain(state_dir, sender, to, at, created, bool(key or every)) if check_chain else None   # #2544: check and write are one critical section
+        if refusal:
+            raise ReminderError(refusal)
         if key and isinstance(sender, str) and sender.strip():   # one pending per owner and key; another owner or key, a fired one and a sender-less one are never touched
             items = [i for i in items if not (i.get("key") == key and i.get("from") == sender and i.get("at", 0) > created)]
         write_reminders(state_dir, items + [item])
@@ -708,9 +707,8 @@ class ReminderFacts:
         return outcomes
 
     def audit_rearmed(self, armed):
-        for item in armed:
-            if self.engine is not None and self.engine.audit is not None:
-                self.engine.audit.append(self.engine.actor, "reminder.rearm", item["to"], {"id": item["id"], "at": iso(item["at"]), "key": _one_line(item.get("key") or "", 60)})
+        for item in armed if self.engine is not None and self.engine.audit is not None else ():
+            self.engine.audit.append(self.engine.actor, "reminder.rearm", item["to"], {"id": item["id"], "at": iso(item["at"]), "key": _one_line(item.get("key") or "", 60)})
 
     def __call__(self):
         self.swept.clear()   # #1711: a pass starts here (each source is read once per pass), so `swept` holds only this pass's ids
@@ -825,20 +823,18 @@ def late_reminder_lines(state_dir, config, now):
 
 
 # ---- #2544: recurring reminders sit on the 15-minute UTC grid; a one-off stays exact
-
 GRID_SECONDS = 900
-SELF_WAKE_FILE = "self-wakes.json"   # {name: {"at": when a reminder the agent set for itself was delivered}}
+SELF_WAKE_FILE = "self-wakes.json"   # {name: {"at": when a self-set reminder was delivered}}
 PROTECTED_ROLES = ("chief-of-staff", "orchestrator")
 
 
 def grid_when(text, now):
-    """`--key` / `--every` time: a delay under 15m is refused, a longer delay is snapped UP onto :00/:15/:30/:45 UTC (never under 15m ahead), an ISO
-    time must already be on the grid with :00 seconds. Returns epoch seconds; ReminderError otherwise."""
+    """`--key` / `--every` time: a delay under 15m is refused, a longer one snaps UP onto :00/:15/:30/:45 UTC, an ISO time must be future and on the grid."""
     at = parse_when(text, now)
     if re.fullmatch(r"\+?[0-9]+[smhd]", text.strip()):
         if at - now < GRID_SECONDS:
             raise ReminderError("a --key or --every reminder needs at least 15m (got %r): use 15m or more, or arm upfront one-shots without --key" % text[:40])
-        return float(math.ceil(at / GRID_SECONDS) * GRID_SECONDS)
+        return float((int(at // GRID_SECONDS) + (1 if at % GRID_SECONDS else 0)) * GRID_SECONDS)
     if at <= now:
         raise ReminderError("a --key or --every reminder at an explicit time must be in the future, got %r" % text[:40])
     if at % GRID_SECONDS:
@@ -847,7 +843,7 @@ def grid_when(text, now):
 
 
 def parse_every(text):
-    """`--every 30m`: whole seconds, at least 15m and a multiple of 15m; ReminderError otherwise."""
+    """`--every 30m`: seconds, at least 15m and a multiple of 15m."""
     match = re.fullmatch(r"([0-9]{1,6})([mhd])", str(text).strip())
     seconds = int(match.group(1)) * REMINDER_UNITS[match.group(2)] if match else 0
     if seconds < GRID_SECONDS or seconds % GRID_SECONDS:
@@ -856,22 +852,19 @@ def parse_every(text):
 
 
 def next_tick(at, every, now):
-    """The first tick after `now` on the series at, at+every, ...: anchored to the scheduled time, so a late delivery never drifts the grid."""
-    steps = max(1, int((now - at) // every) + 1)
-    return at + steps * every
+    """The first tick after `now` of the series at, at+every, ...: anchored to the schedule, so a late delivery never drifts."""
+    return at + max(1, int((now - at) // every) + 1) * every
 
 
 def rearm_item(item, now):
-    """The next tick of a delivered `--every` reminder (same recipient, text, key, sender, condition), or None."""
+    """The next tick of a delivered `--every` reminder, or None."""
     if not _is_number(item.get("every")) or item["every"] < GRID_SECONDS:
         return None
-    nxt = {k: v for k, v in item.items() if k not in ("id", "at", "created")}
-    nxt.update({"id": uuid.uuid4().hex[:12], "at": float(next_tick(item["at"], item["every"], now)), "created": float(now)})
-    return nxt
+    return dict(item, id=uuid.uuid4().hex[:12], at=float(next_tick(item["at"], item["every"], now)), created=float(now))
 
 
 def note_self_wake(state_dir, name, now):
-    """Remember that a reminder the agent set for itself reached it at `now` (read by `self_poll_chain`)."""
+    """Remember that a self-set reminder reached `name` at `now` (read by `self_poll_chain`)."""
     with reminders_lock(state_dir):
         known = read_record_file(Path(state_dir) / SELF_WAKE_FILE)
         known = {k: v for k, v in (known if isinstance(known, dict) else {}).items()
@@ -889,23 +882,19 @@ def write_text_atomic(path, text):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(str(temp), str(path))
-    except BaseException:
-        try:
+    finally:
+        if os.path.exists(str(temp)):
             os.unlink(str(temp))
-        except OSError:
-            pass
-        raise
 
 
 def self_poll_chain(state_dir, sender, to, at, now, keyed):
-    """The refusal text when an unkeyed reminder under 15m that an agent sets for ITSELF is armed right after it woke from a self-reminder
-    (delivered within 15m): a chain that polls on wake. Upfront one-shots (armed before the first fires) and launch checkpoint reminders
-    (the boss sets those, never the agent for itself) pass. None when it passes."""
+    """The refusal text for an unkeyed self-reminder under 15m armed within 15m of waking from a self-reminder (a polling chain), else None.
+    Upfront one-shots and launch checkpoint reminders (set by the boss) pass."""
     if keyed or not (isinstance(sender, str) and sender.strip() and sender == to) or at - now >= GRID_SECONDS:
         return None
     last = (read_record_file(Path(state_dir) / SELF_WAKE_FILE) or {}).get(sender)
     woke = [last["at"]] if isinstance(last, dict) and _is_number(last.get("at")) else []
-    woke += [i["at"] for i in read_reminders(state_dir) if i.get("from") == sender and i.get("to") == sender and i["at"] <= now]
+    woke += [i["at"] for i in read_reminders(state_dir) if i.get("from") == i.get("to") == sender and i["at"] <= now]
     if any(0 <= now - w < GRID_SECONDS for w in woke):
         return ("you woke from a reminder you set for yourself less than 15m ago and this arms another under 15m: that is a self-polling chain. "
                 "Use --key with --every (15m or more, on :00/:15/:30/:45 UTC), or arm one-shots upfront (+5m, +15m, +30m) before the first fires")
@@ -913,24 +902,21 @@ def self_poll_chain(state_dir, sender, to, at, now, keyed):
 
 
 def remove_delivered(state_dir, ids, now, extra=()):
-    """One locked step for reminders that were delivered (`ids`) and ones to drop (`extra`). An `--every` one still in the file arms its next tick
-    first (a delivered id already gone, as after a `--cancel-key`, is never brought back; a newer pending reminder of the same key and sender wins),
-    and a self-reminder is noted as a wake. Returns (delivered ids removed, extra ids removed, the next-tick items armed)."""
+    """One locked step for delivered reminders (`ids`) and ones to drop (`extra`): an `--every` one still in the file arms its next tick first (a
+    cancelled one is never brought back; a newer pending one of the same key and sender wins), a self-reminder is noted as a wake.
+    Returns (delivered ids removed, extra ids removed, next-tick items armed)."""
     ids, extra, armed, woke = set(ids), set(extra) - set(ids), [], set()
     with reminders_lock(state_dir):
         items = read_reminders(state_dir)
-        for item in items:
-            if item["id"] not in ids:
-                continue
+        for item in (i for i in items if i["id"] in ids):
             if item.get("from") == item["to"]:
                 woke.add(item["to"])
             nxt = rearm_item(item, now) if item.get("every") else None
             if nxt and not any(i.get("key") == nxt.get("key") and i.get("from") == nxt.get("from") and i["id"] not in ids and i["at"] > now for i in items):
                 armed.append(nxt)
-        gone = [i["id"] for i in items if i["id"] in ids]
-        dropped = [i["id"] for i in items if i["id"] in extra]
+        gone, dropped = [i["id"] for i in items if i["id"] in ids], [i["id"] for i in items if i["id"] in extra]
         if armed or dropped:
-            write_reminders(state_dir, [i for i in items if i["id"] not in ids and i["id"] not in extra] + armed)
+            write_reminders(state_dir, [i for i in items if i["id"] not in ids | extra] + armed)
     if not (armed or dropped):
         gone = remove_reminders(state_dir, ids) if ids else []
     for name in sorted(woke):
@@ -939,20 +925,17 @@ def remove_delivered(state_dir, ids, now, extra=()):
 
 
 def retired_orphans(state_dir, discovery, items):
-    """Ids of reminders for a retired worker (or an `--every` chain of one): never a name in the registry, in `live`, or a chartered lane."""
-    if discovery is None or getattr(discovery, "problems", None):
-        return []   # a partial look at the fleet never prunes
-    live = set(discovery.agents)
-    reg = load_module("registry").read(state_dir)
+    """Ids of reminders for a retired worker (or its `--every` chain): never a registered, live or chartered name."""
+    reg = load_module("registry").read(state_dir) if discovery is not None and not getattr(discovery, "problems", None) else {}
     if not reg.get("whole"):
-        return []
+        return []   # a partial look at the fleet (or an unreadable registry) never prunes
     gone = []
     for item in items:
         for who, chain_only in ((item.get("to"), False), (item.get("from"), True)):
             entry = reg["retired"].get(who)
-            if not isinstance(entry, dict) or not entry.get("session") or who in reg["agents"] or who in live or who in PROTECTED_ROLES or (chain_only and not item.get("every")):
+            if not isinstance(entry, dict) or not entry.get("session") or who in reg["agents"] or who in discovery.agents or who in PROTECTED_ROLES or (chain_only and not item.get("every")):
                 continue
-            record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
+            record = entry["record"] if isinstance(entry.get("record"), dict) else {}
             if record.get("charter") or record.get("role") in PROTECTED_ROLES or record.get("kind") == "orchestrator":
                 continue
             gone.append(item["id"])
@@ -981,11 +964,9 @@ def prune_delivered_reminders(engine, discovery):
     orphans = retired_orphans(source.state_dir, discovery, read_reminders(source.state_dir))
     gone, dropped, armed = remove_delivered(source.state_dir, set(delivered), engine.now(), orphans) if delivered or orphans else ([], [], [])
     source.audit_rearmed(armed)
-    if engine.audit is not None:
-        if gone:
-            engine.audit.append(engine.actor, "reminder.prune", None, {"ids": gone})
-        if dropped:
-            engine.audit.append(engine.actor, "reminder.prune_orphans", None, {"ids": dropped})
+    for event, found in (("reminder.prune", gone), ("reminder.prune_orphans", dropped)):   # audited after the removal, each only for its own ids
+        if found and engine.audit is not None:
+            engine.audit.append(engine.actor, event, None, {"ids": found})
     return gone
 
 

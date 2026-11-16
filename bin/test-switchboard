@@ -13106,6 +13106,7 @@ class TestOneCharter(CharterRig, Base):
     READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
         ("bin/switchboard/work_moves.py", "guard"): "registry: the charter set guard, on the registry lock's own read",
+        ("bin/switchboard/reminders.py", "retired_orphans"): "registry: a retired record that carries a charter is never pruned as a worker orphan",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
         ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/switchboard/plan_notice.py", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
