@@ -47,9 +47,26 @@ def _manifest_files():
 SWITCHBOARD_SOURCE_FILES = _manifest_files()
 
 
-def switchboard_source():
+def _cached_ast_parse(source, filename="<unknown>", mode="exec", *, type_comments=False, feature_version=None, _memo={}, _real=ast.parse, **kw):
+    if kw or not isinstance(source, str) or len(source) < 100000:
+        return _real(source, filename, mode, type_comments=type_comments, feature_version=feature_version, **kw)
+    key = (source, filename, mode, type_comments, feature_version)
+    tree = _memo.get(key)
+    if tree is None:
+        tree = _memo[key] = _real(source, filename, mode, type_comments=type_comments, feature_version=feature_version)
+    return tree
+
+
+setattr(ast, "parse", _cached_ast_parse)
+
+
+def switchboard_source(_cache={}):
     """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
-    return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
+    stamp = tuple((p.stat().st_mtime_ns, p.stat().st_size) for p in SWITCHBOARD_SOURCE_FILES)
+    text = _cache.get(stamp)
+    if text is None:
+        text = _cache[stamp] = "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
+    return text
 
 
 SCENARIO = BIN / "fleet-scenario"
