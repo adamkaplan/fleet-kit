@@ -21890,6 +21890,7 @@ def add_core_parsers(sub):
     remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
     remind.add_argument("--cancel-key", metavar="KEY", help="Cancel every waiting reminder of yours with this key (a chain armed with --key); a delivered one is not recalled")
     remind.add_argument("--key", default=None, help="Name the purpose: arming again with the same key replaces your pending reminder of that key.")
+    remind.add_argument("--every", metavar="INTERVAL", default=None, help="With --key: repeat on the 15-minute UTC grid (15m, 30m, 1h, 2h, 1d; a multiple of 15m)")
     remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
                         "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
