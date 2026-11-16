@@ -435,13 +435,13 @@ class Base(unittest.TestCase):
                 return json.dumps([MODEL_ROW], separators=(",", ":"))
             return real_model_entry()
 
-        def fast_git_token():
+        def fast_git_token(repo, cluster, role="worker"):
             gt = self.stub_dir / "git_token"
             if (os.environ.get("CW_GIT_TOKEN_CMD") == "cat %s" % gt
                     and not os.environ.get("CW_SECRET_DIR")
                     and gt.exists() and gt.read_text() == GIT_TOKEN + "\n"):
                 return GIT_TOKEN
-            return real_git_token()
+            return real_git_token(repo, cluster, role=role)
 
         def fast_cluster_token(env=None, now=None, recovery=None):
             e = os.environ if env is None else env
