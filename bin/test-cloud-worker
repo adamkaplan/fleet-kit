@@ -82,13 +82,13 @@ class FakeRemote:
                 if self.command == "GET" and "/message" in self.path:
                     return self._answer(200, {"data": list(reversed(outer.messages))})
                 if self.command == "GET" and self.path == "/api/model":
-                    return self._answer(200, {"data": [{"providerID": "github-copilot", "id": "model-a"}]})
+                    return self._answer(200, {"data": [{"providerID": "github-copilot", "id": "model-a"}, {"providerID": "github-copilot", "id": "claude-sonnet-5.5"}]})
                 return self._answer(404, {"error": "no such route"})
 
             do_GET = do_POST = _handle
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
         self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
 
@@ -109,15 +109,15 @@ tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
 login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
          "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
 open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
-CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--no-commit", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
+CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--no-commit", "--pr-label", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
 if command == "create":
     unknown = [a for a in argv[2:] if a.startswith("--") and a not in CREATE_OPTIONS]
     if unknown:
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
     shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
-    if shape not in ("XS", "O", "S", "M"):
-        sys.stderr.write("error: shape must be XS, S or M\\n")
+    if shape not in ("XS", "O", "S", "M", "L"):
+        sys.stderr.write("error: shape is not one of the launcher's shapes\\n")
         sys.exit(2)
 if command == "create":
     for item in argv:
@@ -142,6 +142,10 @@ elif command == "stop":
     print(json.dumps({"worker": worker, "runtime_id": "pod/%%s-7f9c" %% worker, "pushed": True, "wip_branch": worker + "/wip"}))
 elif command == "status":
     print(json.dumps({"worker": worker, "runtime_id": "pod/%%s-7f9c" %% worker, "phase": "running", "cost_estimate_usd": 0.07}))
+elif command == "snapshot" and os.environ.get("STUB_PODS") is not None:   # the cluster's pods, only when a test sets them (JSON list of names)
+    print(json.dumps({"pods": [{"name": n} for n in json.loads(os.environ["STUB_PODS"])]}))
+    if os.environ.get("STUB_SNAPSHOT_FAIL"):
+        sys.exit(1)
 """
 
 
@@ -674,6 +678,32 @@ class TestWiring(Base):
         self.assertIn("create", [c[0] for c in self.stub_calls()])
         self.assertTrue(any("model-auth=" in a for a in self.stub_calls()[0]))
 
+    def test_ask2404_s2_a_gone_pod_is_closed_not_kept(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1", "STUB_PODS": "[]"}):   # the end hook fails because the pod is gone
+            code, out, err = self.main("retire", "coder7", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("pod kept", out + err)
+        self.assertIn("its pod was already gone", out)
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+        self.assertFalse((self.state / "cloud" / "coder7.password").exists())
+
+    def test_ask2404_s3_a_live_pod_with_a_failing_hook_is_kept(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1", "STUB_PODS": '["coder7-7f9c"]'}):
+            code, out, err = self.main("retire", "coder7", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("pod kept", out)
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
+
+    def test_ask2404_an_unreadable_cluster_keeps_the_pod_and_the_record(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1", "STUB_PODS": "[]", "STUB_SNAPSHOT_FAIL": "1"}):
+            code, out, err = self.main("retire", "coder7", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("pod kept", out)
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
+
     def test_s2_send_read_and_status_each_open_and_close_their_own_tunnel(self):
         baseline = self.main("status")[0]   # the base status reflects the daemon and herdr (absent here); a cloud worker adds no failure of its own
         self.assertEqual(self.launch()[0], 0)
@@ -783,6 +813,14 @@ class TestWiring(Base):
             self.assertIn("did not open", err)
             self.assertNoSecret(out, err)
         self.assertNothingKept()
+
+    def test_a_refused_create_audit_line_names_the_launching_lane(self):
+        with mock.patch.dict(os.environ, {"STUB_CREATE_FAIL": "1"}):
+            self.assertEqual(self.launch()[0], 1)
+        lines = [json.loads(l) for p in self.state.rglob("*") if p.is_file() and p.suffix != ".password" for l in p.read_text(errors="replace").splitlines()
+                 if "cloud.create_failed" in l]
+        self.assertTrue(lines, "no cloud.create_failed audit line")
+        self.assertEqual(lines[0]["detail"].get("boss"), "orch")
 
     def test_u2_a_launch_that_dies_at_the_tunnel_stops_the_pod_and_says_nothing_secret(self):
         (self.stub_dir / "pf_die").write_text("")
@@ -1589,7 +1627,7 @@ class TestLaunchStack(Base):
 
     FIXTURES = BIN.parent / "cloud" / "tests" / "fixtures"
     SHAPES = (None, "S", "M")
-    BAD_SHAPES = ("L", "m", "s", "XL", "2", "SM", "S M", "S\n", "--privileged", "S --stack", "/etc/passwd", "S=1")
+    BAD_SHAPES = ("LL", "m", "s", "XL", "2", "SM", "S M", "S\n", "--privileged", "S --stack", "/etc/passwd", "S=1")
 
     def create_argv(self):
         calls = [c for c in self.stub_calls() if c[0] == "create"]
@@ -1664,6 +1702,13 @@ class TestLaunchStack(Base):
                 self.assertEqual(argv.count("--no-commit"), 1 if extra else 0)
                 self.assertEqual([x for x in argv if x != "--no-commit"], base)   # the other options are identical
 
+    def test_2269_pr_label_reaches_create_and_the_record(self):
+        code, out, err = self.launch_with("--cloud", "--pr-label", "needs:captain", "--pr-label", "x")
+        self.assertEqual(code, 0, err)
+        argv = self.create_argv()
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--pr-label"], ["needs:captain", "x"])
+        self.assertEqual(json.loads((self.state / "cloud" / "coder7.json").read_text())["pr_labels"], ["needs:captain", "x"])
+
     def test_s9_the_fake_launcher_refuses_an_option_it_does_not_know(self):
         text = self.stub.read_text().replace('"--stack", ', "")
         self.stub.write_text(text)
@@ -1708,9 +1753,9 @@ class TestLaunchStack(Base):
         self.nothing_was_called()
 
     def test_s10_a_bad_shape_is_handed_on_without_stack_as_before(self):
-        code, out, err = self.launch_with("--cloud", "--shape", "L")
+        code, out, err = self.launch_with("--cloud", "--shape", "LL")
         self.assertNotEqual(code, 0)   # the launcher (here its fake) refuses it: the switchboard does not validate it without --stack
-        self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "L")
+        self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "LL")
 
     def test_family_every_flag_combination_with_stack(self):
         """The table of flag combinations is the product of the launch flags the code reads (cloud, mode, timing, shape); the oracle is stated once."""

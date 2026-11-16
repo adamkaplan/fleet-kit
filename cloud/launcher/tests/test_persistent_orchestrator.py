@@ -778,15 +778,29 @@ class S10Manifest(unittest.TestCase):
     OLD_RULES = [(("",), ("pods",), ("get", "list", "watch", "create", "patch", "delete")), (("",), ("pods/log",), ("get",)), (("",), ("pods/exec",), ("create",)),
                  (("",), ("pods/portforward",), ("create",)), (("",), ("secrets",), ("get", "list", "create", "patch", "delete"))]
 
-    def test_s10_exactly_one_rule_is_added_and_no_other_is_widened(self):
-        role = [d for d in k1.rbac_docs() if d["kind"] == "Role"][0]
+    # Documented additions relative to OLD_RULES: the StatefulSet rule (the persistent workload) and the PodDisruptionBudget rule (one budget per worker pod).
+    EXPECTED_ADDED = [(("",), ("events",), ("get", "list")),
+                      (("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete")),
+                      (("policy",), ("poddisruptionbudgets",), ("get", "list", "create", "delete"))]
+
+    def check_rules(self, role):
         rules = [(tuple(r["groups"]), tuple(r["resources"]), tuple(r["verbs"])) for r in role["rules"]]
         added = [r for r in rules if r not in self.OLD_RULES]
-        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete"))])
+        self.assertEqual(sorted(added), sorted(self.EXPECTED_ADDED))   # the order in the file is not a rule
         self.assertEqual([r for r in self.OLD_RULES if r not in rules], [])
-        self.assertEqual(len(rules), len(self.OLD_RULES) + 1)
-        self.assertEqual(len(added[0][2]), 5)
+        self.assertEqual(len(rules), len(self.OLD_RULES) + len(self.EXPECTED_ADDED))
+        self.assertEqual([len(r[2]) for r in added if r[1] == ("statefulsets",)], [5])
         self.assertNotIn("*", role["text"].replace('apiGroups: [""]', ""))
+
+    def test_s10_mutant_a_widened_budget_rule_fails_the_check(self):
+        text = open(os.path.join(ROOT, "cloud/k8s/operator-rbac.yaml")).read()
+        changed = text.replace('verbs: ["get", "list", "create", "delete"]', 'verbs: ["get", "list", "create", "patch", "delete"]')
+        self.assertNotEqual(changed, text)
+        with self.assertRaises(AssertionError):
+            self.check_rules([d for d in k1.rbac_docs(changed) if d["kind"] == "Role"][0])
+
+    def test_s10_exactly_the_documented_rules_are_added_and_no_other_is_widened(self):
+        self.check_rules([d for d in k1.rbac_docs() if d["kind"] == "Role"][0])
 
 
 class S10Verbs(unittest.TestCase):
@@ -844,6 +858,8 @@ class S10Verbs(unittest.TestCase):
 
 class OneRead(PBase):
     """S15 and S17: a stop or a delete of a worker whose pod NAME is absent takes ONE strict read of the StatefulSet; a worker with a pod takes none."""
+    stop_at_first_problem = False   # a mutant test (which expects the check to raise) sets this: the first failing answer is enough to kill the mutant
+
     def answers(self):
         base = S7Lookup.table(S7Lookup)
         table = {}
@@ -886,6 +902,8 @@ class OneRead(PBase):
             last = [l for l in self.audit_lines() if l.get("action") == "stop"][-1]
             if last.get("ok") is not False:
                 problems.append("%s: the audit stop line is not ok false" % what)
+            if problems and self.stop_at_first_problem:
+                return self.assertEqual(problems, [])
         self.assertEqual(len(self.answers()), 22)
         self.assertEqual(problems, [])
 
@@ -903,6 +921,8 @@ class OneRead(PBase):
             last = [l for l in self.audit_lines() if l.get("action") == "stop"][-1]
             if last.get("ok") is not False:
                 problems.append("%s: the audit stop line is not ok false" % what)
+            if problems and self.stop_at_first_problem:
+                return self.assertEqual(problems, [])
         self.assertEqual(problems, [])
 
     def setUp_again(self):
@@ -962,6 +982,7 @@ class OneRead(PBase):
         self.check_pod_present_reads_none()
 
     def test_s15_mutant_forbidden_read_as_no_workload_fails_the_check(self):
+        self.stop_at_first_problem = True
         self.mod = mutant("                    workload = self._absent_pod_workload(name)\n", "                    workload = self._persistent_workload(name)\n")
         with self.assertRaises(AssertionError):
             self.check_persistent()
@@ -1008,6 +1029,8 @@ class OneRead(PBase):
             code, out, err = self.gone_plain_delete(planted)
             if code != 2 or "stop %s" % WORKER not in err or self.writes() or len(self.sts_reads()) != 1 or '"deleted": true' in out:
                 problems.append("%s: exit %s, %d reads, %d writes" % (what, code, len(self.sts_reads()), len(self.writes())))
+                if self.stop_at_first_problem:
+                    break
         self.assertEqual(problems, [])
 
     def test_s17_the_22_answers_refuse_the_delete_of_a_worker_with_its_pod_gone(self):
@@ -1032,6 +1055,7 @@ class OneRead(PBase):
         self.assertEqual(len(self.sts_reads()), 1)
 
     def test_s17_mutant_the_delete_proceeding_on_a_non_exact_answer_fails_the_check(self):
+        self.stop_at_first_problem = True
         self.mod = mutant("                except CloudError:\n                    found = True\n", "                except CloudError:\n                    found = None\n")
         with self.assertRaises(AssertionError):
             self.check_delete_table()

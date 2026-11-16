@@ -25,6 +25,9 @@ class _LazySb:
 _sb = _LazySb()
 
 
+START_WAIT = float(os.environ.get("FLEET_TEST_START_WAIT", "5"))   # the inner run of S10's mutant shortens it: only the mutant waits it out
+
+
 def _made_up_pid():
     if os.environ.get("FLEET_TEST_INNER"):   # a scratch child: a number nobody holds, without loading the switchboard just for the helper
         pid = 4000000 + os.getpid() % 100000
@@ -110,8 +113,8 @@ class Rig:
                 if alive and os.environ.get("FLEET_TEST_SELFCLOCK") and not rig.started.wait(2):   # S12's copy has no progress thread: the fake child runs on its own clock
                     rig.now[0] = rig.began[0] + alive
                     return status
-                if alive and os.environ.get("FLEET_TEST_INNER") and not rig.started.wait(5):   # a guard against a hang, not a measure
-                    raise AssertionError("the progress thread did not start within 5 s")
+                if alive and os.environ.get("FLEET_TEST_INNER") and not rig.started.wait(START_WAIT):   # a guard against a hang, not a measure
+                    raise AssertionError("the progress thread did not start within %g s" % START_WAIT)
                 if alive and not rig.done.wait(30):
                     raise AssertionError("the fake child was never ended")
                 return status
@@ -289,12 +292,12 @@ class TestHeavyProgress(unittest.TestCase):
                 open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 with open(path, "w") as handle:
                     handle.write(copies[kind])
-                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1")
+                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", FLEET_TEST_START_WAIT="1.5")
                 results[kind] = subprocess.run([sys.executable, __file__, "TestHeavyProgress.test_s10_inner_s4_with_the_thread_start_awaited"], cwd=here, env=env,
                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
         self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
         self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
-        self.assertIn("the progress thread did not start within 5 s", results["mutant"].stdout)
+        self.assertIn("the progress thread did not start within 1.5 s", results["mutant"].stdout)
 
     def test_u1_a_run_that_ends_before_the_interval_prints_nothing_of_its_own(self):
         rig = Rig(self, alive=0, status=5)
@@ -415,7 +418,7 @@ class TestHeavyProgress(unittest.TestCase):
                 child = subprocess.Popen([sys.executable, __file__, "TestHeavyProgress.test_s14_inner_a_blocked_write_does_not_hold_the_return"], cwd=here, env=env,
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
                 try:
-                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "20")))   # the outer bound: only the mutant reaches it
+                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "6")))   # the outer bound: only the mutant reaches it
                     outcome[kind] = (child.returncode, output, False)
                 except subprocess.TimeoutExpired:
                     child.send_signal(signal.SIGUSR1)   # the job's kill notice: the child names the hang and ends

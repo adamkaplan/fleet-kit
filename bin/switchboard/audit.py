@@ -35,7 +35,7 @@ _AUDIT_TS = re.compile(rb'"ts": "([^"]+)"')
 
 
 class AuditLog:
-    """Append-only JSON lines. Never read by a decision; written before and after.
+    """Append-only JSON lines. Never read by a decision (the end notice reads its `push_watch.sent` lines for one display line, bin/cloud_end_alert.py push_reader); written before and after.
 
     Appenders open the file per write (O_APPEND) under a shared lock; a rotation archives the old part to
     `audit-<UTC date>.jsonl.gz` (0600, written to a temp file and renamed), then takes the lock exclusively for the swap only, carries what was
@@ -260,7 +260,7 @@ class github_write:
         number, self.subject = github_write_subject(repo, endpoint, number)
         self.audit, self.actor = audit, actor or "cli"
         self.detail = {"verb": str(verb).upper(), "endpoint": str(endpoint).split("?", 1)[0], "repo": repo, "number": number}
-        self.call = uuid.uuid4().hex[:12]
+        self.call = os.urandom(6).hex()   # not uuid4: the tests count uuid4 draws to make ids repeat (#2247), so a write's audit call id must not take one
         self.outcome = {}
         try:
             self.audit.append(self.actor, GITHUB_WRITE_EVENT, self.subject, self.detail, phase="intent", call=self.call)

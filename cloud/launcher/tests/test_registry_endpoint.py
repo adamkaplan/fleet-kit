@@ -268,7 +268,7 @@ class Mutants(unittest.TestCase):
          "    _registry_note(engine, \"retire\", state, args.name, reason)\n    try:\n        with Cluster() as cluster:\n            code, body, note = run_launcher(runner, \"stop\", args.name, extra, STOP_SECONDS, cluster=cluster)", "^(FAIL|ERROR): test_matches_a_failed_stop_leaves_the_row "),
     )
 
-    def run_tree(self, rel=None, old=None, new=None):
+    def run_tree(self, rel=None, old=None, new=None, only=None):
         """Run Behaviour in a scratch copy; with a mutation, it is asserted applied (counted). Returns (exit code, output, applied)."""
         with tempfile.TemporaryDirectory() as tmp:
             copy = Path(tmp) / "tree"
@@ -283,7 +283,7 @@ class Mutants(unittest.TestCase):
                 target.write_text(text.replace(old, new))
                 applied = target.read_text() != text and self.occurrences == 1
                 self.assertTrue(applied, "the mutation was not applied")
-            done = subprocess.run([sys.executable, "-m", "unittest", "test_registry_endpoint.Behaviour"], cwd=str(copy / "cloud/launcher/tests"),
+            done = subprocess.run([sys.executable, "-m", "unittest"] + (["-f", "test_registry_endpoint.Behaviour." + only] if only else ["-f", "test_registry_endpoint.Behaviour"]), cwd=str(copy / "cloud/launcher/tests"),
                                   env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
             return done.returncode, done.stderr, applied
 
@@ -306,7 +306,9 @@ class Mutants(unittest.TestCase):
         self.assertEqual(control_code, 0, "the control must pass first: " + control_output[-1500:])
         for label, rel, old, new, anchor in self.CASES:
             with self.subTest(label):
-                code, output, applied = self.run_tree(rel, old, new)
+                # a mutant is killed by its first failing check: run only the anchored test when the anchor names one, else stop at the first failure
+                names = re.search(r"\(FAIL\|ERROR\): (test_\w+)", anchor)
+                code, output, applied = self.run_tree(rel, old, new, only=names.group(1) if names else None)
                 named = bool(re.search(anchor, output, re.M))
                 _, mutant_failed = self.counts(output)
                 print("mutant %s: control passes %d of %d, mutant fails %d checks (exit %d), anchored check named %s, mutation applied %s (fragment occurs %d time in the original)"

@@ -88,7 +88,7 @@ def decisions_from_requests(engine, now):
         asked = _created(request)
         seen[key] = asked if asked is not None else engine.decision_seen.get(key, now)
         ask = _issue_of(observation.fleet)
-        tier = decision_core.request_tier(now, seen[key], grace, "%s:%s" % key in escalated)
+        tier = decision_core.request_tier(now, seen[key], grace, decision_core.is_escalated(decision_core.request_escalation_key(*key), escalated))
         items.append({"kind": kind, "title": "%s: %s" % (kind, what), "ask": ask,
                       "repo": _fleet_repo(observation.fleet, engine.config),
                       "agent": observation.name, "since": seen[key],

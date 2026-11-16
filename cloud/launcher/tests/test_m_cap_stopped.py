@@ -50,23 +50,25 @@ class Stopped(base.Cap):
 
 class TestScenarios(Stopped):
     def test_s2_three_stopped_of_four_count_one_and_the_launch_goes(self):
-        for n in range(1, 5):
+        cap = base.CAP
+        for n in range(1, cap + 1):
             self.put("coder%d" % n)
-        self.write_audit(*[self.line("coder%d" % n, "create") for n in range(1, 5)], *[self.line("coder%d" % n, "stop") for n in range(1, 4)])
+        self.write_audit(*[self.line("coder%d" % n, "create") for n in range(1, cap + 1)], *[self.line("coder%d" % n, "stop") for n in range(1, 4)])
         held = self.count()
-        code, out, err = self.ask("coder5")
-        print("S2: counted %d of 1, launch exit %d" % (len(held), code))
-        self.assertEqual(held, ["coder4"], ANCHOR)
+        code, out, err = self.ask("extra1")
+        print("S2: counted %d of %d, launch exit %d" % (len(held), cap - 3, code))
+        self.assertEqual(sorted(held), sorted("coder%d" % n for n in range(4, cap + 1)), ANCHOR)
         self.assertEqual(code, 0, err)
 
     def test_s3_four_running_count_four_and_the_fifth_is_refused(self):
-        for n in range(1, 5):
+        cap = base.CAP
+        for n in range(1, cap + 1):
             self.put("coder%d" % n)
-        self.write_audit(*[self.line("coder%d" % n, "create") for n in range(1, 5)])
+        self.write_audit(*[self.line("coder%d" % n, "create") for n in range(1, cap + 1)])
         held = self.count()
-        code, out, err = self.ask("coder5")
-        print("S3: counted %d of 4, launch exit %d" % (len(held), code))
-        self.assertEqual(len(held), 4)
+        code, out, err = self.ask("extra1")
+        print("S3: counted %d of %d, launch exit %d" % (len(held), cap, code))
+        self.assertEqual(len(held), cap)
         self.assertEqual(code, 2, err)
 
     def test_s4_an_unreadable_stop_record_counts(self):

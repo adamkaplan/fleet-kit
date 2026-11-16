@@ -76,6 +76,12 @@ class Mint(w.Wired):
         self.sig = file_with(d, "sign.sh", "#!/bin/sh\nprintf sig\n")
         self.said = file_with(d, "said.txt", "", 0o644)
         self.fail_vault = file_with(d, "vault.sh", "#!/bin/sh\ncat %s >&2\nexit 1\n" % self.said)
+        # a passing failure (a 500) is retried after the mint's own real waits (2+5+10 s) in the preflight child; run the same program with that one wait faked
+        # (test_mint_retry covers the waits themselves): every label, line and exit status is the program's own
+        wrapper = ("import sys; sys.path.insert(0, %r); import preflight; preflight._sleep = lambda seconds: None; sys.exit(preflight.main(sys.argv[1:]))" % LAUNCHER)
+        fast = mock.patch.object(w.cw, "PREFLIGHT_ARGV", [os.path.realpath(sys.executable), "-I", "-S", "-c", wrapper])
+        fast.start()
+        self.addCleanup(fast.stop)
 
     def mint_env(self, **kw):
         env = {"CW_APP_ID_CMD": "echo 12345", "CW_APP_KEY_CMD": "echo key", "CW_OPENSSL": self.sig,

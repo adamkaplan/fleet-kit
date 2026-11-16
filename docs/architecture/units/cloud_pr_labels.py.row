@@ -1,0 +1,1 @@
+| `cloud_pr_labels.py` | 5 | the `--pr-label` option of the cloud launch (#2269): the create options and the worker record key `pr_labels`; a part of `cloud_worker.py` | |

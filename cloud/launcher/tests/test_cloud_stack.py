@@ -272,6 +272,21 @@ class FreshNodeRace(Base):
         self.stack("--stack", "--wait", "10", code=cw.EXIT_TIMEOUT)
         self.assertEqual(len([o for o in self.st()["applied"] if o["kind"] == "Pod"]), 1)
 
+    def test_a_forbidden_events_list_does_not_fail_the_stack_create(self):   # kills: no try/except around pod_events in _raise_on_race
+        self.patch_state(never_ready=True)
+        calls = []
+        def forbidden(kube, name):
+            calls.append(name)
+            raise cw.CloudError('Error from server (Forbidden): events is forbidden: User "system:serviceaccount:cw:cw-operator" cannot list resource "events" in namespace "cw"')
+        real = cw.Kube.pod_events
+        cw.Kube.pod_events = forbidden
+        try:
+            self.stack("--stack", "--wait", "10", code=cw.EXIT_TIMEOUT)   # waits as before, no crash on the events
+        finally:
+            cw.Kube.pod_events = real
+        self.assertTrue(calls)
+        self.assertEqual(len([o for o in self.st()["applied"] if o["kind"] == "Pod"]), 1)
+
     def test_the_default_create_never_watches(self):
         self.stack()
         self.assertEqual(self.calls("events"), [])

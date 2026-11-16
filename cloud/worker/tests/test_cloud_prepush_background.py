@@ -128,8 +128,8 @@ class Base(unittest.TestCase):
 @unittest.skipIf(UNDER_MUTANT, "run on the script under test only")
 class Foreground(Base):
     def test_s2_the_foreground_run_cannot_finish_a_file_longer_than_its_bound(self):
-        repo = self.repo(3)
-        p = tp.run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "2"})
+        repo = self.repo(1.5)
+        p = tp.run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "1"})
         lines = [l for l in p.stdout.splitlines() if l.startswith("COULD NOT RUN")]
         self.assertEqual(len(lines), 1, p.stdout)
         self.assertIn("timed out after", lines[0])
@@ -139,7 +139,7 @@ class Foreground(Base):
 
 class Background(Base):
     def test_s3_s4_start_returns_at_once_and_the_run_finishes_after_the_starter_and_its_group_end(self):
-        repo = self.repo(3)
+        repo = self.repo(2)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "20"})
         path_printed = sum(1 for l in out.splitlines() if l.endswith("result.json") and os.path.join(result, "") in l)
         pid = self.wait(result, lambda d: d["pid"] > 0)["pid"]
@@ -153,7 +153,7 @@ class Background(Base):
             os.killpg(p.pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        d = self.wait(result, lambda d: d["status"] == "finished", 40)
+        d = self.wait(result, lambda d: d["status"] == "finished", 20)
         done = [f for f in d["files"] if f["branch"] != "not started" and f["base"] != "not started" and f["branch_seconds"] is not None]
         self.assertEqual(len(done), 3, d)
         tally("finished")
@@ -163,19 +163,19 @@ class Background(Base):
 
     @unittest.skipIf(UNDER_MUTANT, "S5 compares two runs")
     def test_s5_a_file_longer_than_the_foreground_bound_passes_in_the_background_run(self):
-        repo = self.repo(3)
-        fg = tp.run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "2"})
+        repo = self.repo(1.5)
+        fg = tp.run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "1"})
         nofg = sum(1 for l in fg.stdout.splitlines() if l.startswith("COULD NOT RUN") and "test_b_slow" in l)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "20"})
         d = self.finished(result)
         slow = [f for f in d["files"] if f["file"].endswith("test_b_slow.py")][0]
         self.assertEqual((slow["branch"], slow["base"]), ("pass", "pass"))
-        self.assertGreaterEqual(slow["branch_seconds"], 2.5)
+        self.assertGreaterEqual(slow["branch_seconds"], 1.2)
         print("S5: background passed 1, foreground could not run %d" % nofg, file=sys.stderr)
         self.assertEqual(nofg, 1)
 
     def test_s6_a_failing_file_is_named_with_its_result(self):
-        repo = self.repo(1)
+        repo = self.repo(0.1)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "20"})
         d = self.finished(result)
         fail = [f for f in d["files"] if f["file"].endswith("test_c_fail.py")]
@@ -187,9 +187,9 @@ class Background(Base):
         self.assertIn("cloud-prepush: run 3, identical: 2", r.stdout)
 
     def test_s7_a_run_in_progress_is_reported_as_running_and_never_as_passed(self):
-        repo = self.repo(6)
+        repo = self.repo(2.5)
         p, took, result, installed, out = self.start_background(repo, {"CLOUD_PREPUSH_TIMEOUT": "30"})
-        d = self.wait(result, lambda d: any(f["file"].endswith("test_b_slow.py") and "running" in (f["branch"], f["base"]) for f in d["files"]), 25)
+        d = self.wait(result, lambda d: any(f["file"].endswith("test_b_slow.py") and "running" in (f["branch"], f["base"]) for f in d["files"]), 12)
         r = self.read(installed, result, repo)
         running = [l for l in r.stdout.splitlines() if l.startswith("RUNNING ") and "test_b_slow" in l]
         d = self.doc(result)

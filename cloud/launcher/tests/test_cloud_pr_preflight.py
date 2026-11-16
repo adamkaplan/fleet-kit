@@ -185,10 +185,11 @@ class Signals(unittest.TestCase):
         self.addCleanup(self.r.close)
         self.r.put("cloud/launcher/tests/test_a.py", SLEEP); self.r.commit("sleepy")
 
-    def go(self, sig, script=SCRIPT):
+    def go(self, sig, script=SCRIPT, ignored=False):
         before = set(os.listdir(tempfile.gettempdir()))
         e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main")
-        p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             preexec_fn=(lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)) if ignored else None)
         for _ in range(100):
             if leftovers(before):
                 break
@@ -217,6 +218,11 @@ class Signals(unittest.TestCase):
         rc, left = self.go(signal.SIGINT)
         self.assertNotEqual(rc, 0)
         self.assertEqual(left, [])
+
+    def test_sigint_cleans_up_when_inherited_as_ignored(self):
+        # a process started in the background by a non-interactive shell inherits SIGINT as ignored (ask #2387)
+        rc, left = self.go(signal.SIGINT, ignored=True)
+        self.assertEqual((rc, left), (130, []))
 
     def test_mutant_without_handlers_leaks(self):
         m = mutant("signal.signal(sg, _on_signal)", "pass"); self.addCleanup(os.remove, m)

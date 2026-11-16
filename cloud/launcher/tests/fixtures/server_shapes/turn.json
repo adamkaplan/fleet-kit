@@ -1,0 +1,156 @@
+{
+ "_note": "Shapes recorded from a live OpenCode v2.2.7 server (GET /api/session/active, /api/session, /api/session/<id>/message?limit=1&order=desc&type=assistant); content and ids replaced by neutral text. The idle message has no live capture in the recording pod (its session was running): its shape is the server's own /openapi.json schema Session.Message.Idle (id, time.created, type, outcome, optional error).",
+ "active_none": {
+  "data": {}
+ },
+ "active_running": {
+  "data": {
+   "ses_example0001": {
+    "type": "running"
+   }
+  }
+ },
+ "assistant_in_flight": {
+  "agent": "worker",
+  "content": [
+   {
+    "text": "neutral example text",
+    "type": "text"
+   }
+  ],
+  "id": "msg_example0001",
+  "model": {
+   "id": "claude-sonnet-5.5",
+   "providerID": "github-copilot",
+   "variant": "medium"
+  },
+  "time": {
+   "created": 1794451865389,
+   "streamed": 1794451869626
+  },
+  "type": "assistant"
+ },
+ "assistant_stop": {
+  "agent": "worker",
+  "content": [
+   {
+    "text": "neutral example text",
+    "type": "text"
+   }
+  ],
+  "cost": 0.0204185,
+  "finish": "stop",
+  "id": "msg_example0002",
+  "model": {
+   "id": "claude-sonnet-5.5",
+   "providerID": "github-copilot",
+   "variant": "medium"
+  },
+  "rawFinish": "end_turn",
+  "time": {
+   "completed": 1794451865332,
+   "created": 1794451857042,
+   "streamed": 1794451865284
+  },
+  "tokens": {
+   "cache": {
+    "read": 70345,
+    "write": 2899
+   },
+   "input": 2,
+   "output": 1221,
+   "reasoning": 117
+  },
+  "type": "assistant"
+ },
+ "assistant_tool_calls": {
+  "agent": "worker",
+  "content": [
+   {
+    "text": "neutral example text",
+    "type": "text"
+   }
+  ],
+  "cost": 0.0204185,
+  "finish": "tool-calls",
+  "id": "msg_example0003",
+  "model": {
+   "id": "claude-sonnet-5.5",
+   "providerID": "github-copilot",
+   "variant": "medium"
+  },
+  "rawFinish": "tool_use",
+  "time": {
+   "completed": 1794451865332,
+   "created": 1794451857042,
+   "streamed": 1794451865284
+  },
+  "tokens": {
+   "cache": {
+    "read": 70345,
+    "write": 2899
+   },
+   "input": 2,
+   "output": 1221,
+   "reasoning": 117
+  },
+  "type": "assistant"
+ },
+ "idle_failed": {
+  "error": {
+   "message": "neutral example error",
+   "name": "example"
+  },
+  "id": "msg_example0004",
+  "outcome": "failed",
+  "time": {
+   "created": 1794451862042
+  },
+  "type": "idle"
+ },
+ "idle_interrupted": {
+  "id": "msg_example0005",
+  "outcome": "interrupted",
+  "time": {
+   "created": 1794451862042
+  },
+  "type": "idle"
+ },
+ "idle_succeeded": {
+  "id": "msg_example0006",
+  "outcome": "succeeded",
+  "time": {
+   "created": 1794451862042
+  },
+  "type": "idle"
+ },
+ "session": {
+  "agent": "worker",
+  "cost": 0.2280684,
+  "id": "ses_example0001",
+  "location": {
+   "directory": "/work"
+  },
+  "metadata": {},
+  "model": {
+   "id": "claude-sonnet-5.5",
+   "providerID": "github-copilot",
+   "variant": "medium"
+  },
+  "projectID": "example",
+  "time": {
+   "created": 1794451723934,
+   "updated": 1794451866033
+  },
+  "title": "example",
+  "tokens": {
+   "cache": {
+    "read": 799184,
+    "write": 64193
+   },
+   "input": 40,
+   "output": 10857,
+   "reasoning": 3950
+  }
+ }
+}

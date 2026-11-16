@@ -47,6 +47,8 @@ import urllib.parse
 from unittest import mock
 import datetime  # noqa: E402  (this section's only import)
 from support.core import Base, FakeRunner
+from support.orders_and_adapters import FakeGhPr
+from support.herdr_world import World
 from support.fake_hubs import WaitingInputs
 from support.fake_jev import FakeJev, JEV_SETTINGS, KEY_VALUE, confident
 from support.installs_and_keys import InstallCase, KeyCase, PR16_KEY
@@ -752,9 +754,6 @@ class TestCaptainLabels(Base):
     def labels(self, *kinds):
         return ["%s:%s" % (self.U, k) for k in kinds]
 
-    def window(self, until):
-        return mock.patch.object(sb, "CAPTAIN_MARKER_UNTIL", until)
-
     def test_the_label_makes_a_pr_captain_with_no_first_line_at_all(self):
         self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "Adds the widget."}))
         self.assertTrue(sb.is_captain({"labels": [{"name": self.labels("merge-captain")[0]}], "body": None}))   # label dicts too
@@ -762,26 +761,17 @@ class TestCaptainLabels(Base):
         self.assertFalse(sb.is_captain({"labels": ["bug", "merge-captain-ish", "x:merge-captain-not"], "body": "x"}))
         self.assertFalse(sb.is_captain(None))
 
-    def test_the_first_line_marker_counts_only_inside_the_dated_window_and_only_without_a_merge_label(self):
-        pr = {"labels": [], "body": "\n\nMERGE: captain\nrest"}
-        end = datetime.datetime.strptime(sb.CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() + 86400
-        self.assertTrue(sb.is_captain(pr, now=end - 60))                      # the last minute of the window
-        self.assertFalse(sb.is_captain(pr, now=end + 60))                     # the day after: the line is no longer read
-        with self.window(None):                                               # the one-line way to drop the marker
-            self.assertFalse(sb.is_captain(pr))
-            self.assertTrue(sb.is_captain(dict(pr, labels=self.labels("merge-captain"))))
-        for body in ("see MERGE: captain", "intro\nMERGE: captain", "MERGE: captainship", "merge: captain"):
-            self.assertFalse(sb.is_captain({"labels": [], "body": body}, now=end - 60), body)
+    def test_the_first_line_marker_holds_nothing_the_label_is_the_only_signal(self):
+        for body in ("\n\nMERGE: captain\nrest", "MERGE: captain", "see MERGE: captain", "intro\nMERGE: captain", "MERGE: captainship", "merge: captain"):
+            self.assertFalse(sb.is_captain({"labels": [], "body": body}), body)
+        self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "no line at all"}))
+        self.assertFalse(sb.is_captain({"labels": self.labels("merge-automatic"), "body": "MERGE: captain\nx"}))
 
-    def test_the_window_ends_30_days_after_the_labels_landed_on_2026_10_11(self):
-        self.assertEqual(sb.CAPTAIN_MARKER_UNTIL, "2026-11-10")           # what the definitions tell agents and the owner approved
-        landed = datetime.datetime(2026, 10, 11, tzinfo=datetime.timezone.utc)
-        end = datetime.datetime.strptime(sb.CAPTAIN_MARKER_UNTIL, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
-        self.assertEqual((end - landed).days, 30)
-        pr = {"labels": [], "body": "MERGE: captain\nx"}
-        day = lambda y, m, d, h=12: datetime.datetime(y, m, d, h, tzinfo=datetime.timezone.utc).timestamp()
-        self.assertTrue(sb.is_captain(pr, now=day(2026, 11, 10)))          # the last day still reads the line
-        self.assertFalse(sb.is_captain(pr, now=day(2026, 11, 11, 1)))      # the day after it does not
+    def test_the_held_rule_reads_no_clock_and_no_date(self):
+        for now in (0, 1767225600, 4102444800):   # before and after the old window's end: one answer
+            with mock.patch.object(sb.time, "time", return_value=now):
+                self.assertFalse(sb.is_captain({"labels": [], "body": "MERGE: captain\nx"}))
+                self.assertTrue(sb.is_captain({"labels": self.labels("merge-captain"), "body": "x"}))
 
     def test_the_label_wins_when_it_disagrees_with_the_line(self):
         auto = {"labels": self.labels("merge-automatic"), "body": "MERGE: captain\nx"}
@@ -795,12 +785,15 @@ class TestCaptainLabels(Base):
         agree = sb.pr_marker_state(self.labels("merge-captain"), "MERGE: captain\nx")
         self.assertEqual((agree["captain"], agree["findings"]), (True, []))
         line_only = sb.pr_marker_state([], "MERGE: captain\nx")
-        self.assertEqual((line_only["captain"], line_only["findings"]), (True, ["marker-without-label"]))
+        self.assertEqual((line_only["captain"], line_only["findings"]), (False, ["marker-without-label"]))   # a note: the line is ignored, nothing is held
 
     def test_hold_reasons_come_from_the_hold_labels_only_and_sorted(self):
         self.assertEqual(sb.pr_hold_reasons(self.labels("hold-security", "merge-captain", "hold-contract", "hold-other-area")),
                          ["contract", "other-area", "security"])
         self.assertEqual(sb.pr_hold_reasons(["bug", None, 5]), [])
+        self.assertEqual(sb.pr_hold_reasons(set(self.labels("hold-security"))), ["security"])   # a set of names reads like a list
+        self.assertTrue(sb.is_captain({"labels": set(self.labels("merge-captain")), "body": ""}))
+        self.assertEqual(sb.pr_hold_reasons("tester:hold-security"), [])   # a bare string is not a collection of labels
         self.assertEqual(sb.pr_hold_reasons(self.labels("hold-impact", "merge-captain")), ["impact"])   # #179 L4: the same held-PR label set
         self.assertTrue(sb.pr_marker_state(self.labels("merge-captain", "hold-impact"), "")["captain"])
 
@@ -811,13 +804,66 @@ class TestCaptainLabels(Base):
         self.assertEqual((facts["captain"], facts["holds"], facts["captain_findings"]), (True, ["credential"], []))
         self.assertIn("labels", sb.PR_VIEW_FIELDS)
         old = sb.pr_facts_from(dict(data, labels=[], body="MERGE: captain\nx"))
-        self.assertEqual((old["captain"], old["captain_findings"]), (True, ["marker-without-label"]))     # still works in the window
+        self.assertEqual((old["captain"], old["captain_findings"]), (False, ["marker-without-label"]))     # the line alone holds nothing; the finding notes it
         self.assertFalse(sb.pr_facts_from(dict(data, labels=[], body="plain"))["captain"])
 
-    def test_every_caller_reads_the_one_helper(self):
-        text = switchboard_source()
-        callers = [l for l in text.splitlines() if "pr_is_captain(" in l and not l.lstrip().startswith(("def ", "return pr_marker"))]
-        self.assertEqual(callers, [], "a caller still reads the first line alone: %r" % callers)
+    def test_labels_that_cannot_be_read_are_not_a_pr_that_is_not_held(self):
+        data = dict(json.loads(pr_view_json()), body="MERGE: captain\nx")
+        for labels in (None, "merge-captain", 5):
+            self.assertIsNone(sb.pr_facts_from(dict(data, labels=labels))["captain"], labels)
+        self.assertIsNone(sb.pr_facts_from({k: v for k, v in data.items() if k != "labels"})["captain"])
+        self.assertFalse(sb.pr_facts_from(dict(data, labels=[]))["captain"])
+
+    def test_g6_is_not_open_when_the_labels_could_not_be_read(self):
+        facts = {"head": "a" * 40, "ci": "green", "captain": None, "captain_findings": [], "body": "plain", "floor": {"decision": "none"}}
+        gate = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6")
+        self.assertEqual(gate(facts)["status"], "waiting")
+        self.assertIn("labels could not be read", " ".join(gate(facts)["missing"]))
+        self.assertEqual(gate({k: v for k, v in facts.items() if k != "captain"})["status"], "waiting")   # an absent fact is not "not held" either
+        self.assertEqual(gate(dict(facts, captain=False, holds=["hold"]))["status"], "ok")   # G6 reads the merge-captain label only; a hold label is G6b's input
+        g6b = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6b")
+        self.assertEqual(g6b(facts)["status"], "missing")   # unreadable labels do not skip the held-PR body check (no `held_check` on these facts: fails closed)
+        self.assertEqual(g6b({k: v for k, v in facts.items() if k != "captain"})["status"], "missing")   # nor does an absent fact
+        self.assertEqual(g6b(dict(facts, held_check=lambda: []))["status"], "ok")
+        self.assertEqual(g6b(dict(facts, captain=False))["status"], "n/a")
+        self.assertEqual(gate(dict(facts, captain=False))["status"], "ok")   # control: readable and not held passes
+
+
+class TestUnreadableLabelsAreNotNotHeld(Base):
+    """(#2379) a pull request whose labels could not be read is not a pull request that is not held: the real notice reader and the real escalate path."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+
+    def unread_labels_pr(self, number=50):
+        """A noticed pull request whose `gh pr view` answer has no readable `labels` (captain None), through the real readers."""
+        sb.record_pr_notice(self.world.state, "acme/api", number, "platform", "", self.world.clock.now())
+        self.engine.gh_runner = FakeGhPr({number: (0, json.dumps({k: v for k, v in json.loads(pr_view_json(headRefOid="c" * 40, body="MERGE: captain\nx")).items() if k != "labels"}), "")})
+        return self.engine.gh_runner
+
+    def test_unreadable_labels_keep_the_notice_a_captain_row_marked_unreadable(self):
+        self.unread_labels_pr()
+        entries, _errors = sb.decisions_from_notices(self.engine, self.world.clock.now())
+        row = [e for e in entries if e.get("number") == 50]
+        self.assertEqual([e["kind"] for e in row], ["captain"])   # never a plain notice that loses a possible hold
+        self.assertIn("labels could not be read", row[0]["review_evidence"])
+
+    def test_a_pr_with_readable_labels_and_no_hold_stays_a_plain_notice(self):   # the control: the readable-empty case
+        sb.record_pr_notice(self.world.state, "acme/api", 51, "platform", "", self.world.clock.now())
+        self.engine.gh_runner = FakeGhPr({51: (0, pr_view_json(headRefOid="c" * 40, labels=[]), "")})
+        entries, _errors = sb.decisions_from_notices(self.engine, self.world.clock.now())
+        self.assertEqual([e["kind"] for e in entries if e.get("number") == 51], ["notice"])
+
+    def test_escalating_a_notice_whose_labels_are_unreadable_says_so_and_is_not_information_only(self):
+        runner = self.unread_labels_pr()
+        decision = {"id": "pr:api#50", "kind": "notice", "tier": "human", "repo": "acme/api", "number": 50}
+        with self.assertRaises(sb.DecisionReadError) as caught:
+            sb.escalate_notice(self.engine, runner, decision, None, "cos")
+        self.assertIn("labels", str(caught.exception))
+        self.assertNotIn("information only", str(caught.exception))
 
 
 class TestLedgerReadRace(unittest.TestCase):
@@ -2103,3 +2149,82 @@ class TestEndTickWithoutStateDirectory(unittest.TestCase):
         engine = types.SimpleNamespace(audit=None, actor="daemon", now=time.time)
         self.assertFalse(hasattr(engine, "state_dir"))
         self.assertEqual(sb.cloud_end_tick(engine, None), [])
+
+
+class TestUnreadLabelsAreNotAHeldReading(Base):
+    """(#2379) The labels of a pull request that could not be read are not "not held". The REAL sweep board (`sweep_gate_reading` over the real
+    `_ledger_context` and `pr_picture`; only gh, the gate evaluation and the who-clears answer are faked) says so, and `pr-explain --check` keeps
+    the held-body defects for such a pull request."""
+    HEAD = "c" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+        self.board = {"gates": [{"gate": "G6", "status": "open"}], "ready": False}
+
+    def reading(self, labels):
+        """sweep_gate_reading of acme/api#600 whose `gh pr view` answers with this `labels` value (an absent key when it is the string "absent")."""
+        pr = dict(json.loads(pr_view_json(headRefOid=self.HEAD, body="no plan line here\n")), labels=labels)
+        if labels == "absent":
+            del pr["labels"]
+
+        def gh(args, **kw):
+            assert args[1:3] == ["pr", "view"], "only the read of the pull request: %r" % (args,)
+            return subprocess.CompletedProcess(args, 0, json.dumps(pr), "")
+        self.engine.gh_runner = gh
+        stack = contextlib.ExitStack()
+        who = {"who": "owner only", "floor_ids": [], "owner_only": [{"why": "x"}], "threshold": None, "min_rating": None}
+        for name, value in (("enforced_gates_of", lambda c: ["G6"]), ("clear_who", lambda *a, **k: who)):
+            stack.enter_context(mock.patch.object(sb, name, value))
+        stack.enter_context(mock.patch.object(sb.plan_ledger, "evaluate_gates", lambda *a, **k: self.board))
+        with stack:
+            return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+
+    def test_the_sweep_board_does_not_read_a_pull_request_whose_labels_could_not_be_read(self):
+        for labels in (None, "absent", "merge-captain"):   # null, no key, and a value that is not a list
+            with self.subTest(labels=labels):
+                self.assertEqual(self.reading(labels), (None, None, None, "the labels could not be read"))
+
+    def test_the_sweep_board_reads_a_pull_request_whose_labels_were_read_even_when_there_are_none(self):
+        opened, head, who, why = self.reading([])   # the control: readable labels, none of them a hold
+        self.assertEqual((opened, head, why), (["G6"], self.HEAD, None))
+        self.assertIn("Who can clear", who)
+        opened, head, who, why = self.reading([{"name": "me:merge-captain"}])
+        self.assertEqual((opened, head, why), (["G6"], self.HEAD, None))
+
+    def test_pr_explain_check_keeps_the_held_body_defects_when_the_labels_are_unreadable(self):
+        body = "PLAN: https://example.test/acme/api/issues/9\n\n" + sb.explainer_block("old", "new") + "\nNothing here is a held top.\n"
+        self.assertTrue(sb.held_defects(body), "the body has no held sections")
+        got = {}
+        for name, labels in (("none", None), ("missing", "absent"), ("empty", []), ("captain", [{"name": "me:merge-captain"}])):
+            got[name] = self.check(body, labels)
+        for name in ("none", "missing", "captain"):
+            self.assertEqual(got[name][0], 1, name)
+            for defect in sb.held_defects(body):
+                self.assertIn("DEFECT: %s" % defect, got[name][1], name)
+        self.assertEqual(got["empty"], (0, "explainer: PASS\n"), "readable labels with no hold: a body that is not held is not judged as held")
+
+    def check(self, body, labels):
+        pr = dict(json.loads(pr_view_json(body=body)), labels=labels, files=[])
+        if labels == "absent":
+            del pr["labels"]
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+        def route(args, **kw):
+            if args[0] == FAKE_GH or args[0].endswith("gh"):
+                assert args[1:3] == ["pr", "view"], "pr-explain only reads: %r" % (args,)
+                return subprocess.CompletedProcess(args, 0, json.dumps(pr), "")
+            return self.world.route(args, **kw)
+        with captured() as (out, err):
+            code = sb.main(["pr-explain", "acme/api#7", "--check"], runner=route, now=self.world.clock.now)
+        return code, out.getvalue()
+
+    def test_two_merge_labels_are_held_and_disagree(self):
+        names = [{"name": "me:merge-captain"}, {"name": "me:merge-automatic"}]
+        state = sb.pr_marker_state(names, "x")
+        self.assertEqual((state["captain"], state["findings"]), (True, ["disagree"]))
+        self.assertTrue(sb.is_captain({"labels": names, "body": "x"}))
+        one = sb.pr_marker_state(names[:1], "x")   # the control: the one merge label alone does not disagree
+        self.assertEqual((one["captain"], one["findings"]), (True, []))

@@ -32,9 +32,7 @@ SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
 HOST_URL = "https://github.com/"
 HELPER_DIR = "/run/cw-tmp/bin"   # the directory entrypoint.sh fills ($TMP/bin, TMP=/run/cw-tmp); the helper is git-credential-cw in it
 HELPER_NAME = "git-credential-cw"
-# git is run by ABSOLUTE path, never found on PATH: in a pod the guard wrapper ($TMP/bin/git, first on the entrypoint's PATH) refuses the
-# hook's own calls (a global-configuration override variable in the environment) and would make every pre-stop push fail. The wrapper itself execs the real
-# binary the image installs (cloud/worker/entrypoint.sh: CW_REAL_GIT, found before the wrapper exists); the image's git package puts
+# git is run by ABSOLUTE path, never found on PATH, so nothing first on the pod's PATH can stand in for it; the image's git package puts
 # it at /usr/bin/git. Test seam: the tests patch GIT_BIN like the two constants above.
 GIT_CANDIDATES = ("/usr/bin/git", "/usr/local/bin/git")
 
@@ -346,6 +344,9 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped, "head_on": head_branch(contained), **extra}
     branch = "%s/wip" % worker
+    if prestop and ff_over_snapshots(workdir, worker, url, ctx):   # #2304: a running save made wip not an ancestor of HEAD: push a fast-forward instead
+        return {"pushed": True, "wip_branch": branch, "skipped": skipped, **extra}
+    # (#2437: ff_over_snapshots above is the one lease push of the pre-stop path, to this one reference)
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
         git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
@@ -420,6 +421,41 @@ def pr_note(workdir, res, hub=None, comment=None):
         return "PR #%s marked ready, no review comment is configured" % number
     except Exception as e:
         return "PR not marked ready: the call failed (%s)" % type(e).__name__
+
+
+MADE_MAX = 100
+MADE_REFLOG = re.compile(r"commit\b|cherry-pick\b(?!: fast-forward)|rebase \((pick|continue|squash|fixup|reword|edit)\)|merge .*: Merge made|pull\b.*(\((pick|continue|squash|fixup|reword|edit)\)|: Merge made)")   # a reflog subject of a commit this clone CREATED (a fast-forward or a fetch is not)
+
+
+def made_commits(workdir, ctx=None):
+    """Ask #2470: the full shas of the commits the pod itself created in this clone (newest first, at most MADE_MAX): the commits named by `commit`, `cherry-pick`,
+    `rebase` and `merge ... Merge made` entries of the reflog of HEAD and of every local branch. The end notice names a remote branch as the pod's when its tip is one of them.
+    None when git cannot say (the notice then cannot call it `nothing pushed`). Local only, never raises."""
+    def entries(ref):
+        p = git(workdir, "reflog", "show", "--format=%H\t%gs", ref, "--", check=False, ctx=ctx)
+        if p.returncode != 0:
+            raise RuntimeError("reflog")
+        for line in p.stdout.splitlines():
+            sha, _, subject = line.partition("\t")
+            if re.fullmatch(r"[0-9a-f]{40}", sha) and MADE_REFLOG.match(subject):
+                yield sha
+    try:
+        refs = ["HEAD"] + git(workdir, "for-each-ref", "--format=%(refname)", "refs/heads", ctx=ctx).stdout.split()
+        made = []
+        for ref in refs[:200]:
+            for sha in entries(ref):
+                if sha not in made:
+                    made.append(sha)
+        return made[:MADE_MAX]
+    except Exception:
+        return None
+
+
+def with_made(workdir, res):
+    """The hook's answer with `made` added (see made_commits); a checkout-less answer gets none."""
+    if isinstance(res, dict) and not res.get("no_repository"):
+        res["made"] = made_commits(workdir)
+    return res
 
 
 def with_pr(workdir, res, hub=None, comment=None):
@@ -526,7 +562,405 @@ def prestop_main():
         ctx.close()
 
 
+# ---- the wip save (ask #2304): the reaper's save of a RUNNING pod's work to <worker>/wip, by exec: the launcher ships this file on stdin to `python3 -I - --snapshot` ----
+SNAP_SAVED_FILE = "cw-wip-saved"   # inside .git: the tree hash of the last save (never the branch, the index or a file of the tree)
+MAX_SNAPSHOT_FILE = 50 * 1024 * 1024   # a bigger file is left out of a running save (it is read whole)
+SNAP_IDENT = ["-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid"]
+
+
+def _gitb(workdir, ctx, *args, data=None):
+    """One pinned git call in bytes (names are not always UTF-8); a failure raises RuntimeError with the last line of its stderr."""
+    p = subprocess.run([GIT_BIN, "-C", workdir] + ctx.opts + list(args), input=data, capture_output=True, env=ctx.env)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr.decode("utf-8", "replace").strip().splitlines() or ["git %s failed" % args[0]])[-1])
+    return p.stdout
+
+
+def _read_nofollow(root, rel):
+    """(kind, bytes) of a path below `root`, never following a link: every directory on the way and the file are opened with O_NOFOLLOW from the
+    previous directory's descriptor. kind is 'file', 'exec', 'link' or None (missing). A link on the way, a non-regular file or an unreadable one raises OSError."""
+    parts = rel.split(b"/")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in parts[:-1]:
+            nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        name = parts[-1]
+        try:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None, b""
+        if stat.S_ISLNK(st.st_mode):
+            return "link", os.fsencode(os.readlink(name, dir_fd=fd))
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        try:
+            if not stat.S_ISREG(os.fstat(f).st_mode):
+                raise OSError("not a regular file")
+            if os.fstat(f).st_size > MAX_SNAPSHOT_FILE:
+                raise OSError("a file over the size cap")
+            with os.fdopen(f, "rb", closefd=False) as fh:
+                data = fh.read(MAX_SNAPSHOT_FILE + 1)
+            if len(data) > MAX_SNAPSHOT_FILE:
+                raise OSError("a file over the size cap")
+        finally:
+            os.close(f)
+        return ("exec" if st.st_mode & 0o100 else "file"), data
+    finally:
+        os.close(fd)
+
+
+def stage_paths(workdir, paths, ctx):
+    """Put the working-tree state of `paths` (bytes) into the index copy WITHOUT any filter and without trusting a name: each file is read by
+    _read_nofollow, hashed in Python, and written by `git hash-object -w --no-filters --stdin` only when it differs from the index entry; update-index
+    --index-info records it (a missing path is removed). A path that cannot be read (a link on the way, a special file, an error) is left as it is. A name with a newline is left out."""
+    import hashlib
+    entries = {}
+    for rec in _gitb(workdir, ctx, "ls-files", "-s", "-z").split(b"\0"):
+        meta, _, name = rec.partition(b"\t")
+        if name:
+            entries[name] = tuple(meta.split()[:2])
+    lines = []
+    for rel in paths:
+        if b"\n" in rel or not rel or rel.startswith(b"/") or b".." in rel.split(b"/"):
+            continue
+        try:
+            kind, data = _read_nofollow(os.fsencode(workdir), rel)
+        except OSError:
+            continue
+        if kind is None:
+            if rel in entries:
+                lines.append(b"0 " + b"0" * 40 + b"\t" + rel + b"\0")
+            continue
+        mode = {"file": b"100644", "exec": b"100755", "link": b"120000"}[kind]
+        if entries.get(rel) == (mode, hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()):
+            continue
+        try:
+            sha = _gitb(workdir, ctx, "hash-object", "-w", "--no-filters", "--stdin", data=data).strip()
+        except RuntimeError:
+            continue   # one file that cannot be hashed does not stop the save
+        lines.append(mode + b" " + sha + b"\t" + rel + b"\0")
+    if lines:
+        _gitb(workdir, ctx, "update-index", "-z", "--add", "--index-info", data=b"".join(lines))
+
+
+def net_repo(parent, workdir, ctx):
+    """A private bare repository for the calls that reach the network (ls-remote, fetch, commit-tree over the fetched head, push): it has NO configuration of
+    its own (the pod's .git/config, which the agent may edit while a save runs, is never read by a network call) and reads the pod's objects through
+    an alternates file. Returns its path."""
+    net = os.path.join(parent, "net")
+    git(parent, "init", "-q", "--bare", "--template=", net, ctx=ctx, opts=True)
+    with open(os.path.join(net, "objects", "info", "alternates"), "w") as f:
+        f.write(os.path.join(os.path.realpath(workdir), ".git", "objects") + "\n")
+    return net
+
+
+def remote_head(net, url, branch, ctx):
+    """The commit the remote's refs/heads/<branch> names, or "" (the exact ref name: ls-remote also matches the tail of a longer one)."""
+    for line in git(net, "ls-remote", url, "refs/heads/" + branch, ctx=ctx).stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref == "refs/heads/" + branch and re.fullmatch(r"[0-9a-f]{40,64}", sha):
+            return sha
+    return ""
+
+
+def read_marker(path):
+    """The words of the marker file (tree, commit), or []: opened without blocking and without following a link, a regular file only."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return []
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return []
+        return os.read(fd, 400).decode("utf-8", "replace").split()
+    finally:
+        os.close(fd)
+
+
+def write_marker(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
+def snapshot(workdir, worker, repo, ctx):
+    """Save the pod's commits and files to <worker>/wip as ONE new commit, without touching the pod's branch, index or files: a copy of the
+    index in a temporary GIT_INDEX_FILE, `git add -A` into the copy, write-tree, commit-tree with the pod's HEAD as the ONE parent (the old save is named in a `Previous-Save:` line of the message), then a plain push when
+    the remote tip is an ancestor of the new commit, else one --force-with-lease push naming that tip, to this one reference. Secret-looking untracked files are left out.
+    Returns {saved, tree, wip_branch}; saved is False when the tree equals the last saved one. A failure raises RuntimeError."""
+    url = globals()["HOST_" + "URL"] + "%s.git" % repo   # by name: test_cloud_prestop counts the lines that hold the seam's identifier (its definition and its one use)
+    branch = "%s/wip" % worker
+    gitdir = os.path.join(workdir, ".git")
+    saved_path = os.path.join(gitdir, SNAP_SAVED_FILE)
+    tmp = tempfile.mkdtemp(prefix="cw-snap-", dir=gitdir)
+    try:
+        real_index = os.path.join(gitdir, "index")
+        index = os.path.join(tmp, "index")
+        if os.path.isfile(real_index):
+            shutil.copyfile(real_index, index)
+        ctx.env["GIT_INDEX_FILE"] = index
+        config_refusal(workdir, repo, ctx)   # again, right before the add: the agent is running while a save is made
+        # what to stage: the untracked files and every tracked file (read without filters); a secret-looking path is never staged (a tracked one keeps its old version)
+        changed = _gitb(workdir, ctx, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0") + _gitb(workdir, ctx, "ls-files", "-z").split(b"\0")   # every tracked path is re-read without filters (diff would run a clean filter)
+        stage_paths(workdir, sorted({x for x in changed if x and not is_secret(x.decode("utf-8", "surrogateescape"))}), ctx)
+        staged = [x for x in _gitb(workdir, ctx, "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv").split(b"\0") if x and is_secret(x.decode("utf-8", "surrogateescape"))]
+        if staged:   # a secret-looking path the agent staged itself: back to the committed version (or out of the copy when HEAD has none)
+            has_head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).returncode == 0
+            verb = ["reset", "-q", "HEAD"] if has_head else ["rm", "--cached", "-q", "--ignore-unmatch"]
+            _gitb(workdir, ctx, "--literal-pathspecs", *verb, "--pathspec-from-file=-", "--pathspec-file-nul", data=b"\0".join(staged))
+        tree = git(workdir, "write-tree", ctx=ctx).stdout.strip()
+        if read_marker(saved_path)[:1] == [tree]:
+            return {"saved": False, "tree": tree, "wip_branch": branch}
+        head = git(workdir, "rev-parse", "--verify", "-q", "HEAD", check=False, ctx=ctx).stdout.strip()
+        if head and git(workdir, "rev-parse", "%s^{tree}" % head, ctx=ctx).stdout.strip() == tree and git(workdir, "branch", "-r", "--contains", head, ctx=ctx).stdout.strip():
+            return {"saved": False, "tree": tree, "wip_branch": branch}   # a clean tree whose commit is on a remote branch: nothing of the pod's own to save
+        net = net_repo(tmp, workdir, ctx)
+        wip = remote_head(net, url, branch, ctx)
+        if wip:
+            git(net, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch + ":refs/cw/wip", ctx=ctx)
+        if not head and not wip:   # no commit yet and no earlier save: the commit would have no parent (a root); save nothing until the pod has a commit
+            return {"saved": False, "tree": tree, "wip_branch": branch, "note": "no commit yet: nothing saved"}
+        parents = [x for x in (head or wip,) if x]   # #2437: the pod's own HEAD only, so a rebase of the branch replays each commit once; the previous save is named in the message (HEAD unreadable but an earlier save exists: that save, never a root)
+        same = bool(wip) and git(net, "rev-parse", "%s^{tree}" % wip, ctx=ctx).stdout.strip() == tree
+        commit = wip
+        if not same:
+            args = [a for x in parents for a in ("-p", x)]
+            message = "WIP: work in progress saved by %s while it runs" % worker
+            if wip:
+                message += "\n\nPrevious-Save: %s" % wip
+            commit = git(net, *SNAP_IDENT, "commit-tree", tree, *args, "-m", message, ctx=ctx).stdout.strip()
+            spec = "%s:refs/heads/%s" % (commit, branch)
+            if not wip or git(net, "merge-base", "--is-ancestor", wip, commit, check=False, ctx=ctx).returncode == 0:
+                git(net, "push", "--no-verify", url, spec, ctx=ctx)
+            else:   # the remote tip is not an ancestor (the pod rebased): a lease on the tip fetched in this call, this one reference only, one try
+                try:
+                    git(net, "push", "--no-verify", "--force-with-lease=refs/heads/%s:%s" % (branch, wip), url, spec, ctx=ctx)
+                except TokenEnded:
+                    raise
+                except RuntimeError:
+                    print("the save of %s was not pushed: the branch moved since it was read" % branch, file=sys.stderr)
+                    return {"saved": False, "tree": tree, "wip_branch": branch, "note": "the branch moved: nothing saved"}
+        write_marker(saved_path, "%s %s\n" % (tree, commit))
+        return {"saved": not same, "tree": tree, "wip_branch": branch}
+    finally:
+        shutil.rmtree(tmp, True)
+
+
+def ff_over_snapshots(workdir, worker, url, ctx):
+    """True when the remote <worker>/wip is the commit of this pod's own last running save, is not an ancestor of HEAD and a fast-forward commit of HEAD's tree
+    (parent: HEAD only, the wip head named in a `Previous-Save:` line; #2437) was pushed. False means: no such case, the plain push of HEAD follows.
+    The case still arises with a save whose one parent is HEAD's older state: wip is then never an ancestor of a newer HEAD."""
+    branch = "%s/wip" % worker
+    if not os.path.isfile(os.path.join(workdir, ".git", SNAP_SAVED_FILE)):
+        return False   # never saved by a running save: the earlier path, no extra call
+    ours = read_marker(os.path.join(workdir, ".git", SNAP_SAVED_FILE))[1:]
+    tmp = tempfile.mkdtemp(prefix="cw-ff-", dir=os.path.join(workdir, ".git"))
+    try:
+        net = net_repo(tmp, workdir, ctx)
+        wip = remote_head(net, url, branch, ctx)
+        if not wip or ours != [wip]:
+            return False   # no wip, or its head is not the commit of our own last save: a diverged branch of someone else stays refused by the plain push
+        head = git(workdir, "rev-parse", "HEAD", ctx=ctx).stdout.strip()
+        git(net, "fetch", "--no-tags", "-q", url, "refs/heads/" + branch + ":refs/cw/wip", ctx=ctx)
+        if git(net, "merge-base", "--is-ancestor", wip, head, check=False, ctx=ctx).returncode == 0:
+            return False
+        tree = git(workdir, "rev-parse", "HEAD^{tree}", ctx=ctx).stdout.strip()
+        commit = git(net, *SNAP_IDENT, "commit-tree", tree, "-p", head, "-m",
+                     "WIP: work in progress saved by %s at the end of the worker\n\nPrevious-Save: %s" % (worker, wip), ctx=ctx).stdout.strip()
+        # one reference, the lease names the tip read above; a failure is the plain push's answer (no retry)
+        git(net, "push", "--no-verify", "--force-with-lease=refs/heads/%s:%s" % (branch, wip), url, "%s:refs/heads/%s" % (commit, branch), ctx=ctx)
+        return True
+    finally:
+        shutil.rmtree(tmp, True)
+
+
+def snapshot_main():
+    """--snapshot: one JSON line {saved, tree, wip_branch, error}; exit 0 on success (saved or nothing changed), 1 on a failure."""
+    workdir, worker, repo = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", ""), os.environ.get("CW_REPO", "")
+    fail = lambda why: (print(json.dumps({"saved": False, "error": why})), 1)[1]
+    if not valid_worker(worker) or not REPO_RE.match(repo) or ".." in repo:
+        return fail("the worker or repository name is not valid")
+    try:
+        if not stat.S_ISDIR(os.lstat(os.path.join(workdir, ".git")).st_mode):
+            return fail(".git is not a directory")
+    except OSError:
+        return fail("there is no git repository here")
+    helper = find_helper()
+    if not helper:
+        return fail("the pod's credential helper was not found")
+    ctx = Ctx(helper)
+    try:
+        config_refusal(workdir, repo, ctx)
+        print(json.dumps(snapshot(workdir, worker, repo, ctx)))
+        return 0
+    except OriginElsewhere:
+        return fail("origin points elsewhere")
+    except ConfigRefused:
+        return fail("the repository configuration is not a plain one")
+    except TokenEnded as e:
+        return fail(str(e))
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+        return fail(re.sub(r"https?://\S+", "<url>", " ".join(str(e).split()))[:120])
+    finally:
+        ctx.close()
+
+
+# ---- the run files (ask #2432): the pod's /work/runs and progress file live outside the checkout and end with the pod; the answer carries their tails ----
+# Cause: the wip save commits only the checkout, and the run record kept only this answer, so a run's exit number, its log and whether the end-of-run
+# wake was delivered (cw-run's files NAME.log, NAME.exit, NAME.pid, NAME.woke and its progress lines `run NAME exited CODE after Ns; ...` and
+# `wake not delivered`) were lost with the pod. The files are an agent's text: read as bytes, never executed, names checked, links skipped, every
+# read bounded, nothing raised. The answer's `runs` and `wake_lines` go to the run record only, never to the wip branch.
+# TEST SEAM: the tests patch RUNS_DIR and PROGRESS_FILE (nothing is read from the environment: the agent cannot move the directory).
+RUNS_DIR = "/work/runs"
+PROGRESS_FILE = "/work/progress.txt"
+RUN_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+RUN_EXTS = (".log", ".exit", ".pid", ".woke")
+MAX_RUNS = 20
+MAX_TAIL = 3000
+MAX_WAKE_LINES = 10
+MAX_WAKE_LINE = 200
+MAX_RUN_ADDITION = 20000
+MAX_RUN_FILE = 50 * 1024 * 1024   # a bigger file is named with an empty tail
+READ_TAIL_BYTES = 32768
+# The same pattern as cw-run's redact (cloud/worker/cw-run), which makes the wake's tail: one redaction path for both.
+RUN_SECRET = re.compile(r"(?i)(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|xox[a-z]-[A-Za-z0-9-]{8,}"
+                        r"|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]*)?"
+                        r"|(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|://[^/\s:@]+:[^@\s]+@|--(password|token|secret)[= ]\S+"
+                        r"|[A-Za-z0-9_]*(token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*[\"']?\s*[=:]\s*(\"[^\"]*\"|'[^']*'|\S+)"
+                        r"|[A-Za-z0-9+/_-]{40,}={0,2})")
+LEAD_TOKEN = re.compile(r"^[A-Za-z0-9+/_=.-]*")
+
+
+def _redact_line(line):
+    """One line, cut to its last MAX_TAIL characters (a cut also drops the token-shaped piece it may have split), control characters out, secrets replaced."""
+    if len(line) > MAX_TAIL:
+        line = line[-MAX_TAIL:]
+        line = line[LEAD_TOKEN.match(line).end():]
+    line = "".join(c if c in "\t" or c.isprintable() else " " for c in line)
+    return RUN_SECRET.sub("[redacted]", line)
+
+
+def _read_tail(path):
+    """(ok, bytes of the end of a regular file, not a link, at most READ_TAIL_BYTES); ok False when absent, a link, special, oversized or unreadable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return False, b""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_RUN_FILE:
+            return False, b""
+        if st.st_size > READ_TAIL_BYTES:
+            os.lseek(fd, st.st_size - READ_TAIL_BYTES, os.SEEK_SET)
+            data = os.read(fd, READ_TAIL_BYTES)
+            cut = data.find(b"\n")   # the window began mid-line: that partial line (a secret may be split in it) is dropped
+            return True, data[cut + 1:] if cut >= 0 else data   # no newline at all: one long line, which _redact_line cuts and strips
+        return True, os.read(fd, READ_TAIL_BYTES)
+    except OSError:
+        return False, b""
+    finally:
+        os.close(fd)
+
+
+def _is_link_or_odd(path):
+    """True when the path exists and is not a regular file (a link, a directory, a special file); False when absent."""
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def run_tail(path):
+    """The last 20 lines of a log, redacted, at most MAX_TAIL characters; "" for an unreadable one."""
+    ok, data = _read_tail(path)
+    if not ok:
+        return ""
+    lines = data.decode("utf-8", "replace").splitlines()[-20:]
+    return "\n".join(_redact_line(x) for x in lines)[-MAX_TAIL:]
+
+
+def run_exit(path):
+    ok, data = _read_tail(path)
+    text = data.decode("utf-8", "replace").strip() if ok else ""
+    return int(text) if re.fullmatch(r"-?[0-9]{1,6}", text) else None
+
+
+def wake_lines(progress=None):
+    """The last MAX_WAKE_LINES lines of the progress file that start with `run ` and contain ` exited `, or equal `wake not delivered`."""
+    ok, data = _read_tail(PROGRESS_FILE if progress is None else progress)
+    if not ok:
+        return []
+    keep = [x for x in data.decode("utf-8", "replace").splitlines()
+            if (x.startswith("run ") and " exited " in x) or x == "wake not delivered"]
+    return [_redact_line(x)[:MAX_WAKE_LINE] for x in keep[-MAX_WAKE_LINES:]]
+
+
+def run_entries(directory=None):
+    """The `runs` list: at most MAX_RUNS entries, newest first, {name, exit, woke, log_tail}. A name outside RUN_NAME_RE, or one of whose files is a link
+    or not a regular file, is skipped; a missing directory gives []. Never raises."""
+    directory = RUNS_DIR if directory is None else directory
+    try:
+        stems = {}
+        for f in os.listdir(directory):
+            for ext in RUN_EXTS:
+                if f.endswith(ext) and RUN_NAME_RE.fullmatch(f[:-len(ext)]):
+                    stems.setdefault(f[:-len(ext)], []).append(os.path.join(directory, f))
+        found = []
+        for name, paths in stems.items():
+            if any(_is_link_or_odd(os.path.join(directory, name + e)) for e in RUN_EXTS):
+                continue
+            try:
+                newest = max(os.lstat(x).st_mtime for x in paths)
+            except OSError:
+                continue
+            found.append((newest, name))
+        found.sort(reverse=True)
+        out = []
+        for _, name in found[:MAX_RUNS]:
+            base = os.path.join(directory, name)
+            out.append({"name": name, "exit": run_exit(base + ".exit"), "woke": os.path.lexists(base + ".woke"), "log_tail": run_tail(base + ".log")})
+        return out
+    except Exception:
+        return []
+
+
+def run_files(directory=None, progress=None):
+    """({runs, wake_lines}) with the whole addition at most MAX_RUN_ADDITION characters: the tails give way, newest kept longest. Never raises."""
+    try:
+        lines = wake_lines(progress)
+        runs = run_entries(directory)
+        room = MAX_RUN_ADDITION - len(json.dumps(lines)) - 200 - sum(len(json.dumps(dict(r, log_tail=""))) + 2 for r in runs)
+        for r in runs:
+            r["log_tail"] = r["log_tail"][-min(MAX_TAIL, max(0, room)):] if room > 0 else ""
+            room -= len(json.dumps(r["log_tail"])) - 2
+        for r in reversed(runs):   # escapes make a character longer than counted: the oldest tails are emptied until the whole fits
+            if len(json.dumps({"runs": runs, "wake_lines": lines})) <= MAX_RUN_ADDITION:
+                break
+            r["log_tail"] = ""
+        return {"runs": runs, "wake_lines": lines}
+    except Exception:
+        return {"runs": [], "wake_lines": []}
+
+
+def with_runs(res):
+    """The hook's answer with the run files added (see run_files). Never raises."""
+    try:
+        res.update(run_files())
+    except Exception:
+        pass
+    return res
+
+
 def main():
+    if "--snapshot" in sys.argv[1:]:
+        return snapshot_main()
     if "--prestop" in sys.argv[1:]:
         return prestop_main()
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
@@ -534,7 +968,7 @@ def main():
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
     try:
-        print(json.dumps(with_pr(workdir, run(workdir, worker))))
+        print(json.dumps(with_runs(with_pr(workdir, with_made(workdir, run(workdir, worker))))))
         return 0
     except TokenEnded as e:
         # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.

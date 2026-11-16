@@ -1,0 +1,12 @@
+# A strategic merge patch (NOT a manifest: do not `kubectl apply` it) for the stock Sysbox installer DaemonSet
+# (sysbox-deploy-k8s, kube-system; the repository does not hold that manifest, it comes from upstream). Ask #2489.
+# It lets the installer run on a node that still carries the startup taint. A patch REPLACES the list: if the
+# installer already has tolerations, read them first and add them here (see cloud/README.md, "Startup taint").
+spec:
+  template:
+    spec:
+      tolerations:
+        - key: startup-taint.cluster-autoscaler.kubernetes.io/sysbox-not-ready
+          operator: Equal
+          value: "true"
+          effect: NoSchedule

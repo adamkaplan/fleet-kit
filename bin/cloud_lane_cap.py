@@ -58,11 +58,11 @@ def _stopped_ids():
     return {rid: when for rid, when in state.items() if when is not None}
 
 
-def lane_m_workers(state, lane):
-    """The sorted names of the lane's live shape-M workers, from the record directory alone (no token, no cluster call)."""
+def lane_m_workers(state, lane, shape="M"):
+    """The sorted names of the lane's live workers of the shape, from the record directory alone (no token, no cluster call)."""
     found, stopped = [], None
     for record in D["list_records"](state):
-        if not isinstance(record, dict) or "problem" in record or record.get("shape") != "M" or _ended(record):
+        if not isinstance(record, dict) or "problem" in record or record.get("shape") != shape or _ended(record):
             continue
         if (record.get("reports_to") or "(no boss)") == lane:
             stopped = _stopped_ids() if stopped is None else stopped
@@ -80,3 +80,16 @@ def _ended(record, clock=None):
     except (TypeError, ValueError):
         return False
     return when.timestamp() < (time.time() if clock is None else clock)
+
+
+def _pod_is_gone(runner, record):
+    """True only when the cluster was READ and holds no pod of the record. A read that fails, a snapshot that is not a dict, or a record whose pod
+    cannot be matched by name says False: the caller keeps the pod and the record, as before."""
+    try:
+        if not D["_pod_known"](record):
+            return False
+        with D["Cluster"](timeout=D["SNAPSHOT_SECONDS"]) as cluster:
+            snapshot = D["_cluster_snapshot"](runner, cluster, D["SNAPSHOT_SECONDS"])
+        return isinstance(snapshot.get("pods"), list) and D["_pod_of"](record, snapshot) is None
+    except Exception:
+        return False

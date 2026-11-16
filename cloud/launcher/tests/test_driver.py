@@ -119,7 +119,7 @@ class Driver(base.Base):
         self.assertNotIn(base64.b64encode(OTHER.encode()).decode(), sent)
 
     def test_s5_a_failure_midway_stops_the_worker_and_cleans_up(self):
-        p, out = self.run_driver(STUB_MODE="never-healthy", CW_HEALTH_TIMEOUT="1")
+        p, out = self.run_driver(STUB_MODE="never-healthy", CW_HEALTH_TIMEOUT="1", CW_RECORD_TIMEOUT="2")
         self.assertEqual(p.returncode, cw.EXIT_CLOUD, out)
         self.assertIn("did not become healthy", out)
         self.assert_clean(out)
@@ -149,7 +149,7 @@ class Driver(base.Base):
                 self.assert_no_secret(self.everything(out))
 
     def test_s5_an_interrupt_between_pod_start_and_the_prompt_cleans_up(self):
-        rc, out = self.interrupt(signal.SIGINT, lambda: bool(self.st()["pods"]) and self.pf_up(), STUB_MODE="never-healthy", CW_HEALTH_TIMEOUT="60")
+        rc, out = self.interrupt(signal.SIGINT, lambda: bool(self.st()["pods"]) and self.pf_up(), STUB_MODE="never-healthy", CW_HEALTH_TIMEOUT="60", CW_RECORD_TIMEOUT="2")
         self.assertEqual(rc, 130, out)
         self.assertNotIn("prompt", self.read(self.stub_log))
         self.assert_clean(out)

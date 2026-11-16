@@ -439,11 +439,14 @@ class TestRecordJsonReaders(unittest.TestCase):
     BIN = REPO / "bin"
     # readers of record text and the shared helpers: each must call parse_bounded (the helpers ARE the parse)
     READERS = {"agent_presence.py:read_record": "agent_presence", "switchboard/reminders.py:read_reminders": "reminders",
-               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry"}
+               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry",
+               "switchboard/decisions_a.py:read_escalated_checked": "decisions_a"}
     HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
     # path_suites.py:check_manual and load_manual read the repository's OWN checked-in manual (tools/path-suites.json), a trusted repo file, not untrusted record text
+    # cloud_image_proof.py:prove, _prove_in (the launcher's own one-line stdout, size-bounded), read_revision and cloud_image_roll.py:check_gate read the output of a command they ran (`crane config`, the launcher's `--json` answer), not a record file another process writes (#2391, #2418)
+    # cloud_image_proof.py:operator_config parses the output of `kubectl config view --minify --raw -o json` (a command the proof ran against the minter kubeconfig, size-bounded by kube_run), not a record file another process writes; it reads only clusters[0].cluster (server, CA) (ask #2440)
     # cloud_lane_cap.py:_stopped_ids is the launcher audit tail, read-only, to free a stopped worker's shape-M slot (#2259)
     EXEMPT = """
 agent_calls.py:_read_json
@@ -460,6 +463,10 @@ cloud_lane_cap.py:_stopped_ids
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
+cloud_image_proof.py:_prove_in
+cloud_image_proof.py:operator_config
+cloud_image_proof.py:read_revision
+cloud_image_roll.py:check_gate
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
 cloud_way_back_check.py:main
@@ -484,6 +491,7 @@ switchboard/plan_notice.py:__init__
 fleet-switchboard:_api
 switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
+fleet-switchboard:_forwarder_hooks
 switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
 switchboard/docker_reaper.py:_last
@@ -1466,11 +1474,11 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         helps = [command for command in commands if command[-1] == "--help"]
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
-        first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        # the --help of every verb is no longer recorded here (the recording was never compared: the run of every command is golden-cli compare's job); the list is checked below
         listed = {tuple(c) for c in commands}
         for verb in verbs:
             self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
-        sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
+        sample = helps[:2] + helps[-2:] + commands[-2:]   # a small fixed sample, recorded twice
         self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):

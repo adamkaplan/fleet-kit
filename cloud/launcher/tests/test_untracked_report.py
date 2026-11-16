@@ -245,7 +245,7 @@ class Mutants(unittest.TestCase):
             t = Cases(self, end_hook, prestop).tree()
             res = Cases(self, end_hook, prestop).run(t)
             self.assertEqual((res["untracked"], res["untracked_more"]), ([], 0))
-            mod = mutant('"local_only": not refreshed, **extra})', '"local_only": not refreshed})')   # mutation applied True (mutant() raises if not)
+            mod = mutant('"local_only": False, **extra})', '"local_only": False})')   # mutation applied True (mutant() raises if not)
             self.assertTrue(Cases(self, mod, prestop).failures(), "survived: keys missing on the skip-a-push line")
 
     def test_the_real_hook_fails_no_case(self):
@@ -280,7 +280,7 @@ class PrintedCounts(unittest.TestCase):
               % (refused[False], refused[True], control))
 
     def test_s14_skip_a_push_line_keys(self):
-        old, new = '"local_only": not refreshed, **extra})', '"local_only": not refreshed})'
+        old, new = '"local_only": False, **extra})', '"local_only": False})'
         t = Cases(self, end_hook, False).tree()
         res = Cases(self, end_hook, False).run(t)
         lines = 1 if (res.get("untracked") == [] and res.get("untracked_more") == 0) else 0
