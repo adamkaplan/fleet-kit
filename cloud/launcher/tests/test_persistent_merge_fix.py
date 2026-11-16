@@ -53,7 +53,7 @@ class CopyRun(unittest.TestCase):
         target = os.path.join(tmp, "bin", "test-switchboard")
         load = "    suite = loader.loadTestsFromModule(sys.modules[__name__])\n"
         self.assertEqual(text.count(load), 1)
-        slim = "\n".join("pass" if (l.startswith("_support_test_cases_") or (l.startswith("Test") and "_support_test_cases_" in l)) else l for l in text.splitlines()) + "\n"
+        slim = "\n".join("pass" if any(f"_support_test_cases_{i:02d}" in l for i in range(1, 14)) else l for l in text.splitlines()) + "\n"
         with open(target, "w") as f:   # only the one class these checks run is turned into test cases (the other ~1,000 classes are defined, not instantiated)
             f.write(slim.replace(load, "    suite = unittest.TestSuite([loader.loadTestsFromTestCase(TestLaunchRefusedMessage)])\n"))
         os.chmod(target, 0o755)

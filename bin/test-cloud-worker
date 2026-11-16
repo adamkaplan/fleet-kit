@@ -441,31 +441,46 @@ class Base(unittest.TestCase):
                 return GIT_TOKEN
             return real_git_token(repo, cluster, role=role)
 
-        def fast_cluster_token(env=None, now=None, recovery=None):
-            e = os.environ if env is None else env
-            if (e is os.environ and now is None
+        real_bounded = cw_mod.cloud_cluster._cluster_token_bounded
+
+        def _can_fast_token(e):
+            sub, vname = (e.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (e.get("CW_VAULT_NAME") or "").strip()
+            ns, dur = (e.get("CW_CLOUD_NAMESPACE") or "cw"), (e.get("CW_CLUSTER_TOKEN_DURATION") or "20m")
+            return (bool(sub) and bool(vname) and ns == "cw" and dur == "20m"
                     and not e.get("CW_SECRET_DIR")
                     and not e.get("CW_CLUSTER_TOKEN_CMD")
                     and not e.get("CW_CLUSTER_ADMIN_CMD")
-                    and e.get("CW_VAULT_SUBSCRIPTION") == "sub-1"
-                    and e.get("CW_VAULT_NAME") == "kv-test"
+                    and not e.get("CW_CLUSTER_ADMIN_SECRET")
+                    and e.get("CW_KUBECTL") == str(self.stub_dir / "kubectl")
+                    and not (self.stub_dir / "vault_down").exists()
                     and not (self.stub_dir / "az.fail").exists()
                     and not (self.stub_dir / "az.denied").exists()
                     and not (self.stub_dir / "az.forbidden").exists()
+                    and not (self.state / "vault-block.json").exists()
                     and (self.stub_dir / "az").exists() and (self.stub_dir / "az").read_text() == AZ
                     and (self.stub_dir / "kubectl").exists() and (self.stub_dir / "kubectl").read_text() == default_kubectl_text
                     and (self.stub_dir / "admin_kubeconfig").exists() and (self.stub_dir / "admin_kubeconfig").read_text() == ADMIN_KUBECONFIG
-                    and (self.stub_dir / "mint_token").exists() and (self.stub_dir / "mint_token").read_text() == CLUSTER_TOKEN):
-                d = str(self.stub_dir)
-                az_args = ["keyvault", "secret", "show", "--subscription", "sub-1", "--vault-name", "kv-test",
-                           "--name", "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
-                open(d + "/az.log", "a").write(json.dumps(az_args) + "\n")
-                k_args = ["--kubeconfig", "/dev/fd/0", "create", "token", "cw-operator", "-n", "cw", "--duration=20m"]
-                open(d + "/kubectl.log", "a").write(json.dumps({
-                    "args": k_args, "kubeconfig_is_dev_fd": True, "admin_ok": True,
-                    "env_has_token": e.get("KUBECONFIG")}) + "\n")
-                return CLUSTER_TOKEN
+                    and (self.stub_dir / "mint_token").exists() and (self.stub_dir / "mint_token").read_text() == CLUSTER_TOKEN)
+
+        def _record_fast_token(e):
+            d = e.get("STUB_DIR") or str(self.stub_dir)
+            k_args = ["--kubeconfig", "/dev/fd/0", "-n", "cw", "create", "token", "cw-operator", "--duration=20m"]
+            open(d + "/kubectl.log", "a").write(json.dumps({
+                "args": k_args, "kubeconfig_is_dev_fd": True, "admin_ok": True,
+                "env_has_token": "/dev/null"}) + "\n")
+            return CLUSTER_TOKEN
+
+        def fast_cluster_token(env=None, now=None, recovery=None):
+            e = os.environ if env is None else env
+            if now is None and _can_fast_token(e):
+                return _record_fast_token(e)
             return real_cluster_token(env=env, now=now, recovery=recovery)
+
+        def fast_bounded(env, now, recovery, timeout):
+            e = os.environ if env is None else env
+            if now is None and _can_fast_token(e):
+                return _record_fast_token(e)
+            return real_bounded(env, now, recovery, timeout)
 
         real_tunnel = cw_mod.tunnel
 
@@ -479,7 +494,7 @@ class Base(unittest.TestCase):
                     and not (self.stub_dir / "pf_hang").exists()
                     and not (self.stub_dir / "pf_squat").exists()):
                 d = os.environ.get("STUB_DIR") or str(self.stub_dir)
-                argv = [str(self.stub_dir / "kubectl"), "--kubeconfig", cluster.kubeconfig, "--context", "cw",
+                argv = ["--kubeconfig", cluster.kubeconfig, "--context", "cw",
                         "-n", os.environ.get("CW_CLOUD_NAMESPACE", "cw"), "port-forward", "pod/" + found.group(1),
                         "4096:4096", "--address", "127.0.0.1"]
                 kc_text = open(cluster.kubeconfig).read()
@@ -502,6 +517,8 @@ class Base(unittest.TestCase):
                                  (cw_mod, "git_token", fast_git_token),
                                  (cw_mod, "cluster_token", fast_cluster_token),
                                  (cw_mod.cloud_cluster, "cluster_token", fast_cluster_token),
+                                 (cw_mod, "_cluster_token_bounded", fast_bounded),
+                                 (cw_mod.cloud_cluster, "_cluster_token_bounded", fast_bounded),
                                  (cw_mod, "tunnel", fast_tunnel),
                                  (cw_mod.cloud_cluster, "tunnel", fast_tunnel)):
             p = mock.patch.object(target, attr, fn)

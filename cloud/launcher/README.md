@@ -426,7 +426,6 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_pr_record.py` | 1 | parallel |
 | `cloud/worker/tests/test_reach.py` | 1 | parallel |
 | `cloud/worker/tests/test_token_table.py` | 1 | parallel |
-| `cloud/launcher/tests/test_pod_requests.py` | 0 | parallel |
 
 ### Ubuntu (per entry)
 
@@ -607,7 +606,6 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_pr_record.py` | 1 | parallel |
 | `cloud/worker/tests/test_reach.py` | 1 | parallel |
 | `cloud/worker/tests/test_token_table.py` | 1 | parallel |
-| `cloud/launcher/tests/test_pod_requests.py` | 0 | parallel |
 
 ## The vault block (ask #1427)
 

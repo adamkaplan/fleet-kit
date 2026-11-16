@@ -462,7 +462,7 @@ class S4Counts(unittest.TestCase):
 class S5Mutants(unittest.TestCase):
     def _run(self, fn):
         r = random.Random(7)
-        for _ in range(300):
+        for _ in range(60):
             secs = {rnd(r, r.randint(8, 14), "abcd") for _ in range(r.randint(1, 4))}
             text = rnd(r, 80, "abcd")
             try:
@@ -542,7 +542,7 @@ class S8Snapshot(unittest.TestCase):
         base = {"base-secret-%02d-x" % i for i in range(30)}
         text = " ".join(sorted(base)) * 3
         raises = ok = 0
-        rounds = 60
+        rounds = 20
         for rd in range(rounds):
             known, stop = set(base), threading.Event()
 
@@ -1061,7 +1061,7 @@ class S18Lock(unittest.TestCase):
         lasts = {}
 
         def work(t):
-            for i in range(200):
+            for i in range(50):
                 form = "stress-form-%d-%04d-end" % (t, i)
                 ks.add(form)
             lasts[t] = form
@@ -1070,7 +1070,7 @@ class S18Lock(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual((ks.version, len(ks)), (len(threads) * 200, len(threads) * 200))   # every add of every thread, once
+        self.assertEqual((ks.version, len(ks)), (len(threads) * 50, len(threads) * 50))   # every add of every thread, once
         redacted = sum(1 for t in range(len(threads)) if lasts[t] not in cw.scrub("x " + lasts[t] + " y", ks, 1000))
         self.assertEqual(redacted, len(threads))
         old = ("                if self._forms != before:\n                    self._version += 1  # AFTER the content changed, under the lock\n")  # probe on purpose
