@@ -307,6 +307,7 @@ class Mutants(unittest.TestCase):
                 applied = target.read_text() != text and occurrences == 1
                 self.assertTrue(applied, "the mutation was not applied")
             mod_cw = importlib.util.module_from_spec(importlib.util.spec_from_file_location("m_cw", str(copy / "bin" / "cloud_worker.py")))
+            sys.modules["m_cw"] = mod_cw
             mod_cw.__spec__.loader.exec_module(mod_cw)
             suite = unittest.defaultTestLoader.loadTestsFromName(only, Behaviour) if only else unittest.defaultTestLoader.loadTestsFromTestCase(Behaviour)
             buf = io.StringIO()

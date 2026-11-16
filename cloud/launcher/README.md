@@ -251,7 +251,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 
 | Entry | Seconds | Lane |
 |---|---|---|
-| `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-cost-report` | 1 | parallel |
 | `bin/test-cloud-retired` | 66 | parallel |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | parallel |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
@@ -426,12 +426,13 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_pr_record.py` | 1 | parallel |
 | `cloud/worker/tests/test_reach.py` | 1 | parallel |
 | `cloud/worker/tests/test_token_table.py` | 1 | parallel |
+| `cloud/launcher/tests/test_pod_requests.py` | 0 | parallel |
 
 ### Ubuntu (per entry)
 
 | Entry | Seconds | Lane |
 |---|---|---|
-| `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-cost-report` | 0 | parallel |
 | `bin/test-cloud-retired` | 33 | parallel |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | parallel |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
@@ -606,6 +607,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/worker/tests/test_pr_record.py` | 1 | parallel |
 | `cloud/worker/tests/test_reach.py` | 1 | parallel |
 | `cloud/worker/tests/test_token_table.py` | 1 | parallel |
+| `cloud/launcher/tests/test_pod_requests.py` | 0 | parallel |
 
 ## The vault block (ask #1427)
 

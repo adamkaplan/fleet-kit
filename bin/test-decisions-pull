@@ -190,7 +190,7 @@ def check_command_failure_is_unreachable(module):
 
 def check_real_timeout_is_unreachable(module):
     try:
-        module.command_fetch([sys.executable, "-c", "import time; time.sleep(3)"], timeout=0.3)
+        module.command_fetch([sys.executable, "-c", "import time; time.sleep(3)"], timeout=0.08)
         raise AssertionError("a timeout was believed")
     except module.Unreachable as why:
         assert "timed out" in str(why), str(why)
@@ -300,7 +300,7 @@ def check_group_is_killed_when_a_grandchild_holds_the_pipe(module):
             "sys.stdout.write('{}'); sys.stdout.flush()")
     start = time.time()
     try:
-        module.command_fetch([sys.executable, "-c", code], timeout=0.3)
+        module.command_fetch([sys.executable, "-c", code], timeout=0.08)
         raise AssertionError("a source held open by a grandchild was believed")
     except module.Unreachable as why:
         assert "timed out" in str(why), str(why)
@@ -752,7 +752,7 @@ def check_interleaved_pulls_cannot_lower_the_generation(module):   # panel 5
         def slow(path, body, now, written=None):
             if body["generation"] == 9:
                 started.set()
-                time.sleep(0.5)            # pull B runs now; without the lock it checks against the old generation 5
+                time.sleep(0.12)            # pull B runs now; without the lock it checks against the old generation 5
             return real(path, body, now, written)
         module.write_atomic = slow
         def second():

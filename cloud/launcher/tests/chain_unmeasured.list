@@ -4,7 +4,6 @@ cloud/launcher/tests/test_idle_nudge_skipped.py
 cloud/launcher/tests/test_land_shape.py
 cloud/launcher/tests/test_m_request.py
 cloud/launcher/tests/test_pod_boundaries.py
-cloud/launcher/tests/test_pod_requests.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_readonly_root.py

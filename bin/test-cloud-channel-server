@@ -186,7 +186,7 @@ def check_boundaries(module, test):
 
 
 def check_short_body_408(module, test):
-    with Running(module, timeout=0.3) as s:
+    with Running(module, timeout=0.08) as s:
         status, _ = s.raw(request_bytes("tok-a", 100, b"{\"sen"), wait=3.0)
         test.assertEqual(status, 408)
         test.assertEqual(s.inbox.items, {})
@@ -196,7 +196,7 @@ def check_cap_503(module, test):
     with Running(module, timeout=3, max_handlers=2) as s:
         held = [socket.create_connection(("127.0.0.1", s.port())) for _ in range(2)]
         try:
-            time.sleep(0.3)
+            time.sleep(0.05)
             t0 = time.time()
             status, buf = s.raw(request_bytes("tok-a", 2, b"{}"), wait=1.0)
             # closed at once with no reply body: the accept thread does not wait on the client
@@ -269,7 +269,7 @@ def check_token_not_in_audit(module, test):
 
 
 def check_total_deadline(module, test):
-    with Running(module, timeout=2.0, deadline=0.6) as s:
+    with Running(module, timeout=2.0, deadline=0.18) as s:
         sock = socket.create_connection(("127.0.0.1", s.port()), timeout=5)
         try:
             sock.sendall(request_bytes("tok-a", 50))
@@ -279,7 +279,7 @@ def check_total_deadline(module, test):
                     sock.sendall(b"{")   # one byte per read: never trips the per-read timeout
                 except OSError:
                     pass
-                sock.settimeout(0.2)
+                sock.settimeout(0.05)
                 try:
                     chunk = sock.recv(4096)
                     if not chunk:

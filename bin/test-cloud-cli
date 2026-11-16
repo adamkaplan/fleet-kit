@@ -66,8 +66,8 @@ class Base(unittest.TestCase):
         self.url = "http://127.0.0.1:%d/send" % self.srv.server_address[1]
 
     def run_cli(self, args, source=None, **env_over):
-        if source is None and getattr(self, "client_source", None) is None:   # the real modules: run in this process (no interpreter start)
-            return self.run_in_process(args, env_over)
+        if getattr(self, "client_source", None) is None:   # run in this process (no interpreter start)
+            return self.run_in_process(args, env_over, source=source)
         script = Path(self.tmp.name) / "cloud_cli.py"
         script.write_text(source or SOURCE)
         (Path(self.tmp.name) / "cloud_client.py").write_text((getattr(self, "client_source", None) or (BIN / "cloud_client.py").read_text()).replace("BACKOFF_SECONDS = 0.5", "BACKOFF_SECONDS = 0.01"))
@@ -78,11 +78,13 @@ class Base(unittest.TestCase):
         p = subprocess.run([sys.executable, str(script)] + args, env=env, capture_output=True, text=True, timeout=60)
         return p.returncode, p.stdout, p.stderr
 
-    def run_in_process(self, args, env_over):
+    def run_in_process(self, args, env_over, source=None):
         sys.path.insert(0, str(BIN))
         try:
             import cloud_cli
             import cloud_client
+            if source is not None:
+                cloud_cli = load(source)
         finally:
             sys.path.remove(str(BIN))
         env = {"PATH": os.environ.get("PATH", ""), "FLEET_AGENT_NAME": "worker-a", "FLEET_BOSS": "boss-a",

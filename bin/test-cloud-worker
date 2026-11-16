@@ -467,12 +467,43 @@ class Base(unittest.TestCase):
                 return CLUSTER_TOKEN
             return real_cluster_token(env=env, now=now, recovery=recovery)
 
+        real_tunnel = cw_mod.tunnel
+
+        @contextlib.contextmanager
+        def fast_tunnel(cluster, record):
+            found = cw_mod.cloud_cluster.POD_RE.fullmatch(record.get("runtime_id") or "")
+            if (found
+                    and os.environ.get("CW_KUBECTL") == str(self.stub_dir / "kubectl")
+                    and (self.stub_dir / "kubectl").exists() and (self.stub_dir / "kubectl").read_text() == default_kubectl_text
+                    and not (self.stub_dir / "pf_die").exists()
+                    and not (self.stub_dir / "pf_hang").exists()
+                    and not (self.stub_dir / "pf_squat").exists()):
+                d = os.environ.get("STUB_DIR") or str(self.stub_dir)
+                argv = [str(self.stub_dir / "kubectl"), "--kubeconfig", cluster.kubeconfig, "--context", "cw",
+                        "-n", os.environ.get("CW_CLOUD_NAMESPACE", "cw"), "port-forward", "pod/" + found.group(1),
+                        "4096:4096", "--address", "127.0.0.1"]
+                kc_text = open(cluster.kubeconfig).read()
+                tf = json.loads(kc_text)["users"][0]["user"]["tokenFile"]
+                tf_text = open(tf).read()
+                token_ok = hashlib.sha256(tf_text.encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA")
+                entry = {"args": argv, "kubeconfig_is_dev_fd": False, "token_ok": token_ok,
+                         "config_text_has_token": tf_text in kc_text, "env": cluster.env()}
+                open(d + "/kubectl.log", "a").write(json.dumps(entry) + "\n")
+                open(d + "/pf.pid", "a").write("999999\n")
+                port = int(os.environ["STUB_URL"].rsplit(":", 1)[1])
+                yield dict(record, url="http://127.0.0.1:%d" % port)
+                return
+            with real_tunnel(cluster, record) as live:
+                yield live
+
         for target, attr, fn in ((cw_mod, "run_launcher", fast_run_launcher),
                                  (cw_mod.cloud_cluster, "run_launcher", fast_run_launcher),
                                  (cw_mod, "model_entry", fast_model_entry),
                                  (cw_mod, "git_token", fast_git_token),
                                  (cw_mod, "cluster_token", fast_cluster_token),
-                                 (cw_mod.cloud_cluster, "cluster_token", fast_cluster_token)):
+                                 (cw_mod.cloud_cluster, "cluster_token", fast_cluster_token),
+                                 (cw_mod, "tunnel", fast_tunnel),
+                                 (cw_mod.cloud_cluster, "tunnel", fast_tunnel)):
             p = mock.patch.object(target, attr, fn)
             p.start()
             self.addCleanup(p.stop)
