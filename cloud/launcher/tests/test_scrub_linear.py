@@ -1385,13 +1385,21 @@ def class_lines(path, lines):
     return set(range(a + 1, b + 1))
 
 
+_SCAN_CACHE = {}
+
+
 def scan_uses(roots):
     """The uses of a private name of KnownSet, of object.__setattr__ on a known set and of pickle or copy of a Kube or a known set,
     outside the class and outside the lines that carry the probe marker; (path, line number) pairs."""
     found = []
     for root in roots:
+        key = str(root)
+        if key in _SCAN_CACHE and Path(root) in (ROOT / "cloud", ROOT / "bin", ROOT / "tools", ROOT / "tests"):
+            found.extend(_SCAN_CACHE[key])
+            continue
+        sub = []
         for path in sorted(Path(root).rglob("*")):
-            if not path.is_file() or path.is_symlink() or ".git" in path.parts or path.stat().st_size > 20 * 2 ** 20:
+            if not path.is_file() or path.is_symlink() or ".git" in path.parts or "__pycache__" in path.parts or path.stat().st_size > 20 * 2 ** 20:
                 continue
             try:
                 raw = path.read_text(encoding="utf-8", errors="strict")
@@ -1405,8 +1413,12 @@ def scan_uses(roots):
                 if n in own or PROBE in line:
                     continue
                 if any(pat.search(line) for pat in USE_PATTERNS):
-                    found.append((str(path), n))
+                    sub.append((str(path), n))
+        if Path(root) in (ROOT / "cloud", ROOT / "bin", ROOT / "tools", ROOT / "tests"):
+            _SCAN_CACHE[key] = sub
+        found.extend(sub)
     return found
+
 
 
 def use_check(roots):

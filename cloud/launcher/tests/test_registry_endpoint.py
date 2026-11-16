@@ -306,9 +306,14 @@ class Mutants(unittest.TestCase):
                 target.write_text(text.replace(old, new))
                 applied = target.read_text() != text and occurrences == 1
                 self.assertTrue(applied, "the mutation was not applied")
-            done = subprocess.run([sys.executable, "-m", "unittest"] + (["-f", "test_registry_endpoint.Behaviour." + only] if only else ["-f", "test_registry_endpoint.Behaviour"]), cwd=str(copy / "cloud/launcher/tests"),
-                                  env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
-            return done.returncode, done.stderr, applied
+            mod_cw = importlib.util.module_from_spec(importlib.util.spec_from_file_location("m_cw", str(copy / "bin" / "cloud_worker.py")))
+            mod_cw.__spec__.loader.exec_module(mod_cw)
+            suite = unittest.defaultTestLoader.loadTestsFromName(only, Behaviour) if only else unittest.defaultTestLoader.loadTestsFromTestCase(Behaviour)
+            buf = io.StringIO()
+            with mock.patch.object(TCW.sb, "load_module", lambda name, _r=TCW.sb.load_module: mod_cw if name == "cloud_worker" else _r(name)), \
+                    mock.patch.dict(globals(), {"sbcw": mod_cw}):
+                res = unittest.TextTestRunner(stream=buf, verbosity=2, failfast=True).run(suite)
+            return (0 if res.wasSuccessful() else 1), buf.getvalue(), applied
 
     _control_cache = None   # the run of the unmutated copy, made once for the two tests that read it
 
@@ -339,8 +344,7 @@ class Mutants(unittest.TestCase):
             names = re.search(r"\(FAIL\|ERROR\): (test_\w+)", anchor)
             return self.run_tree(rel, old, new, only=names.group(1) if names else None)
         # a mutant is killed by its first failing check: run only the anchored test when the anchor names one, else stop at the first failure
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(one, self.CASES))
+        results = [one(c) for c in self.CASES]
         for (label, rel, old, new, anchor), (code, output, applied) in zip(self.CASES, results):
             with self.subTest(label):
                 named = bool(re.search(anchor, output, re.M))
