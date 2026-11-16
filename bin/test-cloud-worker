@@ -389,7 +389,7 @@ class Base(unittest.TestCase):
                         and not env.get("STUB_SNAPSHOT_FAIL")
                         and not unknown
                         and shape in ("XS", "O", "S", "M", "L")):
-                    argv = [command, name] + list(extra) + ["--json"]
+                    argv = [command] + ([name] if name else []) + list(extra) + ["--json"]
                     if password_fd is not None:
                         argv += ["--password-fd", str(password_fd)]
                     secret_map = dict(secrets)

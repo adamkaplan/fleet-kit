@@ -32565,7 +32565,8 @@ class TestRegistrarFloor(LedgerBase):
 
         proxy = types.SimpleNamespace(**{name: getattr(ast, name) for name in dir(ast)})
         proxy.parse = parse
-        patchers = [mock.patch.object(dc, "ast", proxy)]
+        real_lm = sb.load_module
+        patchers = [mock.patch.object(dc, "ast", proxy), mock.patch.object(sb, "load_module", lambda n: dc if n == "delegated_clear" else real_lm(n))]
         for name, key_of in (("registrar_pattern", lambda tree, *rest: ()), ("pattern_bindings", lambda tree, *rest: ()), ("closure", lambda tree, *rest: tuple(repr(r) for r in rest))):
             real = getattr(dc, name)
             patchers.append(mock.patch.object(dc, name, (lambda real, name, key_of: lambda tree, *rest: keep((name, id(tree)) + key_of(tree, *rest), tree, lambda: real(tree, *rest)))(real, name, key_of)))
@@ -33752,7 +33753,6 @@ class TestRegistrarFloor(LedgerBase):
                                 ("a changed binding is not held", "return any(_spans(b, added) for b in odd) or (len(bindings) > 1 and any(_spans(b, added) for b in bindings))", "return False")):
             with self.subTest(label):
                 self.assertTrue(self.pattern_failures(self.mutant_module(old, new)), "the mutant survives: " + label)
-
     HOSTILE = "global %s\n%s = None"
 
     def serve(self, head_src, base_src=None):
@@ -33772,7 +33772,7 @@ class TestRegistrarFloor(LedgerBase):
 
     def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
         function, binding, module = self.pick()
-        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.small_src), self.small_src)
+        self.serve(self.head_of(self.HOSTILE % (binding, binding), base=self.base_src), self.base_src)
         shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
@@ -37896,8 +37896,8 @@ class TestImpactHold(LedgerBase):
         while not lines[j].rstrip().endswith(":"):
             j += 1
         head = list(lines)
-        head[j + 1] = "    impact_clear_core(None, None, 'a/b', 1, 'someone', 'a long enough reason'); " + head[j + 1].lstrip()
-        diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (j + 2, j + 2, lines[j + 1], head[j + 1])
+        head[j + 2] = "        impact_clear_core(None, None, 'a/b', 1, 'someone', 'a long enough reason'); " + head[j + 2].lstrip()
+        diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (j + 3, j + 3, lines[j + 2], head[j + 2])
         reasons = self.closure_check("\n".join(head), diff)
         self.assertTrue(reasons and "clear entry point" in " ".join(reasons), reasons)
 
