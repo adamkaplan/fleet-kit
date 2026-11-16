@@ -462,7 +462,7 @@ class S4Counts(unittest.TestCase):
 class S5Mutants(unittest.TestCase):
     def _run(self, fn):
         r = random.Random(7)
-        for _ in range(60):
+        for _ in range(240):
             secs = {rnd(r, r.randint(8, 14), "abcd") for _ in range(r.randint(1, 4))}
             text = rnd(r, 80, "abcd")
             try:

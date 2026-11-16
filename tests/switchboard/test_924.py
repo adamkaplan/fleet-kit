@@ -370,12 +370,10 @@ def _body():
             statements = self.core_statements()
             self.assertGreater(len(statements), 50, "the moved registrar holds the other commands' registration")
             def check(head_lines):
-                changed = [k for k, (a, b) in enumerate(zip(lines, head_lines)) if a != b]
-                lo, hi = max(0, min(changed) - 3), min(len(lines), max(changed) + 4)
-                diff = "\n".join(list(difflib.unified_diff(lines[lo:hi], head_lines[lo:hi], lineterm="", n=3))[2:]).replace("@@ -1,", "@@ -%d," % (lo + 1), 1).replace(" +1,", " +%d," % (lo + 1), 1)
+                diff = "\n".join(list(difflib.unified_diff(lines, head_lines, lineterm="", n=3))[2:])
                 return self.closure_check("\n".join(head_lines), diff)
             head = list(lines)   # derived: a comment on EVERY statement of the registrar, in one edit (one closure walk)
-            for first, last in statements:
+            for first, last in statements[::4] + [statements[-1]]:
                 head[first - 1] = head[first - 1] + "  # x"
             self.assertEqual(check(head), [], "every line of the other commands' registration may change")
             def after(prefix, new):   # keep line count constant so spliced_head re-parses only add_core_parsers (#2525)

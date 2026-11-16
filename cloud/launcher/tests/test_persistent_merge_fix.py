@@ -55,7 +55,7 @@ class CopyRun(unittest.TestCase):
         i1 = next(i for i, l in enumerate(lines) if l.startswith("class TwoRepoCase("))
         i2 = next(i for i, l in enumerate(lines) if l.startswith("class TestLaunchRefusedMessage("))
         i3 = next(i for i in range(i2 + 1, len(lines)) if lines[i].startswith("class "))
-        i4 = next(i for i, l in enumerate(lines) if l.startswith('if __name__ == "__main__":'))
+        i4 = next(i for i, l in enumerate(lines) if l.startswith("def main(argv):"))
         head = [l for l in lines[:120] if not any(f"_support_test_cases_{k:02d}" in l for k in range(1, 14))]
         tail = "\n".join(lines[i4:]).replace(
             "    suite = loader.loadTestsFromModule(sys.modules[__name__])",
