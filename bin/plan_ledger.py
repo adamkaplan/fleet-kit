@@ -23,6 +23,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__))); import gate_budget  # noqa: E402,E702  (the sibling, found when loaded by path too)
 
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
@@ -272,7 +273,7 @@ def append_many_checked(state_dir, build, now):
 JUDGED_FIELDS = {
     "proof": ("result", "plan_hash"),
     "verdict": ("result", "plan_hash"),
-    "review_record": ("verdict", "blocks", "notes", "impact_action", "impact_class", "impact_severity", "impact_probability", "carry_confirmed", "block_sha256"),
+    "review_record": ("verdict", "blocks", "notes", "impact_action", "impact_class", "impact_severity", "impact_probability", "carry_confirmed", "block_sha256", "mutants_run", "mutants_survived", "blast_radius"),
 }
 RECORDED_KINDS = tuple(JUDGED_FIELDS)   # the kinds the recording commands write: derived by the tests from the commands
 
@@ -1023,20 +1024,17 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
-            # FAIL MODE (#1119): the new wording ONLY when the floor was read and positively says not held, with no hold label. A floor that is
-            # absent or unreadable (handled above or not a dict) and any hold label keep the old behaviour: waiting for the owner.
-            elif (facts or {}).get("captain") and "marker-without-label" in ((facts or {}).get("captain_findings") or ()) \
-                    and isinstance(floor, dict) and not (facts or {}).get("holds"):   # the floor read above says not held
-                row.update(status="ok", detail="a marker without a hold: set MERGE: automatic", missing=[])
+            elif labels_unread((facts or {}).get("captain")):   # the labels (or the fact itself) were not readable: not "not held" (#2379)
+                row.update(status="waiting", missing=["labels could not be read: whether the PR is held for the owner is not known, so it is NOT READY"])
             elif (facts or {}).get("captain"):
-                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
+                row.update(status="waiting", missing=["held for the owner (merge-captain label): the owner decides, through cos"])
             else:
                 row.update(status="ok", detail="not a held PR")
         elif gid == "G6b":
             floor = (facts or {}).get("floor")
             # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
             # `held_check` on a held PR fails closed (missing)
-            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
+            held = labels_unread((facts or {}).get("captain")) or bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
             check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
             if not held:
                 row.update(status="n/a", detail="not a held PR")
@@ -1174,13 +1172,15 @@ def render_gates(report, pr):
 
 MODES = ("shadow", "enforce")
 CHECK_FOR = ("ready", "merge")
-DEFAULT_BUDGET_MS = 3000
 BUDGET_RANGE = (500, 30000)
 # the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
 REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G0c", "G1", "G4", "G6", "G6b")}
 DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
 ENFORCEABLE = ("G0a", "G0c", "G1", "G4", "G6", "G6b")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
+
+
+def labels_unread(captain): return captain is None   # (#2379) an absent or None `captain` fact means the labels could not be read: held or not is unknown, never "not held"
 
 
 def normal_repo(name):
@@ -1216,15 +1216,15 @@ def validate_plan_gates(raw, source):
         enabled = entry.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError("%s: 'plan_gates.repos.%s.enabled' must be true or false" % (source, name))
-        budget = entry.get("budget_ms", DEFAULT_BUDGET_MS)
-        if not (isinstance(budget, int) and not isinstance(budget, bool) and BUDGET_RANGE[0] <= budget <= BUDGET_RANGE[1]):
+        budget = entry.get("budget_ms")   # NEW: absent stays absent; repo_setting() derives it from the shim's limit when it is read
+        if budget is not None and not (isinstance(budget, int) and not isinstance(budget, bool) and BUDGET_RANGE[0] <= budget <= BUDGET_RANGE[1]):
             raise ValueError("%s: 'plan_gates.repos.%s.budget_ms' must be a whole number from %d to %d"
                              % (source, name, *BUDGET_RANGE))
         gates = entry.get("enforce_gates", list(DEFAULT_ENFORCED))
         if not (isinstance(gates, list) and gates and all(g in ENFORCEABLE for g in gates) and len(set(gates)) == len(gates)):
             raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
                              "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
-        repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
+        repos[name] = dict({"mode": mode, "enabled": enabled, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}, **({} if budget is None else {"budget_ms": budget}))
         if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
             repos[name]["item_checks"] = entry["item_checks"]
         if "ci_current_tip" in entry:   # #1755: only an explicit false turns the rule off; carried as it is
@@ -1251,7 +1251,7 @@ def repo_setting(config, repo):
     """The repo's {"mode", "enabled", "budget_ms"} from the validated config, or None when it is not opted in."""
     for name, entry in ((config.get("plan_gates") or {}).get("repos") or {}).items():
         if normal_repo(name) == normal_repo(repo):
-            return dict(entry, name=name)
+            return dict(entry, name=name, budget_ms=entry.get("budget_ms") or gate_budget.default_budget_ms())
     return None
 
 

@@ -10,6 +10,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, LAUNCHER)
+sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
+import stub_support  # noqa: E402
 import cloud_worker as cw  # noqa: E402
 
 SUB = "00000000-0000-0000-0000-000000000001"
@@ -163,7 +165,7 @@ def scenario_s6(t, module):
             "import types\nm = types.ModuleType('mod'); m.__file__ = %r; sys.modules['mod'] = m\nexec(compile(open(%r).read(), %r, 'exec'), m.__dict__)\n"
             "import os\ntry:\n    m.cluster_token(dict(os.environ), '20m')\nexcept m.ClusterLogin as e:\n    print(e.kind)\n") % (LAUNCHER, REAL, getattr(module, "TEXT_PATH", REAL), REAL)
     env = dict(t.env)
-    procs = [subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) for _ in range(10)]
+    procs = [stub_support.start(t, [sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) for _ in range(10)]
     outs = []
     try:
         for p in procs:
@@ -225,7 +227,7 @@ class Scenarios(Fake):
         self.expire()
         self.mode("slow-ok")
         result = []
-        probe = threading.Thread(target=lambda: result.append(self.refused()))
+        probe = threading.Thread(target=lambda: result.append(self.refused()), daemon=True)
         probe.start()
         try:
             end = time.time() + 20
@@ -254,7 +256,7 @@ class Scenarios(Fake):
         self.assertEqual(self.calls(), 2)
 
     def test_s3_a_lock_of_a_killed_command_is_ignored_at_once(self):
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = stub_support.start(self, [sys.executable, "-c", "pass"])
         dead.wait()
         os.makedirs(os.path.dirname(self.lock_path()), exist_ok=True)
         with open(self.lock_path(), "w") as f:

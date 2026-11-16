@@ -2,11 +2,13 @@
 // turn it into the rows the sidebar draws. No process is spawned and nothing leaves this machine; the file
 // is read from the switchboard's state directory (FLEET_SWITCHBOARD_STATE, else the daemon's default one).
 // See docs/switchboard.md, "Decisions (PR 14)".
-import { readFileSync, statSync } from "node:fs"
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs"
 import { isAbsolute, join } from "node:path"
 
 export const STATE_ENV = "FLEET_SWITCHBOARD_STATE"
 export const DECISIONS_FILE = "decisions.json"
+export const ESCALATED_FILE = "escalated-requests.json"
+export const ESCALATED_READ_MAX = 1 << 20  // the escalation record is read once, at most this many bytes
 export const STALE_MS = 180_000       // older than this (by mtime, which every daemon pass refreshes): not current
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
@@ -160,9 +162,49 @@ export function stateDirOf(env) {
   return null
 }
 
+// The escalation record, read at read time (the same fact `fleet-switchboard decisions escalate` writes at once; the daemon only folds it into decisions.json at its next pass).
+// Bounded (1 MiB), never opened blocking, regular files only, never written. null when it cannot be read: the daemon's tier then stands.
+export function readEscalated(dir, fs = { openSync, fstatSync, readSync, closeSync }) {
+  let fd
+  try {
+    fd = fs.openSync(join(dir, ESCALATED_FILE), constants.O_RDONLY | (constants.O_NONBLOCK ?? 0))
+    if (!fs.fstatSync(fd).isFile()) return null
+    const buf = Buffer.alloc(ESCALATED_READ_MAX + 1)
+    const n = fs.readSync(fd, buf, 0, buf.length, 0)
+    if (n > ESCALATED_READ_MAX) return null
+    const body = JSON.parse(buf.toString("utf8", 0, n))
+    const found = body && typeof body === "object" ? body.requests : null
+    if (!found || typeof found !== "object" || Array.isArray(found)) return null
+    return new Set(Object.keys(found).filter((k) => typeof found[k] === "string"))
+  } catch {
+    return null
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd) } catch {} }
+  }
+}
+
+// The record key a decision row is named by (decision_core.entry_escalation_key): a captain row by repo, number and EXACT head, a request row by session and request.
+export function escalationKeyOf(d) {
+  if (!d || typeof d !== "object") return null
+  if (d.kind === "captain") {
+    const n = Number(d.number)
+    return d.head && typeof d.repo === "string" && Number.isInteger(n) ? `captain:${d.repo}#${n}@${d.head}` : null
+  }
+  return d.session && d.request ? `${d.session}:${d.request}` : null
+}
+
+// decision_core.apply_escalations: a `cos` row the record names is `human`; nothing else changes, a tier is never lowered. `escalated` null (unreadable) leaves the rows as they are.
+export function applyEscalations(decisions, escalated) {
+  if (!escalated) return decisions
+  return decisions.map((d) => {
+    const key = d && d.tier === "cos" ? escalationKeyOf(d) : null
+    return key && escalated.has(key) ? { ...d, tier: "human" } : d
+  })
+}
+
 // What the file says now: {status, decisions, errors, ageMs}.
 // status: "ok" | "stale" | "missing" | "unreadable" | "unset". Only "ok" is a current list.
-export function loadSnapshot(dir, nowMs, fs = { statSync, readFileSync }) {
+export function loadSnapshot(dir, nowMs, fs = { statSync, readFileSync }, readRecord = readEscalated) {
   const none = { decisions: [], errors: [], ageMs: null }
   if (!dir) return { status: "unset", ...none }
   const path = join(dir, DECISIONS_FILE)
@@ -182,7 +224,7 @@ export function loadSnapshot(dir, nowMs, fs = { statSync, readFileSync }) {
   const ageMs = Math.max(0, nowMs - info.mtimeMs)
   return {
     status: ageMs > STALE_MS ? "stale" : "ok",
-    decisions: body.decisions.filter((d) => d && typeof d.id === "string" && typeof d.title === "string"),
+    decisions: applyEscalations(body.decisions.filter((d) => d && typeof d.id === "string" && typeof d.title === "string"), readRecord(dir)),
     errors: Array.isArray(body.errors) ? body.errors : [],
     ageMs,
   }

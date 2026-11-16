@@ -391,7 +391,7 @@ def apply_impact_hold(engine, repo, number, report, record):
 
 def _batch_release(engine, repo, number, report, record):
     """(#955, mirrors the carry of one pull request) A batch that carried and had been held before: drop the daemon's record of its labels, remove the labels it added (`gate.hold_released`), and turn a first-line
-    `MERGE: captain` marker into `MERGE: automatic` (`neutralise_marker`, head-checked: the marker is read by the gate while no merge label says otherwise), then tell the Chief of Staff (`gate.clear_carried`
+    `MERGE: captain` marker into `MERGE: automatic` (`neutralise_marker`, head-checked: the line is no longer read by the gate, and is kept consistent with the label), then tell the Chief of Staff (`gate.clear_carried`
     notice, kind carry). Never raises: the carry is recorded and nothing here may fail the pass. Labels the daemon did not add (an author's) are not touched."""
     pr, head = report["pr"], report["head"]
     try:
@@ -661,7 +661,7 @@ def impact_rehold_open(state_dir, repo, number):
 
 
 def neutralise_marker(engine, runner, repo, number, head, first=None):
-    """#522: the owner's clear lifts the whole hold, so the body's first line `MERGE: captain` becomes `MERGE: automatic` (the gate reads it while no merge label says otherwise).
+    """#522: the owner's clear lifts the whole hold, so the body's first line `MERGE: captain` becomes `MERGE: automatic` (the gate no longer reads it for the hold: the label does; the line is kept consistent).
     The ONE place it is done, called by `impact_clear_core` (the owner's command and his words in the chat both end there; a carry of a clear never does). The body is read fresh
     for `head` only (`first` is the clear's own read of that moment, or None to read one), read again right before the write and written only when it is the same, then read back. Best effort (GitHub has no conditional body write, so an edit landing between the last read and the write is not detected). Never raises: a failure is audited and a line says the marker remains,
     for the owner's clear has already stood. Returns the lines to print."""
@@ -1271,11 +1271,12 @@ def delegated_clear_checks(engine, runner, now, kind, number):
         return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", line), "threshold": threshold, "source": module.OWNER_FILE}, None
     try:
         reader = _intent_reader(runner, now)
-        text = module.order_text(fetch_orders(reader, charter, engine.config.get("intent_repo")), number)
+        charter_repo = module.charter_repo(engine.config, engine.config.get("intent_repo"))   # delegated_clear.repo, else intent_repo as before
+        text = module.order_text(fetch_orders(reader, charter, charter_repo), number)
     except (IntentError, ConfigError, OSError) as err:
         return None, "the charter's orders cannot be read (%s): refused" % module.whole_line(str(err))
     if text is None:
-        return None, "order %d does not exist on charter #%d" % (number, charter)
+        return None, "order %d does not exist on charter %s#%d" % (number, charter_repo, charter)
     if module.order_hash(text) != orders[number]:   # the order numbers are POSITIONS: the text bound in the configuration must still be the text at that number
         return None, "the text of order %d is no longer the one the configuration is bound to (an order was edited, inserted or removed): the owner re-binds it" % number
     return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text), "threshold": threshold}, None
@@ -1721,7 +1722,7 @@ def _make_bind(make_guard):
 
     def bind(namespace, check):
         """Rebind every moved function to `namespace`, install it there under its own name, and return the names bound; the effects are built around `check`."""
-        if any(done is namespace for done in bound):
+        if any(done is namespace for done in bound) or any(getattr(namespace.get(name), "_impact_hold_bound", None) is namespace for name in MOVED):   # the second test outlives a reload of this module (its `bound` list is then a new, empty one): the namespace's own functions say it was bound (they name THIS namespace, never a copy of it)
             raise RuntimeError("impact_hold is already bound to this namespace: a second bind is refused")
         bound.append(namespace)
         if not callable(check):
@@ -1733,6 +1734,7 @@ def _make_bind(make_guard):
             function = rebuilt(original.__wrapped__ if guards else original, namespace)
             if guards:   # the refusal is the namespace's own copy (it names PROG and sys there)
                 function = rebuilt(guard(guards[0], namespace[guards[1].__name__])(function), namespace)
+            function._impact_hold_bound = namespace   # the namespace itself, so a copy of its dict is not 'bound'
             namespace[name] = function
         return MOVED
     return bind

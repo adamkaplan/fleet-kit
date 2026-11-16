@@ -311,6 +311,9 @@ class S13ImportsMutant(unittest.TestCase):
     def test_the_list_without_token_mint_fails_the_test(self):
         self.drop(', "cloud/launcher/token_mint.py"')
 
+    def test_the_list_without_the_launcher_path_walk_fails_the_test(self):
+        self.drop(', "cloud/launcher/path_walk.py"')
+
     def test_the_list_without_record_json_fails_the_test(self):
         self.drop(', "bin/record_json.py"')
 

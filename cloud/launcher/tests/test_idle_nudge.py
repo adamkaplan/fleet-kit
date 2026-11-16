@@ -46,6 +46,8 @@ class Stub:
         self.sent.append(text)
 
     def audit(self, *a):
+        if a[2] == "idle-nudge-skipped":   # the diagnosis line: kept apart, so these cases still pin the nudge itself
+            return self.__dict__.setdefault("skips", []).append(a)
         self.audits.append(a)
 
     def _cost_or_zero(self, p):

@@ -17,6 +17,13 @@ def seen(role, name="widget-lead"):
     return sb.Observation(name, "ses_example", "w1:p1", "idle", {"name": name, "role": role})
 
 
+def seen_in(role, name, repo=None):
+    fleet = {"name": name, "role": role}
+    if repo:
+        fleet["repo"] = repo
+    return sb.Observation(name, "ses_example", "w1:p1", "idle", fleet)
+
+
 def fact(key, kind, created=BASE, recipient="widget-lead", **extra):
     return sb.Fact(key, recipient, kind, extra.pop("summary", "s %s" % key), created, **extra)
 
@@ -125,15 +132,16 @@ class TestOrchestratorLaneGate(unittest.TestCase):
             self.assertEqual(sb.lane_gate(lanes(role), "widget-lead", 3, BASE, BASE), "go")
         self.assertEqual(sb.lane_gate(None, "widget-lead", 3, BASE, BASE), "go")
 
+    def test_a_quiet_pod_whose_record_names_a_cw_run_job_is_not_told(self):
+        d = lanes()
+        self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-1", pod_jobs=["build"]), "wait")
+        self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-1", pod_jobs=[]), "go")
+
     def test_a_quiet_pod_with_a_live_detached_job_is_not_told(self):
         d = lanes()
-        orig = sb.jobs_active_for
-        try:
-            sb.jobs_active_for = lambda name, root=None: name == "w-1"
-            self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-1"), "wait")
-            self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-2"), "go")
-        finally:
-            sb.jobs_active_for = orig
+        alive = lambda name, root=None: name == "w-1"
+        self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-1", jobs_alive=alive), "wait")
+        self.assertEqual(sb.lane_gate(d, "widget-lead", 2, BASE + 99999, BASE, "w-2", jobs_alive=alive), "go")
 
 
 class TestPrGreenEvent(unittest.TestCase):
@@ -157,12 +165,12 @@ class TestPrGreenEvent(unittest.TestCase):
 
     def test_the_hub_queues_one_item_and_a_second_pass_queues_none(self):
         hub = types.SimpleNamespace(engine=types.SimpleNamespace(notice_facts=self.held()), _green=set(), queue={}, lock=_NoLock())
-        sb.GitHubHub.note_pr_green(hub, BASE)
+        sb.queue_pr_green(hub, BASE, sb.GitHubItem)
         self.assertEqual(list(hub.queue), ["github.pr_green:acme-org/widget-service#7:%s" % ("a" * 40)])
         item = next(iter(hub.queue.values()))
         self.assertEqual((item.kind, item.numbers, item.lookups, item.actionable), ("github.pr_green", [7], [("pr", 7)], True))
         hub.queue.clear()
-        sb.GitHubHub.note_pr_green(hub, BASE + 60)
+        sb.queue_pr_green(hub, BASE + 60, sb.GitHubItem)
         self.assertEqual(hub.queue, {})
 
     def test_the_item_is_a_tier_1_wake_for_an_orchestrator(self):
@@ -179,14 +187,28 @@ class _NoLock:
 
 
 class TestChiefLanesRoleFilter(unittest.TestCase):
-    """S4: only role == "chief-of-staff"."""
+    """S4: GitHubHub._chief_lanes selects only role == "chief-of-staff", keeping the repo preference."""
+
+    def agents(self, **repos):
+        return {"cos": seen_in("chief-of-staff", "cos", repos.get("cos")), "widget-lead": seen_in("orchestrator", "widget-lead", repos.get("lead")),
+                "w-1": seen_in("coder", "w-1"), "t-1": seen_in("tester", "t-1")}
+
+    def lanes(self, agents, repo="acme-org/widget-service"):
+        return sb.GitHubHub._chief_lanes(None, types.SimpleNamespace(repo=repo), agents)
 
     def test_only_the_chief_of_staff_is_returned(self):
-        agents = {"cos": seen("chief-of-staff", "cos"), "widget-lead": seen("orchestrator"), "w-1": seen("coder", "w-1"), "t-1": seen("tester", "t-1")}
-        self.assertEqual(sb._chief_lanes(agents), ["cos"])
-        self.assertEqual(sb._chief_lanes({"widget-lead": seen("orchestrator")}), [])
+        self.assertEqual(self.lanes(self.agents()), ["cos"])
+        self.assertEqual(self.lanes({"widget-lead": seen("orchestrator")}), [])
 
-    def test_the_hub_uses_it(self):
-        agents = {"cos": seen("chief-of-staff", "cos"), "widget-lead": seen("orchestrator")}
+    def test_a_lane_bound_to_this_repository_comes_first_and_another_repository_is_left_out(self):
+        agents = self.agents(cos="acme-org/widget-service")
+        agents["cos-2"] = seen_in("chief-of-staff", "cos-2", None)
+        agents["cos-3"] = seen_in("chief-of-staff", "cos-3", "acme-org/other-service")
+        self.assertEqual(self.lanes(agents), ["cos"])
+        del agents["cos"]
+        self.assertEqual(self.lanes(agents), ["cos-2"])
+
+    def test_the_hub_chiefs_of_staff_are_the_same_role(self):
+        agents = self.agents()
         hub = types.SimpleNamespace(discover=lambda: types.SimpleNamespace(agents=agents, problems=[]))
         self.assertEqual(sb.GitHubHub._chiefs_of_staff(hub), ["cos"])

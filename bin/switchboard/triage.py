@@ -11,7 +11,7 @@ TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days"
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
 # (No tracked repo is named here: a public source names no private org. The extra repos go in the config's `triage.repos`.)
 TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no next step",
-                "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
+                "T5": "human-tier decision unanswered", "T6": "merge-captain PR waiting", "T7": "PR with no review",
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
                 "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
 # #805: the inputs each rule judges, in ONE table: the candidates a pass drops and the records the prune keeps are both read from it, so they cannot drift.
@@ -692,7 +692,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             unchecked.setdefault(repo, []).append("comments")
         for number, item in sorted(items.items()):
             comments = triage_comment_facts(by_number.get(number, [])) if comments_unit is not None else None
-            # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
+            # a merge-captain PR already in the decision list is T6's; while the list is incomplete a captain PR waits
             captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
             live = state.live.get((repo, number)) if triage_awaits_live(item) else None
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),

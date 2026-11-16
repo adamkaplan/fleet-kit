@@ -31,8 +31,10 @@ class StackUp(unittest.TestCase):
         self.run_dir, self.tmpfs, self.home, self.bin, self.rec, self.share = [os.path.join(self.d, x) for x in ("run", "tmpfs", "home", "bin", "rec", "share")]
         for x in (self.run_dir, self.tmpfs, self.home, self.bin, self.rec, self.share):
             os.mkdir(x)
-        for src, name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
+        for src, name in (("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
             shutil.copy(os.path.join(WORKER, src), os.path.join(self.share, name))
+        os.makedirs(os.path.join(self.share, "plugins/cw-tool-cap"), exist_ok=True)
+        shutil.copy(os.path.join(WORKER, "plugins/cw-tool-cap/index.js"), os.path.join(self.share, "plugins/cw-tool-cap/index.js"))
         for name, body in (("docker", FAKE_DOCKER),):
             with open(os.path.join(self.bin, name), "w") as f:
                 f.write(body)

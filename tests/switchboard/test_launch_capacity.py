@@ -234,6 +234,7 @@ class FakeKube:
 
 
 LIB = None
+PC11_RUNS = {}   # (script, mutation) -> (code, stderr, stdout) of a scratch run, shared by the tests of the class
 
 
 def build():
@@ -291,6 +292,23 @@ def build():
                 out.append(line)
             return "\n".join(out)
 
+        def expected_room(self, shape, nodes=None, pods=None, shapes=None):
+            """The room the block must say for a shape, from the launcher's own table (capacity_shapes: the REQUEST when SHAPE_REQUESTS has a row, else the limit)
+            and the fake nodes' allocatable minus the requests of their pods, never a pinned number."""
+            row = (shapes or LIB.capacity_shapes())[shape]
+            need_cpu, need_mem = LIB._quantity(row["cpu"], 1000), LIB._quantity(row["memory"], 1)
+            used = {}
+            for p in (PODS if pods is None else pods):
+                on = p["spec"].get("nodeName")
+                if on and p["status"]["phase"] not in ("Succeeded", "Failed"):
+                    u = used.setdefault(on, [0, 0])
+                    for c in p["spec"]["containers"]:
+                        u[0] += LIB._quantity(c["resources"]["requests"]["cpu"], 1000)
+                        u[1] += LIB._quantity(c["resources"]["requests"]["memory"], 1)
+            return sum(1 for n in (NODES if nodes is None else nodes)
+                       if LIB._quantity(n["status"]["allocatable"]["cpu"], 1000) - used.get(n["metadata"]["name"], [0, 0])[0] >= need_cpu
+                       and LIB._quantity(n["status"]["allocatable"]["memory"], 1) - used.get(n["metadata"]["name"], [0, 0])[1] >= need_mem)
+
         def rows(self, block):
             return dict(re.findall(r"shape (\w+): (\d+) nodes with room", block))
 
@@ -300,8 +318,11 @@ def build():
             self.assertEqual(code, 0, err)
             block = self.block(err)
             rows = self.rows(block)
-            for shape, room in {"XS": "4", "S": "3", "M": "1"}.items():   # the room per shape the fixture gives; a new shape adds a row
-                self.assertEqual(rows.get(shape), room, block)
+            for shape in ("XS", "S", "M", "L"):   # the room per shape from the launcher's table and the fixture; a new shape adds a row
+                self.assertEqual(rows.get(shape), str(self.expected_room(shape)), block)
+            limits = {n: dict(r) for n, r in LIB.SHAPES.items()}
+            self.assertNotEqual(self.expected_room("M", shapes=limits), self.expected_room("M"), "the fixture cannot tell the request from the limit")
+            self.assertNotEqual(rows.get("M"), str(self.expected_room("M", shapes=limits)), "the block counted M from its limit, not the table: " + block)
             self.assertIn("Pending pods: 2", block)
             event = [line for line in block.splitlines() if "last FailedScheduling:" in line]
             self.assertEqual(len(event), 1, block)
@@ -316,7 +337,9 @@ def build():
 
         # -- S3
         def test_s3_no_room_for_M_the_launch_proceeds_and_the_block_says_0(self):
-            small = [node("n%d" % i, "3") for i in range(1, 5)]
+            m_cpu = LIB._quantity(LIB.capacity_shapes()["M"]["cpu"], 1000)
+            small = [node("n%d" % i, "%dm" % (m_cpu - 1)) for i in range(1, 5)]   # every node's free cpu is just below M's request in the table
+            self.assertEqual(self.expected_room("M", nodes=small, pods=[]), 0)
             self.set_cluster(FakeKube(nodes=small, pods=[]))
             code, out, err = self.launch_with("--cloud", "--shape", "M", "--stack")
             self.assertEqual(code, 0, err)
@@ -413,7 +436,7 @@ def build():
             with mock.patch.dict(LIB.SHAPES, shapes):
                 code, out, err = self.launch_with("--cloud")
             rows = self.rows(self.block(err))
-            self.assertEqual(sorted(rows), ["M", "Q", "S", "XS"], err)
+            self.assertEqual(sorted(rows), sorted(n for n in shapes if n != "O"), err)
             self.assertEqual(rows["Q"], "1")
             self.assertNotIn("shape O", err)
 
@@ -737,17 +760,23 @@ print(counts)
 """
         PC11_U23 = r"""
 forms = {"v4": "10.99.88.77", "v6": "fd00:abcd:1234:5678:9abc:def0:1234:5678", "mapped": "0:0:0:0:0:ffff:10.99.88.77"}
+# one run of address characters longer than WINDOW is cut into windows of WINDOW that start every WINDOW - WINDOW_OVERLAP: the first window ends at WINDOW,
+# so an address is split exactly when it starts before that end and ends after it: every such offset, one more on each side, for each form
+END = lib.WINDOW
+TOTAL = END + 100
 split = []
+checked = 0
 for name, form in sorted(forms.items()):
-    for offset in range(120, 281):
-        line = "." * offset + form + "." * (400 - offset - len(form))
-        assert len(line) == 400
-        want = "." * offset + "[address]" + "." * (400 - offset - len(form))
-        out = lib._mask_addresses(line)
-        if out != want:
+    for offset in range(END - len(form) - 1, END + 2):
+        line = "." * offset + form + "." * (TOTAL - offset - len(form))
+        assert len(line) == TOTAL
+        want = "." * offset + "[address]" + "." * (TOTAL - offset - len(form))
+        checked += 1
+        if lib._mask_addresses(line) != want:
             split.append((name, offset))
+            break    # the first leak is the answer: the rest of the offsets are not run for a mutant
 if split:
-    sys.exit("an address split by a window boundary leaked: %d of 483, first %r" % (len(split), split[:3]))
+    sys.exit("an address split by a window boundary leaked: %d of %d, first %r" % (len(split), len(forms), split[:3]))
 """
 
         PC11_U24 = r"""
@@ -858,6 +887,12 @@ for line, planted, want in (("::ffff:10.0.0.1ab", "::ffff:10.0.0.1", "[address]a
             self.assertIn("a mapped or dotted-tail form with glue was left", err)
 
         def pc11_run(self, script, mutate=None):
+            key = (script, mutate)
+            if key not in PC11_RUNS:   # a control is run once for the whole class: the launcher sources do not change during a run
+                PC11_RUNS[key] = self.pc11_run_uncached(script, mutate)
+            return PC11_RUNS[key]
+
+        def pc11_run_uncached(self, script, mutate=None):
             import shutil, subprocess, tempfile
             root = Path(__file__).resolve().parents[2]
             with tempfile.TemporaryDirectory(prefix="pc11-") as tmp:

@@ -1,6 +1,10 @@
 # ------------------------------------------------------------ the decision
 
 import copy
+import hashlib
+import math
+import re
+from pathlib import Path
 
 
 class MessageTooLong(Exception):
@@ -102,32 +106,17 @@ def orchestrator_ready_at(recipient, chosen, batch_seconds):
     return min(ready)
 
 
-def jobs_active_for(name, root=None):
-    """True when a detached `job` that `name` started is still alive (its quiet is the job's, not a stall)."""
-    try:
-        base = Path(root or jobs_dir())
-        return any(r.get("starter") == name and job_state(r, base)[0] == "alive"
-                   for r in (job_read(e.name, base) for e in sorted(base.iterdir())[:JOB_SCAN_MAX] if JOB_NAME_RE.match(e.name)) if r)
-    except (OSError, ValueError):
-        return False
-
-
-def lane_gate(discovery, recipient, tier, now, since, worker=None, root=None):
+def lane_gate(discovery, recipient, tier, now, since, worker=None, root=None, pod_jobs=None, jobs_alive=None):
     """"go", "wait" or "drop" for a message the daemon itself would send to `recipient` (push_watch, pod_silence). Only an orchestrator is gated:
-    tier 3 is dropped, tier 2 and 1 wait for their bucket (tier 2 also while the worker has a detached job alive), tier 0 goes."""
+    tier 3 is dropped, tier 2 and 1 wait for their bucket (tier 2 also while the worker has a detached `job` alive here, or a cw-run job its pod record names in `pod_jobs`), tier 0 goes."""
     agents = discovery.agents if discovery is not None and not discovery.problems else {}
     if not is_orchestrator(agents.get(recipient)) or tier == 0:
         return "go"
     if tier == 3:
         return "drop"
-    if tier == 2 and worker and jobs_active_for(worker, root):
+    if tier == 2 and (pod_jobs or (worker and jobs_alive is not None and jobs_alive(worker, root))):
         return "wait"
     return "go" if now >= bucket_target(recipient, tier, since) else "wait"
-
-
-def _chief_lanes(agents):
-    """The names of the Chief of Staff lanes in `agents` ({name: observation}): the role `chief-of-staff` and no other (an orchestrator is not one)."""
-    return sorted(name for name, seen in agents.items() if (getattr(seen, "fleet", None) or {}).get("role") == "chief-of-staff")
 
 
 def pr_green_notes(held, told):
@@ -504,3 +493,15 @@ def describe_items(recipient, facts, repos=None):
     else:
         line = "switchboard: %d items for %s: %s" % (len(facts), recipient, _line_of(lead.summary, 80))
     return _one_line(line, DESCRIPTION_MAX)
+
+
+def queue_pr_green(hub, now, item_class):
+    """#2545: `github.pr_green` for an open PR whose checks all finished green, once per (repo, pr, head sha); from the notice reads already held (no read of its own)."""
+    for repo, number, head in pr_green_notes(getattr(hub.engine, "notice_facts", None), hub._green):
+        item = item_class("github.pr_green:%s#%d:%s" % (repo, number, head), "github.pr_green", "PR #%d: all checks finished green at head %s" % (number, head[:7]),
+                          repo, [], [("pr", number)], None, now, [number], True)
+        with hub.lock:
+            if len(hub._green) > 20000:
+                hub._green.clear()
+            hub._green.add((repo, number, head))
+            hub.queue.setdefault(item.key, item)

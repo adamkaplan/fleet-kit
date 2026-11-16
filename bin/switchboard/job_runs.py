@@ -357,3 +357,13 @@ class JobFacts:
                                                                 self.said(record, root, engine.now())),
                               started or engine.now(), batch=False, sender="switchboard"))
         return facts
+
+
+def jobs_active_for(name, root=None):
+    """True when a detached `job` that `name` started is still alive (its quiet is the job's, not a stall)."""
+    try:
+        base = Path(root or jobs_dir())
+        return any(r.get("starter") == name and job_state(r, base)[0] == "alive"
+                   for r in (job_read(e.name, base) for e in sorted(base.iterdir())[:JOB_SCAN_MAX] if JOB_NAME_RE.match(e.name)) if r)
+    except (OSError, ValueError):
+        return False

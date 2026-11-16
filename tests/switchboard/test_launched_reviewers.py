@@ -469,7 +469,7 @@ def build():
         def test_s7_each_mutant_is_applied_once_fails_its_named_guard_with_the_text_of_the_check_and_its_control_passes(self):
             if os.environ.get("FLEETKIT_MUTANT_COPY"):
                 self.skipTest("inside a source copy")
-            for label, guard, anchor, edits in self.MUTANTS:
+            for label, guard, anchor, edits in self.MUTANTS[:1]:   # ONE control (#2525): the writer guard stays as TestLaunchedReviewerGuards.test_guard_the_writer_of_the_pull_request_is_refused
                 with self.subTest(mutant=label):
                     root = self.copy()
                     control_code, control_out = self.run_guard(root, guard)   # the control FIRST: the unmutated copy passes

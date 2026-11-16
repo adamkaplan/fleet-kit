@@ -57,7 +57,7 @@ def message_text(worker, minutes, line):
 
 
 def scan(workers, now, state_path, send, summary, parse, quiet=QUIET, prune=True, audit=None, gate=None):
-    """`workers`: [{"worker", "boss", "last_report" epoch|None, "last_push" epoch|None, "done" bool}] of the LIVE pods. Returns [(boss, text)] handed to send.
+    """`workers`: [{"worker", "boss", "last_report" epoch|None, "last_push" epoch|None, "done" bool, optional "jobs": the pod's running cw-run job names}] of the LIVE pods. Returns [(boss, text)] handed to send.
     `prune` False (a capped read: the pass did not see every pod) keeps the state of the pods not handed in, so an unread pod keeps its told mark."""
     state = _load(state_path, parse)
     live = {w.get("worker") for w in workers if isinstance(w, dict)}
@@ -75,7 +75,7 @@ def scan(workers, now, state_path, send, summary, parse, quiet=QUIET, prune=True
             mem["told"] = told = None   # a report or a push after the message: a new quiet period
         if told is not None or now - active < quiet:
             continue
-        if gate is not None and gate(boss, active + quiet, name) != "go":
+        if gate is not None and gate(boss, active + quiet, name, w.get("jobs")) != "go":
             continue   # #2545: an orchestrator hears a quiet pod at its :00 UTC bucket (and not while the pod's detached job runs): not told yet, asked again next pass
         reason = None
         try:

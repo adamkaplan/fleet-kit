@@ -44,8 +44,9 @@ def put_cos_orders(test, text, mtime=None):
 def pr_view_json(title="Add the parser", state="OPEN", additions=120, deletions=14, files=5, checks=None,
                  review="APPROVED", **more):
     checks = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}] if checks is None else checks
+    # an unlabelled view reads as unreadable labels (fail closed): the fixture states `labels` (none) unless a test gives them
     return json.dumps(dict({"title": title, "state": state, "additions": additions, "deletions": deletions,
-                            "baseRefName": "main", "headRefOid": "c" * 40,
+                            "baseRefName": "main", "headRefOid": "c" * 40, "labels": [],
                             "changedFiles": files, "statusCheckRollup": checks, "reviewDecision": review}, **more))
 
 
@@ -77,8 +78,10 @@ class FakeGhPr:
 HEAD_A, HEAD_B = "a" * 40, "b" * 40
 
 
-def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
-    """pr_view_json for a PR with a body, an author, a head and reviews [(login, state, commit oid)]."""
+def captain_pr(body="Adds the widget.\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
+    """pr_view_json for a PR HELD for the owner (the label is the only signal: `labels` defaults to the one `merge-captain` label; pass
+    labels=[] for a PR that is not held) with a body, an author, a head and reviews [(login, state, commit oid)]."""
+    more.setdefault("labels", [{"name": "tester:merge-captain"}])
     fields = {"body": body, "headRefOid": head, "author": {"login": author}, "reviews": [
         dict({"author": {"login": r[0]}, "state": r[1], "commit": {"oid": r[2]}}, **({"body": r[3]} if len(r) > 3 else {}))
         for r in (reviews or [])]}

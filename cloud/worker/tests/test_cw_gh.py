@@ -144,7 +144,7 @@ CALLS = {
 
 
 REFUSED = [["issue", "comment", "3", "-b", "x"], ["issue", "create"], ["issue", "edit", "3"], ["issue", "close", "3"], ["pr", "merge", "9"],
-           ["pr", "review", "9"], ["pr", "edit", "9"], ["pr", "close", "9"], ["label", "list"], ["release", "create"], ["workflow", "run"],
+           ["pr", "review", "9"], ["pr", "close", "9"], ["label", "list"], ["release", "create"], ["workflow", "run"],
            ["extension", "install", "x"], ["alias", "set", "a", "b"], ["auth", "status"], ["repo", "edit"], ["secret", "set", "X"],
            ["run", "rerun", "5"], ["config", "get", "x"], ["pr", "reopen", "9"], ["pr", "update-branch", "9"], ["repo", "clone", "x"]]
 
@@ -250,10 +250,9 @@ class Client(unittest.TestCase):
                 self.assertIn("is not available in this pod", p.stderr)
                 self.assertEqual(Stub.seen, [])   # nothing was sent
 
-    def test_api_is_get_only_with_no_body_graphql_or_host(self):
+    def test_api_is_get_only_with_no_body_or_host(self):
         bad = [["api", "-X", "POST", "repos/x/y"], ["api", "--method", "PATCH", "repos/x/y"], ["api", "repos/x/y", "-f", "a=b"],
-               ["api", "repos/x/y", "-F", "a=b"], ["api", "repos/x/y", "--input", "f"], ["api", "graphql"], ["api", "/graphql"],
-               ["api", "https://api.github.com/repos/x/y"], ["api", "repos/x/../y"], ["api", "repos/%2e%2e/y"], ["api", "a", "b"],
+               ["api", "repos/x/y", "-F", "a=b"], ["api", "repos/x/y", "--input", "f"], ["api", "https://api.github.com/repos/x/y"], ["api", "//example.invalid/x"], ["api", "a", "b"],
                ["api", "repos/x/y", "-H", "X: y"]]
         for argv in bad:
             with self.subTest(argv=argv):

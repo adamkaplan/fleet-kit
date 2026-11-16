@@ -107,7 +107,15 @@ class TestTurnEnd(World):
         self.assertEqual(text.count("def save_state("), 1)
         self.assertEqual(text.count("[-SENT_KEEP:]"), 1)   # one bound, in the one save function
         self.assertEqual(text.count("def turn_message_text("), 1)
-        self.assertEqual(text.count("send(to, text)"), 2)   # the alert's own call and the turn pass's: no other sender function
+        # every call of the injected sender sits in a scan_* pass (the alert, the turn, the stall and the idle-notice pass, #2443): no other function sends
+        current, senders = None, set()
+        for line in text.splitlines():
+            if line.startswith("def "):
+                current = line[4:].split("(")[0]
+            if "send(to, text)" in line:
+                senders.add(current)
+        self.assertTrue(senders and all(name.startswith("scan_") for name in senders), senders)
+        self.assertIn("scan_idle", senders)
 
     def test_an_unreadable_activity_sends_nothing(self):
         self.run_pass()

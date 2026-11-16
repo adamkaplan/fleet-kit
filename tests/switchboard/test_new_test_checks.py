@@ -365,7 +365,7 @@ class TestNewTestChecksInCloudPreflight(unittest.TestCase):
 
 
 class TestNewTestChecksMutants(unittest.TestCase):
-    """S10: six mutants, each on a source copy and applied exactly once; each control (the unmutated copy) passes first and the mutant fails the check on its own text."""
+    """S10: six mutants, each on a source copy and applied exactly once; each control (the unmutated copy) passes first and the mutant fails the check on its own text. (#2525: the standing-test subprocess re-runs of bin/test-switchboard on each mutant were deleted; the standing tests run in the suite itself.)"""
 
     def mutate(self, path, old, new):
         source = Path(path).read_text()
@@ -389,39 +389,17 @@ class TestNewTestChecksMutants(unittest.TestCase):
         self.assertFalse(any(": %s: " % rule in line for line in mutant[1]), "the mutant still flags %s: %r" % (rule, mutant))
         self.assertEqual(mutant[0], 0, mutant)
 
-    def standing(self, envname, mutant_path, names, failing, text):
-        """The standing tests `names` (unittest name filters of bin/test-switchboard) on the real tool exit 0 (control); on the mutated copy they exit non-zero and the
-        output names the failing standing test `failing` and carries the check's own assertion text `text`."""
-        def run(env_extra):
-            env = {k: v for k, v in os.environ.items() if not k.startswith("NTC_") or k == "NTC_NONE"}
-            env.update(env_extra)
-            done = subprocess.run([sys.executable, str(BIN / "test-switchboard")] + list(names), cwd=str(REPO), env=env, capture_output=True, text=True)
-            return done.returncode, done.stdout + done.stderr
-        code, out = run({})
-        self.assertEqual(code, 0, "control: the standing tests fail on the real tool: " + out[-3000:])
-        self.assertIn("RESULT: PASS", out)
-        code, out = run({envname: str(mutant_path)})
-        self.assertNotEqual(code, 0, "the standing tests still pass on the mutant: " + out[-3000:])
-        self.assertIn(failing, out)
-        self.assertIn(text, out)
-
     def test_mutant_moved_name_that_stops_flagging(self):
         old, new = "sorted(check_moved(source, root) + check_reads(tree)", "sorted([] + check_reads(tree)"
         self.tool_case(NTC_BINDS, "moved-name", old, new)
-        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
-                      "test_s2_a_moved_name_is_flagged_with_its_line_and_the_rule_is_read_not_copied", "the moved-name rule must flag a binding of a moved name with its file and line: got")
 
     def test_mutant_import_time_read_that_stops_flagging(self):
         old, new = "+ check_reads(tree) +", "+ [] +"
         self.tool_case(NTC_CLASS_READ, "import-time-read", old, new)
-        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
-                      "test_s3_only_a_read_at_import_outside_the_three_directories_is_flagged", "the import-time-read rule must flag a class-body read of a repo file with its file and line: got")
 
     def test_mutant_part_module_that_stops_flagging(self):
         old, new = "+ check_parts(tree, root))", "+ [])"
         self.tool_case(NTC_PATCHES, "part-module-through-import", old, new)
-        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, old, new), ["TestNewTestChecksRules"],
-                      "test_s4_a_part_module_patched_or_caught_through_is_flagged_as_sb_dot_name", "the part-module-through-import rule must flag a part module that is patched or caught through, one finding per file: got")
 
     def test_mutant_table_list_that_stops_listing(self):
         tmp = Path(tempfile.mkdtemp(prefix="ntc-"))
@@ -431,8 +409,6 @@ class TestNewTestChecksMutants(unittest.TestCase):
         self.assertTrue(any(l.startswith("table: class TestListsIt") for l in ntc_run(root, planted)[1]))
         mutant = ntc_run(root, planted, tool=self.mutate(NTC_TOOL, "lines, first = table_lines(source, tree, root, rel)", "lines, first = [], []"))
         self.assertFalse(any(l.startswith("table:") for l in mutant[1]), mutant)
-        self.standing("NTC_TOOL_PATH", self.mutate(NTC_TOOL, "lines, first = table_lines(source, tree, root, rel)", "lines, first = [], []"), ["TestNewTestChecksRules"],
-                      "test_s5_a_class_that_lists_bin_and_a_row_that_does_not_name_the_file_are_listed_not_flagged", "the table rule must list a class that lists bin/ as a table: line, not flag it: got")
 
     def test_mutant_preflight_pr_without_the_call(self):
         old = "    code = EXIT_ERROR if run_new_test_checks(runner, root, now) and code == EXIT_OK else code\n"
@@ -447,8 +423,6 @@ class TestNewTestChecksMutants(unittest.TestCase):
             code, out, err = ntc_preflight(entry, root)
             self.assertNotIn("FAIL new-test-checks", out, "the mutant still runs the check")
             self.assertEqual(code, 0)
-        self.standing("NTC_ENTRY_PATH", self.mutate(NTC_ENTRY, old, "    pass\n"), ["TestNewTestChecksInPreflightPr"],
-                      "test_s14_a_head_that_binds_a_moved_name_fails_and_a_clean_one_passes_in_both_forms", "a head that binds a moved name must make preflight-pr print FAIL new-test-checks and exit 1: got")
 
     def test_mutant_cloud_preflight_without_the_call(self):
         scenario = TestNewTestChecksInCloudPreflight("test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes")
@@ -462,8 +436,6 @@ class TestNewTestChecksMutants(unittest.TestCase):
         code, out = scenario.run_script(root, False, mutant)
         self.assertNotIn("new-test-checks: FAIL", out, "the mutant still runs the check")
         self.assertIn("RESULT: PASS", out)
-        self.standing("NTC_CLOUD_PATH", mutant, ["TestNewTestChecksInCloudPreflight"],
-                      "test_s16_the_block_is_printed_only_for_a_changed_switchboard_test_file_in_both_modes", "the cloud preflight must print the new-test-checks block for a changed switchboard test file in both modes and exit 1 for a moved name: got")
 
 
 class TestNewTestChecksDocs(unittest.TestCase):

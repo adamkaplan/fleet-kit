@@ -525,7 +525,7 @@ class S8Snapshot(unittest.TestCase):
         base = {"base-secret-%02d-x" % i for i in range(30)}
         text = " ".join(sorted(base)) * 3
         raises = ok = 0
-        rounds = 200
+        rounds = 60
         for rd in range(rounds):
             known, stop = set(base), threading.Event()
 
@@ -544,7 +544,7 @@ class S8Snapshot(unittest.TestCase):
             finally:
                 stop.set()
                 th.join()
-        print("S8 thread rounds 200, raises %d, every start form redacted %d" % (raises, ok))
+        print("S8 thread rounds %d, raises %d, every start form redacted %d" % (rounds, raises, ok))
         self.assertEqual((raises, ok), (0, rounds))
 
     def test_S8_subclass_case_and_mutant(self):

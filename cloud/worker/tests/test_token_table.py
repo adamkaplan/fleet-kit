@@ -151,7 +151,7 @@ class BoundaryText(unittest.TestCase):
         sec = m.group(1)
         self.assertIn("the token's scope", sec)
         self.assertIn("the repository's rules", sec)
-        self.assertRegex(sec, r"wrappers? and the client are conveniences")
+        self.assertRegex(sec, r"client and the text rules are conveniences")
         owner = sec.split("Owner decisions", 1)[1] if "Owner decisions" in sec else ""
         self.assertGreaterEqual(len(re.findall(r"^- ", owner, re.M)), 1)
 

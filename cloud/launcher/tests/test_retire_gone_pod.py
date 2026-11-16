@@ -17,10 +17,17 @@ sys.path.insert(0, HERE)
 import test_cloud_worker as tcw  # noqa: E402
 
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "bin")
+import importlib.machinery  # noqa: E402
 import importlib.util  # noqa: E402
+_loader = importlib.machinery.SourceFileLoader("test_cloud_worker_bin", os.path.join(BIN, "test-cloud-worker"))
+tcwb = importlib.util.module_from_spec(importlib.util.spec_from_loader("test_cloud_worker_bin", _loader))
+sys.modules["test_cloud_worker_bin"] = tcwb
+_loader.exec_module(tcwb)   # the switchboard, loaded the way the chain loads it
 _spec = importlib.util.spec_from_file_location("bin_cloud_worker", os.path.join(BIN, "cloud_worker.py"))
 sbcw = importlib.util.module_from_spec(_spec)
+sys.modules["bin_cloud_worker"] = sbcw   # bind() returns sys.modules[__name__]
 _spec.loader.exec_module(sbcw)
+sbcw.bind(tcwb.sb.__dict__)   # a file-loaded copy has an empty H until the switchboard binds it; cmd_retire reads H (load_module of cloud_retired, _one_line)
 
 
 def plant_run_secret(case):

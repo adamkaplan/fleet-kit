@@ -83,7 +83,7 @@ class TestCiOutsideBin(unittest.TestCase):
         self.assertIn("not in the CI outside-bin list: plugins/x/new.test.mjs", problems(*self.args(files=tree_files(REPO) + ["plugins/x/new.test.mjs"])))
 
     def test_removing_a_listed_file_fails_naming_it(self):
-        for name in ("plugins/fleet-hooks/index.test.mjs", "cloud/worker/tests/test_guard.py"):
+        for name in ("plugins/fleet-hooks/index.test.mjs", "cloud/launcher/tests/test_cloud_pod_deadline.py"):
             text = "\n".join(l for l in self.LIST.read_text().splitlines() if name not in l)
             self.assertIn("not in the CI outside-bin list: " + name, problems(*self.args(text=text)))
 

@@ -430,12 +430,29 @@ class S5EndHook(Base):
         self.assertEqual((code, json.loads(out)["pushed"]), (0, False))
         self.assertEqual(self.run_cli("delete", "coder7")[0], 0)  # gone: idempotent
 
+    def stale_ref_repo(self, name, upstream_gone):
+        """HEAD is a second commit that origin/main holds; a commit made and then reset away leaves a reflog entry no remote ref reaches, so the
+        tree is not clean (clean_local) and the hook must look at the remote. With upstream_gone, main is deleted upstream after the last fetch."""
+        work, origin = make_repo(self.tmp.name, name, dirty=False)
+        g = lambda *a: subprocess.run(["git", "-C", work, *a], check=True, capture_output=True)
+        g("commit", "--allow-empty", "-m", "second")
+        g("push", "origin", "HEAD:main")
+        g("fetch", "origin")
+        g("commit", "--allow-empty", "-m", "made then reset away")
+        g("reset", "--hard", "HEAD~1")
+        if upstream_gone:
+            subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/heads/main"], check=True)
+        return work, origin
+
     def test_stale_remote_ref_does_not_make_unpushed_work_look_safe(self):
-        work, origin = make_repo(self.tmp.name, "r", dirty=False)
-        subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/heads/main"], check=True)  # gone upstream
+        work, origin = self.stale_ref_repo("r", upstream_gone=True)
         res = end_hook.run(work, "coder7")
         self.assertEqual((res["pushed"], res["wip_branch"]), (True, "coder7/wip"))
         subprocess.run(["git", "-C", origin, "rev-parse", "--verify", "coder7/wip"], check=True, capture_output=True)
+        # the control: the same tree with main still upstream has nothing to push, so the push above comes from the refreshed reference
+        work2, _ = self.stale_ref_repo("r2", upstream_gone=False)
+        res2 = end_hook.run(work2, "coder7")
+        self.assertEqual((res2["pushed"], res2["wip_branch"]), (False, None))
 
     def test_hook_error_text_is_printable_and_short(self):
         class Fake(cw.Kube):
@@ -718,7 +735,7 @@ class S7Interrupt(Base):
         self.assertIn("secret/%s-pw" % name, err)
         last = self.audit_lines()[-1]
         self.assertEqual(last["action"], "create.interrupted")
-        self.assertIn("REMAINS: pod/%s, secret/%s-pw" % (name, name), last["reason"])
+        self.assertIn("REMAINS: pod/%s, poddisruptionbudget/%s-pdb, secret/%s-pw" % (name, name, name), last["reason"])
 
     def test_failed_cleanup_after_a_cloud_error_exits_nonzero_and_names_remains(self):
         self.patch_state(never_ready=True)

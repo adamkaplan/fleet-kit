@@ -672,10 +672,32 @@ def sends_mutation_tail(spelling):
     return spelling != "graphql"
 
 
-def effect_battery(rig):
-    """#1696 r4: names every call decided wrongly by the effect rule."""
-    bad = []
-    for path in UNKNOWN_PATHS:
+class _Enough(Exception):
+    pass
+
+
+class _Bad(list):
+    """The failures of a battery; `until(list)` true after an append ends the battery (a mutant is seen by the first calls that show it)."""
+    until = None
+
+    def append(self, text):
+        list.append(self, text)
+        if self.until is not None and self.until(self):
+            raise _Enough()
+
+
+def effect_battery(rig, only=None, until=None):
+    """#1696 r4: names every call decided wrongly by the effect rule. `only` names the sections to run (None: all: the control runs them all); `until` ends it early."""
+    bad = _Bad()
+    bad.until = until
+    try:
+        return _effect_battery(rig, bad, lambda name: only is None or name in only)
+    except _Enough:
+        return list(bad)
+
+
+def _effect_battery(rig, bad, want):
+    for path in (UNKNOWN_PATHS if want("unknown") else ()):
         for form in METHOD_FORMS:
             done, calls = rig.run("api", path, *form)
             if not refused_line(done, calls):
@@ -689,31 +711,33 @@ def effect_battery(rig):
             done, calls = rig.run(*args)
             if [c["argv"] for c in calls] != [list(args)]:
                 bad.append("unknown GET without a body not passed: %s %s" % (path, " ".join(args[2:])))
-    done, calls = rig.run("api", "foo/bar", "--method", "GET", "--input", "-", stdin="{}")   # GET with --input: a body
-    if not refused_line(done, calls):
-        bad.append("unknown GET with --input passed")
-    for args in (("api", "foo/bar", "-X", "GET", "-X", "POST"), ("api", "foo/bar", "-X"), ("api", "foo/bar", "--method"), ("api", "foo/bar", "-X", "HEAD")):
+    if want("unknown"):
+        done, calls = rig.run("api", "foo/bar", "--method", "GET", "--input", "-", stdin="{}")   # GET with --input: a body
+        if not refused_line(done, calls):
+            bad.append("unknown GET with --input passed")
+    for args in ((("api", "foo/bar", "-X", "GET", "-X", "POST"), ("api", "foo/bar", "-X"), ("api", "foo/bar", "--method"), ("api", "foo/bar", "-X", "HEAD")) if want("unknown") else ()):
         done, calls = rig.run(*args)
         if not refused_line(done, calls):
             bad.append("last or missing method passed: " + " ".join(args[2:]))
-    for args in (("api", "repos/o/r/pulls/1/merge", "-X", "PUT"), ("api", "repos/o/r/issues/1/labels", "-f", "labels[]=x"), ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "state=closed"),
-                 ("api", "repos/o/r/issues/1/labels/x", "-X", "DELETE"), ("api", "repos/o/r/issues", "-f", "title=t"), ("api", "repos/o/r/issues/1/sub_issues", "-F", "sub_issue_id=3")):
+    for args in ((("api", "repos/o/r/pulls/1/merge", "-X", "PUT"), ("api", "repos/o/r/issues/1/labels", "-f", "labels[]=x"), ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "state=closed"),
+                 ("api", "repos/o/r/issues/1/labels/x", "-X", "DELETE"), ("api", "repos/o/r/issues", "-f", "title=t"), ("api", "repos/o/r/issues/1/sub_issues", "-F", "sub_issue_id=3")) if want("allow") else ()):
         done, calls = rig.run(*args)
         if [c["argv"] for c in calls] != [list(args)]:
             bad.append("allow-listed REST write not passed: " + args[1])
-    done, calls = rig.run("api", "repos/o/r/issues/1/labels", "-X", "PATCH", "-f", "a=b")   # an allow-listed path with a method it does not have
-    if not refused_line(done, calls):
-        bad.append("allow-listed path with a wrong method passed")
-    done, calls = rig.run("api", "repos/o/r/issues/1/comments", "-f", "body=x")   # signed as before
-    if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
-        bad.append("signed comment not signed")
-    for spelling in R4_SPELLINGS:
+    if want("allow"):
+        done, calls = rig.run("api", "repos/o/r/issues/1/labels", "-X", "PATCH", "-f", "a=b")   # an allow-listed path with a method it does not have
+        if not refused_line(done, calls):
+            bad.append("allow-listed path with a wrong method passed")
+        done, calls = rig.run("api", "repos/o/r/issues/1/comments", "-f", "body=x")   # signed as before
+        if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
+            bad.append("signed comment not signed")
+    for spelling in (R4_SPELLINGS if want("spellings") else ()):
         for tail in (("-f", R4_MUTATION), ("-f", "body=x")):
             done, calls = rig.run("api", spelling, *tail)
             if not refused_line(done, calls) and sends_mutation_tail(spelling) or (spelling == "graphql" and tail[1] == "body=x" and not refused_line(done, calls)):
                 if not (spelling not in R3_GRAPHQL and tail[1].startswith("body") and False):
                     bad.append("round-3 spelling with %s passed: %r" % (tail[1][:5], spelling))
-    for host in R4_MACOS:
+    for host in (R4_MACOS if want("macos") else ()):
         for tail in (("graphql", ("-f", R4_MUTATION)), ("repos/o/r/git/refs", ("-f", "ref=x"))):
             done, calls = rig.run("api", host + "/" + tail[0], *tail[1])
             if not refused_line(done, calls):
@@ -722,7 +746,7 @@ def effect_battery(rig):
         done, calls = rig.run(*args)
         if not refused_line(done, calls):   # r5 (OLD: passed): not accepted for a write
             bad.append("macOS form read query not refused: " + host)
-    for spelling in ("graphql", "/graphql", "https://api.github.com/graphql"):
+    for spelling in (("graphql", "/graphql", "https://api.github.com/graphql") if want("read") else ()):
         args = ("api", spelling, "-f", "query=" + R3_READ)
         done, calls = rig.run(*args)
         if [c["argv"] for c in calls] != [list(args)]:
@@ -837,27 +861,27 @@ class TestGhShimEffectRule(unittest.TestCase):
                 done, calls = self.rig.run("api", "graphql", "-f", "query=" + query)
                 self.assertTrue(refused_line(done, calls), done.stderr)
 
-    def mutant4(self, old, new):
+    def mutant4(self, old, new, only=None, until=None):
         self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone: " + old)
         rig = hermetic_rig()
         self.addCleanup(rig.close)
         shim = rig.shims / "gh"
         shim.write_text(shim.read_text().replace(old, new, 1))
-        return effect_battery(rig)
+        return effect_battery(rig, only, until)
 
     def test_r4_mutant_1_the_allow_list_check_skipped_is_seen(self):
-        seen = self.mutant4("        found = None\n        for label, pattern in SIGNED_API + SIGNED_API_MORE:", "        found = (\"x\", (\"POST\", \"PUT\", \"PATCH\", \"DELETE\"), False)\n        for label, pattern in SIGNED_API + SIGNED_API_MORE:")
+        seen = self.mutant4("        found = None\n        for label, pattern in SIGNED_API + SIGNED_API_MORE:", "        found = (\"x\", (\"POST\", \"PUT\", \"PATCH\", \"DELETE\"), False)\n        for label, pattern in SIGNED_API + SIGNED_API_MORE:", only=("unknown",), until=lambda b: any(x.startswith("unknown+method passed") for x in b) and any(x.startswith("unknown+body passed") for x in b))
         print("R4 mutant 1 seen:", len(seen))
         self.assertTrue(any(s.startswith("unknown+method passed") for s in seen) and any(s.startswith("unknown+body passed") for s in seen), seen[:5])
 
     def test_r4_mutant_2_implicit_post_treated_as_get_is_seen(self):
-        seen = self.mutant4('("POST" if has_body else "GET")', '"GET"')
+        seen = self.mutant4('("POST" if has_body else "GET")', '"GET"', only=("unknown",), until=lambda b: any(x.startswith("unknown+body passed: foo/bar -f") for x in b))
         print("R4 mutant 2 seen:", len(seen))
         self.assertTrue(any(s.startswith("unknown+body passed: foo/bar -f") for s in seen), seen[:5])
         self.assertFalse(any(s.startswith("unknown+method passed") and "-X" in s for s in seen), seen[:5])   # an explicit method is still seen
 
     def test_r4_mutant_3_the_parser_sees_a_mutation_in_every_case_that_reaches_it(self):
-        seen = self.mutant4("        op = word\n", '        op = "query"\n')
+        seen = self.mutant4("        op = word\n", '        op = "query"\n', only=("spellings",))
         print("R4 mutant 3 seen:", len(seen))
         reach = 0   # derived: the battery's own spellings, on the real shim, whose read reaches gh and whose mutation is refused with the GraphQL text
         for spelling in [s for s in R4_SPELLINGS if sends_mutation_tail(s)]:
@@ -890,12 +914,12 @@ class TestGhShimEffectRule(unittest.TestCase):
         self.assertTrue(load_parser(self.source)["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # control
 
     def test_r4_mutant_4_the_unknown_body_refusal_removed_is_seen(self):
-        seen = self.mutant4("        if found is None:\n            for text in (f.partition", "        if found is None:\n            continue\n            for text in (f.partition")
+        seen = self.mutant4("        if found is None:\n            for text in (f.partition", "        if found is None:\n            continue\n            for text in (f.partition", only=("unknown",), until=lambda b: any(x.startswith("unknown+method passed") for x in b) and any(x.startswith("unknown+body passed") for x in b))
         print("R4 mutant 4 seen:", len(seen))
         self.assertTrue(any(s.startswith("unknown+body passed") for s in seen) and any(s.startswith("unknown+method passed") for s in seen), seen[:5])
 
     def test_r4_mutant_5_canonicalisation_skipped_is_seen(self):
-        seen = self.mutant4('    if rest.startswith("/"):\n        rest = rest[1:]', '    if False:\n        rest = rest[1:]')   # r5 (OLD: canonicalisation skipped): the one leading slash is no longer accepted
+        seen = self.mutant4('    if rest.startswith("/"):\n        rest = rest[1:]', '    if False:\n        rest = rest[1:]', only=("read",), until=lambda b: "read query not passed: /graphql" in b and "read query not passed: https://api.github.com/graphql" in b)   # r5 (OLD: canonicalisation skipped): the one leading slash is no longer accepted
         print("R4 mutant 5 seen:", len(seen))
         self.assertIn("read query not passed: /graphql", seen)
         self.assertIn("read query not passed: https://api.github.com/graphql", seen)
@@ -2235,13 +2259,31 @@ class TestGhShimMethodFlagBeforeApi(unittest.TestCase):
     def test_s39_a_method_flag_before_api_is_refused(self):
         self.assertEqual(early_flag_failures(self.rig), [])
 
-    def test_s39_a_mutant_ignoring_the_early_flag_is_seen(self):
-        self.assertEqual(early_flag_failures(self.rig), [])   # control first
-        old = "    if early_method_flag(args[:at]):"
-        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the early flag refusal of api_parsed)")
-        rig = Rig(self.source.replace(old, "    if False:", 1))
+    def mutant_rig(self, shim_old=None, body_old=None):
+        """A scratch copy of the shim with the early-flag refusal of shims/gh (`shim_old`) and/or the lead-flag refusal of shims/gh_body.py (`body_old`) switched off."""
+        rig = Rig(self.source.replace(shim_old, "    if False:", 1) if shim_old else None)
         self.addCleanup(rig.close)
-        self.assertIn("a method flag before api went out unsigned", early_flag_failures(rig), "a method flag before api went out unsigned")
+        if body_old:
+            body = rig.shims / "gh_body.py"
+            text = body.read_text()
+            self.assertEqual(text.count(body_old), 1, "the mutant's anchor is gone (the lead-flag refusal of gh_body.guard)")
+            body.write_text(text.replace(body_old, "        if False and lead:", 1))
+        return rig
+
+    def test_s39_a_mutant_ignoring_the_early_flag_is_seen(self):
+        """Two independent layers refuse a method flag before api (#2398 added the second, in shims/gh_body.py): the shim's own early-flag refusal, and the body guard, which reads
+        the method from every flag before api and refuses anything but a GET. The property is that the flag never goes out unsigned, so the mutant that matters switches BOTH off;
+        each layer off alone must still be refused (the other holds), and only the pair off must be seen."""
+        self.assertEqual(early_flag_failures(self.rig), [])   # control first
+        shim_old = "    if early_method_flag(args[:at]):"
+        self.assertEqual(self.source.count(shim_old), 1, "the mutant's anchor is gone (the early flag refusal of api_parsed)")
+        body_old = "        if lead and all(a.startswith(\"-\") or (j > 0 and lead[j - 1].startswith(\"-\")) for j, a in enumerate(lead)):"
+        both = self.mutant_rig(shim_old, body_old)
+        self.assertIn("a method flag before api went out unsigned", early_flag_failures(both), "both layers off: the flag went out unsigned and the test must see it")
+        only_shim = self.mutant_rig(shim_old)
+        self.assertEqual(early_flag_failures(only_shim), [], "the body guard alone still refuses")
+        only_body = self.mutant_rig(None, body_old)
+        self.assertEqual(early_flag_failures(only_body), [], "the shim's early-flag refusal alone still refuses")
 
 
 if __name__ == "__main__":
