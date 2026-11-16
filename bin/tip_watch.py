@@ -1,6 +1,6 @@
-"""The integration tip's CI is watched after each merge (ask #2247).
+"""The main tip's CI is watched after each merge (ask #2247).
 
-Nothing ran CI on the integration tip after a merge, so a merge that turned the tip red went unseen and pull requests were then merged against 'the reds the
+Nothing ran CI on the main tip after a merge, so a merge that turned the tip red went unseen and pull requests were then merged against 'the reds the
 tip already has'. This is the daemon's look at the runs of the tip branch. Per watched repository it lists the recent runs of the branch `BRANCH` (ONE read, no
 oftener than LIST_SECONDS), takes the newest finished run of each head in the order the runs began, and for a head whose run FAILED reads that run's jobs (one
 read) to name the failed ones. A head is noticed ONCE, to the Chief of Staff and to the lane that merged it (the pull request named by the merge commit's title,
