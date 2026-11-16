@@ -190,7 +190,7 @@ def check_command_failure_is_unreachable(module):
 
 def check_real_timeout_is_unreachable(module):
     try:
-        module.command_fetch([sys.executable, "-c", "import time; time.sleep(3)"], timeout=0.08)
+        module.command_fetch([sys.executable, "-c", "import time; time.sleep(0.5)"], timeout=0.08)
         raise AssertionError("a timeout was believed")
     except module.Unreachable as why:
         assert "timed out" in str(why), str(why)
@@ -296,7 +296,7 @@ def check_temp_file_is_exclusive_private_and_random(module):
 
 
 def check_group_is_killed_when_a_grandchild_holds_the_pipe(module):
-    code = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)']); "
+    code = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.6)']); "
             "sys.stdout.write('{}'); sys.stdout.flush()")
     start = time.time()
     try:
@@ -304,7 +304,7 @@ def check_group_is_killed_when_a_grandchild_holds_the_pipe(module):
         raise AssertionError("a source held open by a grandchild was believed")
     except module.Unreachable as why:
         assert "timed out" in str(why), str(why)
-    assert time.time() - start < 2, "blocked past the deadline"
+    assert time.time() - start < 0.45, "blocked past the deadline"
 
 
 @breaks_as(RecursionError)
@@ -792,7 +792,7 @@ def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
         module.LOCK_WAIT = 0.02   # the eight tries 0.25 s apart are the real bound; a short pause keeps the same eight tries
         try:
             thread.start()
-            thread.join(1.5)
+            thread.join(0.4)
             assert not thread.is_alive(), "the pull hangs on a held lock"
         finally:
             module.LOCK_WAIT = wait

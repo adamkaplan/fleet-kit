@@ -103,8 +103,12 @@ class UnreadableTreeTests:
     def mend_tree(self):
         (self.tree / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
 
+    _KNOWN = None
+
     def known(self):
-        return sb.build_parser().commands
+        if UnreadableTreeTests._KNOWN is None:
+            UnreadableTreeTests._KNOWN = sb.build_parser().commands
+        return UnreadableTreeTests._KNOWN
 
     def recording(self):
         return sorted(name for name in self.known() if sb.command_records(name, self.known()))

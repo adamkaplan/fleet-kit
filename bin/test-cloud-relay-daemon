@@ -903,7 +903,7 @@ class LiveHead(Fixture):
         self.backend.live_head = blocked
         answer, audits = [], len(self.backend.audits)
         t = threading.Thread(target=lambda: answer.append(self.run_one(CODER, "prove", **PROVE)), daemon=True)
-        t.start(); t.join(1.5)   # same guard (the honest answer comes at HEAD_TIMEOUT, 0.2 s)
+        t.start(); t.join(0.5)   # same guard (the honest answer comes at HEAD_TIMEOUT, 0.2 s)
         answered, still_blocked = bool(answer), not release.is_set()
         release.set()
         t.join(10)
@@ -1473,7 +1473,7 @@ class Round2(Fixture):
         env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(path)}
         th = threading.Thread(target=lambda: box.append(mod.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)), daemon=True)
         th.start()
-        th.join(2)
+        th.join(0.4)
         return (not th.is_alive()), notes
 
     def test_fifo_token_returns_quickly_and_is_refused(self):
@@ -1555,7 +1555,7 @@ class OneWallClock(unittest.TestCase):
         out = []
         t = threading.Thread(target=lambda: out.append(self.timed(mod, "http://127.0.0.1:9", 0.1)), daemon=True)
         t.start()
-        t.join(1.5)   # hang guard, never a verdict: the real fetch has answered (at 0.3 s), the mutant one is still blocked on the lookup
+        t.join(0.4)   # hang guard, never a verdict: the real fetch has answered (at 0.1 s), the mutant one is still blocked on the lookup
         returned, answered = self.lookup_returned.is_set(), bool(out)   # both taken BEFORE the release
         self.lookup_release.set()
         t.join(10)   # hang guard: the mutant fetch answers once the lookup returned
@@ -1928,11 +1928,11 @@ class GhBudget(Fixture):
     def late_head_scenario(self, mod=relay):
         gate = threading.Event()
         ex, backend = self.world(mod, block=(3, gate))   # the third context of request 1 is its final head read
-        saved, relay.HEAD_TIMEOUT = relay.HEAD_TIMEOUT, 0.1
+        saved, mod.HEAD_TIMEOUT = mod.HEAD_TIMEOUT, 0.1
         try:
             got = self.one(ex, "prove", **dict(PROVE))
         finally:
-            relay.HEAD_TIMEOUT = saved
+            mod.HEAD_TIMEOUT = saved
         self.assertEqual(got["status"], 504)
         self.n_ctx = 10   # later reads are never blocked
         gate.set()

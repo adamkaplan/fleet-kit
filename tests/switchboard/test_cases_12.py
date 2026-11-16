@@ -329,8 +329,8 @@ class TestAgentShellCalls(Base):
 
     def setUp(self):
         Base.setUp(self)
-        if time.time() % 3600 > 3570 or time.time() % 3600 < 10:   # the shim stamps real time: never start these across an hour boundary
-            time.sleep(40)
+        if time.time() % 3600 > 3595:   # the shim stamps real time: never start these across an hour boundary
+            time.sleep(3600.2 - (time.time() % 3600))
         self.bin = self.home / "realbin"
         self.bin.mkdir()
         fake = self.bin / "gh"

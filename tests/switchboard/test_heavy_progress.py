@@ -300,10 +300,10 @@ class TestHeavyProgress(unittest.TestCase):
                 open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 with open(path, "w") as handle:
                     handle.write(copies[kind])
-                results[kind] = _inner_run(path, "test_s10_inner_s4_with_the_thread_start_awaited", {"FLEET_TEST_START_WAIT": "1.5"})
+                results[kind] = _inner_run(path, "test_s10_inner_s4_with_the_thread_start_awaited", {"FLEET_TEST_START_WAIT": "0.4"})
         self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
         self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
-        self.assertIn("the progress thread did not start within 1.5 s", results["mutant"].stdout)
+        self.assertIn("the progress thread did not start within 0.4 s", results["mutant"].stdout)
 
     def test_u1_a_run_that_ends_before_the_interval_prints_nothing_of_its_own(self):
         rig = Rig(self, alive=0, status=5)

@@ -140,7 +140,7 @@ def check_no_token_401(module, test):
 
 
 def check_auth_before_body(module, test):
-    with Running(module, timeout=2) as s:
+    with Running(module, timeout=0.4) as s:
         # lying Content-Length, no body sent: the answer must come at once, from the header check alone
         status, _ = s.raw(request_bytes(None, 100), wait=1.0)
         test.assertEqual(status, 401)
@@ -187,7 +187,7 @@ def check_boundaries(module, test):
 
 def check_short_body_408(module, test):
     with Running(module, timeout=0.08) as s:
-        status, _ = s.raw(request_bytes("tok-a", 100, b"{\"sen"), wait=3.0)
+        status, _ = s.raw(request_bytes("tok-a", 100, b"{\"sen"), wait=0.6)
         test.assertEqual(status, 408)
         test.assertEqual(s.inbox.items, {})
 
@@ -274,7 +274,7 @@ def check_total_deadline(module, test):
         try:
             sock.sendall(request_bytes("tok-a", 50))
             t0, buf = time.time(), b""
-            while time.time() - t0 < 4 and b"\r\n\r\n" not in buf:
+            while time.time() - t0 < 0.7 and b"\r\n\r\n" not in buf:
                 try:
                     sock.sendall(b"{")   # one byte per read: never trips the per-read timeout
                 except OSError:
