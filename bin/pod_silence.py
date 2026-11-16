@@ -6,8 +6,11 @@ A worker is silent when `now - max(first seen, last report, last push)` reaches 
 written to the state file BEFORE the message goes, and is told again only after a later report or push. A worker that reported `done`, or is no longer
 live (finished or retired), sends nothing and leaves the state. The state is one private file (0600): {"workers": {name: {"seen": epoch, "told": epoch|null}}}.
 """
+import hashlib
 import json
+import math
 import os
+from pathlib import Path
 
 QUIET = 20 * 60
 STATE_FILE = "pod-silence.json"
@@ -56,9 +59,40 @@ def message_text(worker, minutes, line):
     return "[cloud worker quiet] %s has pushed nothing and sent no report for %d minutes. Its state: %s" % (worker, minutes, one)
 
 
+BUCKET = 3600      # #2545: an orchestrator hears a quiet pod at :00 UTC
+JITTER_MAX = 45
+
+
+def _registry_gate(state_dir, parse, now):
+    """The gate scan() uses when none is handed in: an orchestrator (by the state directory's registry.json) hears a quiet pod at its :00 UTC bucket
+    plus its 0-45 s jitter (sha256 of its name), and not while the pod's detached jobs run. Any other boss, or no registry, goes at once; a registry that cannot be read waits."""
+    registry = Path(state_dir) / "registry.json"
+    if not registry.is_file():
+        return None
+
+    def gate(boss, since, worker, jobs):
+        try:
+            with open(str(registry), "r", encoding="utf-8") as handle:
+                reg = parse(handle.read(READ_BYTES))
+        except (OSError, ValueError):
+            return "wait"
+        agents = reg.get("agents") if isinstance(reg, dict) else None
+        entry = (agents or {}).get(boss) if isinstance(agents, dict) else None
+        if not isinstance(entry, dict) or entry.get("role") != "orchestrator":
+            return "go"
+        if jobs:
+            return "wait"
+        jitter = int(hashlib.sha256(str(boss).encode("utf-8")).hexdigest(), 16) % (JITTER_MAX + 1)
+        target = math.ceil((since - jitter) / BUCKET) * BUCKET + jitter
+        return "go" if now >= target else "wait"
+    return gate
+
+
 def scan(workers, now, state_path, send, summary, parse, quiet=QUIET, prune=True, audit=None, gate=None):
     """`workers`: [{"worker", "boss", "last_report" epoch|None, "last_push" epoch|None, "done" bool, optional "jobs": the pod's running cw-run job names}] of the LIVE pods. Returns [(boss, text)] handed to send.
     `prune` False (a capped read: the pass did not see every pod) keeps the state of the pods not handed in, so an unread pod keeps its told mark."""
+    if gate is None and isinstance(state_path, Path):
+        gate = _registry_gate(Path(state_path).parent, parse, now)
     state = _load(state_path, parse)
     live = {w.get("worker") for w in workers if isinstance(w, dict)}
     if prune:
