@@ -24,12 +24,28 @@ def seen_in(role, name, repo=None):
     return sb.Observation(name, "ses_example", "w1:p1", "idle", fleet)
 
 
-def fact(key, kind, created=BASE, recipient="widget-lead", **extra):
-    return sb.Fact(key, recipient, kind, extra.pop("summary", "s %s" % key), created, **extra)
+def _make_fact(key, kind, created=BASE, recipient="widget-lead", tier=None, **extra):
+    f = sb.Fact(key, recipient, kind, extra.pop("summary", "s %s" % key), created, **extra)
+    f.tier = tier
+    return f
 
 
 def plan(facts, role="orchestrator", now=BASE, name="widget-lead"):
     return sb.decide(name, facts, seen(role, name), now, BATCH, 600)
+
+
+FLEET = {"fleet-account"}
+HUB = types.SimpleNamespace(config={"github_bot_logins": ["Review-Helper"]}, _fleet_login=lambda login: str(login or "").lower() in FLEET)
+
+
+def item(kind, key=None, sender="alice", actionable=True, **extra):
+    """A routed GitHub item as the hub holds it (its own fields: the tier never reads the summary)."""
+    return types.SimpleNamespace(key=key or "%s:1" % kind, recipient="widget-lead", kind=kind, summary="PR #4 whatever: t", created=BASE, issue=4,
+                                 sender=sender, repo="acme-org/widget-service", actionable=actionable, **extra)
+
+
+def tier_of(**kw):
+    return sb.fact_tier(sb.tiered_fact(item(**kw), sb.Fact, HUB))
 
 
 def hhmm(epoch):
@@ -40,76 +56,120 @@ class TestOrchestratorUtcBatching(unittest.TestCase):
     """S1: the four tiers, the jitter, the flush, DELAYED_AFTER from the bucket target."""
 
     def test_the_jitter_is_deterministic_and_between_0_and_45_seconds(self):
-        names = ["widget-lead", "gadget-lead", "ses_example-a", "x"]
-        for name in names:
+        for name in ["widget-lead", "gadget-lead", "ses_example-a", "x"]:
             self.assertEqual(sb.orchestrator_jitter(name), sb.orchestrator_jitter(name))
             self.assertTrue(0 <= sb.orchestrator_jitter(name) <= 45)
         self.assertGreater(len({sb.orchestrator_jitter("lane-%d" % n) for n in range(40)}), 5)
 
     def test_tier_0_wakes_at_once(self):
-        for f in (fact("send:a", "send", batch=False, sender="boss"), fact("r:1", "reminder"), fact("report:1", "report", batch=False),
-                  fact("intent.edit:1", "intent.edit")):
+        for f in (_make_fact("send:a", "send", batch=False, sender="boss"), _make_fact("r:1", "reminder"), _make_fact("report:1", "report", batch=False),
+                  _make_fact("intent.edit:1", "intent.edit")):
             self.assertEqual(plan([f]).action, "wake", f.kind)
 
     def test_tier_1_waits_for_the_half_hour_plus_jitter(self):
         jit = sb.orchestrator_jitter("widget-lead")
-        for kind, key in (("github.review", "github.review:1"), ("github.check", "github.check:1"), ("github.conflict", "github.conflict:1"),
-                          ("github.pr_green", "github.pr_green:1"), ("github.comment", "github.comment:1")):
-            p = plan([fact(key, kind, sender="alice")])
+        for kind in ("github.review", "github.check", "github.conflict", "github.pr_green", "github.comment"):
+            p = plan([_make_fact("%s:1" % kind, kind, tier=1)])
             self.assertEqual(p.action, "wait", kind)
             self.assertEqual(hhmm(p.ready_at), "08:30:%02d" % jit)
-        self.assertEqual(plan([fact("github.check:1", "github.check")], now=BASE + 1500 + jit - 1).action, "wait")
-        self.assertEqual(plan([fact("github.check:1", "github.check")], now=BASE + 1500 + jit).action, "wake")
+        one = lambda now: plan([_make_fact("github.check:1", "github.check", tier=1)], now=now).action
+        self.assertEqual(one(BASE + 1500 + jit - 1), "wait")
+        self.assertEqual(one(BASE + 1500 + jit), "wake")
 
     def test_a_fact_in_the_last_second_of_a_boundary_waits_for_the_next(self):
         jit = sb.orchestrator_jitter("widget-lead")
-        p = plan([fact("github.check:2", "github.check", created=BASE + 1500 + jit + 1)], now=BASE + 1500 + jit + 2)
+        p = plan([_make_fact("github.check:2", "github.check", created=BASE + 1500 + jit + 1, tier=1)], now=BASE + 1500 + jit + 2)
         self.assertEqual(p.ready_at, BASE + 3300 + jit)
 
     def test_tier_2_waits_for_the_hour(self):
         jit = sb.orchestrator_jitter("widget-lead")
-        for f in (fact("github.stage:1", "github.stage"),
-                  fact("github.reviewcomment:1", "github.comment", sender="review-bot[bot]")):
-            p = plan([f])
-            self.assertEqual(p.action, "wait")
-            self.assertEqual(hhmm(p.ready_at), "09:00:%02d" % jit)
+        p = plan([_make_fact("github.stage:1", "github.stage", tier=2)])
+        self.assertEqual((p.action, hhmm(p.ready_at)), ("wait", "09:00:%02d" % jit))
 
-    def test_a_human_review_comment_is_tier_1(self):
-        self.assertEqual(sb.fact_tier(fact("github.reviewcomment:2", "github.comment", sender="alice")), 1)
+    def test_every_branch_of_the_tier_table(self):
+        table = [
+            (dict(kind="github.conflict"), 1), (dict(kind="github.pr_green"), 1), (dict(kind="github.stage"), 2),
+            (dict(kind="github.pr", actionable=False), 3), (dict(kind="github.subissue"), 3),
+            (dict(kind="github.check"), 1), (dict(kind="github.check", actionable=False), 3),   # failed; a passing check only rides
+            (dict(kind="github.review"), 1), (dict(kind="github.review", actionable=False), 3),   # changes requested; approved or commented ride
+            (dict(kind="github.review", key="github.botreview:helper:abc"), 2),
+            (dict(kind="github.comment"), 1), (dict(kind="github.comment", sender="helper[bot]", actionable=False), 3),
+            (dict(kind="github.comment", sender="review-helper", actionable=True), 3),   # a configured bot login
+            (dict(kind="github.comment", key="github.reviewcomment:9"), 1),   # a human's review comment
+            (dict(kind="github.comment", key="github.reviewcomment:9", sender="helper[bot]"), 2),
+            (dict(kind="github.comment", key="github.reviewcomment:9", sender="Review-Helper"), 2),
+            (dict(kind="github.issue", action="labeled", label="alice:awaiting-answer", actor="alice"), 1),
+            (dict(kind="github.issue", action="unlabeled", label="alice:awaiting-answer", actor="alice"), 3),   # removed: not a wake
+            (dict(kind="github.issue", action="labeled", label="bug", actor="alice"), 3),
+            (dict(kind="github.issue", action="closed", actor="alice"), 1), (dict(kind="github.issue", action="reopened", actor="alice"), 1),
+            (dict(kind="github.issue", action="closed", actor="fleet-account"), 3),   # our own close
+            (dict(kind="github.issue", action="edited", actor="alice"), 3), (dict(kind="github.issue"), 3),
+            (dict(kind="alert"), None),
+        ]
+        for kw, want in table:
+            self.assertEqual(tier_of(**kw), want, kw)
 
-    def test_routine_issue_churn_is_tier_3_and_an_awaiting_label_or_a_close_is_tier_1(self):
-        self.assertEqual(sb.fact_tier(fact("github.issue:1", "github.issue", summary="issue #4 edited: t")), 3)
-        self.assertEqual(sb.fact_tier(fact("github.issue:2", "github.issue", summary="issue #4 closed: t")), 1)
-        self.assertEqual(sb.fact_tier(fact("github.issue:3", "github.issue", summary="issue #4 label alice:awaiting-answer added: t")), 1)
+    def test_a_summary_that_looks_like_a_wake_does_not_make_one(self):
+        f = sb.tiered_fact(item("github.issue", action="unlabeled", label="alice:awaiting-answer", actor="alice", ), sb.Fact, HUB)
+        f.summary = "issue #4 label alice:awaiting-answer added: closed"
+        self.assertEqual(sb.fact_tier(f), 3)
+
+    def test_the_other_kinds_and_a_missing_tier_keep_the_batch_window(self):
+        self.assertIsNone(sb.fact_tier(_make_fact("alert:1", "alert")))
+        self.assertIsNone(sb.fact_tier(_make_fact("github.check:1", "github.check")))   # no tier recorded: not an orchestrator tier
+        p = plan([_make_fact("alert:1", "alert")])
+        self.assertEqual((p.action, p.ready_at), ("wait", BASE + BATCH))
+        mixed = plan([_make_fact("alert:1", "alert"), _make_fact("github.stage:1", "github.stage", tier=2)])
+        self.assertEqual(mixed.ready_at, BASE + BATCH)   # the earliest of an untiered fact and a bucket
+        self.assertEqual(sb.orchestrator_ready_at("widget-lead", [_make_fact("alert:1", "alert")], BATCH), BASE + BATCH)
 
     def test_tier_3_never_makes_a_standalone_wake(self):
         for kind in ("github.pr", "github.subissue", "github.issue"):
-            self.assertIsNone(plan([fact("%s:1" % kind, kind, summary="issue #4 edited: t")], now=BASE + 7200), kind)
-        self.assertIsNone(plan([fact("x", "github.pr", rider=True)], now=BASE + 7200))
+            self.assertIsNone(plan([_make_fact("%s:1" % kind, kind, tier=3)], now=BASE + 7200), kind)
+        self.assertIsNone(plan([_make_fact("x", "github.pr", rider=True)], now=BASE + 7200))
 
     def test_any_wake_carries_every_pending_tier(self):
-        pending = [fact("send:a", "send", batch=False, sender="boss"), fact("github.stage:1", "github.stage"),
-                   fact("github.check:1", "github.check"), fact("github.pr:1", "github.pr")]
+        pending = [_make_fact("send:a", "send", batch=False, sender="boss"), _make_fact("github.stage:1", "github.stage", tier=2),
+                   _make_fact("github.check:1", "github.check", tier=1), _make_fact("github.pr:1", "github.pr", tier=3)]
         p = plan(pending)
         self.assertEqual(p.action, "wake")
         self.assertEqual({f.key for f in p.pending}, {f.key for f in pending})
 
     def test_the_chief_of_staff_and_workers_keep_the_batch_window(self):
         for role in ("chief-of-staff", "coder", "tester"):
-            f = fact("github.check:1", "github.check")
-            self.assertEqual(plan([f], role=role).action, "wait")
+            f = _make_fact("github.check:1", "github.check", tier=1)
             self.assertEqual(plan([f], role=role).ready_at, BASE + BATCH, role)
             self.assertEqual(plan([f], role=role, now=BASE + BATCH).action, "wake", role)
 
     def test_delayed_after_is_measured_from_the_bucket_target(self):
         jit = sb.orchestrator_jitter("widget-lead")
-        stage = fact("github.stage:1", "github.stage")   # created 08:05, held to 09:00 + jitter
+        stage = _make_fact("github.stage:1", "github.stage", tier=2)   # created 08:05, held to 09:00 + jitter
         p = plan([stage], now=BASE + 3300 + jit)
         self.assertEqual(p.action, "wake")
         self.assertIsNone(sb.delayed_since(p.pending, BASE + 3300 + jit + 5))   # 55 minutes old, but on time for its bucket
         self.assertIsNotNone(sb.delayed_since(p.pending, BASE + 3300 + jit + sb.DELAYED_AFTER + 5))   # late from the target
-        plain = fact("alert:1", "alert", created=BASE)
+        plain = _make_fact("alert:1", "alert", created=BASE)
         self.assertIsNotNone(sb.delayed_since([plain], BASE + sb.DELAYED_AFTER + 5))   # no bucket: measured from the arrival, as before
+
+    def test_a_tier_0_send_flushes_old_tier_2_and_tier_3_facts_with_no_delayed_flag(self):
+        now = BASE + 3000
+        stage = _make_fact("github.stage:1", "github.stage", created=now - 25 * 60, tier=2)
+        rider = _make_fact("github.pr:1", "github.pr", created=now - 40 * 60, tier=3)
+        send = _make_fact("send:a", "send", created=now, batch=False, sender="boss")
+        p = plan([stage, rider, send], now=now)
+        self.assertEqual(p.action, "wake")
+        self.assertEqual(len(p.pending), 3)
+        self.assertIsNone(sb.delayed_since(p.pending, now))
+        # the same facts to a worker keep the arrival rule: the 40 minute old rider is late there
+        old = _make_fact("github.pr:2", "github.pr", created=now - 40 * 60, tier=3)
+        w = plan([old, send], role="coder", now=now)
+        self.assertIsNotNone(sb.delayed_since(w.pending, now))
+
+    def test_a_fact_held_for_a_blocked_orchestrator_past_its_bucket_is_late_from_the_target(self):
+        jit = sb.orchestrator_jitter("widget-lead")
+        stage = _make_fact("github.stage:1", "github.stage", tier=2)
+        plan([stage], now=BASE)
+        self.assertIsNotNone(sb.delayed_since([stage], BASE + 3300 + jit + sb.DELAYED_AFTER + 5))
 
 
 def lanes(role="orchestrator"):
@@ -174,8 +234,7 @@ class TestPrGreenEvent(unittest.TestCase):
         self.assertEqual(hub.queue, {})
 
     def test_the_item_is_a_tier_1_wake_for_an_orchestrator(self):
-        f = fact("github.pr_green:r#7:h", "github.pr_green")
-        self.assertEqual(sb.fact_tier(f), 1)
+        self.assertEqual(tier_of(kind="github.pr_green", key="github.pr_green:r#7:h", sender=None), 1)
 
 
 class _NoLock:

@@ -10085,6 +10085,7 @@ def _wh_issues(repo, payload, now):
     if action in ("labeled", "unlabeled") and label:
         what = "label %s %s" % (label, "added" if action == "labeled" else "removed")
     item = _issue_item(repo, issue, now, what)
+    if item: item.action, item.label, item.actor = action, label, _login(payload.get("sender"))   # #2545: the tier reads these, never the summary text
     return [item] if item else []
 
 
@@ -10873,9 +10874,7 @@ class GitHubHub:
             self._audit_unrouted()
             self._audit_routed()
         with self.lock:
-            found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender,
-                          repo=i.repo)
-                     for i in self.queue.values() if i.recipient]
+            found = [tiered_fact(i, Fact, self) for i in self.queue.values() if i.recipient]   # #2545: the tier an orchestrator batches it by
         found.extend(self.intent_edit_facts())
         for fact in found:
             # An object seen again (a catch-up, a redelivery) was perhaps delivered long
