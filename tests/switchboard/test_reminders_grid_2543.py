@@ -60,16 +60,24 @@ class TestReminderGridAndRecurring(unittest.TestCase):
         self.assertEqual(sb.next_tick(at, 1800, at + 400), at + 1800)   # delivered late: still on the grid
         self.assertEqual(sb.next_tick(at, 900, at + 2000), at + 2700)   # the daemon was down: the first tick after now
 
-    def test_a_rearm_keeps_the_chain_and_its_condition(self):
+    def test_a_rearm_keeps_the_chain_and_its_condition_and_never_resurrects_a_cancelled_one(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             at = calendar.timegm((2030, 1, 2, 6, 0, 0))
-            item = sb.add_reminder(tmp, "widget-worker", at, at - 900, "poll", sender="widget-orch", key="k", every=1800,
-                                   condition={"until_closed": "acme-org/widget-api#1"})
-            new = sb.rearm_every(tmp, item, at + 5)
-            self.assertEqual((new["at"], new["every"], new["key"], new["to"], new["condition"]),
-                             (at + 1800, 1800, "k", "widget-worker", {"until_closed": "acme-org/widget-api#1"}))
-            self.assertIsNone(sb.rearm_every(tmp, dict(item, every=None), at))
+            cond = {"until_closed": "acme-org/widget-api#1"}
+            item = sb.add_reminder(tmp, "widget-worker", at, at - 900, "poll", sender="widget-orch", key="k", every=1800, condition=cond)
+            gone, dropped, armed = sb.remove_delivered(tmp, {item["id"]}, at + 5)
+            self.assertEqual((gone, dropped), ([item["id"]], []))
+            (new,) = sb.read_reminders(tmp)
+            self.assertEqual((new["at"], new["every"], new["key"], new["to"], new["condition"]), (at + 1800, 1800, "k", "widget-worker", cond))
+            self.assertEqual(armed, [new])
+            sb.cancel_chain(tmp, "widget-orch", "k")   # cancelled before the delivery is recorded
+            self.assertEqual(sb.remove_delivered(tmp, {item["id"]}, at + 6), ([], [], []))
+            self.assertEqual(sb.read_reminders(tmp), [])
+
+    def test_an_explicit_time_in_the_past_is_refused_for_a_keyed_reminder(self):
+        with self.assertRaises(sb.ReminderError):
+            sb.grid_when("2030-01-02T05:00:00Z", self.NOW)
 
     def test_the_self_polling_chain_guard(self):
         import tempfile

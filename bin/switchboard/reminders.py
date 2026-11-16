@@ -703,9 +703,14 @@ class ReminderFacts:
                 gone = [k[len("reminder:"):] for k in outcome.get("keys", []) if str(k).startswith("reminder:")]
                 gone += [m[len("reminder:"):] for f in by_recipient[recipient] for m in (getattr(f, "members", None) or []) if str(m).startswith("reminder:")]
                 if gone:
-                    remove_delivered(self.state_dir, set(gone), now)   # #2544: an `--every` one arms its next tick first
+                    self.audit_rearmed(remove_delivered(self.state_dir, set(gone), now)[2])   # #2544: an `--every` one arms its next tick first
             outcomes.append(dict(outcome, recipient=recipient))
         return outcomes
+
+    def audit_rearmed(self, armed):
+        for item in armed:
+            if self.engine is not None and self.engine.audit is not None:
+                self.engine.audit.append(self.engine.actor, "reminder.rearm", item["to"], {"id": item["id"], "at": iso(item["at"]), "key": _one_line(item.get("key") or "", 60)})
 
     def __call__(self):
         self.swept.clear()   # #1711: a pass starts here (each source is read once per pass), so `swept` holds only this pass's ids
@@ -834,6 +839,8 @@ def grid_when(text, now):
         if at - now < GRID_SECONDS:
             raise ReminderError("a --key or --every reminder needs at least 15m (got %r): use 15m or more, or arm upfront one-shots without --key" % text[:40])
         return float(math.ceil(at / GRID_SECONDS) * GRID_SECONDS)
+    if at <= now:
+        raise ReminderError("a --key or --every reminder at an explicit time must be in the future, got %r" % text[:40])
     if at % GRID_SECONDS:
         raise ReminderError("a --key or --every reminder at an explicit time must fall on :00, :15, :30 or :45 UTC with :00 seconds, got %r" % text[:40])
     return at
@@ -854,13 +861,13 @@ def next_tick(at, every, now):
     return at + steps * every
 
 
-def rearm_every(state_dir, item, now):
-    """A delivered `--every` reminder arms its next tick (same recipient, text, key, sender, condition). Returns the new item or None."""
-    if not item.get("every") or not _is_number(item.get("every")) or item["every"] < GRID_SECONDS:
+def rearm_item(item, now):
+    """The next tick of a delivered `--every` reminder (same recipient, text, key, sender, condition), or None."""
+    if not _is_number(item.get("every")) or item["every"] < GRID_SECONDS:
         return None
-    return add_reminder(state_dir, item["to"], next_tick(item["at"], item["every"], now), now, item["text"], item.get("issue"), item.get("from"),
-                        item.get("repo"), condition=item.get("condition"), key=item.get("key"), wake_class=item.get("wake_class"),
-                        ttl=item.get("ttl"), every=item["every"])
+    nxt = {k: v for k, v in item.items() if k not in ("id", "at", "created")}
+    nxt.update({"id": uuid.uuid4().hex[:12], "at": float(next_tick(item["at"], item["every"], now)), "created": float(now)})
+    return nxt
 
 
 def note_self_wake(state_dir, name, now):
@@ -879,6 +886,8 @@ def write_text_atomic(path, text):
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(str(temp), str(path))
     except BaseException:
         try:
@@ -904,14 +913,29 @@ def self_poll_chain(state_dir, sender, to, at, now, keyed):
 
 
 def remove_delivered(state_dir, ids, now, extra=()):
-    """Remove delivered reminders (and `extra` ids): first an `--every` one arms its next tick and a self-reminder is noted as a wake. Returns the ids removed."""
-    for item in read_reminders(state_dir):
-        if item["id"] in ids:
-            if item.get("every"):
-                rearm_every(state_dir, item, now)
+    """One locked step for reminders that were delivered (`ids`) and ones to drop (`extra`). An `--every` one still in the file arms its next tick
+    first (a delivered id already gone, as after a `--cancel-key`, is never brought back; a newer pending reminder of the same key and sender wins),
+    and a self-reminder is noted as a wake. Returns (delivered ids removed, extra ids removed, the next-tick items armed)."""
+    ids, extra, armed, woke = set(ids), set(extra) - set(ids), [], set()
+    with reminders_lock(state_dir):
+        items = read_reminders(state_dir)
+        for item in items:
+            if item["id"] not in ids:
+                continue
             if item.get("from") == item["to"]:
-                note_self_wake(state_dir, item["to"], now)
-    return remove_reminders(state_dir, set(ids) | set(extra))
+                woke.add(item["to"])
+            nxt = rearm_item(item, now) if item.get("every") else None
+            if nxt and not any(i.get("key") == nxt.get("key") and i.get("from") == nxt.get("from") and i["id"] not in ids and i["at"] > now for i in items):
+                armed.append(nxt)
+        gone = [i["id"] for i in items if i["id"] in ids]
+        dropped = [i["id"] for i in items if i["id"] in extra]
+        if armed or dropped:
+            write_reminders(state_dir, [i for i in items if i["id"] not in ids and i["id"] not in extra] + armed)
+    if not (armed or dropped):
+        gone = remove_reminders(state_dir, ids) if ids else []
+    for name in sorted(woke):
+        note_self_wake(state_dir, name, now)
+    return gone, dropped, armed
 
 
 def retired_orphans(state_dir, discovery, items):
@@ -955,11 +979,13 @@ def prune_delivered_reminders(engine, discovery):
             continue
         delivered += [item["id"] for item in items if "reminder:" + item["id"] in keys]
     orphans = retired_orphans(source.state_dir, discovery, read_reminders(source.state_dir))
-    if orphans and engine.audit is not None:
-        engine.audit.append(engine.actor, "reminder.prune_orphans", None, {"ids": orphans})
-    gone = remove_delivered(source.state_dir, set(delivered), engine.now(), orphans) if delivered or orphans else []
-    if gone and engine.audit is not None:
-        engine.audit.append(engine.actor, "reminder.prune", None, {"ids": gone})
+    gone, dropped, armed = remove_delivered(source.state_dir, set(delivered), engine.now(), orphans) if delivered or orphans else ([], [], [])
+    source.audit_rearmed(armed)
+    if engine.audit is not None:
+        if gone:
+            engine.audit.append(engine.actor, "reminder.prune", None, {"ids": gone})
+        if dropped:
+            engine.audit.append(engine.actor, "reminder.prune_orphans", None, {"ids": dropped})
     return gone
 
 

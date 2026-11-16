@@ -6686,6 +6686,7 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `superseded` / `verdict` / `until_closed` | match is owner+key (not the recipient `to`) | gated newer keeps the older |
 | mutant results (run by hand) | restore the old drop rule: killed; drop without re-checking the kept item in the lock: killed | `TestReminders` |
 | `remove_reminders` / `prune_delivered_reminders` | cancel, condition drop, prune of delivered items | `--cancel` and condition tests |
+| `remove_delivered` (`reminder.rearm`, `reminder.prune_orphans`) | one locked step when a reminder is delivered: an `--every` one still in the file arms its next tick (a cancelled one is never brought back), and the reminders of a retired worker are dropped, audited after the removal | `TestReminderGridAndRecurring`, `TestDeadWorkerReminderPrune` |
 | `reminder.drop` / `reminder.drop_notice` | the issue closed or the pull request merged | `--keep-if-closed` |
 | `reminder.drop_ttl` / `--ttl` | a reminder past its own ttl is dropped unsent, audited | `TestReminderTtl` |
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
