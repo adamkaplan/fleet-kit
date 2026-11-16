@@ -25745,6 +25745,8 @@ class TestOwnerlessSummary(Base):
         self.assertEqual((len(self.lines("orch-web-1")), len(self.lines("orch-web-2"))), (0, 0), "#2545: a digest never wakes an orchestrator on its own")
         self.assertEqual(len(self.lines("cos")), 2, "one line per repository")
         self.assertEqual(len(self.lines("orch-api")), 0, "acme/api's own orchestrator gets none either")
+        dropped = {e["subject"]: e["detail"]["dropped"] for e in self.world.audit() if e["event"] == "triage.ownerless"}
+        self.assertEqual(dropped, {self.TEAM: ["orch-web-1", "orch-web-2"], "acme/api": ["orch-api"]}, "the audit names the orchestrators that were skipped")
 
     def test_s7_the_line_holds_links_and_no_title_text(self):
         self.add(1, created=10, author="alice", body="a body with @mention and https://example.test/x")

@@ -8636,8 +8636,7 @@ def pod_silence_summary(worker):
 
 def pod_silence_tick(engine, discovery, summary=None):
     """#2115: a running cloud pod with no push and no report for 20 minutes tells its recorded boss ONE summary line (bin/pod_silence.py)."""
-    state_dir = getattr(engine, "state_dir", None)
-    watch = getattr(engine, "cloud_watch", None)
+    state_dir, watch = engine.state_dir if hasattr(engine, "state_dir") else None, engine.cloud_watch if hasattr(engine, "cloud_watch") else None
     if state_dir is None or not watch:
         return []
     reports = _read_small(state_dir, LAST_REPORT_FILE)
@@ -8652,11 +8651,12 @@ def pod_silence_tick(engine, discovery, summary=None):
         said = reports.get(name) if isinstance(reports.get(name), dict) else {}
         branches = ((pushes or {}).get(name) or {}).get("branches")
         at = [b.get("at") for b in branches.values() if isinstance(b, dict)] if isinstance(branches, dict) else []
-        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done",
+        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done", "jobs": rec.get("jobs") if isinstance(rec.get("jobs"), list) else None,
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
     return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
                                            summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"),
-                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail))
+                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail),
+                                           gate=lambda boss, since, worker, jobs: lane_gate(discovery, boss, 2, now, since, worker, pod_jobs=jobs, jobs_alive=jobs_active_for))   # #2545: an orchestrator hears a quiet pod at its :00 UTC bucket
 
 
 def lost_worker_tick(engine, discovery):

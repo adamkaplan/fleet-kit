@@ -7,6 +7,7 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from support.loader import sb
@@ -17,6 +18,7 @@ import test_pod_silence as tps
 # five minutes past a full hour (08:05:00 UTC), a time that is in no bucket (EPOCH, 1_800_000_000, is itself a multiple of 1800 and of 3600)
 BASE = EPOCH - EPOCH % 3600 + 300
 BATCH = 90
+HOUR = EPOCH - EPOCH % 3600
 
 
 def seen(role, name="widget-lead"):
@@ -300,6 +302,31 @@ class TestGatedDaemonSends(unittest.TestCase):
                 module.scan(pods, now[0], state, lambda to, t: sent.append(to), lambda n: "stub", json.loads, gate=gate)
                 self.assertEqual(len(sent), want, (role, jobs))
 
+    def tick_at(self, role, jobs, clock):
+        """The real pod_silence_tick (a stub engine, a stub summary), the pod first seen at HOUR + 5 minutes, then ticked at `clock`."""
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = {"worker": "w-a", "reports_to": "lane-a", "hard_deadline": tps._when(HOUR + 86400)}
+            if jobs is not None:
+                rec["jobs"] = jobs
+            engine = types.SimpleNamespace(state_dir=Path(tmp), cloud_watch={"records": [rec], "capped": False},
+                                           send=lambda frm, to, text: sent.append((to, text)), audit=None, actor="switchboard")
+            discovery = types.SimpleNamespace(problems=[], agents={"lane-a": seen(role, "lane-a")})
+            for at in (HOUR + 300, clock):
+                with unittest.mock.patch.object(sb.time, "time", lambda at=at: at):
+                    sb.pod_silence_tick(engine, discovery, lambda w: "summary for " + w)
+        return sent
+
+    def test_the_real_pod_silence_tick_gates_an_orchestrator_boss_by_bucket_and_running_jobs(self):
+        jit = sb.orchestrator_jitter("lane-a")
+        nextbucket = HOUR + 3600 + jit
+        running = [{"state": "running"}]
+        self.assertEqual(self.tick_at("orchestrator", None, nextbucket - 1), [])     # quiet since :25, held to the next :00 + jitter
+        self.assertEqual([to for to, _ in self.tick_at("orchestrator", None, nextbucket)], ["lane-a"])
+        self.assertEqual(self.tick_at("orchestrator", running, nextbucket), [])     # a running job holds it
+        self.assertEqual([to for to, _ in self.tick_at("chief-of-staff", running, HOUR + 300 + 21 * 60)], ["lane-a"])   # not an orchestrator: at once
+        self.assertEqual(self.tick_at("coder", None, HOUR + 300 + 19 * 60), [])      # and not before its 20 quiet minutes
+
     def run_push(self, role, steps):
         pw = tpw.load()
         world = tpw.PushWorld()
@@ -356,7 +383,7 @@ class TestPrGreenEvent(unittest.TestCase):
         self.assertEqual(sb.pr_green_notes({"bad": {"facts": None}, "acme-org/widget-service#x": {"facts": {"state": "open", "ci": "green", "head": "h"}}}, set()), [])
 
     def test_the_hub_queues_one_item_and_a_second_pass_queues_none(self):
-        hub = types.SimpleNamespace(engine=types.SimpleNamespace(notice_facts=self.held()), _green=set(), queue={}, lock=_NoLock())
+        hub = types.SimpleNamespace(engine=types.SimpleNamespace(notice_facts=self.held()), queue={}, lock=_NoLock())
         sb.queue_pr_green(hub, BASE, sb.GitHubItem)
         self.assertEqual(list(hub.queue), ["github.pr_green:acme-org/widget-service#7:%s" % ("a" * 40)])
         item = next(iter(hub.queue.values()))
@@ -364,6 +391,18 @@ class TestPrGreenEvent(unittest.TestCase):
         hub.queue.clear()
         sb.queue_pr_green(hub, BASE + 60, sb.GitHubItem)
         self.assertEqual(hub.queue, {})
+        self.assertEqual(hub._green, {("acme-org/widget-service", 7, "a" * 40)})   # made at the first pass, because the stub hub had none
+
+    def test_the_told_record_is_cleared_when_it_passes_20000(self):
+        hub = types.SimpleNamespace(engine=types.SimpleNamespace(notice_facts=self.held()), queue={}, lock=_NoLock())
+        hub._green = {("acme-org/other-service", n, "c" * 40) for n in range(20001)}
+        sb.queue_pr_green(hub, BASE, sb.GitHubItem)
+        self.assertEqual(hub._green, {("acme-org/widget-service", 7, "a" * 40)})   # the old record dropped, the new head kept
+        self.assertEqual(len(hub.queue), 1)
+        hub._green = {("acme-org/other-service", n, "c" * 40) for n in range(20000)}   # at the cap exactly: kept, and the new one added
+        hub.queue.clear()
+        sb.queue_pr_green(hub, BASE, sb.GitHubItem)
+        self.assertEqual(len(hub._green), 20001)
 
     def test_the_item_is_a_tier_1_wake_for_an_orchestrator(self):
         self.assertEqual(tier_of(kind="github.pr_green", key="github.pr_green:r#7:h", sender=None), 1)
