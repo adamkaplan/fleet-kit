@@ -96,7 +96,7 @@ def ttl_text(seconds):
     return "%ds" % seconds
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None, ttl=None, every=None):
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None, ttl=None, every=None, check_chain=False):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
@@ -117,6 +117,10 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
         item["every"] = int(every)   # #2544: seconds; the daemon arms the next tick on the 15-minute UTC grid when this one is delivered
     with reminders_lock(state_dir):
         items = read_reminders(state_dir)
+        if check_chain:   # #2544: the self-polling check and the write are one critical section
+            refusal = self_poll_chain(state_dir, sender, to, at, created, bool(key or every))
+            if refusal:
+                raise ReminderError(refusal)
         if key and isinstance(sender, str) and sender.strip():   # one pending per owner and key; another owner or key, a fired one and a sender-less one are never touched
             items = [i for i in items if not (i.get("key") == key and i.get("from") == sender and i.get("at", 0) > created)]
         write_reminders(state_dir, items + [item])
@@ -910,8 +914,11 @@ def remove_delivered(state_dir, ids, now, extra=()):
     return remove_reminders(state_dir, set(ids) | set(extra))
 
 
-def retired_orphans(state_dir, live, items):
+def retired_orphans(state_dir, discovery, items):
     """Ids of reminders for a retired worker (or an `--every` chain of one): never a name in the registry, in `live`, or a chartered lane."""
+    if discovery is None or getattr(discovery, "problems", None):
+        return []   # a partial look at the fleet never prunes
+    live = set(discovery.agents)
     reg = load_module("registry").read(state_dir)
     if not reg.get("whole"):
         return []
@@ -919,10 +926,10 @@ def retired_orphans(state_dir, live, items):
     for item in items:
         for who, chain_only in ((item.get("to"), False), (item.get("from"), True)):
             entry = reg["retired"].get(who)
-            if not isinstance(entry, dict) or who in reg["agents"] or who in live or who in PROTECTED_ROLES or (chain_only and not item.get("every")):
+            if not isinstance(entry, dict) or not entry.get("session") or who in reg["agents"] or who in live or who in PROTECTED_ROLES or (chain_only and not item.get("every")):
                 continue
             record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
-            if record.get("role") in PROTECTED_ROLES or record.get("kind") == "orchestrator":
+            if record.get("charter") or record.get("role") in PROTECTED_ROLES or record.get("kind") == "orchestrator":
                 continue
             gone.append(item["id"])
             break
@@ -947,7 +954,7 @@ def prune_delivered_reminders(engine, discovery):
         except V2Error:
             continue
         delivered += [item["id"] for item in items if "reminder:" + item["id"] in keys]
-    orphans = retired_orphans(source.state_dir, set(discovery.agents), read_reminders(source.state_dir))
+    orphans = retired_orphans(source.state_dir, discovery, read_reminders(source.state_dir))
     if orphans and engine.audit is not None:
         engine.audit.append(engine.actor, "reminder.prune_orphans", None, {"ids": orphans})
     gone = remove_delivered(source.state_dir, set(delivered), engine.now(), orphans) if delivered or orphans else []

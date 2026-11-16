@@ -1,6 +1,7 @@
 """#2544: the 15-minute UTC grid for recurring reminders (`--key`, `--every`), the unkeyed under-15m self-polling chain guard, and the prune of
 the reminders of retired workers. build() is called by bin/test-switchboard, which holds PR4Base, captured and the fake binaries."""
 import calendar
+import types
 import unittest
 
 from support.loader import sb
@@ -103,7 +104,7 @@ def build(PR4Base, captured, FAKE_OPENCODE, FAKE_HERDR):
 
         def test_a_retired_workers_reminders_are_pruned_and_live_ones_stay(self):
             registry = sb.load_module("registry")
-            registry.retire(self.world.state, "gone", "test", "done", session="ses_example1")
+            registry.retire(self.world.state, "gone", "test", "done", session="ses_example1", record={"role": "coder"})
             registry.retire(self.world.state, "retired-chief", "test", "done", session="ses_example2", record={"role": "chief-of-staff"})
             dead, chief, live = self.add("gone"), self.add("retired-chief"), self.add("coder")
             self.world.engine.run_pass()
@@ -163,18 +164,42 @@ def build(PR4Base, captured, FAKE_OPENCODE, FAKE_HERDR):
             self.assertEqual(code, 2, err)
             self.assertIn("--every", err)
 
-        def orphans(self, items, live=()):
-            return sb.retired_orphans(self.world.state, set(live), items)
+        def orphans(self, items, live=(), discovery="ok"):
+            if discovery == "ok":
+                discovery = types.SimpleNamespace(agents={n: object() for n in live}, problems=[])
+            return sb.retired_orphans(self.world.state, discovery, items)
+
+        def retire(self, name, record=None, session="ses_example1"):
+            sb.load_module("registry").retire(self.world.state, name, "test", "done", session=session, record=record or {"role": "coder"})
+
+        def test_a_partial_or_missing_discovery_prunes_nothing(self):
+            self.retire("gone")
+            item = self.add("gone")
+            self.assertEqual(self.orphans([item]), [item["id"]])
+            self.assertEqual(self.orphans([item], discovery=None), [])
+            self.assertEqual(self.orphans([item], discovery=types.SimpleNamespace(agents={}, problems=["herdr unreadable"])), [])
+
+        def test_a_chartered_or_sessionless_retirement_is_kept(self):
+            self.retire("chartered", record={"role": "coder", "charter": 7}, session="ses_example3")
+            self.retire("sessionless", session=None)
+            self.assertEqual(self.orphans([self.add("chartered"), self.add("sessionless")]), [])
+
+        def test_the_chain_check_and_the_write_are_one_step(self):
+            now = float(self.world.clock.now())
+            sb.note_self_wake(self.world.state, "coder", now - 10)
+            with self.assertRaises(sb.ReminderError):
+                sb.add_reminder(self.world.state, "coder", now + 300, now, "x", sender="coder", check_chain=True)
+            self.assertEqual(sb.read_reminders(self.world.state), [])
 
         def test_an_unreadable_registry_prunes_nothing(self):
             registry = sb.load_module("registry")
-            registry.retire(self.world.state, "gone", "test", "done", session="ses_example1")
+            registry.retire(self.world.state, "gone", "test", "done", session="ses_example1", record={"role": "coder"})
             item = self.add("gone")
             (self.world.state / "registry.json").write_text("{not json")
             self.assertEqual(self.orphans([item]), [])
 
         def test_a_retired_senders_chain_is_pruned_but_its_one_off_to_a_live_recipient_stays(self):
-            sb.load_module("registry").retire(self.world.state, "gone", "test", "done", session="ses_example1")
+            sb.load_module("registry").retire(self.world.state, "gone", "test", "done", session="ses_example1", record={"role": "coder"})
             now = self.world.clock.now()
             chain = sb.add_reminder(self.world.state, "coder", now + 900, now, "poll", sender="gone", key="k", every=900)
             one_off = sb.add_reminder(self.world.state, "coder", now + 600, now, "once", sender="gone")
@@ -182,7 +207,7 @@ def build(PR4Base, captured, FAKE_OPENCODE, FAKE_HERDR):
 
         def test_a_retired_name_that_is_live_registered_or_an_orchestrator_is_kept(self):
             registry = sb.load_module("registry")
-            for name, record in (("live-one", None), ("reg-one", None), ("orch-one", {"kind": "orchestrator"})):
+            for name, record in (("live-one", {"role": "coder"}), ("reg-one", {"role": "coder"}), ("orch-one", {"kind": "orchestrator"})):
                 registry.retire(self.world.state, name, "test", "done", session="ses_" + name, record=record)
             registry.upsert(self.world.state, "reg-one", {"pane": "p-reg", "session": "ses_other", "role": "coder"})
             items = [self.add(n) for n in ("live-one", "reg-one", "orch-one")]

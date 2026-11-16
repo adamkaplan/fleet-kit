@@ -279,15 +279,16 @@ def cmd_remind(args, runner, now):
         every = parse_every(every) if every else None
         if args.key or every:
             at = grid_when(args.when, moment)   # #2544: a recurring one is on the 15-minute UTC grid
-        chain = self_poll_chain(state, sender, args.name, at, moment, bool(args.key or every))
-        if chain:
-            raise ReminderError(chain)
     except ReminderError as err:
         sys.stderr.write("%s: remind: %s; nothing armed\n" % (PROG, err))
         return EXIT_USAGE
-    item = add_reminder(state, args.name, at, moment,
-                        text, number, sender, repo, condition=condition or None,
-                        key=_one_line(args.key, 80) if args.key else None, ttl=ttl, every=every)
+    try:
+        item = add_reminder(state, args.name, at, moment,
+                            text, number, sender, repo, condition=condition or None,
+                            key=_one_line(args.key, 80) if args.key else None, ttl=ttl, every=every, check_chain=True)
+    except ReminderError as err:
+        sys.stderr.write("%s: remind: %s; nothing armed\n" % (PROG, err))
+        return EXIT_USAGE
     if len(item["text"]) > TEXT_CAP:
         sys.stderr.write("%s: the text is %d characters: it is delivered in parts, each under %d, the last one closing it\n" % (PROG, len(item["text"]), TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
