@@ -51,11 +51,17 @@ class CopyRun(unittest.TestCase):
             if entry != "test-switchboard":
                 os.symlink(os.path.join(ROOT, "bin", entry), os.path.join(tmp, "bin", entry))
         target = os.path.join(tmp, "bin", "test-switchboard")
-        load = "    suite = loader.loadTestsFromModule(sys.modules[__name__])\n"
-        self.assertEqual(text.count(load), 1)
-        slim = "\n".join("pass" if any(f"_support_test_cases_{i:02d}" in l for i in range(1, 14)) else l for l in text.splitlines()) + "\n"
-        with open(target, "w") as f:   # only the one class these checks run is turned into test cases (the other ~1,000 classes are defined, not instantiated)
-            f.write(slim.replace(load, "    suite = unittest.TestSuite([loader.loadTestsFromTestCase(TestLaunchRefusedMessage)])\n"))
+        lines = text.splitlines()
+        i1 = next(i for i, l in enumerate(lines) if l.startswith("class TwoRepoCase("))
+        i2 = next(i for i, l in enumerate(lines) if l.startswith("class TestLaunchRefusedMessage("))
+        i3 = next(i for i in range(i2 + 1, len(lines)) if lines[i].startswith("class "))
+        i4 = next(i for i, l in enumerate(lines) if l.startswith('if __name__ == "__main__":'))
+        head = [l for l in lines[:120] if not any(f"_support_test_cases_{k:02d}" in l for k in range(1, 14))]
+        tail = "\n".join(lines[i4:]).replace(
+            "    suite = loader.loadTestsFromModule(sys.modules[__name__])",
+            "    suite = unittest.TestSuite([loader.loadTestsFromTestCase(TestLaunchRefusedMessage)])")
+        with open(target, "w") as f:
+            f.write("\n".join(head + lines[i1:i3]) + "\n" + tail + "\n")
         os.chmod(target, 0o755)
         p = stub_support.start(self, [sys.executable, target, "-k", "TestLaunchRefusedMessage." + k], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out, _ = p.communicate(timeout=90)

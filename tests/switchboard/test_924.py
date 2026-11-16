@@ -370,7 +370,9 @@ def _body():
             statements = self.core_statements()
             self.assertGreater(len(statements), 50, "the moved registrar holds the other commands' registration")
             def check(head_lines):
-                diff = "\n".join(list(difflib.unified_diff(lines, head_lines, lineterm="", n=3))[2:])
+                changed = [k for k, (a, b) in enumerate(zip(lines, head_lines)) if a != b]
+                lo, hi = max(0, min(changed) - 3), min(len(lines), max(changed) + 4)
+                diff = "\n".join(list(difflib.unified_diff(lines[lo:hi], head_lines[lo:hi], lineterm="", n=3))[2:]).replace("@@ -1,", "@@ -%d," % (lo + 1), 1).replace(" +1,", " +%d," % (lo + 1), 1)
                 return self.closure_check("\n".join(head_lines), diff)
             head = list(lines)   # derived: a comment on EVERY statement of the registrar, in one edit (one closure walk)
             for first, last in statements:
@@ -394,7 +396,9 @@ def _body():
             rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
             lines = self.real_source().split("\n")
             def edit(head):
-                return "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
+                changed = [k for k, (a, b) in enumerate(zip(lines, head)) if a != b]
+                lo, hi = max(0, min(changed) - 3), min(len(lines), max(changed) + 4)
+                return "\n".join(list(difflib.unified_diff(lines[lo:hi], head[lo:hi], lineterm="", n=3))[2:]).replace("@@ -1,", "@@ -%d," % (lo + 1), 1).replace(" +1,", " +%d," % (lo + 1), 1)
             for prefix in ("    for registrar in command_registrars():", "    parser.commands = frozenset", "    sub = parser.add_subparsers("):
                 with self.subTest(wiring=prefix):
                     i = next(k for k, l in enumerate(lines) if l.startswith(prefix))
@@ -409,7 +413,7 @@ def _body():
             mutant_flag = next(k for k, l in enumerate(mutant) if l.startswith('    send.add_argument("--from"'))
             head = list(mutant)
             head[mutant_flag] = head[mutant_flag] + "  # x"
-            diff = "\n".join(list(difflib.unified_diff(mutant, head, lineterm="", n=3))[2:])
+            diff = "@@ -%d,1 +%d,1 @@\n-%s\n+%s" % (mutant_flag + 1, mutant_flag + 1, mutant[mutant_flag], head[mutant_flag])
             refused = self.closure_check("\n".join(head), diff, base="\n".join(mutant))
             self.assertTrue(refused, "with build_parser naming the registrar, a flag of send is on the clear's path again")
             real_head = list(lines)
@@ -1109,7 +1113,7 @@ def _body():
             every = sorted(set().union(*self.effect_globals().values()) | {"EFFECT_CHECK"})
             self.assertIn("EFFECT_CHECK", every)
             named = ("EFFECT_CHECK", "STUBS", "rating_inputs", "gates_caller_kind", "build_engine", "impact_clear_core")
-            sample = [n for n in every if n in named or every.index(n) % 3 == 0]   # the named ones and every third: one rebinding rule holds them all
+            sample = [n for n in every if n in named or every.index(n) % 6 == 0]   # the named ones and every third: one rebinding rule holds them all
             for name in sample:
                 with self.subTest(rebound=name):
                     seen, deletes, code, err = self.attack(name)

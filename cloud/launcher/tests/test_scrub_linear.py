@@ -235,7 +235,7 @@ def case_sets(r):
              ("a[abcdefgh]b[redacted]c", ["[abcdefgh", "abcdefgh]", "[redacted]x", "edacted]xy"]),
              ("12345678901234567890", ["1234567890", "0987654321", "4567890123", "7890123456"]),
              ("aaaaaaaaaaaaaaaaaaaa", ["aaaaaaaaa", "aaaaaaaab", "baaaaaaaa", "aaaaaaaaaa"])]
-    for _ in range(60):
+    for _ in range(240):
         n = r.randint(8, 12)
         secs = [rnd(r, n, "abcd[]") for _ in range(r.randint(4, 6))]
         cases.append(("".join(r.choice(secs)[r.randint(0, 3):r.randint(6, n)] + r.choice(["", "x", " "]) for _ in range(8)), secs))

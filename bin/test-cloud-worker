@@ -396,16 +396,19 @@ class Base(unittest.TestCase):
                     for k, _v in secrets:
                         argv += ["--run-secret-fd", "%s=9" % k]
                     d = env.get("STUB_DIR") or str(self.stub_dir)
-                    open(d + "/calls.log", "a").write(json.dumps(argv) + "\n")
+                    with open(d + "/calls.log", "a") as _f:
+                        _f.write(json.dumps(argv) + "\n")
                     tf = env.get("CW_CLOUD_TOKEN_FILE")
-                    token_ok = bool(tf) and os.path.exists(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == env.get("STUB_TOKEN_SHA")
+                    tf_txt = Path(tf).read_text() if (tf and os.path.exists(tf)) else ""
+                    token_ok = bool(tf) and os.path.exists(tf) and hashlib.sha256(tf_txt.encode()).hexdigest() == env.get("STUB_TOKEN_SHA")
                     token_mode = oct(os.stat(tf).st_mode & 0o777) if (tf and os.path.exists(tf)) else None
-                    open(d + "/login.log", "a").write(json.dumps({"command": command, "argv": argv, "env": dict(env),
-                                                                  "token_ok": token_ok, "token_mode": token_mode}) + "\n")
+                    with open(d + "/login.log", "a") as _f:
+                        _f.write(json.dumps({"command": command, "argv": argv, "env": dict(env),
+                                             "token_ok": token_ok, "token_mode": token_mode}) + "\n")
                     if command == "create":
                         for k in ("model-auth", "git-token"):
                             if k in secret_map:
-                                open(d + "/received-" + k, "w").write(secret_map[k])
+                                Path(d + "/received-" + k).write_text(secret_map[k])
                         if password_fd is not None:
                             os.write(password_fd, (env["STUB_PASSWORD"] + "\n").encode())
                         ans = {"worker": name, "url": env["STUB_URL"], "auth_ref": "file:/etc/passwd", "runtime_id": "pod/%s-7f9c" % name,
@@ -465,9 +468,10 @@ class Base(unittest.TestCase):
         def _record_fast_token(e):
             d = e.get("STUB_DIR") or str(self.stub_dir)
             k_args = ["--kubeconfig", "/dev/fd/0", "-n", "cw", "create", "token", "cw-operator", "--duration=20m"]
-            open(d + "/kubectl.log", "a").write(json.dumps({
-                "args": k_args, "kubeconfig_is_dev_fd": True, "admin_ok": True,
-                "env_has_token": "/dev/null"}) + "\n")
+            with open(d + "/kubectl.log", "a") as _f:
+                _f.write(json.dumps({
+                    "args": k_args, "kubeconfig_is_dev_fd": True, "admin_ok": True,
+                    "env_has_token": "/dev/null"}) + "\n")
             return CLUSTER_TOKEN
 
         def fast_cluster_token(env=None, now=None, recovery=None):
@@ -497,14 +501,16 @@ class Base(unittest.TestCase):
                 argv = ["--kubeconfig", cluster.kubeconfig, "--context", "cw",
                         "-n", os.environ.get("CW_CLOUD_NAMESPACE", "cw"), "port-forward", "pod/" + found.group(1),
                         "4096:4096", "--address", "127.0.0.1"]
-                kc_text = open(cluster.kubeconfig).read()
+                kc_text = Path(cluster.kubeconfig).read_text()
                 tf = json.loads(kc_text)["users"][0]["user"]["tokenFile"]
-                tf_text = open(tf).read()
+                tf_text = Path(tf).read_text()
                 token_ok = hashlib.sha256(tf_text.encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA")
                 entry = {"args": argv, "kubeconfig_is_dev_fd": False, "token_ok": token_ok,
                          "config_text_has_token": tf_text in kc_text, "env": cluster.env()}
-                open(d + "/kubectl.log", "a").write(json.dumps(entry) + "\n")
-                open(d + "/pf.pid", "a").write("999999\n")
+                with open(d + "/kubectl.log", "a") as _f:
+                    _f.write(json.dumps(entry) + "\n")
+                with open(d + "/pf.pid", "a") as _f:
+                    _f.write("999999\n")
                 port = int(os.environ["STUB_URL"].rsplit(":", 1)[1])
                 yield dict(record, url="http://127.0.0.1:%d" % port)
                 return

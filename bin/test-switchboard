@@ -32517,26 +32517,29 @@ class TestRegistrarFloor(LedgerBase):
 
     @staticmethod
     def small_source(tree, names):
-        """The small fixture the planted shapes are linted on (ask #2108): the real file's module-level statements with every function that is not a registrar cut to the bare references it makes to the closure's names (a closure function keeps its edges, any other function goes). The lint of the planted shape answers the same as over the 26k-line file; the real file is linted once, by the tests that say 'real'."""
+        """The small fixture the planted shapes are linted on (ask #2108): the real file's module-level closure definitions and bindings cut to the bare references they make to the closure's names. The lint of the planted shape answers the same as over the 26k-line file; the real file is linted once, by the tests that say 'real'."""
         import ast
         body = []
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name.startswith("add_") and node.name.endswith("_parsers"):
-                    body.append(node)
-                elif node.name in names:
+                if node.name in names:
                     refs = sorted({x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in names and x.id != node.name})
-                    stub = ast.FunctionDef(node.name, node.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], node.decorator_list, None)
-                    body.append(ast.fix_missing_locations(ast.copy_location(stub, node)))
-            elif isinstance(node, ast.ClassDef):   # a class keeps its own statements; each method is cut to the bare references it makes to the closure's names, as a function is
-                kept = []
-                for member in node.body:
-                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        refs = sorted({x.id for x in ast.walk(member) if isinstance(x, ast.Name) and x.id in names})
-                        member = ast.fix_missing_locations(ast.copy_location(ast.FunctionDef(member.name, member.args, [ast.Expr(ast.Name(r, ast.Load())) for r in refs] or [ast.Pass()], member.decorator_list, None), member))
-                    kept.append(member)
-                body.append(ast.fix_missing_locations(ast.copy_location(ast.ClassDef(node.name, node.bases, node.keywords, kept, node.decorator_list), node)))
-            else:
+                    val = ast.Tuple([ast.Name(r, ast.Load()) for r in refs], ast.Load()) if refs else ast.Constant(0)
+                    body.append(ast.fix_missing_locations(ast.copy_location(ast.FunctionDef(node.name, ast.arguments([], [], None, [], [], None, []), [ast.Expr(val)], [], None), node)))
+            elif isinstance(node, ast.ClassDef) and node.name in names:
+                refs = sorted({x.id for x in ast.walk(node) if isinstance(x, ast.Name) and x.id in names and x.id != node.name})
+                val = ast.Tuple([ast.Name(r, ast.Load()) for r in refs], ast.Load()) if refs else ast.Constant(0)
+                body.append(ast.fix_missing_locations(ast.copy_location(ast.ClassDef(node.name, [], [], [ast.Expr(val)], []), node)))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targs = node.targets if isinstance(node, ast.Assign) else [node.target]
+                tnames = {x.id for t in targs for x in ast.walk(t) if isinstance(x, ast.Name)}
+                if "REGISTRAR_NAME_RE" in tnames or any("_DYNAMIC" in x for x in tnames):
+                    body.append(node)
+                elif tnames & names:
+                    refs = sorted({x.id for x in ast.walk(node.value) if isinstance(x, ast.Name) and x.id in names}) if getattr(node, "value", None) else []
+                    val = ast.Tuple([ast.Name(r, ast.Load()) for r in refs], ast.Load()) if refs else ast.Constant(0)
+                    body.append(ast.fix_missing_locations(ast.copy_location(ast.Assign(targs, val), node)))
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 body.append(node)
         return ast.unparse(ast.Module(body, []))
 
