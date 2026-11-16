@@ -13957,7 +13957,7 @@ class TestClearNotice(Base):
             lines = self.clear()
             elapsed = time.monotonic() - began
         self.assertFalse(finished.is_set(), "the clear did not wait for the blocked send")
-        if not entered.wait(10):   # a CEILING, not the decision
+        if not entered.wait(getattr(self, "ENTER_WAIT_SECONDS", 10)):   # a CEILING, not the decision
             self.fail("the notice thread never reached the send: order=%s" % self.order)
         self.assertTrue(self.body.startswith("MERGE: automatic"), "the marker edit is done")
         self.assertTrue(lines[0].startswith("cleared the impact hold") and any("MERGE: automatic" in l for l in lines))
@@ -14371,9 +14371,11 @@ class TestClearNoticeOrderMutants(unittest.TestCase):
         finally:
             setattr(sb, name, original)
 
-    def run_the_test(self):
+    def run_the_test(self, enter_wait=10):
         stream = io.StringIO()
-        result = unittest.TextTestRunner(stream=stream, verbosity=0).run(unittest.TestSuite([TestClearNotice(self.TEST)]))
+        case = TestClearNotice(self.TEST)
+        case.ENTER_WAIT_SECONDS = enter_wait
+        result = unittest.TextTestRunner(stream=stream, verbosity=0).run(unittest.TestSuite([case]))
         return result.wasSuccessful(), stream.getvalue()
 
     def test_the_control_passes_and_both_mutants_of_the_notice_order_are_killed(self):
@@ -14396,7 +14398,7 @@ class TestClearNoticeOrderMutants(unittest.TestCase):
         finally:
             sb.impact_clear_core = original
         with self.rebuilt("notify_clear", "        worker.start()\n", "        pass\n"):
-            ok2, text2 = self.run_the_test()
+            ok2, text2 = self.run_the_test(enter_wait=0.3)
         k1 = (not ok1) and self.ORDER_TEXT in text1
         k2 = (not ok2) and self.NEVER_TEXT in text2 and self.ORDER_TEXT not in text2
         killed = int(k1) + int(k2)
@@ -73795,7 +73797,7 @@ class TestGhShimMergeGate(Base):
         runner = ("import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nspec = importlib.util.spec_from_loader('gh', loader)\n"
                   "m = importlib.util.module_from_spec(spec)\nloader.exec_module(m)\nm.__file__ = %r\nm.MG_HOME = %r\nm.MG_BINARY = %r\nsys.exit(m.main(sys.argv[1:]))\n"
                   % (str(self.shim_path or SHIM), str(self.shim_file or SHIM), str(self.home), str(self.sb) if binary and not linked else None))   # the gate's home and program are module attributes, never environment
-        done = importlib.import_module("support.rebind").run_in_process(runner, args, environ) if "FAKE_MG_SLEEP" not in environ else subprocess.run([sys.executable, "-c", runner, *args], capture_output=True, text=True, env=environ, timeout=60)
+        done = importlib.import_module("support.rebind").run_in_process(runner, args, environ)
         return done, (json.loads(self.log.read_text()) if self.log.exists() else None)
 
     def merge_calls(self):
@@ -74034,7 +74036,7 @@ class TestGhShimMergeGate(Base):
         done, seen = self.run_shim(*self.MERGE, env={"FAKE_MG_EXIT": "1", "FAKE_MG_JSON": "{}"})
         self.assertEqual((done.returncode, seen), (10, None))
         self.assertIn("could not decide", done.stderr)
-        done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FAKE_MG_SLEEP="5", FLEET_SHIM_MERGE_GATE_SECONDS="1"))
+        done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FAKE_MG_SLEEP="1.2", FLEET_SHIM_MERGE_GATE_SECONDS="1"))
         self.assertEqual((done.returncode, seen), (10, None))
         self.assertIn("did not answer in time", done.stderr)
 
@@ -74045,7 +74047,7 @@ class TestGhShimMergeGate(Base):
                 self.assertEqual((done.returncode, seen), (10, None))
         for value in ("0", "-5", "0.001", "nan"):
             with self.subTest(value=value, gate="slow"):   # a wait that clamps to the one-second floor expires before a slow gate answers: refused, the real gh never runs
-                done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FAKE_MG_SLEEP="4", FLEET_SHIM_MERGE_GATE_SECONDS=value))
+                done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FAKE_MG_SLEEP="1.2", FLEET_SHIM_MERGE_GATE_SECONDS=value))
                 self.assertEqual((done.returncode, seen), (10, None))
                 self.assertIn("did not answer in time", done.stderr)
 
