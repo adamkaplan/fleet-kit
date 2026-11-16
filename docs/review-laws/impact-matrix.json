@@ -377,6 +377,7 @@
         "bin/switchboard/heavy_budget.py",
         "bin/switchboard/config_reload.py",
         "bin/switchboard/labels_ensure.py",
+        "bin/switchboard/checkpoint_reminders.py",
         "bin/switchboard/land.py",
         "bin/switchboard/land_gate.py"
       ],
@@ -541,14 +542,19 @@
           "merge_reminder_copies",
           "merge_wake",
           "merge_wake_facts",
+          "next_tick",
+          "note_self_wake",
           "pass_stale",
           "pass_subject",
           "read_record_file",
           "read_reminders",
+          "rearm_item",
           "reminders_lock",
+          "remove_delivered",
           "remove_reminders",
           "wake_class_of",
-          "write_reminders"
+          "write_reminders",
+          "write_text_atomic"
         ],
         "bin/switchboard/plan_review.py": [
           "ReviewError",
@@ -815,6 +821,9 @@
           "ensure_labels",
           "label_names",
           "read_open_items"
+        ],
+        "bin/switchboard/checkpoint_reminders.py": [
+          "self_poll_chain"
         ],
         "bin/switchboard/land.py": [
           "validate_land_repos"

@@ -838,7 +838,7 @@ def grid_when(text, now):
     if re.fullmatch(r"\+?[0-9]+[smhd]", text.strip()):
         if at - now < GRID_SECONDS:
             raise ReminderError("a --key or --every reminder needs at least 15m (got %r): use 15m or more, or arm upfront one-shots without --key" % text[:40])
-        return float(math.ceil(at / GRID_SECONDS) * GRID_SECONDS)
+        return float((int(at // GRID_SECONDS) + (1 if at % GRID_SECONDS else 0)) * GRID_SECONDS)
     if at <= now:
         raise ReminderError("a --key or --every reminder at an explicit time must be in the future, got %r" % text[:40])
     if at % GRID_SECONDS:
@@ -897,21 +897,6 @@ def write_text_atomic(path, text):
         raise
 
 
-def self_poll_chain(state_dir, sender, to, at, now, keyed):
-    """The refusal text when an unkeyed reminder under 15m that an agent sets for ITSELF is armed right after it woke from a self-reminder
-    (delivered within 15m): a chain that polls on wake. Upfront one-shots (armed before the first fires) and launch checkpoint reminders
-    (the boss sets those, never the agent for itself) pass. None when it passes."""
-    if keyed or not (isinstance(sender, str) and sender.strip() and sender == to) or at - now >= GRID_SECONDS:
-        return None
-    last = (read_record_file(Path(state_dir) / SELF_WAKE_FILE) or {}).get(sender)
-    woke = [last["at"]] if isinstance(last, dict) and _is_number(last.get("at")) else []
-    woke += [i["at"] for i in read_reminders(state_dir) if i.get("from") == sender and i.get("to") == sender and i["at"] <= now]
-    if any(0 <= now - w < GRID_SECONDS for w in woke):
-        return ("you woke from a reminder you set for yourself less than 15m ago and this arms another under 15m: that is a self-polling chain. "
-                "Use --key with --every (15m or more, on :00/:15/:30/:45 UTC), or arm one-shots upfront (+5m, +15m, +30m) before the first fires")
-    return None
-
-
 def remove_delivered(state_dir, ids, now, extra=()):
     """One locked step for reminders that were delivered (`ids`) and ones to drop (`extra`). An `--every` one still in the file arms its next tick
     first (a delivered id already gone, as after a `--cancel-key`, is never brought back; a newer pending reminder of the same key and sender wins),
@@ -936,28 +921,6 @@ def remove_delivered(state_dir, ids, now, extra=()):
     for name in sorted(woke):
         note_self_wake(state_dir, name, now)
     return gone, dropped, armed
-
-
-def retired_orphans(state_dir, discovery, items):
-    """Ids of reminders for a retired worker (or an `--every` chain of one): never a name in the registry, in `live`, or a chartered lane."""
-    if discovery is None or getattr(discovery, "problems", None):
-        return []   # a partial look at the fleet never prunes
-    live = set(discovery.agents)
-    reg = load_module("registry").read(state_dir)
-    if not reg.get("whole"):
-        return []
-    gone = []
-    for item in items:
-        for who, chain_only in ((item.get("to"), False), (item.get("from"), True)):
-            entry = reg["retired"].get(who)
-            if not isinstance(entry, dict) or not entry.get("session") or who in reg["agents"] or who in live or who in PROTECTED_ROLES or (chain_only and not item.get("every")):
-                continue
-            record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
-            if record.get("charter") or record.get("role") in PROTECTED_ROLES or record.get("kind") == "orchestrator":
-                continue
-            gone.append(item["id"])
-            break
-    return gone
 
 
 def prune_delivered_reminders(engine, discovery):

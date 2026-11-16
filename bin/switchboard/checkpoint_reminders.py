@@ -337,3 +337,42 @@ def read_text_file(path, flag="--text-file", outcome="nothing armed", own_dirs_o
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 cmd_remind.header_cache = True    # #1520
+
+
+# ---- #2544: the guards of the reminder grid (moved here to keep reminders.py under its part limit)
+
+def self_poll_chain(state_dir, sender, to, at, now, keyed):
+    """The refusal text when an unkeyed reminder under 15m that an agent sets for ITSELF is armed right after it woke from a self-reminder
+    (delivered within 15m): a chain that polls on wake. Upfront one-shots (armed before the first fires) and launch checkpoint reminders
+    (the boss sets those, never the agent for itself) pass. None when it passes."""
+    if keyed or not (isinstance(sender, str) and sender.strip() and sender == to) or at - now >= GRID_SECONDS:
+        return None
+    last = (read_record_file(Path(state_dir) / SELF_WAKE_FILE) or {}).get(sender)
+    woke = [last["at"]] if isinstance(last, dict) and _is_number(last.get("at")) else []
+    woke += [i["at"] for i in read_reminders(state_dir) if i.get("from") == sender and i.get("to") == sender and i["at"] <= now]
+    if any(0 <= now - w < GRID_SECONDS for w in woke):
+        return ("you woke from a reminder you set for yourself less than 15m ago and this arms another under 15m: that is a self-polling chain. "
+                "Use --key with --every (15m or more, on :00/:15/:30/:45 UTC), or arm one-shots upfront (+5m, +15m, +30m) before the first fires")
+    return None
+
+
+def retired_orphans(state_dir, discovery, items):
+    """Ids of reminders for a retired worker (or an `--every` chain of one): never a name in the registry, in `live`, or a chartered lane."""
+    if discovery is None or getattr(discovery, "problems", None):
+        return []   # a partial look at the fleet never prunes
+    live = set(discovery.agents)
+    reg = load_module("registry").read(state_dir)
+    if not reg.get("whole"):
+        return []
+    gone = []
+    for item in items:
+        for who, chain_only in ((item.get("to"), False), (item.get("from"), True)):
+            entry = reg["retired"].get(who)
+            if not isinstance(entry, dict) or not entry.get("session") or who in reg["agents"] or who in live or who in PROTECTED_ROLES or (chain_only and not item.get("every")):
+                continue
+            record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
+            if record.get("charter") or record.get("role") in PROTECTED_ROLES or record.get("kind") == "orchestrator":
+                continue
+            gone.append(item["id"])
+            break
+    return gone
