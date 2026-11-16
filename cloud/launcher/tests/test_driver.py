@@ -67,7 +67,7 @@ class Driver(base.Base):
         self.denv = dict({"PATH": os.environ["PATH"], "HOME": d}, **self.env, TMPDIR=self.scratch, CW_TMPDIR=self.scratch, CW_OPENCODE_BIN=FAKE_EXPORT,
                          CW_GIT_TOKEN_CMD=self.gitcmd, FAKE_SCAN_DIR=self.scratch, FAKE_KUBE_SEEN=self.seen,
                          FAKE_SCAN_VALUES=",".join(MODEL_VALUES + [GIT, OTHER, json.dumps([ROW])]),
-                         STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.05", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60")
+                         STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.01", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60")
 
     def args(self, worker="coder7", repo=REPO, brief=None):
         return [sys.executable, FAKE_PREFLIGHT_DRIVER, worker, repo, "main", brief or self.brief, "--pull-secret", "cw-pull", "--image", "registry.example.internal/cw-worker:1"]

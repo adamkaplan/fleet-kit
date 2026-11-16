@@ -372,57 +372,56 @@ class Base(unittest.TestCase):
                                                       "value": {"type": "api", "key": "must-not-travel"}}])
         default_kubectl_text = KUBECTL % {"python": sys.executable}
 
-        def fast_run_launcher(runner, command, name, extra, timeout, *args, **kwargs):   # the untouched stub is answered in process
-            password_fd = kwargs.get("password_fd", args[0] if len(args) > 0 else None)
-            cluster = kwargs.get("cluster", args[1] if len(args) > 1 else None)
-            secrets = kwargs.get("secrets", args[2] if len(args) > 2 else ())
+        create_options = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait",
+                          "--pull-secret", "--run-secret-fd", "--no-commit", "--pr-label", "--run-id", "--password-fd", "--json")
+
+        def fast_run_launcher(runner, command, name, extra=(), timeout=60, password_fd=None, cluster=None, secrets=()):   # the untouched stub is answered in process
             if (command in ("capacity", "create", "stop", "status", "snapshot")
                     and cw_mod.launcher_argv() == [str(self.stub)]
                     and self.stub.exists() and self.stub.read_text() == default_stub_text):
                 if command == "capacity":
                     return 0, {"nodes": [], "requests": {}, "pending": None, "nodes_read": False, "pods_read": False, "events_read": False}, ""
-                argv = [str(self.stub), command] + ([name] if name else []) + list(extra) + ["--json"]
-                if password_fd is not None:
-                    argv += ["--password-fd", str(password_fd)]
-                secret_map = dict(secrets)
-                for k, _v in secrets:
-                    argv += ["--run-secret-fd", "%s=9" % k]
-                if cluster is not None:
-                    argv += cluster.args()
-                args_list = argv[1:]
-                clean, skip = [], False
-                for i, a in enumerate(args_list):
-                    if skip:
-                        skip = False
-                    elif a in ("--kube-token-file", "--kube-server", "--kube-ca-file", "--kube-namespace") and i + 1 < len(args_list):
-                        skip = True
-                    elif a == "--kube-insecure":
-                        pass
-                    else:
-                        clean.append(a)
-                d = str(self.stub_dir)
-                open(d + "/calls.log", "a").write(json.dumps(clean) + "\n")
-                if "--kube-token-file" in args_list:
-                    tf = args_list[args_list.index("--kube-token-file") + 1]
-                    open(d + "/login.log", "a").write(json.dumps({
-                        "cmd": clean[0], "token_sha": hashlib.sha256(open(tf).read().encode()).hexdigest(),
-                        "mode": oct(os.stat(tf).st_mode & 0o777),
-                        "server": args_list[args_list.index("--kube-server") + 1],
-                        "namespace": args_list[args_list.index("--kube-namespace") + 1],
-                        "env_has_token": any(k in os.environ for k in ("KUBECONFIG", "CW_KUBE_TOKEN", "CW_CLUSTER_TOKEN"))}) + "\n")
-                if "model_auth_json" in secret_map:
-                    open(d + "/received-model-auth", "w").write(secret_map["model_auth_json"])
-                if "git_token" in secret_map:
-                    open(d + "/received-git-token", "w").write(secret_map["git_token"])
-                if password_fd is not None:
-                    pw = os.read(password_fd, 256).decode()
-                    open(d + "/received-password", "w").write(pw)
-                ans = {"worker": name, "pod": "cw-" + str(name), "namespace": "cw", "service": "cw-" + str(name), "port": 4096,
-                       "status": "Running", "ready": True, "created": "2099-10-14T12:00:00Z", "hard_deadline": "2099-10-14T14:00:00Z"}
-                if "idle_seconds" in STUB:
-                    ans.update({"idle_seconds": 3600, "hard_seconds": 7200})
-                return 0, ans, ""
-            return real_run_launcher(runner, command, name, extra, timeout, *args, **kwargs)
+                env = cluster.env() if (cluster is not None and hasattr(cluster, "env")) else dict(os.environ)
+                shape = extra[list(extra).index("--shape") + 1] if "--shape" in extra else "XS"
+                unknown = [a for a in extra if a.startswith("--") and a not in create_options] if command == "create" else []
+                if (not env.get("STUB_CREATE_FAIL")
+                        and int(env.get("STUB_STOP_EXIT", "0") or "0") == 0
+                        and not env.get("STUB_SNAPSHOT_FAIL")
+                        and not unknown
+                        and shape in ("XS", "O", "S", "M", "L")):
+                    argv = [command, name] + list(extra) + ["--json"]
+                    if password_fd is not None:
+                        argv += ["--password-fd", str(password_fd)]
+                    secret_map = dict(secrets)
+                    for k, _v in secrets:
+                        argv += ["--run-secret-fd", "%s=9" % k]
+                    d = env.get("STUB_DIR") or str(self.stub_dir)
+                    open(d + "/calls.log", "a").write(json.dumps(argv) + "\n")
+                    tf = env.get("CW_CLOUD_TOKEN_FILE")
+                    token_ok = bool(tf) and os.path.exists(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == env.get("STUB_TOKEN_SHA")
+                    token_mode = oct(os.stat(tf).st_mode & 0o777) if (tf and os.path.exists(tf)) else None
+                    open(d + "/login.log", "a").write(json.dumps({"command": command, "argv": argv, "env": dict(env),
+                                                                  "token_ok": token_ok, "token_mode": token_mode}) + "\n")
+                    if command == "create":
+                        for k in ("model-auth", "git-token"):
+                            if k in secret_map:
+                                open(d + "/received-" + k, "w").write(secret_map[k])
+                        if password_fd is not None:
+                            os.write(password_fd, (env["STUB_PASSWORD"] + "\n").encode())
+                            os.close(password_fd)
+                        ans = {"worker": name, "url": env["STUB_URL"], "auth_ref": "file:/etc/passwd", "runtime_id": "pod/%s-7f9c" % name,
+                               "idle_deadline": "2099-10-14T12:10:00Z", "hard_deadline": "2099-10-14T14:00:00Z"}
+                        if "idle_seconds" in STUB:
+                            ans.update({"idle_seconds": 3600, "hard_seconds": 7200})
+                        return 0, ans, ""
+                    if command == "stop":
+                        return 0, {"worker": name, "runtime_id": "pod/%s-7f9c" % name, "pushed": True, "wip_branch": str(name) + "/wip"}, ""
+                    if command == "status":
+                        return 0, {"worker": name, "runtime_id": "pod/%s-7f9c" % name, "phase": "running", "cost_estimate_usd": 0.07}, ""
+                    if command == "snapshot":
+                        pods = {"pods": [{"name": n} for n in json.loads(env["STUB_PODS"])]} if env.get("STUB_PODS") is not None else None
+                        return 0, pods, ""
+            return real_run_launcher(runner, command, name, extra, timeout, password_fd=password_fd, cluster=cluster, secrets=secrets)
 
         def fast_model_entry():
             if (os.environ.get("CW_OPENCODE_BIN") == FAKE_EXPORT
@@ -469,9 +468,13 @@ class Base(unittest.TestCase):
                 return CLUSTER_TOKEN
             return real_cluster_token(env=env, now=now, recovery=recovery)
 
-        for attr, fn in (("run_launcher", fast_run_launcher), ("model_entry", fast_model_entry),
-                         ("git_token", fast_git_token), ("cluster_token", fast_cluster_token)):
-            p = mock.patch.object(cw_mod, attr, fn)
+        for target, attr, fn in ((cw_mod, "run_launcher", fast_run_launcher),
+                                 (cw_mod.cloud_cluster, "run_launcher", fast_run_launcher),
+                                 (cw_mod, "model_entry", fast_model_entry),
+                                 (cw_mod, "git_token", fast_git_token),
+                                 (cw_mod, "cluster_token", fast_cluster_token),
+                                 (cw_mod.cloud_cluster, "cluster_token", fast_cluster_token)):
+            p = mock.patch.object(target, attr, fn)
             p.start()
             self.addCleanup(p.stop)
         for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID", "CW_KUBE_CONTEXT", "CW_TOOLING_REPO", "CW_CLUSTER_TOKEN_CMD"):
