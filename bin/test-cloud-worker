@@ -1094,8 +1094,9 @@ class TestWiring(Base):
         spawned[0].poll()
         self.assertEqual(self.leftovers(), [])
 
-    def _signalled(self, signum):
-        self.assertEqual(self.launch()[0], 0)
+    def _signalled(self, signum, launch=True):
+        if launch:
+            self.assertEqual(self.launch()[0], 0)
         (self.stub_dir / "pf_hang").write_text("")
         before = len((self.stub_dir / "pf.pid").read_text().split())
         env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
@@ -1184,7 +1185,7 @@ class TestWiring(Base):
         stranger = FakeRemote("someone-else")
         self.addCleanup(stranger.close)
         (self.stub_dir / "pf_squat").write_text("")   # kubectl never says it forwards
-        with mock.patch.dict(os.environ, {"CW_TUNNEL_TIMEOUT": "2"}):
+        with mock.patch.dict(os.environ, {"CW_TUNNEL_TIMEOUT": "1"}):
             before = len(self.remote.requests)
             code, out, err = self.main("read", "coder7")
         self.assertEqual(code, 1)
@@ -1235,12 +1236,11 @@ class TestSignalsAndOrphans(Base):
         self.assertEqual(ignored, [True] * 4)
 
     def test_signal_table_leaves_no_directory_and_no_tunnel(self):
+        self.assertEqual(self.launch()[0], 0)
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
             with self.subTest(signal=signal.Signals(signum).name):
                 (self.stub_dir / "pf_hang").unlink(missing_ok=True)
-                for leftover in (self.state / "cloud").glob("coder7.*"):
-                    leftover.unlink()
-                self._signalled(signum)
+                self._signalled(signum, launch=False)
 
     def _killed_command(self, launch=True):
         if launch:

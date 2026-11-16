@@ -962,10 +962,10 @@ class AutoGc(Base):
             pathlib.Path(script).write_text("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
             os.chmod(script, 0o755)
             # loose (unreachable) objects so that an auto-gc has a reason to run: gc.auto=1 fires at more than one loose object in objects/17
-            n, d = 0, os.path.join(self.work, ".git", "objects", "17")
-            while len(os.listdir(d)) < 3 if os.path.isdir(d) else True:
-                n += 1
+            d = os.path.join(self.work, ".git", "objects", "17")
+            for n in (134, 331, 1030):
                 subprocess.run([GIT, "-C", self.work, "hash-object", "-w", "--stdin"], input="loose %d" % n, text=True, capture_output=True, check=True)
+            assert os.path.isdir(d) and len(os.listdir(d)) >= 3
         with open(cfg, "w") as f:
             f.write(self.plain_cfg)
         if os.path.exists(self.marker):

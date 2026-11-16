@@ -337,14 +337,14 @@ class TestStopGroupPins(unittest.TestCase):
         port = stub_support.free_port()
         p = stub_support.start(self, [sys.executable, STUB, str(port)], port=port, env=dict(os.environ, STUB_IDLE_SECONDS="0.5"))
         self.assertTrue(wait_until(lambda: not stub_support.port_is_free(port)))
-        end = time.time() + 1.1   # longer than the 0.5 s cap, with a request every 0.15 s
+        end = time.time() + 0.65   # longer than the 0.5 s cap, with a request every 0.12 s
         while time.time() < end:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
             c.request("GET", "/api/info")
             c.getresponse().read()
             c.close()
             self.assertIsNone(p.poll(), "the stub ended while it was being asked")
-            time.sleep(0.15)
+            time.sleep(0.12)
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the stub did not end once the requests stopped")
 
 
