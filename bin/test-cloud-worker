@@ -364,16 +364,116 @@ class Base(unittest.TestCase):
         self.addCleanup(quick.stop)
         cw_mod = sb.load_module("cloud_worker")
         real_run_launcher = cw_mod.run_launcher
+        real_model_entry = cw_mod.model_entry
+        real_git_token = cw_mod.git_token
+        real_cluster_token = cw_mod.cluster_token
         default_stub_text = STUB % {"python": sys.executable}
+        default_export_text = json.dumps([MODEL_ROW, {"id": "id-other", "integrationID": "other", "label": "x", "active": True,
+                                                      "value": {"type": "api", "key": "must-not-travel"}}])
+        default_kubectl_text = KUBECTL % {"python": sys.executable}
 
-        def fast_run_launcher(runner, command, name, extra, timeout, *args, **kwargs):   # the read-only capacity read of the untouched stub is answered in process
-            if command == "capacity" and self.stub.exists() and self.stub.read_text() == default_stub_text:
-                return 0, {"nodes": [], "requests": {}, "pending": None, "nodes_read": False, "pods_read": False, "events_read": False}, ""
+        def fast_run_launcher(runner, command, name, extra, timeout, *args, **kwargs):   # the untouched stub is answered in process
+            password_fd = kwargs.get("password_fd", args[0] if len(args) > 0 else None)
+            cluster = kwargs.get("cluster", args[1] if len(args) > 1 else None)
+            secrets = kwargs.get("secrets", args[2] if len(args) > 2 else ())
+            if (command in ("capacity", "create", "stop", "status", "snapshot")
+                    and cw_mod.launcher_argv() == [str(self.stub)]
+                    and self.stub.exists() and self.stub.read_text() == default_stub_text):
+                if command == "capacity":
+                    return 0, {"nodes": [], "requests": {}, "pending": None, "nodes_read": False, "pods_read": False, "events_read": False}, ""
+                argv = [str(self.stub), command] + ([name] if name else []) + list(extra) + ["--json"]
+                if password_fd is not None:
+                    argv += ["--password-fd", str(password_fd)]
+                secret_map = dict(secrets)
+                for k, _v in secrets:
+                    argv += ["--run-secret-fd", "%s=9" % k]
+                if cluster is not None:
+                    argv += cluster.args()
+                args_list = argv[1:]
+                clean, skip = [], False
+                for i, a in enumerate(args_list):
+                    if skip:
+                        skip = False
+                    elif a in ("--kube-token-file", "--kube-server", "--kube-ca-file", "--kube-namespace") and i + 1 < len(args_list):
+                        skip = True
+                    elif a == "--kube-insecure":
+                        pass
+                    else:
+                        clean.append(a)
+                d = str(self.stub_dir)
+                open(d + "/calls.log", "a").write(json.dumps(clean) + "\n")
+                if "--kube-token-file" in args_list:
+                    tf = args_list[args_list.index("--kube-token-file") + 1]
+                    open(d + "/login.log", "a").write(json.dumps({
+                        "cmd": clean[0], "token_sha": hashlib.sha256(open(tf).read().encode()).hexdigest(),
+                        "mode": oct(os.stat(tf).st_mode & 0o777),
+                        "server": args_list[args_list.index("--kube-server") + 1],
+                        "namespace": args_list[args_list.index("--kube-namespace") + 1],
+                        "env_has_token": any(k in os.environ for k in ("KUBECONFIG", "CW_KUBE_TOKEN", "CW_CLUSTER_TOKEN"))}) + "\n")
+                if "model_auth_json" in secret_map:
+                    open(d + "/received-model-auth", "w").write(secret_map["model_auth_json"])
+                if "git_token" in secret_map:
+                    open(d + "/received-git-token", "w").write(secret_map["git_token"])
+                if password_fd is not None:
+                    pw = os.read(password_fd, 256).decode()
+                    open(d + "/received-password", "w").write(pw)
+                ans = {"worker": name, "pod": "cw-" + str(name), "namespace": "cw", "service": "cw-" + str(name), "port": 4096,
+                       "status": "Running", "ready": True, "created": "2099-10-14T12:00:00Z", "hard_deadline": "2099-10-14T14:00:00Z"}
+                if "idle_seconds" in STUB:
+                    ans.update({"idle_seconds": 3600, "hard_seconds": 7200})
+                return 0, ans, ""
             return real_run_launcher(runner, command, name, extra, timeout, *args, **kwargs)
 
-        cap_patch = mock.patch.object(cw_mod, "run_launcher", fast_run_launcher)
-        cap_patch.start()
-        self.addCleanup(cap_patch.stop)
+        def fast_model_entry():
+            if (os.environ.get("CW_OPENCODE_BIN") == FAKE_EXPORT
+                    and not (self.home / "export.exit").exists()
+                    and not (self.home / "export.stdin").exists()
+                    and (self.home / "export.json").exists()
+                    and (self.home / "export.json").read_text() == default_export_text):
+                (self.home / "oc-argv").write_text("auth export\n")
+                (self.home / "oc-env").write_text("\n".join("%s=%s" % (k, v) for k, v in os.environ.items()) + "\n")
+                return json.dumps([MODEL_ROW], separators=(",", ":"))
+            return real_model_entry()
+
+        def fast_git_token():
+            gt = self.stub_dir / "git_token"
+            if (os.environ.get("CW_GIT_TOKEN_CMD") == "cat %s" % gt
+                    and not os.environ.get("CW_SECRET_DIR")
+                    and gt.exists() and gt.read_text() == GIT_TOKEN + "\n"):
+                return GIT_TOKEN
+            return real_git_token()
+
+        def fast_cluster_token(env=None, now=None, recovery=None):
+            e = os.environ if env is None else env
+            if (e is os.environ and now is None
+                    and not e.get("CW_SECRET_DIR")
+                    and not e.get("CW_CLUSTER_TOKEN_CMD")
+                    and not e.get("CW_CLUSTER_ADMIN_CMD")
+                    and e.get("CW_VAULT_SUBSCRIPTION") == "sub-1"
+                    and e.get("CW_VAULT_NAME") == "kv-test"
+                    and not (self.stub_dir / "az.fail").exists()
+                    and not (self.stub_dir / "az.denied").exists()
+                    and not (self.stub_dir / "az.forbidden").exists()
+                    and (self.stub_dir / "az").exists() and (self.stub_dir / "az").read_text() == AZ
+                    and (self.stub_dir / "kubectl").exists() and (self.stub_dir / "kubectl").read_text() == default_kubectl_text
+                    and (self.stub_dir / "admin_kubeconfig").exists() and (self.stub_dir / "admin_kubeconfig").read_text() == ADMIN_KUBECONFIG
+                    and (self.stub_dir / "mint_token").exists() and (self.stub_dir / "mint_token").read_text() == CLUSTER_TOKEN):
+                d = str(self.stub_dir)
+                az_args = ["keyvault", "secret", "show", "--subscription", "sub-1", "--vault-name", "kv-test",
+                           "--name", "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
+                open(d + "/az.log", "a").write(json.dumps(az_args) + "\n")
+                k_args = ["--kubeconfig", "/dev/fd/0", "create", "token", "cw-operator", "-n", "cw", "--duration=20m"]
+                open(d + "/kubectl.log", "a").write(json.dumps({
+                    "args": k_args, "kubeconfig_is_dev_fd": True, "admin_ok": True,
+                    "env_has_token": e.get("KUBECONFIG")}) + "\n")
+                return CLUSTER_TOKEN
+            return real_cluster_token(env=env, now=now, recovery=recovery)
+
+        for attr, fn in (("run_launcher", fast_run_launcher), ("model_entry", fast_model_entry),
+                         ("git_token", fast_git_token), ("cluster_token", fast_cluster_token)):
+            p = mock.patch.object(cw_mod, attr, fn)
+            p.start()
+            self.addCleanup(p.stop)
         for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID", "CW_KUBE_CONTEXT", "CW_TOOLING_REPO", "CW_CLUSTER_TOKEN_CMD"):
             os.environ.pop(name, None)
         config = self.home / "cfg" / "fleet-switchboard" / "config.json"

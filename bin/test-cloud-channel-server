@@ -274,19 +274,21 @@ def check_total_deadline(module, test):
         try:
             sock.sendall(request_bytes("tok-a", 50))
             t0, buf = time.time(), b""
-            try:
-                while time.time() - t0 < 4 and b"\r\n\r\n" not in buf:
+            while time.time() - t0 < 4 and b"\r\n\r\n" not in buf:
+                try:
                     sock.sendall(b"{")   # one byte per read: never trips the per-read timeout
-                    sock.settimeout(0.2)
-                    try:
-                        chunk = sock.recv(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                    except socket.timeout:
-                        pass
-            except OSError:
-                pass
+                except OSError:
+                    pass
+                sock.settimeout(0.2)
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except socket.timeout:
+                    pass
+                except OSError:
+                    break
         finally:
             sock.close()
         test.assertTrue(buf.split(b"\r\n")[0].endswith(b"408 Request Timeout"), buf)

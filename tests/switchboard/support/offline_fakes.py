@@ -84,10 +84,15 @@ class OfflineRun:
             # the ticks this scenario cannot notice (no cloud pod, no impact, pane health, chat, health file or call record anywhere in it) have
             # nothing to find on any pass: quiet them once for the whole play
             ticks = self.quiet_ticks()
+            text = json.dumps(self.scenario).lower()
             if ticks:
                 with contextlib.ExitStack() as stack:
                     for name in ticks:
                         stack.enter_context(mock.patch.object(sb, name, (lambda _e, d, *_a, **_k: d) if name == "sweep_decisions" else (lambda *a, **k: None)))
+                    if not any(w in text for w in ("unconsumed", "steer")):
+                        stack.enter_context(mock.patch.object(sb.Switchboard, "steer_unconsumed", lambda *_a, **_kw: None))
+                    if not any(w in text for w in ("unread", "badge")):
+                        stack.enter_context(mock.patch.object(sb.Switchboard, "render_badges", lambda *_a, **_kw: None))
                     self._outer_patched = True
                     try:
                         return self._play()
@@ -105,7 +110,10 @@ class OfflineRun:
 
     OPTIONAL_TICKS = (("impact_would_hold_pass", ("impact", "would_hold", "would-hold")), ("pane_health_pass", ("pane_health", "detach", "fleetpane", "close-agent", "adopt", "exit")),
                       ("chat_clear_pass", ("chat", "clear")), ("health_write", ("health",)), ("record_v2_calls", ("call", "budget")),
+                      ("record_github_calls", ("call", "budget")),
                       ("sweep_decisions", ("sweep", "awaiting", "decision", "decisions", "escalate", "resolve", "answer", "supersede", "question")),
+                      ("early_decisions", ("sweep", "awaiting", "decision", "decisions", "triage", "escalate", "resolve", "answer", "supersede", "question", "decide", "edit-cos-orders")),
+                      ("publish_decisions", ("sweep", "awaiting", "decision", "decisions", "triage", "escalate", "resolve", "answer", "supersede", "question", "decide", "edit-cos-orders")),
                       ("triage_pass", ("triage",)), ("pr_events_pass", ("pr_state", "pr-state", "pull", "webhook", "merge")),
                       ("ci_record_pass", ("ci_record", "verdict", "gates", "plan")), ("clear_notice_pass", ("clear_notice", "cleared", "clear")),
                       ("publish_cockpit", ("cockpit", "panel", "tui")), ("write_catching_up", ("catching_up", "catching-up", "catch")),
