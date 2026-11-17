@@ -8744,7 +8744,7 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("pod-silence", "pod-silence", err, report)
     try:
-        lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
+        lost_worker_tick(engine, discovery); stream_error_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff; #2551: a provider stream error is resumed
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
     try:
@@ -8908,7 +8908,7 @@ RESUME_SECONDS = 600            # one resume per agent per 10 minutes
 RESUME_TEXT = "Your last turn ended without a finished answer (for example a provider error). Carry on from where you stopped."
 RESUME_REASON = "its turn ended and nothing is open"
 RESUME_COMMAND = PROG + " resume"   # the one spelling the report, the documentation, the help and the owner's grant use
-PROVIDER_ERROR = re.compile(r"\b499\b|ECONNRESET|time(?:d)?[ -]?out", re.I)
+PROVIDER_ERROR = re.compile(r"\b499\b|ECONNRESET|time(?:d)?[ -]?out|stream ended without finish_reason|incomplete stream|premature close|unexpected eof", re.I)
 
 
 class ResumeRefused(Exception):
@@ -9008,7 +9008,7 @@ def read_errored_turn(engine, observation, now):
             return False
     except Exception:
         return False
-    observation.errored = bool(PROVIDER_ERROR.search(last_turn_error(engine, observation.session_id)))
+    observation.turn_error = (lambda err: err if PROVIDER_ERROR.search(err) else "")(last_turn_error(engine, observation.session_id)); observation.errored = bool(observation.turn_error)   # #2551: the text is kept for stream_error_tick
     return observation.errored
 
 
