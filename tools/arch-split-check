@@ -35,27 +35,44 @@ import tempfile
 import traceback
 
 
+_FILE_STMTS_CACHE = {}
+
+
+def _file_statements(path, ignore_imports):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+    except (OSError, UnicodeDecodeError) as err:
+        sys.exit("arch-split-check: cannot read %s: %s" % (path, err))
+    base = os.path.basename(path)
+    key = (base, ignore_imports, source)
+    cached = _FILE_STMTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError as err:
+        sys.exit("arch-split-check: %s does not parse: %s (line %s)" % (path, err.msg, err.lineno))
+    lines = source.splitlines() if ignore_imports else None
+    items = []
+    for node in tree.body:
+        if ignore_imports and (isinstance(node, (ast.Import, ast.ImportFrom)) or (
+                isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)) or lines[node.lineno - 1].endswith("# support import")):
+            continue
+        dump = ast.dump(node, include_attributes=False)
+        items.append((dump, describe(node, path)))
+    _FILE_STMTS_CACHE[key] = items
+    return items
+
+
 def statements(paths, ignore_imports=False):
     """A Counter of the dump of every top-level statement, and a label for each dump."""
     counts = collections.Counter()
     labels = {}
     for path in paths:
-        try:
-            with open(path, encoding="utf-8") as handle:
-                source = handle.read()
-        except (OSError, UnicodeDecodeError) as err:
-            sys.exit("arch-split-check: cannot read %s: %s" % (path, err))
-        try:
-            tree = ast.parse(source, filename=path)
-        except SyntaxError as err:
-            sys.exit("arch-split-check: %s does not parse: %s (line %s)" % (path, err.msg, err.lineno))
-        for node in tree.body:
-            if ignore_imports and (isinstance(node, (ast.Import, ast.ImportFrom)) or (
-                    isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)) or source.splitlines()[node.lineno - 1].endswith("# support import")):
-                continue   # --ignore-imports: a move adds imports (and a module docstring) to the parts; they are not code
-            dump = ast.dump(node, include_attributes=False)
+        for dump, label in _file_statements(path, ignore_imports):
             counts[dump] += 1
-            labels.setdefault(dump, describe(node, path))
+            labels.setdefault(dump, label)
     return counts, labels
 
 

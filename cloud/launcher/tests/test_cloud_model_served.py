@@ -171,18 +171,41 @@ MUTANTS = {
 }
 
 
+def _link_tree(src, dst, real):
+    """A scratch tree of `src`: the paths in `real` are copied (the mutation and the child test run touch only those), everything else is a symlink."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(src.iterdir()):
+        if entry.name in (".git", "__pycache__"):
+            continue
+        here = [r for r in real if r == entry.name or r.startswith(entry.name + "/")]
+        if not here:
+            (dst / entry.name).symlink_to(entry)
+        elif entry.name in here:
+            shutil.copytree(entry, dst / entry.name, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
+        else:
+            _link_tree(entry, dst / entry.name, [r[len(entry.name) + 1:] for r in here])
+
+
+_CONTROL_CACHE = {}   # test -> (exit code, output) of the unmutated copy
+
+
 def run_in_copy(case, mutation, test):
-    """Run the child test in a faithful scratch copy of the tree outside the repository; the control runs first on the unmutated copy."""
-    with tempfile.TemporaryDirectory() as d:
-        shutil.copytree(ROOT, d, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
-        os.chmod(d, 0o700)   # copytree gives the copy the repository root's mode (setgid here), which the launch's private-directory check refuses
+    """Run the child test in a faithful scratch copy of the tree outside the repository; the control runs first on the unmutated copy (once per test)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp, "tree")
+        _link_tree(ROOT, d, ("bin", "cloud/launcher/tests", "cloud/worker/tests"))
+        os.chmod(tmp, 0o700)   # the launch's private-directory check refuses the repository root's mode (setgid here)
+        os.chmod(d, 0o700)
+        d = str(d)
         cmd = [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name), test]
 
         def child():
             c = stub_support.start(case, cmd, env=dict(os.environ, TMPDIR=d), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=d, text=True)
             out = c.communicate(timeout=90)[0]
             return c.returncode, out
-        control, cout = child()
+        if test not in _CONTROL_CACHE:
+            _CONTROL_CACHE[test] = child()
+        control, cout = _CONTROL_CACHE[test]
         print("control: unmutated copy passes %d of 1" % (control == 0))
         case.assertEqual(control, 0, "the control copy fails: " + cout[-1500:])
         target = Path(d, "bin", "cloud_worker.py")

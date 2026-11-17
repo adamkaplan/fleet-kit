@@ -1,4 +1,5 @@
 """#2094: a key delivered once to a session is never delivered to it again: the sent-keys trim keeps a key for SENT_MIN_AGE (S2 to S4, U1). World is the support World."""
+import ast
 import os
 import shutil
 import subprocess
@@ -154,20 +155,22 @@ class TestSentKeysAge(Base):
         source = (BIN / "switchboard" / "engine.py").read_text()
         needle = "young[sid] = {k: v for k, v in mine.items() if v > newest - SENT_MIN_AGE}"
         self.assertEqual(source.count(needle), 1, "the mutant's anchor")
-        self.assertEqual(self.run_copy(source), 0, "control: the unmutated copy passes")
-        self.assertNotEqual(self.run_copy(source.replace(needle, "young[sid] = {}")), 0, "the mutant must fail")
-        out = self.run_copy(source.replace(needle, "young[sid] = {}"), text=True)
+        node = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "SentLedger")
+        segment = ast.get_source_segment(source, node)   # the ledger's class, rebuilt in the daemon's own namespace with the one line changed
+        ok, _ = self.run_case(segment)
+        self.assertTrue(ok, "control: the unmutated class passes")
+        ok, out = self.run_case(segment.replace(needle, "young[sid] = {}"))
+        self.assertFalse(ok, "the mutant must fail")
         self.assertIn(ANCHOR, out)
 
-    def run_copy(self, engine_text, text=False):
-        with tempfile.TemporaryDirectory() as tmp:
-            copy = Path(tmp) / "repo"
-            shutil.copytree(str(REPO), str(copy), ignore=shutil.ignore_patterns(".git", "__pycache__"))
-            (copy / "bin" / "switchboard" / "engine.py").write_text(engine_text)
-            done = subprocess.run([sys.executable, "-m", "unittest", "test_sent_keys_age.TestSentKeysAge.test_s2_a_delivered_key_survives_a_daemon_restart"],
-                                  cwd=str(copy / "tests" / "switchboard"), capture_output=True, text=True,
-                                  env=dict(os.environ, PYTHONPATH=str(copy / "tests" / "switchboard")))
-            return done.stdout + done.stderr if text else done.returncode
+    def run_case(self, class_text):
+        """The restart case, in this process, with `sb.SentLedger` rebuilt from `class_text`: (passed, the failure text)."""
+        namespace = {}
+        exec(compile(class_text, "<SentLedger copy>", "exec"), sb.__dict__, namespace)
+        result = unittest.TestResult()
+        with mock.patch.object(sb, "SentLedger", namespace["SentLedger"]):
+            type(self)("test_s2_a_delivered_key_survives_a_daemon_restart").run(result)
+        return result.wasSuccessful(), "".join(text for _, text in result.failures + result.errors)
 
 
 if __name__ == "__main__":

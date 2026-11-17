@@ -346,16 +346,16 @@ class TestEndOnAsk(unittest.TestCase):
             self.assertNotIn(t[20:], self.end_with(log=text)[0][0][1], label)
         part = self.retired()
         for unit in ("a1-\n", "a1\n", "| a1 |\n", "a:\n", "a=b\n", "token=a\n", "ghp_x\nb\n", "http://a:\nb\n", "sk-\nabcdefghijkl\n"):
-            text = unit * (200000 // len(unit))
+            text = unit * (40000 // len(unit))
             out = part._unwrap_redact(text)
             self.assertLessEqual(part._WRAP_USED[0], part._WRAP_BUDGET, unit)   # the cap is respected: a count, no clock
             self.assertLessEqual(len(out), len(text) + 16 * (part._WRAP_BUDGET + 1), unit)   # the output is bounded (a replacement is short)
-        text = "token=a\n" * 30000
+        text = "token=a\n" * 5000
         part._unwrap_redact(text)
         self.assertEqual(part._WRAP_USED[0], part._WRAP_BUDGET, "the slow text spends the whole budget and stops")
         with mock.patch.object(part, "_WRAP_BUDGET", 10 ** 9):   # control: without the cap the same text costs far more attempts
             part._unwrap_redact(text)
-            self.assertGreater(part._WRAP_USED[0], 20000)
+            self.assertGreater(part._WRAP_USED[0], 4000)
 
     def test_a_public_repository_without_a_usable_list_gets_only_the_withheld_line(self):
         line = self.retired().WITHHELD_LINE

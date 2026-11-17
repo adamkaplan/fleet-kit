@@ -317,7 +317,9 @@ def build(HandoffCase, FAKE_GH):
             self.assertTrue(folder.is_dir(), str(folder))
             self.assertTrue((folder / "test.yml").is_file())
             runs, jobs = fixture()
-            extra = jobs[1] + [job("shards (%d/8)" % i, 1395, 1395, 1400) for i in range(1, 9)]
+            shard_names = sorted(n for n in sb.ci_queue_workflow_jobs(folder) if n.startswith("shards (") and "${{" not in n)   # as many shards as the workflow has
+            self.assertGreaterEqual(len(shard_names), 1)
+            extra = jobs[1] + [job(n, 1395, 1395, 1400) for n in shard_names]
             with captured() as (out, err):
                 code = sb.main(["ci-queue", "--repo", "o/r", "--until", at(24 * 60), "--json"], runner=self.serve([], extra={1: extra}), now=lambda: NOW,
                                socket_call=self.world.herdr.socket)

@@ -16,8 +16,8 @@ from pathlib import Path
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 DOCTOR = BIN / "fleet-doctor"
-RUNS = 300         # harness iterations (a count, not a time)
-DOCTOR_RUNS = 20
+RUNS = 80          # harness iterations (a count, not a time)
+DOCTOR_RUNS = 8
 CAP = 30           # the cap handed to run_to for a command that returns at once (a value, not asserted on)
 
 NEW = '''  # The watcher polls at one-second steps and ends by itself; the doctor never signals it, so

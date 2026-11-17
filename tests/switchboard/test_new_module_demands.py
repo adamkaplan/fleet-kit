@@ -1,6 +1,9 @@
 """#1620: tools/new-module-demands prints what the guards will demand of a new file under bin/ (scenarios S2-S6 and U3). Run by bin/test-switchboard."""
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -24,7 +27,32 @@ def load_tool():
     return module
 
 
+_LOADED = []   # the tool, loaded once; its derive-closure child is run once too (nothing the tests plant changes what it reads)
+
+
+def loaded_tool():
+    if not _LOADED:
+        module = load_tool()
+        real, memo = module.closure_state, []
+        module.closure_state = lambda: memo[0] if memo else (memo.append(real()) or memo[0])
+        _LOADED.append(module)
+    return _LOADED[0]
+
+
 def run(tool, root, *paths, env=None):
+    if tool == TOOL and env is None:   # the tool's main in this process: no interpreter start per call
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        before = os.getcwd()
+        os.chdir(str(root))
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = loaded_tool().main(["--root", str(root)] + [str(p) for p in paths])
+                except SystemExit as stop:
+                    code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        finally:
+            os.chdir(before)
+        return subprocess.CompletedProcess([str(tool)], code or 0, out.getvalue(), err.getvalue())
     return subprocess.run([sys.executable, str(tool), "--root", str(root)] + list(paths), capture_output=True, text=True, env=env, cwd=str(root))
 
 
