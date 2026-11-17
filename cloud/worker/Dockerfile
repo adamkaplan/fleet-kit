@@ -142,6 +142,11 @@ RUN chown -R root:root /opt/cloud && chmod 0755 /opt/cloud /opt/cloud/launcher &
 
 USER worker
 WORKDIR /home/worker
+# Python 3.11 preinstalled for the run user (mise); the stdlib test suites hold sample PEM keys, so they are removed for the secret scan.
+RUN /usr/local/bin/mise install python@3.11 \
+ && rm -rf /home/worker/.local/share/mise/installs/python/*/lib/python*/test \
+           /home/worker/.local/share/mise/installs/python/*/lib/python*/idlelib/idle_test \
+           /home/worker/.cache/mise
 EXPOSE 4096
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/worker-entrypoint"]
 # The launcher sets OPENCODE_SERVER_PASSWORD at run time; it is never in the image.
