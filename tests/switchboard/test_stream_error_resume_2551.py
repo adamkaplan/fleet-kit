@@ -203,4 +203,38 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             self.assertEqual(len(saved), sb.STREAM_RESUME_AGENTS_MAX)
             self.assertIn("fresh", saved)
 
+        def test_escalation_holds_when_cos_is_blocked_retries_when_refused_and_isolates_agent_errors(self):
+            now = self.world.clock.now()
+            sb.blocked_update(self.world.state, sb.STREAM_RESUME_STATE, lambda _: {"coder": {"times": [now - 30, now - 20, now - 10], "last_id": "msg_old"}})
+            self.fail()
+            cos_pid = self.world.panes["cos"]
+            cos_pane = self.world.herdr.panes.pop(cos_pid)   # cos unreachable -> send refused (held is falsy), last_id not saved
+            self.tick(10)
+            self.assertEqual(self.escalations(), [])
+            self.assertEqual(json.loads((self.world.state / sb.STREAM_RESUME_STATE).read_text())["coder"]["last_id"], "msg_old")
+            cos_pane["status"] = "blocked"
+            self.world.herdr.panes[cos_pid] = cos_pane        # cos blocked -> send held in held-sends.json (held is True), last_id saved
+            self.tick(10)
+            self.tick(10)                                     # next pass does not re-send the same ended turn
+            self.assertEqual(len(self.escalations()), 1)
+            self.assertEqual(len(sb.held_rows(self.world.state)), 1)
+            self.assertEqual(json.loads((self.world.state / sb.STREAM_RESUME_STATE).read_text())["coder"]["last_id"], "msg_err1")
+            (self.world.state / sb.STREAM_RESUME_STATE).unlink()
+            self.world.add_agent("coder2", fleet=FLEET)
+            self.world.herdr.panes[self.world.panes["coder2"]]["status"] = "blocked"
+            self.fail()
+            self.world.v2.sessions[self.world.sessions["coder2"]]["messages"].append(
+                {"id": "msg_c2", "type": "assistant", "error": {"type": "provider", "message": ERROR}})
+            real_resume = sb.resume_ended_turn
+
+            def flaky_resume(engine, caller, name, reason, discovery=None, window=None):
+                if name == "coder":
+                    raise sb.V2Error("synthetic failed")
+                return real_resume(engine, caller, name, reason, discovery, window=window)
+            with mock.patch.object(sb, "resume_ended_turn", flaky_resume):
+                self.tick(10)
+            self.assertEqual(len([a for a in self.world.admissions("coder2") if a["text"] == sb.RESUME_TEXT]), 1)
+            errors = [e for e in self.world.audit() if e["event"] == "error" and e["subject"] == "coder" and e["detail"].get("step") == "stream-error"]
+            self.assertEqual(len(errors), 1)
+
     return TestStreamErrorResume

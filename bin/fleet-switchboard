@@ -1097,7 +1097,12 @@ def _load_config_file(path):
 # ------------------------------------------------------------------- the state
 
 def ensure_state_dir(path=None):
-    """Create the state directory with mode 0700, or check the existing one."""
+    """Create the state directory with mode 0700, or check the existing one.
+
+    It holds the audit log, which records who was sent what. A directory that
+    someone else owns, or that the group or world can read, is refused rather
+    than repaired: something changed it, and that deserves a person's look.
+    """
     path = refuse_real_location(Path(path) if path else state_dir_path(), "state")
     if not path.exists():
         try:
@@ -1117,7 +1122,12 @@ def ensure_state_dir(path=None):
 # ------------------------------------------------------------- the message id
 
 def derive_message_id(recipient, keys):
-    """The v2 message id for a delivery: the recipient plus the keys it covers."""
+    """The v2 message id for a delivery: the recipient plus the keys it covers.
+
+    A retry after a crash derives the same id, and v2 admits a repeated id
+    once, so a message is delivered at most once (invariant 3). Order and
+    duplicates in `keys` do not change the id.
+    """
     if not isinstance(recipient, str) or not recipient:
         raise ValueError("recipient must be a non-empty string")
     keys = list(keys)
@@ -1181,7 +1191,15 @@ TITLE_MAX, BODY_MAX = 80, 240  # herdr's own caps on a toast
 
 
 class HerdrClient:
-    """Reads agents and panes, sets a badge, shows a toast, opens a tab that runs a program directly, and closes a pane `launch` itself opened."""
+    """Reads agents and panes, sets a badge, shows a toast, opens a tab that
+    runs a program directly, and closes a pane `launch` itself opened.
+
+    herdr is never a delivery channel (docs/switchboard.md, the herdr table's
+    "never" row). This class deliberately has no method that types into a pane
+    or moves focus, and no general way to run an arbitrary herdr command. Its
+    one socket method, `layout.apply`, execs a program with argv in a new pane:
+    there is no shell, so nothing is typed, and no focus key is ever sent.
+    """
 
     SOURCE = PROG
     SOCKET_METHODS = ("layout.apply",)
@@ -8755,21 +8773,16 @@ def finish_pass(engine, discovery, report):
         engine._failed("health-records", "health-records", err, report)
     schedule_judge_warm(engine, discovery)
 
-
-# ---- the daily friction wake (docs/switchboard.md, "Self-wakes"). Off unless `friction_wake.enabled`; like
-# `external_decisions` the key is absent from DEFAULTS, so a config that never names it is exactly what it was.
-
-FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or your coders down in the last day? "
-                 "If anything is worth fixing, send %(to)s a one-paragraph proposal: "
-                 "fleet-switchboard send %(to)s --issue <n> \"<proposal>\". "
-                 "If nothing, do nothing and say nothing.")
+# ---- the daily friction wake (docs/switchboard.md, "Self-wakes"). Off unless `friction_wake.enabled`.
+FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or your coders down in the last day? If anything is worth fixing, send %(to)s a one-paragraph proposal: fleet-switchboard send %(to)s --issue <n> \"<proposal>\". If nothing, do nothing and say nothing.")
 FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None}
 FRICTION_STATE = "friction-wake.json"
 FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
 
-
 def validate_friction_config(config, source):
-    """`friction_wake`: absent or null is off; `hour` is 0-23 (daemon local time) or null; `to` / `cos_to` are fleet agent names."""
+    """`friction_wake`: absent or null is off. `hour` is 0-23 in the daemon's local time, or null for every 24 h
+    from the first wake; `to` is the agent an orchestrator's proposal goes to; `cos_to` the agent the Chief of Staff's
+    goes to; `text` null is the default text."""
     if "friction_wake" not in config:
         return
     raw = config["friction_wake"]
@@ -8794,7 +8807,8 @@ def validate_friction_config(config, source):
         raise ConfigError("%s.cos_to' must be a fleet agent name, got %r" % (where, section["cos_to"]))
     text = section["text"]
     if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > 1000):
-        raise ConfigError("%s.text' must be a non-empty string of at most 1000 characters, or null, got %r" % (where, text))
+        raise ConfigError("%s.text' must be a non-empty string of at most 1000 characters, or null, got %r"
+                          % (where, text))
     config["friction_wake"] = section
 
 def friction_slot(now, hour, anchor):
@@ -8869,11 +8883,8 @@ def friction_status_line(config, state_dir, now=None):
     hour = section["hour"]
     slots = [v.get("done") for v in read_friction_state(state_dir).values() if _is_number(v.get("done"))]
     last = iso(max(slots)) if slots else "none yet"
-    return "friction wake: on, %s to %s; cos to %s; last slot %s" % (
-        "%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
-
-# ---- the audited resume (docs/switchboard.md, "A blocked agent is reported"). ONE function resumes an agent whose turn has ended: the
-# `resume` command and the blocked-report pass both call `resume_ended_turn`, so the refusals, the rate limit and the audit line are the same.
+    return "friction wake: on, %s to %s; cos to %s; last slot %s" % ("%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
+# ---- the audited resume (docs/switchboard.md, "A blocked agent is reported").
 RESUME_STATE = "resumes.json"   # {agent: {"at": epoch}}: the last resume of each agent (the rate limit; an ordinary state row)
 RESUME_SECONDS = 600            # one resume per agent per 10 minutes
 RESUME_TEXT = "Your last turn ended without a finished answer (for example a provider error). Carry on from where you stopped."
@@ -8882,27 +8893,22 @@ RESUME_COMMAND = PROG + " resume"   # the one spelling the report, the documenta
 STREAM_ERRORS = ("stream ended without finish_reason", "incomplete stream", "premature close", "unexpected eof")
 STREAM_ERROR = re.compile("|".join(STREAM_ERRORS), re.I)
 PROVIDER_ERROR = re.compile(r"\b499\b|ECONNRESET|time(?:d)?[ -]?out|" + "|".join(STREAM_ERRORS), re.I)
-
 class ResumeRefused(Exception):
     """The resume was not sent: the reason is the message, and nothing was written."""
-
 def last_turn_error_and_id(engine, session_id):
     """(scrubbed error text, message id) of the session's newest message, or ("", None)."""
     try:
         newest = (engine.v2.message_list(session_id, limit=1, order="desc") or [None])[0]
     except Exception:
-        return "", None
+        newest = None
     if not isinstance(newest, dict):
         return "", None
-    mid = newest.get("id") or (newest.get("info") or {}).get("id")
-    error = newest.get("error") or (newest.get("info") or {}).get("error")
+    mid, error = newest.get("id") or (newest.get("info") or {}).get("id"), newest.get("error") or (newest.get("info") or {}).get("error")
     raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", json.dumps(error) if not isinstance(error, str) else error) if error else ""
     return (scrubbed_flag_text(raw, 300) if raw else ""), (mid if isinstance(mid, str) and mid else None)
-
 def last_turn_error(engine, session_id):
     """The error text of the session's newest message, or "" (none, or it could not be read)."""
     return last_turn_error_and_id(engine, session_id)[0]
-
 def resume_ended_turn(engine, caller, name, reason, discovery=None, window=None):
     """Send the resume text to `name`'s session, only when its turn has ended and nothing is open. Raises ResumeRefused (nothing sent, nothing audited)."""
     caller, reason = blocked_sender(caller), _one_line(reason or RESUME_REASON, 200)
@@ -8928,7 +8934,6 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None, window=None)
     if kinds:
         raise ResumeRefused("%s has an open %s: that goes to the owner, nothing is sent" % (name, " and an open ".join(kinds)))
     taken = {}
-
     def take(state):   # the rate record, under the lock: a second resume inside the window finds this one
         last = state.get(name, {}).get("at") if window is None else None
         taken["last"] = state.get(name, {}).get("at")
@@ -8943,8 +8948,7 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None, window=None)
     keys = ["resume:%d" % now]
     message_id = derive_message_id(seen.session_id, keys)
     try:
-        engine.v2.synthetic(seen.session_id, RESUME_TEXT, {"fleet": {"keys": keys, "from": "switchboard"}}, True, "queue", message_id,
-                            "Resume: your turn ended, carry on")
+        engine.v2.synthetic(seen.session_id, RESUME_TEXT, {"fleet": {"keys": keys, "from": "switchboard"}}, True, "queue", message_id, "Resume: your turn ended, carry on")
     except Exception:
         blocked_update(engine.state_dir, RESUME_STATE, lambda s: dict(s, **{name: {"at": taken["last"]}}) if _is_number(taken["last"]) else {k: v for k, v in s.items() if k != name})
         raise
@@ -8952,7 +8956,6 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None, window=None)
     if engine.audit is not None:
         engine.audit.append(engine.actor, "resume", name, {"by": caller, "reason": reason, "session": seen.session_id, "message_id": message_id})
     return message_id
-
 def resume_first_recovery(engine, discovery, seen, reported):
     """The automatic first recovery of the blocked report: a stop whose turn error matches PROVIDER_ERROR is resumed once before it is reported."""
     try:
@@ -8964,7 +8967,6 @@ def resume_first_recovery(engine, discovery, seen, reported):
         return True
     except Exception:
         return False
-
 def read_errored_turn(engine, observation, now):
     """#1697: sets `observation.errored` ONLY when `permission_list` and `form_list` were both read and empty, and newest message matches PROVIDER_ERROR."""
     if observation.status != "blocked" or getattr(engine, "light", False):
@@ -8982,77 +8984,59 @@ def read_errored_turn(engine, observation, now):
     observation.turn_error, observation.turn_error_id = (err, mid) if PROVIDER_ERROR.search(err) else ("", None)
     observation.errored = bool(observation.turn_error)   # #2551: the text and message id are kept for stream_error_tick
     return observation.errored
-
 STREAM_RESUME_STATE = "stream-resumes.json"   # {agent: {"times": [epoch], "last_id": newest message id handled}}
 STREAM_RESUME_WINDOW = 3600
 STREAM_RESUME_MAX = 3
 STREAM_RESUME_AGENTS_MAX = 64
-
 def stream_error_tick(engine, discovery):
-    """#2551: resume (through `resume_ended_turn` with `window=0`) each blocked agent whose newest message error is a provider stream failure;
-    the 4th failure in the hour goes to the Chief of Staff instead. One ended turn (message id) is handled once."""
+    """#2551: resume (through `resume_ended_turn` with `window=0`) each blocked agent on a provider stream failure; 4th in the hour goes to cos."""
     if discovery is None or engine.state_dir is None:
         return
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), "cos")
     for name, seen in sorted(discovery.agents.items()):
-        error, message = getattr(seen, "turn_error", "") or "", getattr(seen, "turn_error_id", None)
-        if seen.status != "blocked" or not getattr(seen, "errored", False) or not STREAM_ERROR.search(error):
-            continue
-        now = engine.now()
-        row = blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda s: None).get(name)
-        row = row if isinstance(row, dict) else {}
-        if not isinstance(message, str) or not message or row.get("last_id") == message:
-            continue
-        current_err, current_id = last_turn_error_and_id(engine, seen.session_id)
-        if current_id != message or not STREAM_ERROR.search(current_err):
-            continue
-        raw_times = row.get("times") if isinstance(row.get("times"), list) else []
-        times = [t for t in raw_times if _is_number(t) and 0 <= now - t < STREAM_RESUME_WINDOW][-STREAM_RESUME_MAX:]
-        if len(times) >= STREAM_RESUME_MAX:
-            outcome = (engine.send("switchboard", cos, "[stream-error] %s failed %d times in the last hour on a provider stream error (%s); auto-resume capped at %d/hour."
-                                   % (name, len(times) + 1, current_err, STREAM_RESUME_MAX)) if name != cos else {"sent": True})
-            if not (outcome.get("sent") or outcome.get("action") in ("hold", "wait")):
+        try:
+            error, message = getattr(seen, "turn_error", "") or "", getattr(seen, "turn_error_id", None)
+            if seen.status != "blocked" or not getattr(seen, "errored", False) or not STREAM_ERROR.search(error):
                 continue
-            engine._note("stream_error.escalated", name, {"error": current_err, "count": len(times) + 1})
-        else:
-            try:
-                resume_ended_turn(engine, "switchboard", name, "provider stream error after an ended turn: %s" % current_err, discovery, window=0)
-            except ResumeRefused:
+            now, row = engine.now(), blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda s: None).get(name)
+            row = row if isinstance(row, dict) else {}
+            if not isinstance(message, str) or not message or row.get("last_id") == message:
                 continue
-            times.append(now)
-
-        def save(state, _name=name, _times=times, _msg=message, _now=now):
-            kept = {k: v for k, v in state.items() if k != _name and isinstance(v, dict) and isinstance(v.get("times"), list)
-                    and any(_is_number(t) and 0 <= _now - t < STREAM_RESUME_WINDOW for t in v["times"])}
-            kept[_name] = {"times": _times, "last_id": _msg}
-            if len(kept) > STREAM_RESUME_AGENTS_MAX:
+            current_err, current_id = last_turn_error_and_id(engine, seen.session_id)
+            if current_id != message or not STREAM_ERROR.search(current_err):
+                continue
+            times = [t for t in (row.get("times") if isinstance(row.get("times"), list) else []) if _is_number(t) and 0 <= now - t < STREAM_RESUME_WINDOW][-STREAM_RESUME_MAX:]
+            if len(times) >= STREAM_RESUME_MAX:
+                outcome = engine.send("switchboard", cos, "[stream-error] %s failed %d times in the last hour on a provider stream error (%s); auto-resume capped at %d/hour." % (name, len(times) + 1, current_err, STREAM_RESUME_MAX)) if name != cos else {}
+                if not (outcome.get("sent") or outcome.get("held")):
+                    continue
+                engine._note("stream_error.escalated", name, {"error": current_err, "count": len(times) + 1})
+            else:
+                try:
+                    resume_ended_turn(engine, "switchboard", name, "provider stream error after an ended turn: %s" % current_err, discovery, window=0)
+                except ResumeRefused:
+                    continue
+                times.append(now)
+            def save(state, _name=name, _times=times, _msg=message, _now=now):
+                kept = {k: v for k, v in state.items() if k != _name and isinstance(v, dict) and isinstance(v.get("times"), list) and any(_is_number(t) and 0 <= _now - t < STREAM_RESUME_WINDOW for t in v["times"])}
+                kept[_name] = {"times": _times, "last_id": _msg}
                 newest = sorted(kept, key=lambda n: max([t for t in kept[n].get("times", []) if _is_number(t)] or [0]), reverse=True)
-                kept = {n: kept[n] for n in newest[:STREAM_RESUME_AGENTS_MAX]}
-            return kept
-        blocked_update(engine.state_dir, STREAM_RESUME_STATE, save)
+                return {n: kept[n] for n in newest[:STREAM_RESUME_AGENTS_MAX]}
+            blocked_update(engine.state_dir, STREAM_RESUME_STATE, save)
+        except Exception as err:
+            engine._failed(name, "stream-error", err, {"errors": []})
 
 def ended_turn_text(name, resumed):
     """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
     if resumed:
-        return ("an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); "
-                "a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60))
-    return ("an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): "
-            "the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name))
-
-
-# ---- an undelivered wake is recovered (#1337, docs/switchboard.md, "An undelivered wake is recovered"). `Switchboard.deliver` counts a key delivered once v2
-# ADMITTED it (`_acknowledge`), so a wake queued for an idle session that never starts a turn is never planned again. This pass reads the inbox (the
-# queue: items the session has not taken), and for an idle agent whose queued wake is older than `undelivered_wake_minutes` and absent from the
-# transcript it calls `resume_ended_turn` once per incident; after twice that time with the keys still absent the Chief of Staff is told once.
-
+        return "an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60)
+    return "an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name)
+# ---- an undelivered wake is recovered (#1337, docs/switchboard.md, "An undelivered wake is recovered").
 UNDELIVERED_STATE = "undelivered-wake.json"   # {agent: {"session", "since", "keys", "resumed", "told"}}: one incident per agent (an ordinary state row)
 UNDELIVERED_KEYS = 20                         # keys named in a line, then "and N more"
 UNDELIVERED_STATES = ("undelivered", "admitted-in-transcript", "admitted-absent", "refused", "resumed", "told")   # the delivery states; the completeness test derives its cases from this
-
-
 def queued_wakes(engine, seen, now, fresh=False):
-    """{key: created} of the switchboard wakes queued in `seen`'s inbox (one read). Inputs are untrusted: a time outside 2000..now is dropped, a
-    non-string key is dropped (`_fleet_keys`), resume: and orders: keys are not wakes."""
+    """{key: created} of the switchboard wakes queued in `seen`'s inbox (one read)."""
     inbox = engine.reads.inbox(seen.session_id, now, fresh=fresh)   # a remembered read finds nothing to do for free; a candidate is read again fresh
     found = {}
     for item in inbox if isinstance(inbox, list) else []:
@@ -9066,12 +9050,8 @@ def queued_wakes(engine, seen, now, fresh=False):
             if not key.startswith(("resume:", "orders:")):
                 found[key] = min(created, found.get(key, created))
     return found
-
-
 def transcript_keys(engine, seen, since):
-    """The keys in the agent's synthetic messages back to `since` (the oldest wake's admission), read page by page like `delivered_keys`, at most
-    MAX_READ_PAGES pages. The sent-keys ledger is NOT consulted: it counts a key at ADMISSION, which is the very thing this rule doubts. The
-    remaining false positive: a delivered key buried under more than MAX_READ_PAGES * SYNTHETIC_PAGE newer synthetic messages reads as absent."""
+    """The keys in the agent's synthetic messages back to `since` (at most MAX_READ_PAGES pages)."""
     have = set()
     for page, more in engine.v2.message_pages(seen.session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
         reached = False
@@ -9085,8 +9065,6 @@ def transcript_keys(engine, seen, since):
         if reached or len(page) < SYNTHETIC_PAGE or more is False:
             break
     return have
-
-
 def undelivered_wakes(engine, seen, now, fresh=False):
     """[(key, created)] of the switchboard wakes queued in `seen`'s inbox whose keys are not in its transcript; [] when nothing is read."""
     found = queued_wakes(engine, seen, now, fresh=fresh)
@@ -9094,13 +9072,8 @@ def undelivered_wakes(engine, seen, now, fresh=False):
         return []
     have = transcript_keys(engine, seen, min(found.values()))
     return sorted(((k, t) for k, t in found.items() if k not in have), key=lambda row: (row[1], row[0]))
-
-
 def undelivered_wake_tick(engine, discovery):
-    """The end of a pass: resume an idle agent whose admitted wake is absent from its transcript past `undelivered_wake_minutes` (once per incident,
-    at most `undelivered_wake_per_pass` agents a pass, oldest first), and tell the Chief of Staff once when it is still absent `undelivered_wake_tell_minutes`
-    after the RESUME. Returns [(agent, "resume" | "told")]. A working or blocked agent, one with an unreadable inbox or transcript, and a wake not yet
-    that old are left alone."""
+    """The end of a pass: resume an idle agent whose admitted wake is absent from its transcript past `undelivered_wake_minutes`."""
     if discovery is None or engine.state_dir is None or engine.light:
         return []
     limit = engine.config["undelivered_wake_minutes"] * 60
@@ -22308,7 +22281,11 @@ _SECRET_PATTERNS = (
 
 
 def redact_command_text(text, extra=()):
-    """`text` with credential-shaped parts replaced, and any value in `extra` (a known key) removed."""
+    """`text` with credential-shaped parts replaced, and any value in `extra` (a known key) removed.
+
+    A tool's arguments go to a third-party model and to the audit log; neither
+    may see a credential. This is a net, not a promise: it catches the usual shapes.
+    """
     text = "" if text is None else str(text)
     for secret in extra:
         if secret:
@@ -22317,17 +22294,45 @@ def redact_command_text(text, extra=()):
         text = pattern.sub(replacement, text)
     return text
 
+
 OVERRIDE_TEXT_LIMIT = 160
 
+
 def scrubbed_flag_text(text, limit=OVERRIDE_TEXT_LIMIT):
-    """Free text as the audit keeps it: secret shapes replaced, control characters removed, cut to `limit` characters."""
+    """Free text of an override audit line (`--boss-unregistered`: the reason and the boss text; `--memory-ok`: the reason) as the audit keeps it:
+    secret shapes replaced (the scrub above), control characters removed (one line), then cut to `limit` characters (160 by default).
+    A text without a secret shape stays as typed."""
     text = redact_command_text(text)
     text = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", text)
     return _one_line(text, limit)
 
-# PR 10: move a v1 session into v2 (`import-v1`, docs/switchboard.md)
-V1_MOVE_DEFAULTS = {"v1_opencode": None, "import_body_limit_bytes": 120000}
+
+# PR 10: move a v1 session into v2 (`import-v1`)
+#
+# One section, so the stack rebases cleanly. docs/switchboard.md, "v1
+# sessions: Imported, not restarted"; docs/switchboard-cutover.md is the
+# runbook. Registered in six places: `DEFAULTS` (below), `validate_config`
+# (`validate_v1_move_config`), `KNOWN_FAULTS` (`no-import-metadata`),
+# `V2Client._call` (`envelope`, so a page keeps its cursor), `build_parser`
+# (`add_v1_move_parsers`) and `main` (`V1_MOVE_COMMANDS`).
+#
+# Three parts: a pure converter (v1's `opencode export` JSON -> v2's
+# Session.Info and messages), a checker for the v2 shapes the converter emits,
+# and the command. The v1 session is only ever read (`export`), never touched.
+# ============================================================================
+V1_MOVE_DEFAULTS = {
+    # The OpenCode v1 binary, by absolute path; the only thing it is ever asked is
+    # `export <session>`. No default: a bare name would be resolved through PATH.
+    "v1_opencode": None,
+    # `opencode api` takes its JSON inline, so a whole transcript travels in one
+    # argument. Longer than this is refused, not cut: see --tool-output-limit.
+    "import_body_limit_bytes": 120000,
+}
+
+
 DEFAULTS.update(V1_MOVE_DEFAULTS)
+
+
 V1_LIST_PAGE = 100           # sessions per page when looking for an earlier import
 
 
