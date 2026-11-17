@@ -10,16 +10,27 @@ import json
 import os
 import re
 import subprocess
+import pwd
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 CONTEXTS = ("land/gates", "land/reviews", "land/merge-gate")
 DEFAULT_API = "https://api.github.com"
-LOCAL_API = ("http://127.0.0.1", "http://localhost")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+MAX_ENV_BYTES = 65536
+MAX_KEY_BYTES = 65536
+MAX_RESPONSE_BYTES = 1 << 20
+OPENSSL_CANDIDATES = ("/usr/bin/openssl", "/opt/homebrew/bin/openssl", "/usr/local/bin/openssl")
+# Test hooks: module attributes, never read from the environment (a caller's environment must not move the token or the API).
+API_BASE = DEFAULT_API
+SECRET_DIR = None
+HOME_DIR = None
+TOKEN = None
+OPENSSL = None
 WANTED = {"statuses": "write"}
 TIMEOUT = 15
 
@@ -33,29 +44,46 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None   # a redirect is an HTTP error: the token is never sent to another place
 
 
+def valid_repo(repo):
+    """A strict OWNER/REPO: no `.` or `..` segment, no leading or trailing dot, no `.git` suffix."""
+    if not isinstance(repo, str) or not REPO_RE.match(repo):
+        return False
+    return all(part not in (".", "..") and not part.startswith(".") and not part.endswith(".") and not part.endswith(".git")
+               for part in repo.split("/"))
+
+
 def api_base():
-    base = (os.environ.get("FLEET_LAND_STATUS_API_BASE") or "").rstrip("/")
-    if base and any(base == ok or base.startswith(ok + ":") or base.startswith(ok + "/") for ok in LOCAL_API):
-        return base
+    base = (API_BASE or "").rstrip("/")
+    if base == DEFAULT_API:
+        return DEFAULT_API
+    try:
+        u = urllib.parse.urlsplit(base)
+        if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.username is None and u.password is None:
+            return base
+    except ValueError:
+        pass
     return DEFAULT_API
 
 
 def secret_dir():
-    value = os.environ.get("CW_SECRET_DIR")
-    if value:
-        return value
+    if SECRET_DIR:
+        return SECRET_DIR
     try:
-        with open(os.path.join(os.path.expanduser("~"), ".config", "fleet-switchboard", "cloud.env")) as handle:
-            for line in handle:
-                if line.startswith("CW_SECRET_DIR="):
-                    return line.split("=", 1)[1].strip().strip("\"'")
-    except OSError:
+        home = HOME_DIR or pwd.getpwuid(os.getuid()).pw_dir
+        with open(os.path.join(home, ".config", "fleet-switchboard", "cloud.env")) as handle:
+            text = handle.read(MAX_ENV_BYTES + 1)
+        if len(text) > MAX_ENV_BYTES:
+            return None
+        for line in text.splitlines():
+            if line.startswith("CW_SECRET_DIR="):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    except (OSError, KeyError, UnicodeError):
         pass
     return None
 
 
 def is_configured():
-    if os.environ.get("FLEET_LAND_STATUS_API_BASE") or os.environ.get("FLEET_LAND_STATUS_TOKEN"):
+    if TOKEN or api_base() != DEFAULT_API:
         return True
     directory = secret_dir()
     return bool(directory) and os.path.isdir(directory)
@@ -73,9 +101,11 @@ def call(method, path, token, body=None, expect=(200, 201, 204), jwt=False):
     opener = urllib.request.build_opener(_NoRedirect)
     try:
         with opener.open(request, timeout=TIMEOUT) as answer:
-            status, raw = answer.status, answer.read(1 << 20)
+            status, raw = answer.status, answer.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as err:
         raise StatusError("%s HTTP %d" % (method, err.code))
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise StatusError("%s response oversize" % method)
     if status not in expect:
         raise StatusError("%s HTTP %d" % (method, status))
     try:
@@ -103,8 +133,11 @@ def sign_jwt(app_id, key_text):
             pass
     threading.Thread(target=feed, daemon=True).start()
     try:
-        done = subprocess.run(["openssl", "dgst", "-sha256", "-sign", "/dev/fd/%d" % read_end], input=signing, capture_output=True,
-                              pass_fds=(read_end,), timeout=TIMEOUT)
+        openssl = OPENSSL or next((c for c in OPENSSL_CANDIDATES if os.access(c, os.X_OK)), None)
+        if not openssl:
+            raise StatusError("sign failed")
+        done = subprocess.run([openssl, "dgst", "-sha256", "-sign", "/dev/fd/%d" % read_end], input=signing, capture_output=True,
+                              pass_fds=(read_end,), timeout=TIMEOUT, env={})
     except (OSError, subprocess.SubprocessError):
         raise StatusError("sign failed")
     finally:
@@ -116,29 +149,37 @@ def sign_jwt(app_id, key_text):
 
 def mint(repo):
     """An installation token for `repo` with exactly {"statuses": "write"}, or StatusError."""
+    if not valid_repo(repo):
+        raise StatusError("bad repository or sha")
     directory = secret_dir()
     if not directory:
         raise StatusError("no secret directory")
     try:
         with open(os.path.join(directory, "cw-app-id")) as handle:
-            app_id = handle.read().strip()
+            app_id = handle.read(MAX_KEY_BYTES + 1)
         with open(os.path.join(directory, "cw-app-key")) as handle:
-            key_text = handle.read()
-    except OSError:
+            key_text = handle.read(MAX_KEY_BYTES + 1)
+    except (OSError, UnicodeError):
         raise StatusError("app credentials unreadable")
+    if len(app_id) > MAX_KEY_BYTES or len(key_text) > MAX_KEY_BYTES:
+        raise StatusError("app credentials oversize")
+    app_id = app_id.strip()
     if not app_id or not key_text:
         raise StatusError("app credentials empty")
     jwt = sign_jwt(app_id, key_text)
     _, found = call("GET", "/repos/%s/installation" % repo, jwt, jwt=True, expect=(200,))
     installation = (found or {}).get("id")
-    if not isinstance(installation, int):
+    if not (isinstance(installation, int) and not isinstance(installation, bool) and installation > 0):
         raise StatusError("installation lookup bad response")
     name = repo.split("/", 1)[1]
     _, made = call("POST", "/app/installations/%d/access_tokens" % installation, jwt, {"repositories": [name], "permissions": dict(WANTED)}, jwt=True, expect=(201,))
     token = (made or {}).get("token")
     if not isinstance(token, str) or not token:
         raise StatusError("token mint bad response")
-    if (made or {}).get("permissions") != WANTED:
+    repos = (made or {}).get("repositories")
+    named = isinstance(repos, list) and len(repos) == 1 and isinstance(repos[0], dict) and \
+        isinstance(repos[0].get("name"), str) and repos[0]["name"].lower() == name.lower()
+    if (made or {}).get("permissions") != WANTED or not named:
         revoke(token)
         raise StatusError("token permissions not narrowed")
     return token
@@ -153,7 +194,7 @@ def revoke(token):
 
 def post_statuses(repo, sha, token, descriptions=None):
     """POST each context as success on `sha`."""
-    if not REPO_RE.match(repo or "") or not SHA_RE.match(sha or ""):
+    if not valid_repo(repo) or not isinstance(sha, str) or not SHA_RE.match(sha):
         raise StatusError("bad repository or sha")
     for context in CONTEXTS:
         text = (descriptions or {}).get(context) or "checked by the fleet gates"
@@ -162,13 +203,16 @@ def post_statuses(repo, sha, token, descriptions=None):
 
 def write_all(repo, sha, descriptions=None):
     """Mint (or take the explicit token), post, and always revoke."""
-    token = os.environ.get("FLEET_LAND_STATUS_TOKEN")
+    token = TOKEN
+    minted = False
     if not token:
         token = mint(repo)
+        minted = True
     try:
         post_statuses(repo, sha, token, descriptions)
     finally:
-        revoke(token)
+        if minted:
+            revoke(token)
 
 
 def read_merge_commit_oid(gh, repo, number, env=None, timeout=15):
@@ -229,26 +273,14 @@ def dual_write_after(repo, number, head, gh, env, spool_fn, listed=None):
         return False
 
 
-def target(args, release_ref=None):
-    """(repo, number, head) read from a canonical `pr merge` argv, or None. The head is the one the merge is bound to."""
+def target(args, release_ref=None, bound=None):
+    """(repo, number, head) from the gate-verified binding `bound`, or None. Nothing is parsed from `args`: a caller-supplied
+    -R, number or --match-head-commit never reaches a status write."""
     try:
-        repo = number = None
-        if release_ref and "#" in release_ref:
-            repo, num = release_ref.rsplit("#", 1)
-            number = int(num)
-        words = list(args)
-        for i, word in enumerate(words[:-1]):
-            if word in ("-R", "--repo") and repo is None:
-                repo = words[i + 1]
-        head = None
-        for i, word in enumerate(words):
-            if word == "--match-head-commit" and i + 1 < len(words):
-                head = words[i + 1]
-            elif word.startswith("--match-head-commit="):
-                head = word.split("=", 1)[1]
-        if number is None:
-            number = next((int(w) for w in words[2:] if w.isdigit()), None)
-        if not repo or number is None or not SHA_RE.match(head or ""):
+        repo, number, head = bound
+        if not valid_repo(repo) or not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            return None
+        if not isinstance(head, str) or not SHA_RE.match(head):
             return None
         return repo, number, head
     except Exception:

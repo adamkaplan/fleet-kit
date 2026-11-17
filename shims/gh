@@ -2582,6 +2582,7 @@ def gate_bind_merge(args, parsed, repo, number, payload):
     new = list(args)
     for start, stop, _ in sorted(parsed["match"], reverse=True):
         del new[start:stop]
+    GATE_BOUND[:] = [(repo, number, head)]   # the one binding the commit statuses are written for (#2560)
     return ("args", new + [MATCH_FLAG, head])
 
 
@@ -2866,6 +2867,7 @@ def merge_gate_probe(args, lookup, gh):
             return mg_refuse("merge of %s refused: the merge gate gave no head to bind the merge to" % ref)
         release = ref if payload.get("locked") is True else None
         if kind == "api":
+            GATE_BOUND[:] = [(repo, number, head)]
             return ("go", args, release)
         bound = gate_bind_merge(args, parsed, repo, number, {"head": head})
         if bound is None or bound[0] == "refuse":
@@ -2886,6 +2888,7 @@ def merge_gate_release(ref):
         pass
 
 
+GATE_BOUND = []   # [(repo, number, head)] set only by a gate that verified the head; cleared at the start of every run()
 STATUS_MODULE = [None, False]   # (module, tried): land_status.py beside this file, loaded by path
 
 
@@ -2905,10 +2908,13 @@ def load_land_status():
 
 
 def status_plan(args, release_ref):
-    """(module, repo, number, head, listed repos) when commit statuses are to be written around this call, else None. Never raises."""
+    """(module, repo, number, head, listed repos) when commit statuses are to be written around this call, else None. Bound only to
+    what a gate verified (GATE_BOUND): never to anything re-read from the caller's argv. Never raises."""
     try:
+        if not GATE_BOUND or not is_write(args):
+            return None
         module = load_land_status()
-        found = module.target(args, release_ref) if module is not None and is_write(args) else None
+        found = module.target(args, release_ref, GATE_BOUND[0]) if module is not None else None
         if found is None:
             return None
         listed = set(merge_gate_repos() or ()) | set(gate_repos())
@@ -3096,6 +3102,7 @@ def run(args):
         sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
         return 127
     plan = None
+    GATE_BOUND[:] = []
     warn_shared_body_file(args)
     args = canonical_pr_merge(args)   # THE one parse of the call shape: every probe below (hold, review, plan gate, merge gate) reads the same canonical `pr merge` (#962)
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
@@ -3200,7 +3207,12 @@ def run(args):
         try:
             if status:
                 status[0].dual_write_before(status[1], status[2], status[3], gate_spool, status[4])
-            code = subprocess.run([gh] + args, env=env).returncode
+            if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, and a killed shim stops it too
+                child = subprocess.Popen([gh] + args, env=env)
+                APP_CHILD.append(child)
+                code = child.wait()
+            else:
+                code = subprocess.run([gh] + args, env=env).returncode
             if status and code == 0:
                 status[0].dual_write_after(status[1], status[2], status[3], gh, env, gate_spool, status[4])
             return code
