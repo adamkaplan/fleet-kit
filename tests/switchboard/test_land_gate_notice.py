@@ -55,7 +55,7 @@ class TestLandedPushNotice(Case):
     def test_s10_the_pod_told_of_its_landing_was_told_at_launch_to_run_spire_land_without_a_land_gate_command(self):
         text = land_module().LAND_SETUP_LINE
         self.assertIn(land_module().LAND_STEP, text)
-        self.assertIn("run it DETACHED: `nohup sh -c '.spire/tool/bin/spire land >", text)
+        self.assertIn("run it DETACHED with cw-run: `cw-run start --name land -- .spire/tool/bin/spire land`", text)
         self.assertNotIn("land-gate", text)   # a cloud pod has no fleet-switchboard: the git proxy gates the push
         self.main = [self.land(SHA)]
         self.run_pass(NOW)
@@ -67,5 +67,5 @@ class TestLandTokenSentence(unittest.TestCase):
         for name in TEXT_FILES:
             text = (REPO / name).read_text()
             with self.subTest(file=name):
-                self.assertIn("run it DETACHED: `nohup sh -c \\'.spire/tool/bin/spire land >" if name.endswith(".py") else "run it DETACHED: `nohup sh -c '.spire/tool/bin/spire land >", text)
+                self.assertIn("run it DETACHED with cw-run: `cw-run start --name land -- .spire/tool/bin/spire land`" if name.endswith(".py") else "run it DETACHED with cw-run: `cw-run start --name land -- .spire/tool/bin/spire land`", text)
                 self.assertNotIn("land-gate take", text)
