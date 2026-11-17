@@ -8114,9 +8114,9 @@ class TestGithubRouting(Base):
         self.assertEqual({f.key: f.recipient for f in rig.hub.facts()}, {"github.comment:5001": "coder"})
 
     def test_an_issue_nobody_owns_goes_to_the_chief_of_staff_and_is_audited_once(self):
-        # ask #2484: two Chief lanes here (no repository of their own): delivered to the first by name, the reason names both
-        self.gh.comment(20, "hi", 5001)
-        self.assertEqual(self.routed(), {"github.comment:5001": "platform"})
+        # ask #2484, #2545: only a chief-of-staff lane takes it (the orchestrators here do not); two of them: the first by name, the reason names both
+        self.rig.world.add_agent("chief-b", fleet={"role": "chief-of-staff"}); self.rig.world.add_agent("chief-a", fleet={"role": "chief-of-staff"}); self.gh.comment(20, "hi", 5001)
+        self.assertEqual(self.routed(), {"github.comment:5001": "chief-a"})
         self.hub.facts()
         self.assertEqual([e for e in self.rig.world.audit() if e["event"] == "github.unrouted"], [])
         lines = [e for e in self.rig.world.audit() if e["event"] == "github.comment.chief_unknown"]
@@ -8473,12 +8473,12 @@ class TestGithubDelivery(Base):
         self.gh.issue(12, parent=1)
         self.hub.tick()
 
-    def test_a_webhook_is_delivered_once_after_the_batch_window_and_leaves_the_queue(self):
-        self.gh.comment(12, "hello", 5001)
+    def test_a_webhook_is_delivered_once_after_its_utc_bucket_and_leaves_the_queue(self):
+        self.world.tick(100); self.gh.comment(12, "hello", 5001)   # past the :00 boundary, so the bucket is the next :30
         self.rig.pump(60)
         self.assertEqual(self.rig.delivered(), [])
         self.assertEqual(self.rig.keys(), ["github.comment:5001"], "held in memory until delivered")
-        self.rig.pump(60)
+        self.rig.pump(1800)
         self.assertEqual(self.rig.delivered(), ["github.comment:5001"])
         self.assertEqual(self.rig.keys(), [])
 
@@ -8506,7 +8506,7 @@ class TestGithubDelivery(Base):
         self.gh.send("issue_comment", {"action": "created", "issue": self.gh.issues[12],
                                        "comment": self.gh.comments[0]}, "d-2")
         self.gh.comment(12, "another", 5002)  # a new key makes a new message id, so v2 admits the repeat
-        self.rig.pump(200)
+        self.rig.pump(1900)
         self.assertEqual(self.rig.delivered(), ["github.comment:5001"] * 2 + ["github.comment:5002"])
 
     def test_a_restart_loses_the_queue_and_the_catch_up_gets_it_back(self):
@@ -8522,7 +8522,7 @@ class TestGithubDelivery(Base):
         restarted.world.clock.t = self.world.clock.now()
         restarted.hub.tick()
         restarted.pump(15)
-        self.assertEqual(restarted.keys(), ["github.comment:5001"], "the catch-up read brings it back")
+        self.assertEqual(restarted.keys() + restarted.delivered(), ["github.comment:5001"], "the catch-up read brings it back")
 
     def test_a_sent_key_is_acknowledged_even_when_only_the_delivery_path_saw_it(self):
         self.gh.comment(12, "hello", 5001)
@@ -8570,7 +8570,7 @@ class TestGithubCatchUp(Base):
         self.gh.comment(12, "both ways", 5001)  # webhook now
         self.gh.kill_forwarder()
         self.rig.pump(30)  # restart + catch-up reads the same comment
-        self.rig.pump(200)
+        self.rig.pump(1900)
         self.assertEqual(self.rig.delivered(), ["github.comment:5001"])
 
     def test_a_failed_read_is_retried_and_reported(self):
@@ -25701,13 +25701,15 @@ class TestOwnerlessSummary(Base):
         self.assertEqual(len(self.lines("cos")), 1, "no second line the same day")
         self.assertEqual([a for a in self.world.admissions("orch-api")], [], "a repository with no such issue gets none")
 
-    def test_s5_the_orchestrators_of_the_repository_and_the_chief_of_staff_get_it_and_a_repository_with_none_only_the_chief(self):
+    def test_s5_only_the_chief_of_staff_gets_it_and_an_orchestrator_none_a_digest_is_tier_3(self):
         self.add(1, created=10, author="alice")
         self.add(2, repo="acme/api", created=10, author="alice")
         self.go()
-        self.assertEqual((len(self.lines("orch-web-1")), len(self.lines("orch-web-2"))), (1, 1))
+        self.assertEqual((len(self.lines("orch-web-1")), len(self.lines("orch-web-2"))), (0, 0), "#2545: a digest never wakes an orchestrator on its own")
         self.assertEqual(len(self.lines("cos")), 2, "one line per repository")
-        self.assertEqual(len(self.lines("orch-api")), 1, "acme/api's own orchestrator gets acme/api's line only")
+        self.assertEqual(len(self.lines("orch-api")), 0, "acme/api's own orchestrator gets none either")
+        dropped = {e["subject"]: e["detail"]["dropped"] for e in self.world.audit() if e["event"] == "triage.ownerless"}
+        self.assertEqual(dropped, {self.TEAM: ["orch-web-1", "orch-web-2"], "acme/api": ["orch-api"]}, "the audit names the orchestrators that were skipped")
 
     def test_s7_the_line_holds_links_and_no_title_text(self):
         self.add(1, created=10, author="alice", body="a body with @mention and https://example.test/x")
@@ -41230,7 +41232,7 @@ class TestForwarderFallback(Base):
         rig.repo(ACME_WEB).webhook_ok = False
         rig.pump(20)
         rig.repo(ACME_WEB).comment(2, "please look", 5001, forward=False)
-        rig.pump(260)
+        rig.pump(1900)
         keys = [k for a in rig.world.admissions("web-orch") for k in a["keys"]]
         self.assertEqual(keys, ["github.comment:5001"])
 
@@ -45658,7 +45660,7 @@ class TestGithubReadsMoveForwardOnly(Base):
         rig.gh.issue(12, parent=1)
         rig.pump(30)
         rig.gh.comment(12, "delivered once", 5001)
-        rig.pump(200)
+        rig.pump(1900)
         self.assertEqual(rig.delivered(), ["github.comment:5001"])
         (rig.world.state / sb.READ_MARKER_FILE).unlink()
         fresh = sb.GitHubHub(rig.world.config, rig.world.state, sb.AuditLog(rig.world.audit_path), rig.gh.runner,
@@ -67083,6 +67085,8 @@ TestLostWorkerRemembers = importlib.import_module("test_lost_worker_remembers").
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly, TestLostWorkerSlowPass = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly, _lost_worker.TestLostWorkerSlowPass
 TestChiefOnlyWhenNeeded = _lost_worker.TestChiefOnlyWhenNeeded
 TestPushWatch = importlib.import_module("test_push_watch").TestPushWatch   # the push watch of #1740
+_batching2543 = importlib.import_module("test_orchestrator_utc_batching_2543")   # #2543
+TestOrchestratorUtcBatching, TestOrchestratorLaneGate, TestJobsActiveFor, TestGatedDaemonSends, TestPrGreenEvent, TestChiefLanesRoleFilter = _batching2543.TestOrchestratorUtcBatching, _batching2543.TestOrchestratorLaneGate, _batching2543.TestJobsActiveFor, _batching2543.TestGatedDaemonSends, _batching2543.TestPrGreenEvent, _batching2543.TestChiefLanesRoleFilter
 TestPodSilence = importlib.import_module("test_pod_silence").TestPodSilence   # the pod silence watch of #2115
 TestPodSilenceTick = importlib.import_module("test_pod_silence").TestPodSilenceTick   # the pod silence tick of #2135
 TestSummaryCluster = importlib.import_module("test_pod_silence").TestSummaryCluster   # the summary cluster session of #2173
@@ -80158,7 +80162,7 @@ class ReviewCommentEndToEndTests(Base):
             self.gh.send("issue_comment", p, "d-%d" % cid)
 
     def after(self):
-        self.rig.pump(120)
+        self.rig.pump(1900)   # a tier 1 item waits for the next :00/:30 UTC bucket
         return [k for k in self.rig.delivered() if k.startswith("github.reviewcomment:")]
 
     def test_delivered_to_the_owners_orchestrator_as_one_line(self):
@@ -80301,7 +80305,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestArchitectureDocument", "TestArchitectureDocumentFailurePaths", "TestArchitectureSafetyNet", "TestAskIssueSubject", "TestAskWaive",
     "TestAssembler", "TestAuditRotation", "TestAuthorityModulesGuard", "TestBatchingDocs", "TestBellMigration", "TestBigRegistrarFile",
     "TestBranches", "TestBriefParsing", "TestBuilderChecklist", "TestCallerWorkspace", "TestCapsAndScrub", "TestCensus", "TestCharterEditGuard",
-    "TestCharterNoParent", "TestChatClearJudge", "TestChatClearOffers", "TestChecklistAndFamilyTexts", "TestChiefOfStaffNativePermissions",
+    "TestCharterNoParent", "TestChatClearJudge", "TestChatClearOffers", "TestChiefLanesRoleFilter", "TestChecklistAndFamilyTexts", "TestChiefOfStaffNativePermissions",
     "TestCiOutsideBin", "TestCiTestFileList", "TestClaimMutants", "TestClaimPlacement", "TestClaimReaders", "TestClaimsNoteDocumentation",
     "TestClaimsNoteMutants", "TestClaimsNotePass", "TestClaimsNoteScan", "TestClaimsNoteSkips", "TestClaimsNoteText", "TestClassify",
     "TestClearCarry", "TestClearCodePathsAlwaysHeld", "TestClearNoticeOrderMutants", "TestClosedUnmergedAskClose", "TestClosedUnmergedDocs",
@@ -80330,7 +80334,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestPlanCheckHash", "TestPlanCheckParser", "TestPlanCheckRound2", "TestPlanCheckRules", "TestPlanCheckSelection", "TestPlanKind",
     "TestPlanOperationsPerBoss", "TestPlanReceipts", "TestPlanReviewCore", "TestPlanRulesWordedAlike", "TestPlanTemplateDoc", "TestPlanningDecision",
     "TestPlanningSkill", "TestPlatformClassList", "TestPlatformPaths", "TestPluginPush", "TestPodNiceness", "TestPolicyRedaction",
-    "TestPolicyRequest", "TestPreflightPr", "TestPushWatch", "TestReadCheckRuns1237", "TestReadOnly", "TestReadWholeAuditTable", "TestRealDirectory",
+    "TestPolicyRequest", "TestPreflightPr", "TestOrchestratorLaneGate", "TestOrchestratorUtcBatching", "TestPrGreenEvent", "TestPushWatch", "TestReadCheckRuns1237", "TestReadOnly", "TestReadWholeAuditTable", "TestRealDirectory",
     "TestReasonsAreOneCleanLine", "TestReconcileOnRead", "TestRecordJsonReaders", "TestRefusalInAPart", "TestRegistryEndpoint", "TestReplay",
     "TestReportFoldVariants", "TestRoutineLocal", "TestRunLauncherShapes", "TestSamples", "TestScanDriftGuard", "TestScenarioValidator",
     "TestScratchDirectory", "TestScratchFileRule", "TestScrubFailsClosed", "TestScrubPatterns", "TestSelfRegisteringCli", "TestSelfWakeInstructions",
@@ -80367,7 +80371,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestReviewerBlockLines", "TestReviewerBlockLinesControl",   # (#2512) read text files of the repository and strings in memory: no World, rig or state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
-    "TestEveryTestClassIsolates", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
+    "TestEveryTestClassIsolates", "TestGatedDaemonSends", "TestJobsActiveFor", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
     "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
     "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile", "TestTheProductionWiring",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392

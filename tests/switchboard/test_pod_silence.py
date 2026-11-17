@@ -96,7 +96,7 @@ class TestPodSilenceTick(unittest.TestCase):
     def tick(self, engine, ahead=0):
         real = time.time
         with unittest.mock.patch.object(sb.time, "time", lambda: real() + ahead):
-            return sb.pod_silence_tick(engine, None, self.summary)
+            return sb.pod_silence_tick(engine, types.SimpleNamespace(problems=[], agents={}), self.summary)
 
     def test_a_live_pod_is_told_after_the_quiet_period_and_the_boss_is_cleaned(self):
         engine = self.world([self.rec("live", reports_to="lane\x07-a")])

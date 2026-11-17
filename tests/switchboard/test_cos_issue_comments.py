@@ -11,7 +11,7 @@ GithubRig = None   # set by bin/test-switchboard after the import
 _roles = importlib.import_module("support.scenario_roles")
 SCRATCH = _roles.GH_REPO
 
-AGENTS = {"chief": {"role": "orchestrator", "charter": 1},
+AGENTS = {"chief": {"role": "chief-of-staff", "charter": 1},
           "coder": {"role": "coder", "issue": 12, "reports_to": "chief"}}
 
 

@@ -382,13 +382,24 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
         if isinstance(b_, str) and b_:
             claimed.setdefault(b_, set()).add(n)
 
-    def tell(lane, text, worker):
+    gate = getattr(engine, "lane_gate", None)   # #2545: an orchestrator's lane gets a quiet item at its :00 UTC bucket and no feature-branch push of its own
+
+    def tell(lane, text, worker, tier=0, since=None):
+        """"sent", "dropped" (a tier 3 item for an orchestrator: told to nobody, never retried) or None (not sent: retried at the next pass)."""
+        verdict = gate(lane, tier, since, worker) if gate is not None and tier else "go"
+        if verdict == "wait":
+            return None
+        if verdict == "drop":
+            engine.audit.append(engine.actor, "push_watch.dropped", worker, {"to": lane, "why": "a feature-branch push is not worth an orchestrator's wake"})
+            return "dropped"
         try:
             if not engine.send("switchboard", lane, text).get("sent"):
                 raise RuntimeError("not sent")
             sent.append((lane, text))
+            return "sent"
         except Exception as err:
             engine.audit.append(engine.actor, "push_watch.read_failed", worker, {"to": lane, "why": sb._one_line(str(err), 160)})
+            return None
 
     for name in order:
         record = records[name]
@@ -483,14 +494,14 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     continue
                 b["told"] = (b["told"] + [csha])[-TOLD_MAX:]
                 text = item_text(name, branch, csha, dict(c, files=stats.get("files", c.get("files")), stats=stats.get("stats", c.get("stats"))) if len(batch) > 1 or prev else c)
-                n_before = len(sent)
-                tell(lane, text + (" (counts are those of the whole push)" if len(batch) > 1 else ""), name)
-                if len(sent) == n_before:   # the send failed: not told, retried at the next pass
+                told = tell(lane, text + (" (counts are those of the whole push)" if len(batch) > 1 else ""), name, 3)
+                if not told:   # the send failed: not told, retried at the next pass
                     b["told"].remove(csha)
                     unsent = True
                     break
                 mem["told"] = (mem.get("told", []) + [csha])[-TOLD_MAX:]
-                engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": csha[:8], "branch": _clean(branch, 100), "head": csha})
+                if told == "sent":
+                    engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": csha[:8], "branch": _clean(branch, 100), "head": csha})
             if unsent:
                 continue
             b["told"] = (b["told"] + [sha])[-TOLD_MAX:]
@@ -501,9 +512,8 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
         for branch, b in mem.get("branches", {}).items():
             minutes = (now - b.get("at", now)) / 60.0
             if b.get("sha") and not b.get("quiet") and state["reported"].get(name, 0) <= b.get("at", 0) and minutes >= cfg["quiet_minutes"]:
-                n_before = len(sent)
-                tell(lane, item_text(name, branch, b["sha"], {}, "quiet", int(minutes), b["at"], b.get("made")), name)
-                if len(sent) == n_before:   # a failed send leaves it unmarked: retried at the next pass
+                told = tell(lane, item_text(name, branch, b["sha"], {}, "quiet", int(minutes), b["at"], b.get("made")), name, 2, b["at"] + cfg["quiet_minutes"] * 60)
+                if not told:   # a failed send leaves it unmarked: retried at the next pass
                     continue
                 b["quiet"] = True   # marked only after a successful send: once per sha
                 engine.audit.append(engine.actor, "push_watch.quiet", name, {"to": lane, "sha": b["sha"][:8]})
