@@ -315,9 +315,12 @@ class DelegatedOrderCheck(DoctorCase):
         cases = {"exact": ("- a\n" + self.LINE + "\n", "ok"), "deleted": ("- a\n", "FAIL"), "edited": ("- a\n" + self.LINE.replace("Serious", "Serioux") + "\n", "FAIL"),
                  "duplicated": (self.LINE + "\n" + self.LINE + "\n", "FAIL"), "case changed": (self.LINE.lower() + "\n", "FAIL"), "substring": (self.LINE + " not on Tuesdays\n", "FAIL"),
                  "file missing": (None, "FAIL"), "too large": ("x" * 9000, "FAIL")}
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(cases)) as pool:   # each case is its own scratch HOME and its own doctor run: the eight runs go side by side
+            runs = {label: pool.submit(self.run_with, text) for label, (text, _status) in cases.items()}
         for label, (text, status) in cases.items():
             with self.subTest(label):
-                run = self.run_with(text)
+                run = runs[label].result()
                 self.assertTrue(self.only(run, "delegated-order").startswith(status + " "), run.output)
 
     def test_no_owner_file_order_configured_is_ok(self):

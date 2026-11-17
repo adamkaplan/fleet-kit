@@ -24,7 +24,7 @@ class Run(unittest.TestCase):
         return r, time.time() - t0
 
     def test_s2_start_returns_at_once_and_waits_are_bounded(self):
-        r, took = self.cw("start", "--name", "job", "--", "sh", "-c", "sleep 12; echo done")
+        r, took = self.cw("start", "--name", "job", "--", "sh", "-c", "sleep 7; echo done")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertLess(took, 2, "a slow start: the command ran in the foreground")
         self.assertIn("job", r.stdout); self.assertRegex(r.stdout, r"pid \d+"); self.assertIn("cw-run wait job", r.stdout)

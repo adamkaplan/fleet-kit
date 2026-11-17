@@ -432,6 +432,15 @@ class TestPlatformPaths(unittest.TestCase):
     @classmethod
     def derived(cls, root):
         """{repo-relative path: first hit} over the non-test files of bin/, cloud/, plugins/ and shims/ (python files and extensionless python scripts)."""
+        if root == REPO and getattr(cls, "_derived_repo", None) is not None:   # the real tree, derived once per process
+            return dict(cls._derived_repo)
+        found = cls._derive(root)
+        if root == REPO:
+            cls._derived_repo = found
+        return dict(found)
+
+    @classmethod
+    def _derive(cls, root):
         found = {}
         for top in ("bin", "cloud", "plugins", "shims"):
             for path in sorted((root / top).rglob("*")) if (root / top).is_dir() else []:

@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """Refs #2440: the proof command reaches the cluster as cw-operator with a short-lived token, and fails at once (exit 2, one line) when kubectl cannot be used.
 Offline: fake kubectl and switchboard scripts; the mutant is an in-memory copy of the source run as a child process."""
+import contextlib
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import test_image_gate as G
 
+time_sleep = __import__("time").sleep
 MARK = "TOKMARK-9f3a1c77"
 PROMPT = "To sign in, use a web browser to open the page https://example.invalid/devicelogin and enter the code ABCD1234"
 FAKE = """#!/bin/sh
 echo "$@" >> "$FAKE_DIR/kubectl.log"
-tr '\\0' ' ' < /proc/$$/cmdline >> "$FAKE_DIR/argv.log"; echo >> "$FAKE_DIR/argv.log"
-tr '\\0' '\\n' < /proc/$$/environ | grep -v '^PATH=' >> "$FAKE_DIR/env.log"
+if [ -d /proc/$$ ]; then tr '\\0' ' ' < /proc/$$/cmdline >> "$FAKE_DIR/argv.log"; echo >> "$FAKE_DIR/argv.log"; tr '\\0' '\\n' < /proc/$$/environ | grep -v '^PATH=' >> "$FAKE_DIR/env.log"; else ps -o command= -p $$ >> "$FAKE_DIR/argv.log"; env | grep -v '^PATH=' >> "$FAKE_DIR/env.log"; fi
 case "$*" in
   *"create token cw-operator --duration="*) echo "$*" >> "$FAKE_DIR/mint.log"; [ -f "$FAKE_DIR/refuse" ] && exit 1
     n=$(cat "$FAKE_DIR/mints" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/mints"
@@ -47,7 +51,7 @@ class ProofOperatorKubectl(G.Base):
         Path(self.fake, "kubectl").write_text(FAKE)
         self.env.pop("CW_KUBECTL")
         self.env["PATH"] = self.fake + os.pathsep + os.environ.get("PATH", "")
-        self.env["CW_PROOF_KUBECTL_TIMEOUT"] = "2"
+        self.env["CW_PROOF_KUBECTL_TIMEOUT"] = str(self.WAIT)
         self.env["HOME"] = os.environ.get("HOME", "")
         self.secrets = tempfile.mkdtemp(prefix="proof-secrets-", dir=os.path.expanduser("~"))
         self.addCleanup(shutil.rmtree, self.secrets, True)
@@ -59,7 +63,30 @@ class ProofOperatorKubectl(G.Base):
         Path(p).write_text("apiVersion: v1\nkind: Config\n")
         os.chmod(p, 0o600)
 
-    def child(self, source=None, bound=25, wait="0"):
+    WAIT = 1   # seconds the kubectl call may take before the proof gives up; the hanging mutant is bounded by WAIT + 2
+
+    def in_process(self, wait):
+        """The real source, run in this process with a fake clock (what CHILD does in a child), its output captured."""
+        m = types.ModuleType("p")
+        m.__file__ = str(G.ROOT / "bin" / "cloud_image_proof.py")
+        exec(compile(G.PROOF, "p", "exec"), m.__dict__)
+        clock = [0.0]
+
+        def nap(s):
+            clock[0] += s
+        m.__dict__["time"] = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=time_sleep)
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = m.main([G.SRC, "--repo", "acme/widget", "--wait", wait], env=dict(self.env), sleep=nap)
+            except SystemExit as e:
+                code = e.code
+        return subprocess.CompletedProcess([], code or 0, out.getvalue(), err.getvalue())
+
+    def child(self, source=None, bound=60, wait="0"):
+        if source is None:
+            return self.in_process(wait)
         return subprocess.run([sys.executable, "-c", CHILD, str(G.ROOT / "bin" / "cloud_image_proof.py"), source or G.PROOF, G.SRC, wait],
                               env=self.env, capture_output=True, text=True, timeout=bound)
 
@@ -153,7 +180,7 @@ class ProofOperatorKubectl(G.Base):
         self.assertEqual(G.PROOF.count(old), 1)
         waiting = G.PROOF.replace(old, "out, err = proc.communicate(stdin)")
         try:
-            done = self.child(waiting, bound=10)
+            done = self.child(waiting, bound=self.WAIT + 2)
         except subprocess.TimeoutExpired:
             return   # the mutant waited past the bound, as the mutant must
         self.fail("the waiting mutant ended in time with exit %s" % done.returncode)

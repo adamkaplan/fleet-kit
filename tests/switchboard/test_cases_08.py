@@ -2065,8 +2065,26 @@ class TestArchTools(unittest.TestCase):
                 self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
         self.assertIn("__warningregistry__", str(caught.exception), "the mutant's failure names the planted name")
 
+    TOOLS = {}   # name -> the tool's module, loaded once for the class (the tools are plain scripts with a `main(argv)`; they keep no state between runs)
+
     def tool(self, name, *args):
-        return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
+        """Run the tool in this process (its output and exit status as `subprocess.run` gives them): no interpreter is started for each case."""
+        argv = [str(a) for a in args]
+        if name not in self.TOOLS:
+            loader = importlib.machinery.SourceFileLoader("arch_tool_" + name.replace("-", "_"), str(REPO / "tools" / name))
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+            loader.exec_module(module)
+            self.TOOLS[name] = module
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.object(sys, "argv", [str(REPO / "tools" / name)]):
+            try:
+                code = self.TOOLS[name].main(argv)
+            except SystemExit as stop:
+                code = stop.code
+        if isinstance(code, str):   # `sys.exit("message")` prints the message to stderr and exits 1
+            err.write(code + "\n")
+            code = 1
+        return subprocess.CompletedProcess([str(REPO / "tools" / name)] + argv, code or 0, out.getvalue(), err.getvalue())
 
     def test_the_surface_of_the_daemon_is_read_as_its_entry_assembles_it_not_as_a_text_join(self):
         listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]

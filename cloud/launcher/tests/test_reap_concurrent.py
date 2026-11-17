@@ -3,6 +3,7 @@
 Offline: a fake clock, a fake cluster whose end hook blocks until the test releases it (the test moves the fake clock), the real Launcher.reap.
 The four mutants run in child processes on scratch copies of the source outside the repository (the edit asserted applied).
 """
+import concurrent.futures
 import datetime as dt
 import json
 import os
@@ -433,20 +434,28 @@ class ScrubSnapshot(unittest.TestCase):
         planted = "PLANTED-known-secret-value-0001"
         known = {planted} | {"early-known-%07d-xx" % i for i in range(SCRUB_SET)}
         text = "log line with " + planted + " inside"
-        errors, removed, done = [], 0, threading.Event()
+        errors, removed, done, started = [], 0, threading.Event(), threading.Event()
+        BURST = 50   # the scrubs that run while the set changes, each one building the index afresh
 
         def adder():
             i = 0
-            while not done.is_set() and i < 20000:   # keeps growing the set for the whole run: the scrub keeps a built copy of an unchanged set
-                known.add("late-added-%07d-yy" % i)
+            while not done.is_set():
+                started.set()   # keeps changing the set for the burst: every scrub of it builds the index from a changing set
+                known.add("late-added-%07d-yy" % (i % 4000))
+                known.discard("late-added-%07d-yy" % ((i - 2000) % 4000))
                 i += 1
-                time.sleep(0)
         t = threading.Thread(target=adder, daemon=True)
         old_interval = sys.getswitchinterval()
         sys.setswitchinterval(1e-6)   # the adder gets the interpreter inside a scrub, not only between two
         self.addCleanup(sys.setswitchinterval, old_interval)
         t.start()
-        for _ in range(SCRUB_RUNS):
+        started.wait(5)   # the adder runs while the scrubs do, also on a runner with few cores
+        for n in range(SCRUB_RUNS):
+            if n == BURST:
+                done.set()   # the set stops changing: the rest of the scrubs use the kept index
+                t.join()
+            if n < BURST:
+                mod._SCRUB_SLOT[0] = None   # forces a build from the changing set on each of the burst scrubs
             try:
                 removed += planted not in mod.scrub(text, known)
             except RuntimeError as e:
@@ -474,29 +483,40 @@ def mutant(directory, name, edits):
 
 
 class Mutants(unittest.TestCase):
+    _control_cache = {}   # (target, test) -> (output, exit code) of the unmutated copy: the same control is run once
+    _control_lock = threading.Lock()
+
+    def _run(self, label, edits, test, target):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mutant(tmp, label, edits)   # outside the repository
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent." + target + "." + test], cwd=HERE,
+                                   env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return (p.communicate(timeout=90)[0], p.returncode)
+
     def child(self, name, edits, test, target="Concurrent"):
-        """Runs the test on an UNMUTATED scratch copy first (the control: exit 0), then on the mutant (exit 1 and the test's own FAIL line)."""
-        res = []
-        for label, ed in (("control", []), (name, edits)):
-            with tempfile.TemporaryDirectory() as tmp:
-                path = mutant(tmp, label + "-" + name, ed)   # outside the repository
-                p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent." + target + "." + test], cwd=HERE,
-                                       env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                res.append((p.communicate(timeout=90)[0], p.returncode))
+        """The test on an UNMUTATED scratch copy (the control: exit 0, run once per test), then on the mutant (exit 1 and the test's own FAIL line)."""
+        key = (target, test)
+        with Mutants._control_lock:
+            if key not in Mutants._control_cache:
+                Mutants._control_cache[key] = self._run("control-" + test, [], test, target)
+            control = Mutants._control_cache[key]
+        res = [control, self._run(name, edits, test, target)]
         self.assertEqual(res[0][1], 0, res[0][0])
         self.assertEqual(res[1][1], 1, res[1][0])
         self.assertIn("FAIL: " + test, res[1][0])
-        self.controls = getattr(self, "controls", 0) + 1
         return 1
 
     def test_the_four_mutants_are_caught(self):
-        n = [
-            self.child("m1", [("REAP_PARALLEL = 4 ", "REAP_PARALLEL = 1 ")], "test_S2_U3_eight_stops_four_at_a_time"),
-            self.child("m2", [("REAP_PARALLEL = 4 ", "REAP_PARALLEL = 8 ")], "test_S2_U3_eight_stops_four_at_a_time"),
-            self.child("m3", [("elif took >= REAP_STOP_SECONDS:", "elif False:")], "test_S4_a_stop_past_its_limit_is_abandoned_and_tried_again"),
-            self.child("m4", [("                    dead.set()\n", "                    dead.set()\n                    self.kube.delete(pod_name(jobs[i][1]))\n")],
-                       "test_S4_a_stop_past_its_limit_is_abandoned_and_tried_again"),
+        jobs = [
+            ("m1", [("REAP_PARALLEL = 4 ", "REAP_PARALLEL = 1 ")], "test_S2_U3_eight_stops_four_at_a_time"),
+            ("m2", [("REAP_PARALLEL = 4 ", "REAP_PARALLEL = 8 ")], "test_S2_U3_eight_stops_four_at_a_time"),
+            ("m3", [("elif took >= REAP_STOP_SECONDS:", "elif False:")], "test_S4_a_stop_past_its_limit_is_abandoned_and_tried_again"),
+            ("m4", [("                    dead.set()\n", "                    dead.set()\n                    self.kube.delete(pod_name(jobs[i][1]))\n")],
+             "test_S4_a_stop_past_its_limit_is_abandoned_and_tried_again"),
         ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:   # the four mutants run side by side
+            n = list(pool.map(lambda j: self.child(*j), jobs))
+        self.controls = len(n)
         print("S7: mutants caught %d of 4, mutations applied 4 of 4" % sum(n))
         print("S7 control: unmutated copies pass %d of 4" % self.controls)
         self.assertEqual(sum(n), len(n))   # every mutant is caught

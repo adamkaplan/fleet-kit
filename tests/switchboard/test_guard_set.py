@@ -2,7 +2,12 @@
 
 Run with `python3 bin/test-switchboard TestGuardSet`. Standard library only.
 """
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -10,6 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 TOOL = REPO / "tools" / "guard-set"
@@ -18,7 +24,32 @@ NAMED = ["TestHygiene", "TestSupportRebinding", "TestArchitectureDocument", "Tes
          "TestV2LightGuards", "TestImpactHold", "TestEveryTestFileIsWired"]
 
 
+_MOD = []
+
+
+def _tool():   # tools/guard-set, loaded once
+    if not _MOD:
+        loader = importlib.machinery.SourceFileLoader("guard_set_under_test", str(TOOL))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        _MOD.append(module)
+    return _MOD[0]
+
+
 def run(*args):
+    if "--run" not in args:   # the listing and the check run in this process; --run starts the classes it lists, so it keeps a child
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        before = os.getcwd()
+        os.chdir(REPO)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = _tool().main(list(args))
+                except SystemExit as stop:
+                    code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        finally:
+            os.chdir(before)
+        return subprocess.CompletedProcess([sys.executable, str(TOOL), *args], code or 0, out.getvalue(), err.getvalue())
     return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True, cwd=REPO)
 
 
@@ -54,23 +85,25 @@ class TestGuardSet(unittest.TestCase):
             self.assertEqual(l, "python3 bin/test-switchboard " + e["class"] + want)
 
     def test_a_class_with_no_loader_line_is_caught_by_the_wired_guard_control_first(self):
-        # in-process: the copy's own test_wired_tests module (loaded from the tree copy) runs the guard's test; no child run per step
-        import importlib.util
+        # in-process: the real test_wired_tests module runs the guard's test with its paths pointed at a tree of links to the real files (so the parse caches hold); no child run per step
+        import test_wired_tests as wired
         with tempfile.TemporaryDirectory() as d:
-            tree = Path(d) / "tree"
-            shutil.copytree(REPO, tree, ignore=shutil.ignore_patterns(".git", "__pycache__"))
-            spec = importlib.util.spec_from_file_location("guard_tree_wired", tree / "tests" / "switchboard" / "test_wired_tests.py")
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            self.assertEqual(mod.TESTS, tree / "tests" / "switchboard")      # the copy's own paths, not the repository's
-            self.assertEqual(mod.RUNNER, tree / "bin" / "test-switchboard")
+            tree = Path(d).resolve()
+            (tree / "bin").mkdir()   # only what the guard reads: the runner and the test directory
+            (tree / "bin" / "test-switchboard").symlink_to(REPO / "bin" / "test-switchboard")
+            (tree / "tests" / "switchboard").mkdir(parents=True)
+            for path in (REPO / "tests" / "switchboard").glob("*.py"):
+                (tree / "tests" / "switchboard" / path.name).symlink_to(path)
 
             def guard_run():
                 result = unittest.TestResult()
-                mod.TestEveryTestFileIsWired("test_the_real_directory_is_wired").run(result)
+                orig_problems = wired.problems   # the runner's text is read again by the guard: hand it the cached reduced text (the loader lines) instead of a full-file walk
+                with mock.patch.object(wired, "TESTS", tree / "tests" / "switchboard"), mock.patch.object(wired, "RUNNER", tree / "bin" / "test-switchboard"), \
+                        mock.patch.object(wired, "problems", side_effect=lambda td, src, ex: orig_problems(td, wired.runner_loader_source() if len(src) > 100000 else src, ex)):
+                    wired.TestEveryTestFileIsWired("test_the_real_directory_is_wired").run(result)
                 return result, "".join(t for _, t in result.failures + result.errors)
             c, text = guard_run()
-            self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated copy
+            self.assertTrue(c.wasSuccessful(), text)  # the control passes on the unmutated tree
             self.assertGreaterEqual(c.testsRun, 1)     # the named guard test ran (not a skipped-everything pass)
             self.assertEqual(c.skipped, [], "the guard test ran, it was not skipped")   # a skipped guard is a pass that checked nothing
             # since #2210 a Test* class is bound by the runner's self-registration; a class with no loader line AND not named Test* is the one nothing reaches
@@ -100,23 +133,28 @@ class TestGuardSet(unittest.TestCase):
         needle = ', REPO / "tests" / "test_installed_guard.py"'
         text = TOOL.read_text()
         self.assertIn(needle, text)
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            (root / "tools").mkdir()
-            for n in ("tests", "bin", "docs"):
-                (root / n).symlink_to(REPO / n)
-            copy = root / "tools" / "guard-set"
-
-            def go():
-                return subprocess.run([sys.executable, str(copy), "--check"], capture_output=True, text=True)
-            copy.write_text(text)
-            control = go()
-            self.assertEqual(control.returncode, 0, control.stdout + control.stderr)  # the control passes first
-            copy.write_text(text.replace(needle, "", 1))
-            r = go()
-            self.assertEqual(r.returncode, 1)
-            self.assertIn("every class of the guard set exists", r.stdout)
-            self.assertIn("TestTheEntryGuard", r.stdout)
+        def go(source):   # in-process: the tool's own text (the control) or the mutated text, loaded as a module under the real path (so REPO is the real one) and run
+            loader = importlib.machinery.SourceFileLoader("guard_set_scan_mutant", str(TOOL))
+            loader.get_data = lambda path: source.encode()
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+            loader.exec_module(module)
+            out, err, code, before = io.StringIO(), io.StringIO(), 0, os.getcwd()
+            os.chdir(REPO)
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    try:
+                        code = module.main(["--check"])
+                    except SystemExit as stop:
+                        code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+            finally:
+                os.chdir(before)
+            return subprocess.CompletedProcess(["guard-set", "--check"], code or 0, out.getvalue(), err.getvalue())
+        control = go(text)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)  # the control passes first
+        r = go(text.replace(needle, "", 1))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("every class of the guard set exists", r.stdout)
+        self.assertIn("TestTheEntryGuard", r.stdout)
 
 
 class TestGuardSetRun(unittest.TestCase):

@@ -89,9 +89,13 @@ def stop_group(p, port=None):
             time.sleep(0.05)
 
 
+STARTED = [0]   # how many children start() has spawned in this process
+
+
 def start(test, argv, port=None, **kw):
     """spawn() and register the cleanup on the TestCase (or the class, from setUpClass) at once, before any wait. Returns the Popen."""
     p = spawn(argv, **kw)
+    STARTED[0] += 1   # a fixture that needs to know whether a child may exist reads this
     (test.addClassCleanup if isinstance(test, type) else test.addCleanup)(stop_group, p, port)   # a class (setUpClass) or a test instance
     return p
 

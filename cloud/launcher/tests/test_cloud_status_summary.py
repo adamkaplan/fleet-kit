@@ -24,6 +24,15 @@ LAUNCHER = os.path.dirname(HERE)
 KIT = os.path.dirname(os.path.dirname(LAUNCHER))
 BIN = os.path.join(KIT, "bin")
 
+# the launcher's cloud_worker (not bin/'s module of the same name): loaded first, then its name is freed for the switchboard's loader below
+sys.path.insert(0, LAUNCHER)
+sys.path.insert(0, HERE)
+import cloud_worker as cw_mod  # noqa: E402
+import test_cloud_worker as tcw  # noqa: E402
+tcw.patch_kube_module(cw_mod)
+if sys.modules.get("cloud_worker") is cw_mod:
+    del sys.modules["cloud_worker"]
+
 # the switchboard's program name, assembled from a fragment: this file lives under cloud/, where the old name is not written (#404)
 SWITCHBOARD = os.path.join(BIN, "fl" + "eet-switchboard")
 loader = importlib.machinery.SourceFileLoader("cw_switchboard", SWITCHBOARD)
@@ -61,7 +70,7 @@ class Base(unittest.TestCase):
             "CW_CLOUD_SERVER": "https://cluster.example.internal:6443", "CW_CLOUD_NAMESPACE": "cw",
             "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
             "CW_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": str(self.kube), "FAKE_KUBE_CALLS": str(self.calls),
-            "CW_CLUSTER_TOKEN_CMD": str(token),
+            "CW_CLUSTER_TOKEN_CMD": str(token), "CW_TUNNEL_TIMEOUT": "3",   # a fake port-forward never serves: give up in 3 s, not 30
         })
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -81,6 +90,43 @@ class Base(unittest.TestCase):
             patch = mock.patch.object(sb, name, value)
             patch.start()
             self.addCleanup(patch.stop)
+        self.patch_launcher()
+
+    def patch_launcher(self):
+        """snapshot and stop run the launcher's main() in this process when nothing in the environment needs a real child; else the real run_launcher."""
+        orig = CLOUD.run_launcher
+
+        def inproc_ok(command):
+            return (command in ("snapshot", "stop")
+                    and os.environ.get(CLOUD.LAUNCHER_ENV) == os.path.join(LAUNCHER, "cloud-worker")
+                    and os.environ.get("CW_KUBECTL") == os.path.join(HERE, "fake_kubectl")
+                    and not os.environ.get("FAKE_KUBE_HANG")
+                    and not os.environ.get("CW_CLUSTER_ADMIN_CMD")
+                    and "sleep" not in (os.environ.get("CW_CLUSTER_TOKEN_CMD") or "")
+                    and CLOUD.cloud_cluster.LAUNCHER_OUTPUT_LIMIT >= 10000)
+
+        def fast(runner, command, worker, options=(), timeout=None, password_fd=None, cluster=None, secrets=()):
+            if not inproc_ok(command) or password_fd is not None or secrets:
+                kwargs = {} if timeout is None else {"timeout": timeout}
+                return orig(runner, command, worker, options, password_fd=password_fd, cluster=cluster, secrets=secrets, **kwargs)
+            out, err = io.StringIO(), io.StringIO()
+            argv = [command] + ([worker] if worker else []) + list(options) + ["--json"]
+            with redirect_stdout(out), redirect_stderr(err):
+                code = cw_mod.main(argv, env=cluster.env() if cluster is not None else dict(os.environ))
+            try:
+                body = json.loads(out.getvalue()) if out.getvalue().strip() else None
+            except ValueError:
+                body = None
+            clean = cluster.clean if cluster is not None else (lambda text, limit=300: text)
+            if not isinstance(body, dict):
+                body = None
+            return code, body, CLOUD.cloud_cluster.D["_one"](clean(err.getvalue() or "", 2000))
+
+        for target in (CLOUD, CLOUD.cloud_cluster):
+            if hasattr(target, "run_launcher"):
+                patch = mock.patch.object(target, "run_launcher", fast)
+                patch.start()
+                self.addCleanup(patch.stop)
 
     # ---- the fake cluster
 
@@ -223,9 +269,9 @@ class TestSummary(Base):
         os.environ["FAKE_KUBE_HANG_MARK"] = str(self.home / "hang")
         self.addCleanup(os.environ.pop, "FAKE_KUBE_HANG", None)
         self.addCleanup(os.environ.pop, "FAKE_KUBE_HANG_MARK", None)
-        self.cloud().SNAPSHOT_SECONDS = 2   # the bound of the whole read, shortened for the test
         started = time.monotonic()
-        lines, _ = self.status()
+        with mock.patch.object(self.cloud(), "SNAPSHOT_SECONDS", 2):   # the bound of the whole read, shortened for the test
+            lines, _ = self.status()
         self.assertLess(time.monotonic() - started, 30)
         failed = [line.strip() for line in lines if line.strip().startswith("cloud: cluster not read (")]
         self.assertEqual(len(failed), 1, lines)
@@ -382,18 +428,18 @@ class TestWholeRun(Base):
         os.environ["CW_CLUSTER_ADMIN_CMD"] = "sleep 1.5; echo kubeconfig"   # the vault read: 1.5 s
         os.environ["CW_KUBECTL"] = self.slow_script("slow-kubectl", "0", 'case " $* " in *" create "*) sleep 1.5;; esac; exec "%s" "$@"' % os.path.join(HERE, "fake_kubectl"))
         self.hang_get()   # and the launcher's read never ends
-        self.cloud().SNAPSHOT_SECONDS = 2
         started = time.monotonic()
-        lines, _ = self.status()
+        with mock.patch.object(self.cloud(), "SNAPSHOT_SECONDS", 2):
+            lines, _ = self.status()
         took = time.monotonic() - started
         self.assertLess(took, 2.9, took)   # per-step caps would allow 1.5 + 1.5 and then the launcher's own second: over 3 s
         self.assertEqual(len([l for l in lines if l.strip().startswith("cloud: cluster not read (")]), 1, lines)
 
     def bounded_slow_token(self):
         os.environ["CW_CLUSTER_TOKEN_CMD"] = self.slow_script("slow-token", "20", "echo synthetic-cluster-token")
-        self.cloud().SNAPSHOT_SECONDS = 1
         started = time.monotonic()
-        lines, _ = self.status()
+        with mock.patch.object(self.cloud(), "SNAPSHOT_SECONDS", 1):
+            lines, _ = self.status()
         took = time.monotonic() - started
         self.assertLess(took, 4, took)
         return lines

@@ -21,7 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, HERE)
 sys.path.insert(0, LAUNCHER)
 import cloud_worker as cw  # noqa: E402
-from test_cloud_worker import Base, T0  # noqa: E402
+from test_cloud_worker import Base, T0, patch_kube_module  # noqa: E402
 import test_cloud_stack as stack_tests  # noqa: E402
 import test_git_token_renewal as renewal  # noqa: E402
 import test_cloud_k1 as k1  # noqa: E402
@@ -46,6 +46,7 @@ def mutant(old, new):
     mod = types.ModuleType("cloud_worker_mutant")
     mod.__file__ = SOURCE
     exec(compile(changed, SOURCE, "exec"), mod.__dict__)
+    patch_kube_module(mod)   # a mutant's Kube runs the fake kubectl in process too
     return mod
 
 

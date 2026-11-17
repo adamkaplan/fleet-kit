@@ -98,9 +98,22 @@ class WorkflowPlanPins(unittest.TestCase):
         summary = Path(tmp) / "summary.txt"
         summary.write_text("")
         env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary))
-        done = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
-        if done.returncode:
-            raise AssertionError("the plan script failed: " + done.stderr[-400:])
+        body = script.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        out_io, here = io.StringIO(), os.getcwd()   # the script's python body runs in this process, in the temporary directory, with its own environment
+        failure = None
+        os.chdir(tmp)
+        try:
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "argv", ["-"]), contextlib.redirect_stdout(out_io):
+                exec(compile(body, "plan-script", "exec"), {"__name__": "__main__"})
+        except SystemExit as e:
+            failure = e.code if e.code not in (None, 0) else None
+        except Exception as e:
+            failure = repr(e)
+        finally:
+            os.chdir(here)
+        done = subprocess.CompletedProcess([], 0, out_io.getvalue(), "")
+        if failure:
+            raise AssertionError("the plan script failed: " + str(failure)[-400:])
         self.log, self.summary = done.stdout, summary.read_text()
         line = [l for l in out.read_text().splitlines() if l.startswith("matrix=")][-1]
         return json.loads(line[len("matrix="):])
@@ -316,8 +329,8 @@ class TestAgentShellCalls(Base):
 
     def setUp(self):
         Base.setUp(self)
-        if time.time() % 3600 > 3570 or time.time() % 3600 < 10:   # the shim stamps real time: never start these across an hour boundary
-            time.sleep(40)
+        if time.time() % 3600 > 3595:   # the shim stamps real time: never start these across an hour boundary
+            time.sleep(3600.2 - (time.time() % 3600))
         self.bin = self.home / "realbin"
         self.bin.mkdir()
         fake = self.bin / "gh"
@@ -340,7 +353,7 @@ class TestAgentShellCalls(Base):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
                    "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS}
         environ.update(env or {})
-        return subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        return importlib.import_module("support.rebind").run_in_process(None, list(args), environ)
 
     def test_s1_calls_are_counted_per_account(self):
         for _ in range(5):
@@ -1477,7 +1490,8 @@ class TestGhShimGateProbe(Base):
         if self.log.exists():
             self.log.unlink()
         started = time.time()
-        done = subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        done = importlib.import_module("support.rebind").run_in_process(None, list(args), environ, shim_path=SHIM) if "FAKE_GATE_SLEEP" not in environ else subprocess.run(
+            [sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
         self.elapsed = time.time() - started
         seen = json.loads(self.log.read_text()) if self.log.exists() else None
         return done, seen

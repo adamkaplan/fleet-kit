@@ -8,6 +8,7 @@ Run with `python3 bin/test-switchboard TestEveryTestFileIsWired TestWiredCheckPl
 import ast
 import functools
 import importlib
+import os
 import shutil
 import tempfile
 import unittest
@@ -22,17 +23,38 @@ MIN_REASON = 20
 EXEMPT_FILES = {}
 
 
-def test_classes(path):
-    """The module-level classes of a test file that are TestCases (a test_ method or a base named *TestCase)."""
-    out = set()
-    for node in parse_cached(Path(path).read_text()).body:
+def _stamp(path):
+    """What names one state of a file: its real path, modification time and size (a symlinked copy of an unchanged file is the same state)."""
+    stat = Path(path).stat()
+    return (os.path.realpath(str(path)), stat.st_mtime_ns, stat.st_size)
+
+
+@functools.lru_cache(maxsize=None)
+def _facts(stamp):
+    """(the module-level TestCases, their bases by name, the count of each class name) of a file in one state, or None when it does not parse: read and analysed once per state."""
+    try:
+        body = parse_cached(Path(stamp[0]).read_text()).body
+    except SyntaxError:
+        return None
+    classes, parents, counts = set(), {}, {}
+    for node in body:
         if not isinstance(node, ast.ClassDef):
             continue
         bases = [ast.unparse(b) for b in node.bases]
         if any(b.endswith("TestCase") for b in bases) or any(
                 isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_") for n in node.body):
-            out.add(node.name)
-    return out
+            classes.add(node.name)
+        parents[node.name] = [b.split(".")[-1] for b in bases]
+        counts[node.name] = counts.get(node.name, 0) + 1
+    return classes, parents, counts
+
+
+def test_classes(path):
+    """The module-level classes of a test file that are TestCases (a test_ method or a base named *TestCase)."""
+    facts = _facts(_stamp(path))
+    if facts is None:
+        raise SyntaxError("does not parse: %s" % path)
+    return set(facts[0])
 
 
 @functools.lru_cache(maxsize=None)
@@ -170,11 +192,7 @@ def problems(tests_dir, source, exempt):
 
 def parses(path):
     """True when the file is Python the runner can read (#2206: a file that does not parse is not discovered)."""
-    try:
-        parse_cached(Path(path).read_text())
-        return True
-    except SyntaxError:
-        return False
+    return _facts(_stamp(path)) is not None
 
 
 def discovery_gaps(tests_dir, source, exempt, files):
@@ -235,12 +253,7 @@ def class_problems(tests_dir, source, exempt):
             continue
         classes = test_classes(path)
         bound_here = bound.get(mod, set()) | discovered(classes, source)
-        parents = {}
-        counts = {}
-        for node in parse_cached(path.read_text()).body:
-            if isinstance(node, ast.ClassDef):
-                parents[node.name] = [ast.unparse(b).split(".")[-1] for b in node.bases]
-                counts[node.name] = counts.get(node.name, 0) + 1
+        parents, counts = _facts(_stamp(path))[1:]
         for cls in sorted(classes):
             if counts[cls] > 1:
                 out.append("%s: class %s defined %d times: only the last runs" % (name, cls, counts[cls]))
@@ -274,8 +287,8 @@ class TestEveryTestFileIsWired(unittest.TestCase):
     def test_the_real_directory_is_wired(self):
         files = list(TESTS.glob("test_*.py"))
         self.assertGreaterEqual(len(files), 21)
-        self.assertEqual(problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
-        self.assertEqual(problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])     # the reduced text the planted tests use gives the same verdict
+        self.assertEqual(loader_lines(RUNNER.read_text()), runner_loader_source())    # the reduced text is the runner's own loader lines (the full-file walk of `problems` is not repeated on it)
+        self.assertEqual(problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])
 
     def test_the_exemption_list_is_the_only_one(self):
         tree = ast.parse(Path(__file__).read_text())
@@ -332,7 +345,7 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="wired-tests-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         for p in TESTS.glob("test_*.py"):
-            shutil.copy(p, self.tmp / p.name)
+            (self.tmp / p.name).symlink_to(p.resolve())
         self.source = runner_loader_source()
 
     def plant(self):
@@ -486,13 +499,13 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.assertEqual(len(out), 2, out)
         self.assertIn("class TestE ", out[0])
         self.assertIn("class TestF ", out[1])
-        self.assertEqual(problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
+        self.assertEqual(problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])
 
     def test_s2_the_real_directory_has_no_unbound_class(self):
         files = list(TESTS.glob("test_*.py"))
         classes = [c for f in files for c in test_classes(f)]
         self.assertGreaterEqual(len(classes), 276)
-        self.assertEqual(class_problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
+        self.assertEqual(class_problems(TESTS, runner_loader_source(), EXEMPT_FILES), [])
 
 # Both lines are built from halves so that each appears once, in `problems`, never as one literal in this file.
 MUTATED_LINE = "    files = sorted(m + " + '".py" for m in imported if (Path(tests_dir) / (m + ".py")).exists())'

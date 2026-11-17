@@ -362,7 +362,7 @@ class TestPinsReview(PinsRepo):
         self.assertEqual(len(lines), 50001)
         hits = [("tests/big.py", 1 + 2500 * t + 25 * h, "x", "compute_widget_total") for t in range(20) for h in range(1, 101)]
         self.assertEqual(len(hits), 2000)
-        count = [0]   # compile calls of _pins_re plus every use of a pattern (match, search, finditer, findall), whether through _pins_re or through re directly
+        count = self.scan_count = [0]   # compile calls of _pins_re plus every use of a pattern (match, search, finditer, findall), whether through _pins_re or through re directly
         real = re.compile   # the unpatched compile: _pins_re reaches it through counting, so a helper compile is counted once
 
         class Counted:
@@ -410,10 +410,12 @@ class TestPinsReview(PinsRepo):
                     indent = len(m.group(1))
             return "-", None, None
         self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()   # control: the unmutated finder passes
-        applied = [0]
+        applied, real_enclosing = [0], sb.pins_enclosing
 
         def mutated(*args, **kw):
             applied[0] += 1
+            if self.scan_count[0] > 5 * 50001:   # the rescans have already passed the bound the test asserts: the rest of the hits take the real answer, not 2.5 million more matches
+                return real_enclosing(*args, **kw)
             return rescan(*args, **kw)
         with mock.patch.object(sb, "pins_enclosing", mutated):
             with self.assertRaises(AssertionError) as caught:
@@ -432,10 +434,12 @@ class TestPinsReview(PinsRepo):
                     indent = len(m.group(1))
             return "-", None, None
         self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()   # control: the unmutated finder passes
-        applied = [0]
+        applied, real_enclosing = [0], sb.pins_enclosing
 
         def mutated(*args, **kw):
             applied[0] += 1
+            if self.scan_count[0] > 5 * 50001:   # the rescans have already passed the bound the test asserts: the rest of the hits take the real answer, not 2.5 million more matches
+                return real_enclosing(*args, **kw)
             return rescan(*args, **kw)
         with mock.patch.object(sb, "pins_enclosing", mutated):
             with self.assertRaises(AssertionError) as caught:
@@ -454,10 +458,12 @@ class TestPinsReview(PinsRepo):
                     indent = len(m.group(1))
             return "-", None, None
         self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()   # control: the unmutated finder passes
-        applied = [0]
+        applied, real_enclosing = [0], sb.pins_enclosing
 
         def mutated(*args, **kw):
             applied[0] += 1
+            if self.scan_count[0] > 5 * 50001:   # the rescans have already passed the bound the test asserts: the rest of the hits take the real answer, not 2.5 million more matches
+                return real_enclosing(*args, **kw)
             return rescan(*args, **kw)
         with mock.patch.object(sb, "pins_enclosing", mutated):
             with self.assertRaises(AssertionError) as caught:
