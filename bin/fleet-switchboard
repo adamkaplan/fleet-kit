@@ -2018,6 +2018,9 @@ class Switchboard:
         read_mark(self, "agents", not problems, "the fleet could not be read whole: %s" % _one_line(problems[0], 80) if problems else "", now)
         return found
 
+    def lane_gate(self, lane, tier, since, worker=None):   # #2545: push_watch asks it (bin/push_watch.py)
+        return lane_gate(self.discovery, lane, tier, self.now(), since, worker, jobs_alive=jobs_active_for)
+
     def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
@@ -8633,8 +8636,7 @@ def pod_silence_summary(worker):
 
 def pod_silence_tick(engine, discovery, summary=None):
     """#2115: a running cloud pod with no push and no report for 20 minutes tells its recorded boss ONE summary line (bin/pod_silence.py)."""
-    state_dir = getattr(engine, "state_dir", None)
-    watch = getattr(engine, "cloud_watch", None)
+    state_dir, watch = engine.state_dir if hasattr(engine, "state_dir") else None, engine.cloud_watch if hasattr(engine, "cloud_watch") else None
     if state_dir is None or not watch:
         return []
     reports = _read_small(state_dir, LAST_REPORT_FILE)
@@ -8649,11 +8651,12 @@ def pod_silence_tick(engine, discovery, summary=None):
         said = reports.get(name) if isinstance(reports.get(name), dict) else {}
         branches = ((pushes or {}).get(name) or {}).get("branches")
         at = [b.get("at") for b in branches.values() if isinstance(b, dict)] if isinstance(branches, dict) else []
-        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done",
+        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done", "jobs": rec.get("jobs") if isinstance(rec.get("jobs"), list) else None,
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
     return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
                                            summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"),
-                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail))
+                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail),
+                                           gate=lambda boss, since, worker, jobs: lane_gate(discovery, boss, 2, now, since, worker, pod_jobs=jobs, jobs_alive=jobs_active_for))   # #2545: an orchestrator hears a quiet pod at its :00 UTC bucket
 
 
 def lost_worker_tick(engine, discovery):
@@ -10084,8 +10087,7 @@ def _wh_issues(repo, payload, now):
     label = (payload.get("label") or {}).get("name") if isinstance(payload.get("label"), dict) else None
     if action in ("labeled", "unlabeled") and label:
         what = "label %s %s" % (label, "added" if action == "labeled" else "removed")
-    item = _issue_item(repo, issue, now, what)
-    return [item] if item else []
+    return issue_item_list(_issue_item(repo, issue, now, what), action, label, _login(payload.get("sender")))   # #2545: the tier reads these, never the summary text
 
 
 def _wh_issue_comment(repo, payload, now):
@@ -10856,7 +10858,7 @@ class GitHubHub:
         with self.lock:
             for key in [k for k, i in self.queue.items() if i.created < now - self.lookback]:
                 del self.queue[key]
-        self.note_conflicts(now)
+        self.note_conflicts(now); queue_pr_green(self, now, GitHubItem)   # #2545
         with self.lock:
             waiting = [item for item in self.queue.values() if item.recipient is None]
         if waiting:
@@ -10873,9 +10875,7 @@ class GitHubHub:
             self._audit_unrouted()
             self._audit_routed()
         with self.lock:
-            found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender,
-                          repo=i.repo)
-                     for i in self.queue.values() if i.recipient]
+            found = [tiered_fact(i, Fact, self) for i in self.queue.values() if i.recipient]   # #2545: the tier an orchestrator batches it by
         found.extend(self.intent_edit_facts())
         for fact in found:
             # An object seen again (a catch-up, a redelivery) was perhaps delivered long
@@ -10999,7 +10999,7 @@ class GitHubHub:
         return self._deliver_summary(item, lane, "chief", "no lane could be decided (%s)" % why)
 
     def _chief_lanes(self, item, agents):
-        lanes = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
+        lanes = [n for n in sorted(agents) if (agents[n].fleet or {}).get("role") == "chief-of-staff" and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
         own = [n for n in lanes if (agents[n].fleet or {}).get("repo") == item.repo]
         return own or lanes   # a lane bound to this repository comes before one bound to none: two Chiefs of different organisations never share an issue
 

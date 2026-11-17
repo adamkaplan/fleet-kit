@@ -77,7 +77,11 @@ class OfflineRun:
         def client_init(client, *args, **kwargs):
             original_init(client, *args, **kwargs)
             client.clock = lambda: float(world.clock.t)
-        with mock.patch.object(os.path, "realpath", realpath), mock.patch.object(sb.V2Client, "__init__", client_init):
+        # The 3m-8m offline scripts are written for the 60s `batch_seconds` window; the synchronized :00/:30 UTC buckets of an
+        # orchestrator would need half-hour waits (thousands of simulated ticks). They run on the legacy window unless they opt in.
+        legacy = (lambda observation: False) if not self.scenario.get("utc_buckets") else sb.is_orchestrator
+        with mock.patch.object(os.path, "realpath", realpath), mock.patch.object(sb.V2Client, "__init__", client_init), \
+                mock.patch.object(sb, "is_orchestrator", legacy):
             if getattr(world.engine, "v2", None) is not None and hasattr(world.engine.v2, "calls"):
                 world.engine.v2.clock = lambda: float(world.clock.t)   # the engine made in __init__
             return self._play()

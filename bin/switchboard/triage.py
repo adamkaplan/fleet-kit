@@ -943,9 +943,9 @@ def triage_ownerless_pass(engine, state, cfg, now):
             sent[repo] = {"at": int(now)}
             _write_small(engine.state_dir, OWNERLESS_FILE, sent)   # before the send: at most one line a day, even when a send fails
             line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True, len(parked))
-            names = ["chief-of-staff"] + sorted(name for name, agent in (discovery.agents.items() if discovery else [])
-                                                if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
-            told = []
+            dropped = sorted(name for name, agent in (discovery.agents.items() if discovery else [])   # #2545: tier 3: a digest never wakes an orchestrator on its own
+                             if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
+            names, told = ["chief-of-staff"], []
             for name in names:
                 try:
                     outcome = engine.send("switchboard", name, line)
@@ -953,7 +953,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                         told.append(name)
                 except Exception as err:   # a failed send is audited, never retried into a second line
                     engine._note("triage.ownerless_send_failed", repo, {"to": name, "error": _one_line(str(err), 120)})
-            engine._note("triage.ownerless", repo, {"count": len(rows), "parked": len(parked), "read": read, "total": total, "told": told})
+            engine._note("triage.ownerless", repo, {"count": len(rows), "parked": len(parked), "read": read, "total": total, "told": told, "dropped": dropped})
     except Exception as err:
         engine._note("triage.ownerless_error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return shown
