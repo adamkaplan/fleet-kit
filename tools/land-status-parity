@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Read-only parity check of the `land/*` commit statuses (#2560).
+
+Usage: tools/land-status-parity [--repo OWNER/REPO] [--count N] [--bot LOGIN] [--fixture PATH]
+
+Every checked commit must carry `state == "success"` for land/gates, land/reviews and land/merge-gate, each created by the bot
+(`--bot LOGIN`, default: any login ending in `[bot]`). Exit 0 only when all pass. The commits come from `--fixture PATH` (a JSON
+list of {"sha", "statuses": [{"context", "state", "creator": {"login"}}]}) or from `gh api` reads of the repository. Writes nothing.
+"""
+import argparse
+import json
+import subprocess
+import sys
+
+CONTEXTS = ("land/gates", "land/reviews", "land/merge-gate")
+
+
+def gh_json(path):
+    done = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        raise RuntimeError("gh api %s failed (exit %d)" % (path.split("?")[0], done.returncode))
+    return json.loads(done.stdout)
+
+
+def from_api(repo, count):
+    commits = []
+    for item in gh_json("repos/%s/commits?per_page=%d" % (repo, count))[:count]:
+        sha = item["sha"]
+        combined = gh_json("repos/%s/commits/%s/status" % (repo, sha))
+        commits.append({"sha": sha, "statuses": combined.get("statuses") or []})
+    return commits
+
+
+def bot_ok(login, bot):
+    return login == bot if bot else isinstance(login, str) and login.endswith("[bot]")
+
+
+def check(commit, bot):
+    """(list of problems, the bot logins seen) for one commit."""
+    problems, bots = [], []
+    statuses = [s for s in commit.get("statuses") or [] if isinstance(s, dict)]
+    for context in CONTEXTS:
+        mine = [s for s in statuses if s.get("context") == context]
+        if not mine:
+            problems.append((context, "no such status"))
+            continue
+        good = [s for s in mine if s.get("state") == "success" and bot_ok(((s.get("creator") or {}).get("login")), bot)]
+        if good:
+            bots.append(good[0]["creator"]["login"])
+            continue
+        shown = mine[0]
+        if shown.get("state") != "success":
+            problems.append((context, "state is %s, not success" % shown.get("state")))
+        else:
+            problems.append((context, "creator %s is not the bot" % ((shown.get("creator") or {}).get("login"))))
+    return problems, bots
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="read-only parity check of the land/* commit statuses")
+    parser.add_argument("--repo")
+    parser.add_argument("--count", type=int, default=10)
+    parser.add_argument("--bot")
+    parser.add_argument("--fixture")
+    opts = parser.parse_args(argv)
+    try:
+        if opts.fixture:
+            with open(opts.fixture) as handle:
+                commits = json.load(handle)
+        elif opts.repo:
+            commits = from_api(opts.repo, opts.count)
+        else:
+            parser.error("give --repo or --fixture")
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as err:
+        print("land-status-parity: cannot read the commits (%s)" % type(err).__name__, file=sys.stderr)
+        return 2
+    if not isinstance(commits, list) or not commits:
+        print("land-status-parity: no commits to check", file=sys.stderr)
+        return 2
+    failed = False
+    for commit in commits:
+        sha = str(commit.get("sha", ""))[:12]
+        problems, bots = check(commit, opts.bot)
+        if problems:
+            failed = True
+            for context, reason in problems:
+                print("MISSING %s: %s (%s)" % (sha, context, reason))
+        else:
+            print("OK %s: %s by %s" % (sha, ", ".join(CONTEXTS), bots[0]))
+    if failed:
+        return 1
+    print("PARITY OK (%d commits checked)" % len(commits))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

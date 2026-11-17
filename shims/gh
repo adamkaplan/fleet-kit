@@ -2886,6 +2886,37 @@ def merge_gate_release(ref):
         pass
 
 
+STATUS_MODULE = [None, False]   # (module, tried): land_status.py beside this file, loaded by path
+
+
+def load_land_status():
+    """The commit-status dual-write module, or None when it cannot be loaded."""
+    if not STATUS_MODULE[1]:
+        STATUS_MODULE[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "land_status.py")
+            spec = importlib.util.spec_from_file_location("land_status", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            STATUS_MODULE[0] = module
+        except Exception:
+            STATUS_MODULE[0] = None
+    return STATUS_MODULE[0]
+
+
+def status_plan(args, release_ref):
+    """(module, repo, number, head, listed repos) when commit statuses are to be written around this call, else None. Never raises."""
+    try:
+        module = load_land_status()
+        found = module.target(args, release_ref) if module is not None and is_write(args) else None
+        if found is None:
+            return None
+        listed = set(merge_gate_repos() or ()) | set(gate_repos())
+        return (module,) + found + (listed,) if module.enabled(found[0], listed) else None
+    except Exception:
+        return None
+
+
 HOLD_MODULE = [None, False]   # (module, tried): gh_hold.py beside this file, loaded by path (a plain `import` would need a package)
 
 
@@ -3164,11 +3195,18 @@ def run(args):
     if not write and command_words(args) and command_words(args)[0] not in NO_NETWORK_GROUPS:
         low_budget_read(agent)   # only a READ that reaches GitHub (not a write, not a cached answer): the top spender's message, and its bounded wait
     count_call(args)
-    if plan is None and release_ref:   # a merge under the lock: the lock is released when the merge returns, whatever it returned
+    status = status_plan(args, release_ref) if plan is None else None   # commit statuses next to the old gates (#2560): never changes the result
+    if plan is None and (release_ref or status):   # a call under the lock: the lock is released when it returns, whatever it returned
         try:
-            return subprocess.run([gh] + args, env=env).returncode
+            if status:
+                status[0].dual_write_before(status[1], status[2], status[3], gate_spool, status[4])
+            code = subprocess.run([gh] + args, env=env).returncode
+            if status and code == 0:
+                status[0].dual_write_after(status[1], status[2], status[3], gh, env, gate_spool, status[4])
+            return code
         finally:
-            merge_gate_release(release_ref)
+            if release_ref:
+                merge_gate_release(release_ref)
     if plan is None:
         if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
             child = subprocess.Popen([gh] + args, env=env)

@@ -66934,6 +66934,7 @@ _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
 _branch_ff = importlib.import_module("test_branch_ff"); TestBranchFf = _branch_ff.TestBranchFf
+_land_status = importlib.import_module("test_land_status_shim"); TestLandStatusShim, TestLandStatusParity, TestLandStatusRoles = _land_status.TestLandStatusShim, _land_status.TestLandStatusParity, _land_status.TestLandStatusRoles   # #2560
 TestScratchCommand, TestForwarderHooks = importlib.import_module("test_scratch_command").TestScratchCommand, importlib.import_module("test_forwarder_hooks").TestForwarderHooks
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
