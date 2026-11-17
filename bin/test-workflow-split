@@ -519,7 +519,7 @@ class Mutants(unittest.TestCase):
         text = WORKFLOW.read_text()
         i = text.index("\n  test:\n")
         self.killed(text[:i] + text[i:].replace("    steps:\n", "    steps:\n      - run: echo x\n", 1), self.STEPS)
-        self.killed(mutate(text, "\n  # bin/test-switchboard in 8 shards", "\n      - run: echo x\n\n  # bin/test-switchboard in 8 shards"), self.STEPS)
+        self.killed(mutate(text, "\n  # bin/test-switchboard in 6 shards", "\n      - run: echo x\n\n  # bin/test-switchboard in 6 shards"), self.STEPS)
 
     def relay_step(self, name):
         return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 10\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)

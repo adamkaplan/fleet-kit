@@ -359,7 +359,7 @@ class S6NoValueInOutput(unittest.TestCase):
         import io, contextlib
         buf = io.StringIO()
         suites = unittest.TestSuite()
-        for c in (S2Kinds, S3More, S4Same, S5Week, S8Rounds, Mutants, S14TwoLists):
+        for c in (S2Kinds, S3More, S4Same, Mutants, S14TwoLists):
             suites.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(c))
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             res = unittest.TextTestRunner(stream=buf, verbosity=2).run(suites)

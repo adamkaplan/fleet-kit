@@ -121,9 +121,31 @@ def line_count(path):
     return size_ceilings.line_count(path)
 
 
+_PARSED = {}   # {(kind, path): (stamp, value)}: one parse of a file for every reader of it, until the file's size or time changes
+
+
+def _stamped(kind, path, make):
+    path = str(path)
+    st = os.stat(path)
+    stamp = (st.st_size, st.st_mtime_ns)
+    hit = _PARSED.get((kind, path))
+    if hit is None or hit[0] != stamp:
+        hit = _PARSED[(kind, path)] = (stamp, make())
+    return hit[1]
+
+
+def _source_and_tree(path):
+    def make():
+        source = Path(path).read_text(encoding="utf-8")
+        return source, ast.parse(source)
+    return _stamped("tree", path, make)
+
+
 def _tables(path):
-    source = Path(path).read_text(encoding="utf-8")
-    return symtable.symtable(source, str(path), "exec"), ast.parse(source)
+    def make():
+        source, tree = _source_and_tree(path)
+        return symtable.symtable(source, str(path), "exec"), tree
+    return _stamped("tables", path, make)
 
 
 def _walk(table):
@@ -253,11 +275,15 @@ def _chain_root(node):
 
 
 def dynamic_uses(path):
+    return list(_stamped("dynamic", path, lambda: _dynamic_uses(path)))
+
+
+def _dynamic_uses(path):
     """[(line, scope, kind, how, constant)] for every use of a module that can load code by name, of `sys.modules` and of the loading builtins. `how` is
     `followed` (a direct call with a constant module name: `constant` holds it) or `site`. A kind is `import(module)` for an import statement, the module
     name for a use of the module object or of a name bound to it (however it is reached: an attribute, `getattr`, a subscript, an argument), `sys.modules`,
     or the builtin name, with `(non-constant)`, `(relative)` or `(reference)` where it is not a plain call."""
-    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    tree = _source_and_tree(path)[1]
     bound = _bindings(tree)
     sys_names = {"sys"} | {item.asname for node in ast.walk(tree) if isinstance(node, ast.Import) for item in node.names if item.name == "sys" and item.asname} \
         | {item.asname or item.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module != "sys" for item in node.names if item.name == "sys"}
@@ -344,7 +370,7 @@ def dynamic_uses(path):
 def loaded_modules(path, helpers):
     """The flat modules a file of the daemon loads: a direct `load_module("x")` and the `load_x()` helpers."""
     found = {constant for _line, _scope, kind, how, constant in dynamic_uses(path) if how == "followed" and kind == "load_module"}
-    for node in ast.walk(ast.parse(Path(path).read_text(encoding="utf-8"))):
+    for node in ast.walk(_source_and_tree(path)[1]):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helpers:
             found.add(helpers[node.func.id])
     return found
@@ -354,7 +380,7 @@ def imported_modules(path, flat):
     """The flat modules a file imports: `import x`, `from x import y`, the relative `from . import x` and `from .x import y`, and a direct
     `__import__("x")` or `import_module("x")` with a constant name."""
     found = set()
-    for node in ast.walk(ast.parse(Path(path).read_text(encoding="utf-8"))):
+    for node in ast.walk(_source_and_tree(path)[1]):
         if isinstance(node, ast.Import):
             found |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom):
@@ -374,7 +400,7 @@ def unfollowed_sites(path):
     """[(line, "scope:kind")] of every use the derivation does not follow: all of dynamic_uses that is not a direct constant call, and a relative
     import of level two or more."""
     sites = [(line, "%s:%s" % (scope, kind)) for line, scope, kind, how, _constant in dynamic_uses(path) if how == "site"]
-    for node, scope in _walk_scopes(ast.parse(Path(path).read_text(encoding="utf-8"))):
+    for node, scope in _walk_scopes(_source_and_tree(path)[1]):
         if isinstance(node, ast.ImportFrom) and node.level >= 2:
             sites.append((node.lineno, "%s:from-import(relative level %d)" % (scope, node.level)))
     return sorted(sites)

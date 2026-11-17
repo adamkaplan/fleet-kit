@@ -5,15 +5,18 @@ commands, the real `run_daemon` loop for the daemon, and the real standalone scr
 (two small scripts that log their arguments), the engine of the daemon (a counter of its passes), and the clock.
 """
 import ast
+import atexit
 import contextlib
 import io
 import json
 import threading
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -44,21 +47,38 @@ def commit(tree, name):
 class TreeCase(Base):
     """An origin with two commits on main and one more on a branch `integration`; `self.tree` is a clone of it on main, recorded by the install."""
 
+    _template = None   # (origin, clone, first, second, integration): built once for the process, each test works on copies of it
+
+    @classmethod
+    def template(cls):
+        if TreeCase._template is None:
+            root = Path(tempfile.mkdtemp(prefix="guard-template-"))
+            origin, tree = root / "origin", root / "installed"
+            origin.mkdir()
+            git(origin, "init", "-q", "-b", "main")
+            first = commit(origin, "one.txt")
+            second = commit(origin, "two.txt")
+            git(origin, "switch", "-q", "-c", "integration")
+            integration = commit(origin, "three.txt")
+            git(origin, "switch", "-q", "main")
+            git(root, "clone", "-q", str(origin), str(tree))
+            git(tree, "fetch", "-q", "origin")
+            TreeCase._template = (origin, tree, first, second, integration)
+            atexit.register(shutil.rmtree, str(root), True)
+        return TreeCase._template
+
     def setUp(self):
         super().setUp()
         os.environ.update(GIT_ENV)
         os.environ["PATH"] = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
         self.origin = self.home / "origin"
-        self.origin.mkdir()
-        git(self.origin, "init", "-q", "-b", "main")
-        self.first = commit(self.origin, "one.txt")
-        self.second = commit(self.origin, "two.txt")
-        git(self.origin, "switch", "-q", "-c", "integration")
-        self.integration = commit(self.origin, "three.txt")
-        git(self.origin, "switch", "-q", "main")
         self.tree = self.home / "installed"
-        git(self.home, "clone", "-q", str(self.origin), str(self.tree))
-        git(self.tree, "fetch", "-q", "origin")
+        template = self.template()
+        shutil.copytree(str(template[0]), str(self.origin), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        shutil.copytree(str(template[1]), str(self.tree), symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+        config = self.tree / ".git" / "config"   # the copy of the clone follows the copy of the origin: its url is changed in the file, not by a git child
+        config.write_text(config.read_text().replace("url = %s\n" % template[0], "url = %s\n" % self.origin))
+        self.first, self.second, self.integration = template[2:]
         self.state = sb.ensure_state_dir()
         (self.state / "installed-tree").write_text("%s\nmain\n" % self.tree)
         self.patch = mock.patch.object(sb, "KIT_ROOT", self.tree)
@@ -83,8 +103,12 @@ class UnreadableTreeTests:
     def mend_tree(self):
         (self.tree / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
 
+    _KNOWN = None
+
     def known(self):
-        return sb.build_parser().commands
+        if UnreadableTreeTests._KNOWN is None:
+            UnreadableTreeTests._KNOWN = sb.build_parser().commands
+        return UnreadableTreeTests._KNOWN
 
     def recording(self):
         return sorted(name for name in self.known() if sb.command_records(name, self.known()))
@@ -374,16 +398,14 @@ class TestTheEntryGuard(UnreadableTreeTests, TreeCase):
         script = other / ".git" / "hooks" / "pre-commit"
         script.write_text("#!/bin/sh\nexec \"%s\" -c 'import sys; sys.exit(0 if sys.argv[1] == \"feat\" else 1)' \"$(git rev-parse --abbrev-ref HEAD)\"\n" % sys.executable)
         script.chmod(0o755)
-        probe = self.home / "probe.py"
-        probe.write_text("import json, os, sys\nsys.path.insert(0, %r)\nimport installed_guard as g\nprint(json.dumps(g.problem(sys.argv[1], sys.argv[2])))\n" % str(BIN))
         env = dict(os.environ, **GIT_ENV)
         planted = {k: v for k, v in env.items()}
         planted.update({"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other), "GIT_INDEX_FILE": str(other / ".git" / "index")})
-        done = subprocess.run([sys.executable, str(probe), str(self.state), str(self.tree)], capture_output=True, text=True, env=planted)
-        self.assertEqual(json.loads(done.stdout), None, done.stderr)   # the installed tree is the clean default branch: good, whatever git was told
+        with mock.patch.dict(os.environ, planted):   # the guard's own git children inherit what git exports to a hook; no probe process
+            self.assertEqual(guard.problem(str(self.state), str(self.tree)), None)   # the installed tree is the clean default branch: good, whatever git was told
         git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
-        done = subprocess.run([sys.executable, str(probe), str(self.state), str(self.tree)], capture_output=True, text=True, env=planted)
-        self.assertIn("branch scratch", json.loads(done.stdout))
+        with mock.patch.dict(os.environ, planted):
+            self.assertIn("branch scratch", guard.problem(str(self.state), str(self.tree)))
 
     def rev_parse_fails(self, code=128, out=""):
         real = subprocess.run

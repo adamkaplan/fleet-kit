@@ -244,16 +244,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: bin/fleet-scenario coverage --enforce --through-pr 4
 
-  # bin/test-switchboard in 8 shards on ubuntu, beside `test` (needs only `plan`; `test` does not wait for it). Check names: `shards (I/8)`.
+  # bin/test-switchboard in 6 shards on ubuntu, beside `test` (needs only `plan`; `test` does not wait for it). Check names: `shards (I/6)`.
   # Not on the nightly: there `test` runs the whole file for each ref.
   shards:
     needs: plan
     if: ${{ github.event_name != 'schedule' && contains(fromJSON(needs.plan.outputs.matrix).*.os, 'ubuntu-latest') }}
-    name: shards (${{ matrix.shard }}/8)
+    name: shards (${{ matrix.shard }}/6)
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -265,9 +265,9 @@ jobs:
 
       - run: python3 --version
 
-      - name: bin/test-switchboard --shard ${{ matrix.shard }}/8
+      - name: bin/test-switchboard --shard ${{ matrix.shard }}/6
         run: |
-          bin/test-switchboard --shard ${{ matrix.shard }}/8 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          bin/test-switchboard --shard ${{ matrix.shard }}/6 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
   # The cloud suites run beside the job above, not after it (both need only `plan`): the macOS check ends at the slower of the two. Check names:

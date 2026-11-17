@@ -635,6 +635,10 @@ class TestHardening(Fixture):
             "ghp\uff3f" + "A" * 20,                                                                   # fullwidth underscore: a token
             ]
 
+    def setUp(self):
+        super().setUp()
+        sb._COCKPIT_EPISODE.update(unreadable=False, withheld=False)
+
     def test_nfkc_runs_before_the_patterns_and_each_sample_is_removed_only_because_of_it(self):
         for sample in self.NFKC:
             with self.subTest(sample=sample):

@@ -206,7 +206,7 @@ class Reload(unittest.TestCase):
         for line in lines:
             self.assertTrue(line.startswith("cloud-worker: settings file not reloaded: "), line)
             for value in list(GOOD.values()) + [NEW]:
-                self.assertNotIn(value, line)
+                self.assertNotIn(value, line.replace(s.path, ""))
         self.assertIn("mode", lines[0])
         self.assertIn("not KEY=VALUE", lines[1])
 

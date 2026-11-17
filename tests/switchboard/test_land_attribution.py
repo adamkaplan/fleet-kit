@@ -20,7 +20,12 @@ RAW = "acme-org/widget"
 
 def sb_module():
     from importlib.machinery import SourceFileLoader
-    return SourceFileLoader("sb_land_attr", str(REPO / "bin" / "fleet-switchboard")).load_module()
+    import importlib.util
+    loader = SourceFileLoader("sb_land_attr", str(REPO / "bin" / "fleet-switchboard"))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("sb_land_attr", loader))
+    sys.modules["sb_land_attr"] = mod
+    loader.exec_module(mod)
+    return mod
 
 
 def patch(text):

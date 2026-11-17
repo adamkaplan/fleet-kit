@@ -6,10 +6,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "bin"))
 import plan_check  # noqa: E402
+from support.loader import captured, sb  # noqa: E402
 
 DONE = "(1) the verb prints a summary"
 BASE = """## Plan (scenarios)
@@ -63,9 +65,14 @@ def run(text):
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "plan.md"
         path.write_text(text)
-        return subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "plan", "check", "--file", str(path), "--done-when", DONE],
-                              capture_output=True, text=True,
-                              env=dict(os.environ, HOME=tmp, XDG_STATE_HOME=tmp, XDG_CONFIG_HOME=tmp, FLEET_SWITCHBOARD_STATE=tmp))   # an isolated location, never the real one (#1322 guard)
+        argv = ["plan", "check", "--file", str(path), "--done-when", DONE]
+        isolated = dict(os.environ, HOME=tmp, XDG_STATE_HOME=tmp, XDG_CONFIG_HOME=tmp, FLEET_SWITCHBOARD_STATE=tmp)   # an isolated location, never the real one (#1322 guard)
+        with mock.patch.dict(os.environ, isolated), captured() as (out, err):   # the entry's main in this process: no interpreter start and import per run
+            try:
+                code = sb.main(argv)
+            except SystemExit as stop:
+                code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        return subprocess.CompletedProcess(argv, code or 0, out.getvalue(), err.getvalue())
 
 
 class TestNoFailureMode(unittest.TestCase):
@@ -104,7 +111,8 @@ class TestNoFailureMode(unittest.TestCase):
         for word in plan_check.FAILURE_TRIGGER_WORDS:
             with self.subTest(trigger=word):
                 warned = quiet.replace("prints a summary line", "the verb will %s it" % word)
-                self.assertEqual(run(warned).stdout.count("no-failure-mode"), 1, word)
+                # in this process: the CLI of this check is run by the tests above and below
+                self.assertEqual(len([w for w in plan_check.check(warned, DONE)["warnings"] if w.get("code") == "no-failure-mode"]), 1, word)
                 for fw in failure_words:
                     with self.subTest(trigger=word, failure=fw):
                         self.assertIsNone(plan_check.failure_mode_warning([{"text": "an input that is %s" % fw}], "the verb will %s it" % word))
