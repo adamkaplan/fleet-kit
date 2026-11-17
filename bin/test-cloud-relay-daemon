@@ -1368,7 +1368,7 @@ class Round2(Fixture):
 
     def timed_fetch(self, mod):
         self.trickle_finished = threading.Event()
-        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.3
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.1
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, _ = mod.http_transport(self.serve(self.header_trickle), "tok")
         t0 = time.monotonic()

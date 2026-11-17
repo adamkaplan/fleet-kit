@@ -9,24 +9,50 @@ list of {"sha", "statuses": [{"context", "state", "creator": {"login"}}]}) or fr
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
 
 CONTEXTS = ("land/gates", "land/reviews", "land/merge-gate")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+MAX_FIXTURE_BYTES = 10 * 1024 * 1024
+MAX_API_BYTES = 10 * 1024 * 1024
+MAX_COMMITS = 1000
+
+
+def valid_repo(repo):
+    if not isinstance(repo, str) or not REPO_RE.match(repo):
+        return False
+    return all(p not in (".", "..") and not p.startswith(".") and not p.endswith(".") and not p.endswith(".git") for p in repo.split("/"))
+
+
+def clean(text, limit=80):
+    """Text safe to print: every control, escape or odd character becomes `?`."""
+    return re.sub(r"[^A-Za-z0-9._:/\[\]-]", "?", str(text))[:limit]
 
 
 def gh_json(path):
-    done = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
+    done = subprocess.run(["gh", "api", path], capture_output=True, timeout=60)
     if done.returncode != 0:
         raise RuntimeError("gh api %s failed (exit %d)" % (path.split("?")[0], done.returncode))
+    if len(done.stdout) > MAX_API_BYTES:
+        raise RuntimeError("gh api answer oversize")
     return json.loads(done.stdout)
 
 
 def from_api(repo, count):
     commits = []
-    for item in gh_json("repos/%s/commits?per_page=%d" % (repo, count))[:count]:
-        sha = item["sha"]
+    listing = gh_json("repos/%s/commits?per_page=%d" % (repo, count))
+    if not isinstance(listing, list):
+        raise RuntimeError("commit list is not a list")
+    for item in listing[:count]:
+        sha = item.get("sha") if isinstance(item, dict) else None
+        if not isinstance(sha, str) or not SHA_RE.match(sha):
+            raise RuntimeError("malformed commit item")
         combined = gh_json("repos/%s/commits/%s/status" % (repo, sha))
+        if not isinstance(combined, dict):
+            raise RuntimeError("malformed status answer")
         commits.append({"sha": sha, "statuses": combined.get("statuses") or []})
     return commits
 
@@ -38,21 +64,21 @@ def bot_ok(login, bot):
 def check(commit, bot):
     """(list of problems, the bot logins seen) for one commit."""
     problems, bots = [], []
-    statuses = [s for s in commit.get("statuses") or [] if isinstance(s, dict)]
+    raw = commit.get("statuses")
+    statuses = [s for s in (raw if isinstance(raw, list) else []) if isinstance(s, dict)]
     for context in CONTEXTS:
         mine = [s for s in statuses if s.get("context") == context]
         if not mine:
             problems.append((context, "no such status"))
             continue
-        good = [s for s in mine if s.get("state") == "success" and bot_ok(((s.get("creator") or {}).get("login")), bot)]
-        if good:
-            bots.append(good[0]["creator"]["login"])
-            continue
-        shown = mine[0]
-        if shown.get("state") != "success":
-            problems.append((context, "state is %s, not success" % shown.get("state")))
+        latest = mine[0]   # GitHub lists newest first: only the latest status of a context counts
+        login = (latest.get("creator") or {}).get("login")
+        if latest.get("state") != "success":
+            problems.append((context, "state is %s, not success" % clean(latest.get("state"))))
+        elif not bot_ok(login, bot):
+            problems.append((context, "creator %s is not the bot" % clean(login)))
         else:
-            problems.append((context, "creator %s is not the bot" % ((shown.get("creator") or {}).get("login"))))
+            bots.append(login)
     return problems, bots
 
 
@@ -63,30 +89,45 @@ def main(argv):
     parser.add_argument("--bot")
     parser.add_argument("--fixture")
     opts = parser.parse_args(argv)
+    if not 1 <= opts.count <= 100:
+        print("land-status-parity: --count must be from 1 to 100", file=sys.stderr)
+        return 2
+    if opts.repo is not None and not valid_repo(opts.repo):
+        print("land-status-parity: --repo must be OWNER/REPO", file=sys.stderr)
+        return 2
     try:
         if opts.fixture:
-            with open(opts.fixture) as handle:
-                commits = json.load(handle)
+            with open(opts.fixture, "rb") as handle:
+                raw = handle.read(MAX_FIXTURE_BYTES + 1)
+            if len(raw) > MAX_FIXTURE_BYTES:
+                raise ValueError("fixture oversize")
+            commits = json.loads(raw)
         elif opts.repo:
             commits = from_api(opts.repo, opts.count)
         else:
             parser.error("give --repo or --fixture")
-    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as err:
+    except (OSError, ValueError, RuntimeError, KeyError, AttributeError, subprocess.SubprocessError) as err:
         print("land-status-parity: cannot read the commits (%s)" % type(err).__name__, file=sys.stderr)
         return 2
     if not isinstance(commits, list) or not commits:
         print("land-status-parity: no commits to check", file=sys.stderr)
         return 2
+    if len(commits) > MAX_COMMITS:
+        print("land-status-parity: too many commits (limit %d)" % MAX_COMMITS, file=sys.stderr)
+        return 2
     failed = False
     for commit in commits:
-        sha = str(commit.get("sha", ""))[:12]
+        if not isinstance(commit, dict):
+            print("land-status-parity: malformed commit entry", file=sys.stderr)
+            return 2
+        sha = clean(commit.get("sha", ""), 12)
         problems, bots = check(commit, opts.bot)
         if problems:
             failed = True
             for context, reason in problems:
                 print("MISSING %s: %s (%s)" % (sha, context, reason))
         else:
-            print("OK %s: %s by %s" % (sha, ", ".join(CONTEXTS), bots[0]))
+            print("OK %s: %s by %s" % (sha, ", ".join(CONTEXTS), clean(bots[0])))
     if failed:
         return 1
     print("PARITY OK (%d commits checked)" % len(commits))
