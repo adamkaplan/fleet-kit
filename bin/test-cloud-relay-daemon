@@ -1358,10 +1358,11 @@ class Round2(Fixture):
     def header_trickle(self, h):
         import time
         try:
-            for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 30:   # one byte per 0.03 s: every socket read succeeds
+            for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 40:   # one byte per 0.02 s: every socket read succeeds
                 h.wfile.write(bytes([byte]))
                 h.wfile.flush()
-                time.sleep(0.01)
+                time.sleep(0.02)
+            self.trickle_finished.set()   # set before the handler returns and closes the socket, so the client never races the finally
         finally:
             self.trickle_finished.set()   # #1521: what the tests observe: had the handler finished when the fetch answered?
 

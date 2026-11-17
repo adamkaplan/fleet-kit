@@ -776,7 +776,7 @@ def _hold_lock(state):
     return fd
 
 
-def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
+def check_held_lock_skips_within_the_bound_and_writes_nothing(module, lock_wait=0.02, join_bound=2.0):
     import threading
     with tempfile.TemporaryDirectory() as state:
         held = fresh_file(state, "OLD\n", age=5)
@@ -789,10 +789,10 @@ def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
             out["t"] = time.monotonic() - start
         thread = threading.Thread(target=run, daemon=True)
         wait = module.LOCK_WAIT
-        module.LOCK_WAIT = 0.02   # the eight tries 0.25 s apart are the real bound; a short pause keeps the same eight tries
+        module.LOCK_WAIT = lock_wait   # the eight tries 0.25 s apart are the real bound; a short pause keeps the same eight tries
         try:
             thread.start()
-            thread.join(0.4)
+            thread.join(join_bound)   # generous: a loaded runner must not be mistaken for a hang
             assert not thread.is_alive(), "the pull hangs on a held lock"
         finally:
             module.LOCK_WAIT = wait
@@ -801,6 +801,11 @@ def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
         assert out["r"] == "untouched" and out["t"] < 4, out
         assert "lock" in err.getvalue() and len(err.getvalue().splitlines()) == 1, err.getvalue()
         assert (held.read_bytes(), held.stat().st_mtime_ns) == before, "the held file changed without the lock"
+
+
+def check_held_lock_tolerates_loaded_runner_scheduling_delay(module):
+    # 0.07 s per try (20 ms sleep plus ~50 ms of scheduling delay) x 8 tries = 0.56 s, past the old 0.4 s bound
+    check_held_lock_skips_within_the_bound_and_writes_nothing(module, lock_wait=0.07)
 
 
 def check_free_lock_writes(module):
@@ -870,6 +875,7 @@ ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_i
        check_unusable_held_pid_is_judged_by_generation_alone, check_pid_change_with_higher_generation_is_written,
        check_same_pid_restart_at_generation_one, check_response_age_edges_and_one_fetch, check_written_at_formats,
        check_interleaved_pulls_cannot_lower_the_generation, check_held_lock_skips_within_the_bound_and_writes_nothing,
+       check_held_lock_tolerates_loaded_runner_scheduling_delay,
        check_free_lock_writes]
 
 
@@ -1200,6 +1206,12 @@ class Mutants(unittest.TestCase):
 
     def test_m33_blocking_flock_hangs_on_a_held_lock(self):
         self.failing(check_held_lock_skips_within_the_bound_and_writes_nothing, mutant("fcntl.LOCK_EX | fcntl.LOCK_NB", "fcntl.LOCK_EX"))
+
+    def test_m35_tight_join_bound_fails_under_loaded_runner_delay(self):
+        module = load(SOURCE)
+        with self.assertRaises(AssertionError):   # the old 0.4 s bound mistakes 8 x 0.07 s of tries for a hang
+            check_held_lock_skips_within_the_bound_and_writes_nothing(module, lock_wait=0.07, join_bound=0.4)
+        check_held_lock_skips_within_the_bound_and_writes_nothing(module, lock_wait=0.07, join_bound=2.0)
 
     def test_m34_skip_writes_without_the_lock(self):
         self.failing(check_held_lock_skips_within_the_bound_and_writes_nothing, mutant("            return UNTOUCHED\n        held", "            pass\n        held"))

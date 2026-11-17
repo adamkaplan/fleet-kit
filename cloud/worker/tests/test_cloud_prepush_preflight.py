@@ -14,13 +14,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.a
 SCRIPT = os.path.join(ROOT, "bin", "cloud-prepush")
 TD = "cloud/worker/tests/"
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t",
-           GIT_COMMITTER_EMAIL="t@example.invalid", GIT_CONFIG_NOSYSTEM="1")
+           GIT_COMMITTER_EMAIL="t@example.invalid", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
 PASS = "import sys\nsys.exit(0)\n"
 PLANT = "PLANTED_" + "TOK" + "EN_VALUE"  # assembled at runtime; a fake value only
 
 
+GIT_FLAGS = ("-c", "maintenance.auto=0", "-c", "gc.auto=0")
+
+
 def git(cwd, *a):
-    p = subprocess.run(["git"] + list(a), cwd=cwd, capture_output=True, text=True, env=ENV)
+    p = subprocess.run(["git", *GIT_FLAGS, *a], cwd=cwd, capture_output=True, text=True, env=ENV)
     assert p.returncode == 0, (a, p.stderr)
 
 
@@ -92,6 +95,26 @@ class PreflightStep(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="prepush-pf-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_git_helper_disables_auto_maintenance_and_global_config(self):
+        from unittest import mock
+        def calls(helper):
+            seen = []
+            real = subprocess.run
+            def spy(cmd, **kw):
+                seen.append(cmd)
+                return real(["git", "--version"], **kw)
+            with mock.patch.object(subprocess, "run", spy):
+                helper(self.tmp, "status")
+            return seen[0]
+        def mutant_git(cwd, *a):   # omits maintenance.auto=0
+            p = subprocess.run(["git", "-c", "gc.auto=0", *a], cwd=cwd, capture_output=True, text=True, env=ENV)
+            assert p.returncode == 0, (a, p.stderr)
+        self.assertEqual(ENV.get("GIT_CONFIG_GLOBAL"), "/dev/null")
+        good = " ".join(calls(git))
+        self.assertIn("-c maintenance.auto=0", good)
+        self.assertIn("-c gc.auto=0", good)
+        self.assertNotIn("-c maintenance.auto=0", " ".join(calls(mutant_git)))
 
     def test_failing_preflight_prints_its_lines_and_runs_no_test(self):
         repo = make_repo(self.tmp, TESTS)
