@@ -91,14 +91,22 @@ ALLOWED = {}   # ask #2402: the one exemption (a guarded fixture write in test_p
 GUARD_TEXT = 'os.environ.get("WRITE_PUSH_RULES") == "1"'
 
 
+_FILE_CACHE = {}
+
+
 def scan(files, allowed):
     """`path:line` of every write under the root, minus the lines of an allowed path whose source holds its guard (at most one line)."""
     found = []
     for p in files:
         rel = os.path.relpath(p, KIT)
-        with open(p) as fh:
-            src = fh.read()
-        lines = writes_under_root(src)
+        if p in _FILE_CACHE:
+            src, lines = _FILE_CACHE[p]
+        else:
+            with open(p) as fh:
+                src = fh.read()
+            lines = writes_under_root(src)
+            if p.startswith(KIT):
+                _FILE_CACHE[p] = (src, lines)
         if rel in allowed and GUARD_TEXT in src and len(lines) <= 1:
             continue
         found += ["%s:%d" % (rel, ln) for ln in lines]

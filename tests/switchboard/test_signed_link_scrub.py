@@ -157,6 +157,7 @@ def build(Base, GithubRig):
             rig.gh.issue(1)
             rig.gh.issue(12, parent=1)
             rig.hub.tick()
+            rig.world.tick(100)
             values = []
             for i, name in enumerate(LINK_SCRUB_NAMES):
                 values.append(_planted(i))

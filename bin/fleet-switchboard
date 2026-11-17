@@ -2018,6 +2018,9 @@ class Switchboard:
         read_mark(self, "agents", not problems, "the fleet could not be read whole: %s" % _one_line(problems[0], 80) if problems else "", now)
         return found
 
+    def lane_gate(self, lane, tier, since, worker=None):   # #2545: push_watch asks it (bin/push_watch.py)
+        return lane_gate(self.discovery, lane, tier, self.now(), since, worker, jobs_alive=jobs_active_for)
+
     def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
@@ -8633,8 +8636,7 @@ def pod_silence_summary(worker):
 
 def pod_silence_tick(engine, discovery, summary=None):
     """#2115: a running cloud pod with no push and no report for 20 minutes tells its recorded boss ONE summary line (bin/pod_silence.py)."""
-    state_dir = getattr(engine, "state_dir", None)
-    watch = getattr(engine, "cloud_watch", None)
+    state_dir, watch = engine.state_dir if hasattr(engine, "state_dir") else None, engine.cloud_watch if hasattr(engine, "cloud_watch") else None
     if state_dir is None or not watch:
         return []
     reports = _read_small(state_dir, LAST_REPORT_FILE)
@@ -8649,11 +8651,12 @@ def pod_silence_tick(engine, discovery, summary=None):
         said = reports.get(name) if isinstance(reports.get(name), dict) else {}
         branches = ((pushes or {}).get(name) or {}).get("branches")
         at = [b.get("at") for b in branches.values() if isinstance(b, dict)] if isinstance(branches, dict) else []
-        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done",
+        live.append({"worker": name, "boss": _cloud_boss(rec.get("reports_to")), "last_report": said.get("at"), "done": said.get("state") == "done", "jobs": rec.get("jobs") if isinstance(rec.get("jobs"), list) else None,
                      "last_push": max([a for a in at if isinstance(a, (int, float))] or [None], key=lambda a: a or 0)})
     return load_module("pod_silence").scan(live, now, Path(state_dir) / "pod-silence.json", lambda to, text: engine.send("switchboard", to, text),
                                            summary or pod_silence_summary, load_module("record_json").parse_bounded, prune=not watch.get("capped"),
-                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail))
+                                           audit=lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "pod_silence.unreadable", worker, detail),
+                                           gate=lambda boss, since, worker, jobs: lane_gate(discovery, boss, 2, now, since, worker, pod_jobs=jobs, jobs_alive=jobs_active_for))   # #2545: an orchestrator hears a quiet pod at its :00 UTC bucket
 
 
 def lost_worker_tick(engine, discovery):
@@ -8745,6 +8748,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
     try:
+        stream_error_tick(engine, discovery)   # #2551: a provider stream error is resumed
+    except Exception as err:
+        engine._failed("stream-error", "stream-error", err, report)
+    try:
         push_watch_tick(engine, discovery)   # #1740: a worker's push is told to the lane that launched it
     except Exception as err:
         engine._failed("push-watch", "push-watch", err, report)
@@ -8766,18 +8773,11 @@ def finish_pass(engine, discovery, report):
         engine._failed("health-records", "health-records", err, report)
     schedule_judge_warm(engine, discovery)
 
-
-# ---- the daily friction wake (docs/switchboard.md, "Self-wakes"). Off unless `friction_wake.enabled`; like
-# `external_decisions` the key is absent from DEFAULTS, so a config that never names it is exactly what it was.
-
-FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or your coders down in the last day? "
-                 "If anything is worth fixing, send %(to)s a one-paragraph proposal: "
-                 "fleet-switchboard send %(to)s --issue <n> \"<proposal>\". "
-                 "If nothing, do nothing and say nothing.")
+# ---- the daily friction wake (docs/switchboard.md, "Self-wakes"). Off unless `friction_wake.enabled`.
+FRICTION_TEXT = ("Daily friction check (one short answer): what slowed you or your coders down in the last day? If anything is worth fixing, send %(to)s a one-paragraph proposal: fleet-switchboard send %(to)s --issue <n> \"<proposal>\". If nothing, do nothing and say nothing.")
 FRICTION_DEFAULTS = {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None}
 FRICTION_STATE = "friction-wake.json"
 FRICTION_GRACE = 4 * 3600   # a slot is asked for at most this long after it began: a wake at 09:00, never at 15:00
-
 
 def validate_friction_config(config, source):
     """`friction_wake`: absent or null is off. `hour` is 0-23 in the daemon's local time, or null for every 24 h
@@ -8811,17 +8811,14 @@ def validate_friction_config(config, source):
                           % (where, text))
     config["friction_wake"] = section
 
-
 def friction_slot(now, hour, anchor):
-    """The start (epoch seconds) of the newest wake slot at or before `now`: the last `hour`:00 in the daemon's
-    local time, or, with no hour, the newest 24 h step from `anchor`."""
+    """The start (epoch seconds) of the newest wake slot at or before `now`."""
     if hour is None:
         return anchor + int((now - anchor) // 86400) * 86400
     moment = datetime.fromtimestamp(now).replace(hour=hour, minute=0, second=0, microsecond=0)
     if moment.timestamp() > now:
         moment = datetime.fromtimestamp(now - 86400).replace(hour=hour, minute=0, second=0, microsecond=0)
     return moment.timestamp()
-
 
 def read_friction_state(state_dir):
     """{name: {"anchor", "done"}}. Disposable: a file that is missing or unreadable is an empty one."""
@@ -8830,7 +8827,6 @@ def read_friction_state(state_dir):
     except (OSError, ValueError):
         return {}
     return {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
-
 
 def write_friction_state(state_dir, found):
     path = Path(state_dir) / FRICTION_STATE
@@ -8841,13 +8837,8 @@ def write_friction_state(state_dir, found):
         handle.write("\n")
     os.replace(str(temp), str(path))
 
-
 def friction_tick(engine, discovery):
-    """The end of a pass: an orchestrator (or the Chief of Staff, whose proposals go to `cos_to`) whose slot has begun and has not been asked gets ONE reminder (the
-    ordinary kind, delivered by the next pass by the ordinary rule). Nothing is read from v2 and nothing is written
-    unless someone is due; `friction-wake.json` records the slot asked, so a restart or a later pass makes no second
-    one. An orchestrator a person has engaged with, or that is blocked or held, is skipped for now (asked again
-    until the slot is FRICTION_GRACE old). Returns [(name, slot)]."""
+    """The end of a pass: an orchestrator (or cos) whose slot has begun and has not been asked gets ONE reminder. Returns [(name, slot)]."""
     section = engine.config.get("friction_wake") or {}
     if not section.get("enabled") or discovery is None or engine.state_dir is None:
         return []
@@ -8884,7 +8875,6 @@ def friction_tick(engine, discovery):
         write_friction_state(engine.state_dir, state)
     return asked
 
-
 def friction_status_line(config, state_dir, now=None):
     """The `status` line for the daily friction wake, or None when the config cannot be read."""
     section = (config or {}).get("friction_wake")
@@ -8893,39 +8883,34 @@ def friction_status_line(config, state_dir, now=None):
     hour = section["hour"]
     slots = [v.get("done") for v in read_friction_state(state_dir).values() if _is_number(v.get("done"))]
     last = iso(max(slots)) if slots else "none yet"
-    return "friction wake: on, %s to %s; cos to %s; last slot %s" % (
-        "%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
-
-
-# ---- the audited resume (docs/switchboard.md, "A blocked agent is reported"). ONE function resumes an agent whose turn has ended: the
-# `resume` command and the blocked-report pass both call `resume_ended_turn`, so the refusals, the rate limit and the audit line are the same.
-
+    return "friction wake: on, %s to %s; cos to %s; last slot %s" % ("%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
+# ---- the audited resume (docs/switchboard.md, "A blocked agent is reported").
 RESUME_STATE = "resumes.json"   # {agent: {"at": epoch}}: the last resume of each agent (the rate limit; an ordinary state row)
 RESUME_SECONDS = 600            # one resume per agent per 10 minutes
 RESUME_TEXT = "Your last turn ended without a finished answer (for example a provider error). Carry on from where you stopped."
 RESUME_REASON = "its turn ended and nothing is open"
 RESUME_COMMAND = PROG + " resume"   # the one spelling the report, the documentation, the help and the owner's grant use
-PROVIDER_ERROR = re.compile(r"\b499\b|ECONNRESET|time(?:d)?[ -]?out", re.I)
-
-
+STREAM_ERRORS = ("stream ended without finish_reason", "incomplete stream", "premature close", "unexpected eof")
+STREAM_ERROR = re.compile("|".join(STREAM_ERRORS), re.I)
+PROVIDER_ERROR = re.compile(r"\b499\b|ECONNRESET|time(?:d)?[ -]?out|" + "|".join(STREAM_ERRORS), re.I)
 class ResumeRefused(Exception):
     """The resume was not sent: the reason is the message, and nothing was written."""
-
-
-def last_turn_error(engine, session_id):
-    """The error text of the session's newest message, or "" (none, or it could not be read)."""
+def last_turn_error_and_id(engine, session_id):
+    """(scrubbed error text, message id) of the session's newest message, or ("", None)."""
     try:
         newest = (engine.v2.message_list(session_id, limit=1, order="desc") or [None])[0]
     except Exception:
-        return ""
-    error = (newest.get("error") or (newest.get("info") or {}).get("error")) if isinstance(newest, dict) else None
-    return _one_line(json.dumps(error) if not isinstance(error, str) else error, 300) if error else ""
-
-
-def resume_ended_turn(engine, caller, name, reason, discovery=None):
-    """Send the resume text to `name`'s session, only when its turn has ended and nothing is open. Raises ResumeRefused (nothing sent, nothing
-    audited) for a missing or unreadable agent, a working session, an open permission request or question (that goes to the owner), and an agent
-    resumed less than RESUME_SECONDS ago. Otherwise one `resume` audit line (who, whom, why) and the send; returns the message id."""
+        newest = None
+    if not isinstance(newest, dict):
+        return "", None
+    mid, error = newest.get("id") or (newest.get("info") or {}).get("id"), newest.get("error") or (newest.get("info") or {}).get("error")
+    raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", json.dumps(error) if not isinstance(error, str) else error) if error else ""
+    return (scrubbed_flag_text(raw, 300) if raw else ""), (mid if isinstance(mid, str) and mid else None)
+def last_turn_error(engine, session_id):
+    """The error text of the session's newest message, or "" (none, or it could not be read)."""
+    return last_turn_error_and_id(engine, session_id)[0]
+def resume_ended_turn(engine, caller, name, reason, discovery=None, window=None):
+    """Send the resume text to `name`'s session, only when its turn has ended and nothing is open. Raises ResumeRefused (nothing sent, nothing audited)."""
     caller, reason = blocked_sender(caller), _one_line(reason or RESUME_REASON, 200)
     now = engine.now()
     discovery = discovery if discovery is not None else engine.discover(now)
@@ -8949,10 +8934,9 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None):
     if kinds:
         raise ResumeRefused("%s has an open %s: that goes to the owner, nothing is sent" % (name, " and an open ".join(kinds)))
     taken = {}
-
     def take(state):   # the rate record, under the lock: a second resume inside the window finds this one
-        last = state.get(name, {}).get("at")
-        taken["last"] = last
+        last = state.get(name, {}).get("at") if window is None else None
+        taken["last"] = state.get(name, {}).get("at")
         if _is_number(last) and now - last < RESUME_SECONDS:
             return None
         state[name] = {"at": now}
@@ -8964,8 +8948,7 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None):
     keys = ["resume:%d" % now]
     message_id = derive_message_id(seen.session_id, keys)
     try:
-        engine.v2.synthetic(seen.session_id, RESUME_TEXT, {"fleet": {"keys": keys, "from": "switchboard"}}, True, "queue", message_id,
-                            "Resume: your turn ended, carry on")
+        engine.v2.synthetic(seen.session_id, RESUME_TEXT, {"fleet": {"keys": keys, "from": "switchboard"}}, True, "queue", message_id, "Resume: your turn ended, carry on")
     except Exception:
         blocked_update(engine.state_dir, RESUME_STATE, lambda s: dict(s, **{name: {"at": taken["last"]}}) if _is_number(taken["last"]) else {k: v for k, v in s.items() if k != name})
         raise
@@ -8973,11 +8956,8 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None):
     if engine.audit is not None:
         engine.audit.append(engine.actor, "resume", name, {"by": caller, "reason": reason, "session": seen.session_id, "message_id": message_id})
     return message_id
-
-
 def resume_first_recovery(engine, discovery, seen, reported):
-    """The automatic first recovery of the blocked report: a stop whose turn error holds HTTP 499, ECONNRESET or a timeout is resumed once,
-    through `resume_ended_turn` (the same refusals, rate limit and audit line), before it is reported. True when it was resumed; never raises."""
+    """The automatic first recovery of the blocked report: a stop whose turn error matches PROVIDER_ERROR is resumed once before it is reported."""
     try:
         error = last_turn_error(engine, seen.session_id) if reported is None else ""
         found = PROVIDER_ERROR.search(error)
@@ -8987,13 +8967,8 @@ def resume_first_recovery(engine, discovery, seen, reported):
         return True
     except Exception:
         return False
-
-
 def read_errored_turn(engine, observation, now):
-    """#1697: herdr says `blocked`, but after a provider error nothing is open. Sets `observation.errored` ONLY when the open permission list AND
-    the open question list were both read and are both empty, and the newest message's error matches PROVIDER_ERROR. Everything else stays
-    blocked: an open request, an unreadable list, an ended turn with no provider error, a spent read budget (fail closed). Never reads for an
-    agent herdr does not call blocked; at most three reads (two lists, the newest message). Returns the observation's `errored`."""
+    """#1697: sets `observation.errored` ONLY when `permission_list` and `form_list` were both read and empty, and newest message matches PROVIDER_ERROR."""
     if observation.status != "blocked" or getattr(engine, "light", False):
         return False
     reads = engine.reads
@@ -9005,32 +8980,63 @@ def read_errored_turn(engine, observation, now):
             return False
     except Exception:
         return False
-    observation.errored = bool(PROVIDER_ERROR.search(last_turn_error(engine, observation.session_id)))
+    err, mid = last_turn_error_and_id(engine, observation.session_id)
+    observation.turn_error, observation.turn_error_id = (err, mid) if PROVIDER_ERROR.search(err) else ("", None)
+    observation.errored = bool(observation.turn_error)   # #2551: the text and message id are kept for stream_error_tick
     return observation.errored
-
+STREAM_RESUME_STATE = "stream-resumes.json"   # {agent: {"times": [epoch], "last_id": newest message id handled}}
+STREAM_RESUME_WINDOW = 3600
+STREAM_RESUME_MAX = 3
+STREAM_RESUME_AGENTS_MAX = 64
+def stream_error_tick(engine, discovery):
+    """#2551: resume (through `resume_ended_turn` with `window=0`) each blocked agent on a provider stream failure; 4th in the hour goes to cos."""
+    if discovery is None or engine.state_dir is None:
+        return
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), "cos")
+    for name, seen in sorted(discovery.agents.items()):
+        try:
+            error, message = getattr(seen, "turn_error", "") or "", getattr(seen, "turn_error_id", None)
+            if seen.status != "blocked" or not getattr(seen, "errored", False) or not STREAM_ERROR.search(error):
+                continue
+            now, row = engine.now(), blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda s: None).get(name)
+            row = row if isinstance(row, dict) else {}
+            if not isinstance(message, str) or not message or row.get("last_id") == message:
+                continue
+            current_err, current_id = last_turn_error_and_id(engine, seen.session_id)
+            if current_id != message or not STREAM_ERROR.search(current_err):
+                continue
+            times = [t for t in (row.get("times") if isinstance(row.get("times"), list) else []) if _is_number(t) and 0 <= now - t < STREAM_RESUME_WINDOW][-STREAM_RESUME_MAX:]
+            if len(times) >= STREAM_RESUME_MAX:
+                outcome = engine.send("switchboard", cos, "[stream-error] %s failed %d times in the last hour on a provider stream error (%s); auto-resume capped at %d/hour." % (name, len(times) + 1, current_err, STREAM_RESUME_MAX)) if name != cos else {}
+                if not (outcome.get("sent") or outcome.get("held")):
+                    continue
+                engine._note("stream_error.escalated", name, {"error": current_err, "count": len(times) + 1})
+            else:
+                try:
+                    resume_ended_turn(engine, "switchboard", name, "provider stream error after an ended turn: %s" % current_err, discovery, window=0)
+                except ResumeRefused:
+                    continue
+                times.append(now)
+            def save(state, _name=name, _times=times, _msg=message, _now=now):
+                kept = {k: v for k, v in state.items() if k != _name and isinstance(v, dict) and isinstance(v.get("times"), list) and any(_is_number(t) and 0 <= _now - t < STREAM_RESUME_WINDOW for t in v["times"])}
+                kept[_name] = {"times": _times, "last_id": _msg}
+                newest = sorted(kept, key=lambda n: max([t for t in kept[n].get("times", []) if _is_number(t)] or [0]), reverse=True)
+                return {n: kept[n] for n in newest[:STREAM_RESUME_AGENTS_MAX]}
+            blocked_update(engine.state_dir, STREAM_RESUME_STATE, save)
+        except Exception as err:
+            engine._failed(name, "stream-error", err, {"errors": []})
 
 def ended_turn_text(name, resumed):
     """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
     if resumed:
-        return ("an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); "
-                "a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60))
-    return ("an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): "
-            "the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name))
-
-
-# ---- an undelivered wake is recovered (#1337, docs/switchboard.md, "An undelivered wake is recovered"). `Switchboard.deliver` counts a key delivered once v2
-# ADMITTED it (`_acknowledge`), so a wake queued for an idle session that never starts a turn is never planned again. This pass reads the inbox (the
-# queue: items the session has not taken), and for an idle agent whose queued wake is older than `undelivered_wake_minutes` and absent from the
-# transcript it calls `resume_ended_turn` once per incident; after twice that time with the keys still absent the Chief of Staff is told once.
-
+        return "an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60)
+    return "an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name)
+# ---- an undelivered wake is recovered (#1337, docs/switchboard.md, "An undelivered wake is recovered").
 UNDELIVERED_STATE = "undelivered-wake.json"   # {agent: {"session", "since", "keys", "resumed", "told"}}: one incident per agent (an ordinary state row)
 UNDELIVERED_KEYS = 20                         # keys named in a line, then "and N more"
 UNDELIVERED_STATES = ("undelivered", "admitted-in-transcript", "admitted-absent", "refused", "resumed", "told")   # the delivery states; the completeness test derives its cases from this
-
-
 def queued_wakes(engine, seen, now, fresh=False):
-    """{key: created} of the switchboard wakes queued in `seen`'s inbox (one read). Inputs are untrusted: a time outside 2000..now is dropped, a
-    non-string key is dropped (`_fleet_keys`), resume: and orders: keys are not wakes."""
+    """{key: created} of the switchboard wakes queued in `seen`'s inbox (one read)."""
     inbox = engine.reads.inbox(seen.session_id, now, fresh=fresh)   # a remembered read finds nothing to do for free; a candidate is read again fresh
     found = {}
     for item in inbox if isinstance(inbox, list) else []:
@@ -9044,12 +9050,8 @@ def queued_wakes(engine, seen, now, fresh=False):
             if not key.startswith(("resume:", "orders:")):
                 found[key] = min(created, found.get(key, created))
     return found
-
-
 def transcript_keys(engine, seen, since):
-    """The keys in the agent's synthetic messages back to `since` (the oldest wake's admission), read page by page like `delivered_keys`, at most
-    MAX_READ_PAGES pages. The sent-keys ledger is NOT consulted: it counts a key at ADMISSION, which is the very thing this rule doubts. The
-    remaining false positive: a delivered key buried under more than MAX_READ_PAGES * SYNTHETIC_PAGE newer synthetic messages reads as absent."""
+    """The keys in the agent's synthetic messages back to `since` (at most MAX_READ_PAGES pages)."""
     have = set()
     for page, more in engine.v2.message_pages(seen.session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
         reached = False
@@ -9063,8 +9065,6 @@ def transcript_keys(engine, seen, since):
         if reached or len(page) < SYNTHETIC_PAGE or more is False:
             break
     return have
-
-
 def undelivered_wakes(engine, seen, now, fresh=False):
     """[(key, created)] of the switchboard wakes queued in `seen`'s inbox whose keys are not in its transcript; [] when nothing is read."""
     found = queued_wakes(engine, seen, now, fresh=fresh)
@@ -9072,13 +9072,8 @@ def undelivered_wakes(engine, seen, now, fresh=False):
         return []
     have = transcript_keys(engine, seen, min(found.values()))
     return sorted(((k, t) for k, t in found.items() if k not in have), key=lambda row: (row[1], row[0]))
-
-
 def undelivered_wake_tick(engine, discovery):
-    """The end of a pass: resume an idle agent whose admitted wake is absent from its transcript past `undelivered_wake_minutes` (once per incident,
-    at most `undelivered_wake_per_pass` agents a pass, oldest first), and tell the Chief of Staff once when it is still absent `undelivered_wake_tell_minutes`
-    after the RESUME. Returns [(agent, "resume" | "told")]. A working or blocked agent, one with an unreadable inbox or transcript, and a wake not yet
-    that old are left alone."""
+    """The end of a pass: resume an idle agent whose admitted wake is absent from its transcript past `undelivered_wake_minutes`."""
     if discovery is None or engine.state_dir is None or engine.light:
         return []
     limit = engine.config["undelivered_wake_minutes"] * 60
@@ -10084,8 +10079,7 @@ def _wh_issues(repo, payload, now):
     label = (payload.get("label") or {}).get("name") if isinstance(payload.get("label"), dict) else None
     if action in ("labeled", "unlabeled") and label:
         what = "label %s %s" % (label, "added" if action == "labeled" else "removed")
-    item = _issue_item(repo, issue, now, what)
-    return [item] if item else []
+    return issue_item_list(_issue_item(repo, issue, now, what), action, label, _login(payload.get("sender")))   # #2545: the tier reads these, never the summary text
 
 
 def _wh_issue_comment(repo, payload, now):
@@ -10856,7 +10850,7 @@ class GitHubHub:
         with self.lock:
             for key in [k for k, i in self.queue.items() if i.created < now - self.lookback]:
                 del self.queue[key]
-        self.note_conflicts(now)
+        self.note_conflicts(now); queue_pr_green(self, now, GitHubItem)   # #2545
         with self.lock:
             waiting = [item for item in self.queue.values() if item.recipient is None]
         if waiting:
@@ -10873,9 +10867,7 @@ class GitHubHub:
             self._audit_unrouted()
             self._audit_routed()
         with self.lock:
-            found = [Fact(i.key, i.recipient, i.kind, i.summary, i.created, issue=i.issue, sender=i.sender,
-                          repo=i.repo)
-                     for i in self.queue.values() if i.recipient]
+            found = [tiered_fact(i, Fact, self) for i in self.queue.values() if i.recipient]   # #2545: the tier an orchestrator batches it by
         found.extend(self.intent_edit_facts())
         for fact in found:
             # An object seen again (a catch-up, a redelivery) was perhaps delivered long
@@ -10999,7 +10991,7 @@ class GitHubHub:
         return self._deliver_summary(item, lane, "chief", "no lane could be decided (%s)" % why)
 
     def _chief_lanes(self, item, agents):
-        lanes = [n for n in sorted(agents) if _is_orchestrator(agents[n]) and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
+        lanes = [n for n in sorted(agents) if (agents[n].fleet or {}).get("role") == "chief-of-staff" and ((agents[n].fleet or {}).get("repo") in (None, item.repo))]
         own = [n for n in lanes if (agents[n].fleet or {}).get("repo") == item.repo]
         return own or lanes   # a lane bound to this repository comes before one bound to none: two Chiefs of different organisations never share an issue
 
@@ -22505,8 +22497,8 @@ def add_core_parsers(sub):
     remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
     remind.add_argument("--cancel-key", metavar="KEY", help="Cancel every waiting reminder of yours with this key (a chain armed with --key); a delivered one is not recalled")
     remind.add_argument("--key", default=None, help="Name the purpose: arming again with the same key replaces your pending reminder of that key.")
-    remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
-                        "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
+    remind.add_argument("--every", metavar="INTERVAL", default=None, help="With --key: repeat on the 15-minute UTC grid (15m, 30m, 1h, 2h, 1d; a multiple of 15m)")
+    remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed (by default a reminder about an issue is dropped, unsent, once the issue is closed)")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
     remind.add_argument("--ttl", metavar="DURATION", default=None, help="Drop the reminder, unsent and audited, if it cannot be delivered within this long "
                         "after it is due (30m, 2h; at most 24h)")

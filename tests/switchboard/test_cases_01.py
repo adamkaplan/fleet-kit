@@ -850,8 +850,8 @@ class TestGhShim(Base):
         write_fake_env(self.home, environ)
         if self.log.exists():
             self.log.unlink()
-        done = subprocess.run([sys.executable, str(SHIM)] + list(args), input=stdin, capture_output=True, text=True,
-                              env=environ, timeout=60)
+        done = importlib.import_module("support.rebind").run_in_process(None, list(args), environ, stdin=stdin) if "FAKE_WHO_SLEEP" not in environ else subprocess.run(
+            [sys.executable, str(SHIM)] + list(args), input=stdin, capture_output=True, text=True, env=environ, timeout=60)
         seen = json.loads(self.log.read_text()) if self.log.exists() else None
         return done, seen
 

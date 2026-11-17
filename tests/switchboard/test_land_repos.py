@@ -7,11 +7,14 @@ import sys
 import tempfile
 import types
 import unittest
+import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_push_watch import Case, NOW, load, record, parse_iso   # noqa: E402  (the push watch's own fake world)
+from support.loader import captured, sb   # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SHA = "d" * 40
@@ -65,9 +68,17 @@ class TestReader(unittest.TestCase):
             self.land.validate_land_repos({"land_repos": good}, "config.json")
 
 
+def _load_source(name, path):
+    loader = SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    sys.modules[name] = mod
+    loader.exec_module(mod)
+    return mod
+
+
 class TestConfigLoader(unittest.TestCase):
     def test_the_daemons_config_check_accepts_the_key_and_refuses_a_bad_one(self):
-        sb = SourceFileLoader("sb_land_repos", str(REPO / "bin" / "fleet-switchboard")).load_module()
+        sb = _load_source("sb_land_repos", str(REPO / "bin" / "fleet-switchboard"))
         self.assertEqual(sb.validate_config({"land_repos": []})["land_repos"], [])
         self.assertNotIn("land_repos", sb.validate_config({"land_repos": None}))
         with self.assertRaises(sb.ConfigError) as caught:
@@ -118,7 +129,12 @@ class TestGatesSkipped(unittest.TestCase):
         if self.log.exists():
             self.log.unlink()
         args = [command, "%s#7" % repo] + (["--for", "merge"] if command == "gates-check" else []) + list(extra)
-        done = subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard")] + args, capture_output=True, text=True, env=env, timeout=90)
+        with mock.patch.dict(os.environ, env), captured() as (out, err):   # the entry's main in this process: no interpreter start and import per call
+            try:
+                code = sb.main(args)
+            except SystemExit as stop:
+                code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        done = subprocess.CompletedProcess(args, code or 0, out.getvalue(), err.getvalue())
         calls = [json.loads(l) for l in self.log.read_text().splitlines()] if self.log.exists() else []
         return done, calls
 
@@ -264,10 +280,10 @@ class TestLandCompletion(Case):
         self.assertEqual([r[0] for r in self.reports], ["w-ab"])
 
     def test_the_daemons_own_tick_gives_the_push_watch_the_land_reader(self):
-        sb = SourceFileLoader("sb_land_tick", str(REPO / "bin" / "fleet-switchboard")).load_module()
+        sb = _load_source("sb_land_tick", str(REPO / "bin" / "fleet-switchboard"))
         seen = []
         engine = types.SimpleNamespace(state_dir=None, hub=types.SimpleNamespace(gh_api=lambda *a, **k: []), config={"land_repos": ["acme-org/*"]}, now=lambda: NOW, audit=None, actor="switchboard")
-        real = SourceFileLoader("pw_probe", str(REPO / "bin" / "push_watch.py")).load_module()
+        real = _load_source("pw_probe", str(REPO / "bin" / "push_watch.py"))
         real_run = real.run_pass
         import importlib.util
         orig = importlib.util.spec_from_file_location
@@ -294,7 +310,7 @@ class TestLandCompletion(Case):
 
 class TestSweepSkip(unittest.TestCase):
     def test_sweep_refresh_does_not_read_a_land_repository_and_reads_another(self):
-        sb = SourceFileLoader("sb_land_sweep", str(REPO / "bin" / "fleet-switchboard")).load_module()
+        sb = _load_source("sb_land_sweep", str(REPO / "bin" / "fleet-switchboard"))
         read = []
         sb.sweep_read_repo = lambda hub, repo, *a, **k: (read.append(repo), {"at": 0, "items": {}, "truncated": False, "error": None})[1]
         for config, expected in (({"land_repos": ["acme-org/*"]}, ["acme/other"]), ({"land_repos": []}, ["acme/other", "acme-org/widget"]), ({}, ["acme/other", "acme-org/widget"])):

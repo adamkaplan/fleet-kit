@@ -1,6 +1,8 @@
 # ------------------------------------------------------------ the decision
 
 import copy
+import hashlib
+import math
 
 
 class MessageTooLong(Exception):
@@ -45,6 +47,126 @@ def hold_reason(observation, missing=None):
     return None
 
 
+# ---- #2545: an orchestrator's non-urgent events are batched onto synchronized UTC buckets (the Chief of Staff, workers and testers keep `batch_seconds`).
+# Tier 0: at once. Tier 1: the next :00/:30 UTC. Tier 2: the next :00 UTC. Tier 3: a rider, never the reason for a message.
+# Every wake carries everything pending (Tier 0 to 3). A deterministic per-agent jitter (sha256 of the name, 0 to 45 s) spreads the lanes.
+ORCH_BUCKET_SECONDS = {1: 1800, 2: 3600}
+ORCH_JITTER_MAX = 45
+def orchestrator_jitter(recipient):
+    """0 to ORCH_JITTER_MAX seconds, the same for one name on every pass and every machine."""
+    return int(hashlib.sha256(str(recipient).encode("utf-8")).hexdigest(), 16) % (ORCH_JITTER_MAX + 1)
+
+
+def bucket_target(recipient, tier, since):
+    """The first bucket boundary (plus the recipient's jitter) at or after `since`: :00/:30 UTC for tier 1, :00 UTC for tier 2."""
+    period, jitter = ORCH_BUCKET_SECONDS[tier], orchestrator_jitter(recipient)
+    return math.ceil((since - jitter) / period) * period + jitter
+
+
+def github_tier(item, hub):
+    """The tier (1, 2 or 3) of a GitHub item bound for an orchestrator, from the item's own fields (never from its summary text); None for a kind not tiered here."""
+    kind, key, actionable = item.kind, item.key, bool(item.actionable)
+    if kind in ("github.conflict", "github.pr_green"):
+        return 1
+    if kind == "github.stage":
+        return 2
+    if kind in ("github.pr", "github.subissue"):
+        return 3
+    if kind == "github.check":
+        return 1 if actionable else 3   # a failed check; a passing one is only carried
+    if kind == "github.review":
+        return 2 if key.startswith("github.botreview:") else 1 if actionable else 3   # changes requested; approved and commented only ride
+    if kind == "github.comment":
+        login = str(item.sender or "").lower()
+        bot = login.endswith("[bot]") or login in {str(b).lower() for b in (hub.config.get("github_bot_logins") or [])}
+        if key.startswith("github.reviewcomment:"):
+            return 2 if bot else 1
+        return 1 if actionable and not bot else 3
+    if kind == "github.issue":
+        action, label, actor = getattr(item, "action", None), getattr(item, "label", None), getattr(item, "actor", None)
+        if action == "labeled" and isinstance(label, str) and ":awaiting-" in label:
+            return 1
+        if action in ("closed", "reopened") and not hub._fleet_login(actor):
+            return 1   # an external close or reopen
+        return 3
+    return None
+
+
+def issue_item_list(item, action, label, actor):
+    """[item] with the fields `github_tier` reads (the webhook's action, the label and who did it), or [] for no item."""
+    if item is None:
+        return []
+    item.action, item.label, item.actor = action, label, actor
+    return [item]
+
+
+def tiered_fact(item, fact_class, hub):
+    """The Fact of a routed GitHub item, with its `tier` (the one decision.fact_tier reads)."""
+    fact = fact_class(item.key, item.recipient, item.kind, item.summary, item.created, issue=item.issue, sender=item.sender, repo=item.repo)
+    fact.tier = github_tier(item, hub)
+    return fact
+
+
+def fact_tier(fact):
+    """0, 1, 2 or 3 for a fact bound for an orchestrator, or None for a kind this rule does not tier (it keeps `batch_seconds`)."""
+    if not fact.batch or fact.kind in ("send", "report", "reminder", "intent.edit"):
+        return 0
+    if fact.rider:
+        return 3
+    return getattr(fact, "tier", None)
+
+
+def is_orchestrator(observation):
+    return observation is not None and (getattr(observation, "fleet", None) or {}).get("role") == "orchestrator"
+
+
+def mark_bucket_targets(recipient, facts, now):
+    """Sets `bucket_target` on every pending fact of an orchestrator that is not tier 0, before anything is delivered or measured: tier 1 and 2 to their bucket,
+    tier 3 (which has no time of its own) to `now`. DELAYED_AFTER counts from it, so a fact flushed early by a tier 0 event, or at its bucket, is never late for waiting."""
+    for fact in facts:
+        tier = fact_tier(fact)
+        if tier in ORCH_BUCKET_SECONDS:
+            fact.bucket_target = bucket_target(recipient, tier, fact.created)
+        elif tier == 3:
+            fact.bucket_target = now
+
+
+def orchestrator_ready_at(recipient, chosen, batch_seconds):
+    """When the first of `chosen` (facts that are not riders; `mark_bucket_targets` has run) may start a message to an orchestrator."""
+    return min(f.bucket_target if fact_tier(f) in ORCH_BUCKET_SECONDS else f.created + (0 if fact_tier(f) == 0 else batch_seconds) for f in chosen)
+
+
+def lane_gate(discovery, recipient, tier, now, since, worker=None, root=None, pod_jobs=None, jobs_alive=None):
+    """"go", "wait" or "drop" for a message the daemon itself would send to `recipient` (push_watch, pod_silence). Only an orchestrator is gated:
+    tier 3 is dropped, tier 2 and 1 wait for their bucket (tier 2 also while the worker has a detached `job` alive here, or a cw-run job its pod record names
+    in `pod_jobs`), tier 0 goes. A fleet that was not read (no discovery, or one with problems) waits: a role that is not known is never taken for not an orchestrator."""
+    if tier == 0:
+        return "go"
+    if discovery is None or getattr(discovery, "problems", None):
+        return "wait"
+    if not is_orchestrator((getattr(discovery, "agents", None) or {}).get(recipient)):
+        return "go"
+    if tier == 3:
+        return "drop"
+    if tier == 2 and (pod_jobs or (worker and jobs_alive is not None and jobs_alive(worker, root))):
+        return "wait"
+    return "go" if now >= bucket_target(recipient, tier, since) else "wait"
+
+
+def pr_green_notes(held, told):
+    """[(repo, number, head)] for each held PR read that is open and whose checks all finished green, once per (repo, pr, head) (`told` is the set)."""
+    found = []
+    for key, entry in sorted((held or {}).items()):
+        facts = entry.get("facts") if isinstance(entry, dict) else None
+        repo, _, number = key.rpartition("#")
+        head = facts.get("head") if facts else None
+        if not facts or facts.get("state") != "open" or facts.get("ci") != "green" or not isinstance(head, str) or not head or not number.isdigit():
+            continue
+        if (repo, int(number), head) not in told:
+            found.append((repo, int(number), head))
+    return found
+
+
 def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds, missing=None):
     """The delivery rule for one recipient's pending facts. Reads nothing; writes nothing.
 
@@ -66,11 +188,14 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
             return Plan(recipient, "hold", reason, standing, observation)
     # PR 13: riders are carried, never the reason for a message. Only the others choose the action
     # and start the batch clock; when there is any other, every rider goes with it.
-    chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider]
+    orchestrator = is_orchestrator(observation)
+    if orchestrator:
+        mark_bucket_targets(recipient, pending, now)   # before the batching rule and before delayed_since: a fact flushed early is not late for its bucket
+    chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider and not (orchestrator and fact_tier(fact) == 3)]   # #2545: tier 3 never starts a message
     if not chosen:
         return None
     if not fault("no-batch") and all(fact.batch for fact in chosen):
-        ready_at = chosen[0].created + batch_seconds
+        ready_at = orchestrator_ready_at(recipient, chosen, batch_seconds) if orchestrator else chosen[0].created + batch_seconds
         if now < ready_at:
             return Plan(recipient, "wait", "batching until %s" % iso(ready_at), pending, observation, ready_at)
     reason = hold_reason(observation, missing)
@@ -162,7 +287,7 @@ def in_late_scope(fact):
 
 def delayed_since(facts, delivered):
     """The oldest sent time among the alerts and digests older than DELAYED_AFTER at `delivered`, or None."""
-    late = [sent_at(f) for f in facts if in_late_scope(f) and delivered - sent_at(f) > DELAYED_AFTER]
+    late = [sent_at(f) for f in facts if in_late_scope(f) and delivered - (getattr(f, "bucket_target", None) or sent_at(f)) > DELAYED_AFTER]   # #2545: a fact held to its bucket is late from the bucket target
     return min(late) if late else None
 
 
@@ -404,3 +529,19 @@ def describe_items(recipient, facts, repos=None):
     else:
         line = "switchboard: %d items for %s: %s" % (len(facts), recipient, _line_of(lead.summary, 80))
     return _one_line(line, DESCRIPTION_MAX)
+
+
+def queue_pr_green(hub, now, item_class):
+    """#2545: `github.pr_green` for an open PR whose checks all finished green (`pr_green_notes`), once per (repo, pr, head sha): the check and the record are one step under the lock,
+    from the notice reads already held (no read of its own)."""
+    for repo, number, head in pr_green_notes(getattr(hub.engine, "notice_facts", None), ()):
+        item = item_class("github.pr_green:%s#%d:%s" % (repo, number, head), "github.pr_green", "PR #%d: all checks finished green at head %s" % (number, head[:7]),
+                          repo, [], [("pr", number)], None, now, [number], True)
+        with hub.lock:
+            green = hub.__dict__.setdefault("_green", set())   # kept on the hub, made at the first pass
+            if (repo, number, head) in green:
+                continue
+            if len(green) > 20000:
+                green.clear()
+            green.add((repo, number, head))
+            hub.queue.setdefault(item.key, item)

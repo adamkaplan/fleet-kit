@@ -29,7 +29,7 @@ index 0110153c..76b34d5f 100644
        - name: bin/fleet-scenario validate
          if: ${{ !cancelled() }}
 @@ -270,6 +273,42 @@ jobs:
-           bin/test-switchboard --shard ${{ matrix.shard }}/8 2>&1 | tee "$RUNNER_TEMP/out.txt"
+           bin/test-switchboard --shard ${{ matrix.shard }}/6 2>&1 | tee "$RUNNER_TEMP/out.txt"
            grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
  
 +  # The cloud launcher suite (bin/test-cloud-launcher.chain) in 4 shards, beside `test-cloud` (needs only `plan`) (ask #2500). One step of the whole chain outgrew its

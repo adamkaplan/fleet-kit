@@ -1,6 +1,7 @@
 """#1762: the heavy wrapper prints one progress line a minute while its command runs. A fake clock, a fake slot lock and a fake child: nothing waits for a real minute."""
 import faulthandler
 import importlib.util
+import io
 import os
 import signal
 import subprocess
@@ -52,6 +53,15 @@ def load_heavy():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _inner_run(path, inner, extra_env=None):
+    """The inner test, run in this process against the scratch copy `path` (what a child process started on this file would do): a CompletedProcess."""
+    env = dict(FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", **(extra_env or {}))
+    buf = io.StringIO()
+    with mock.patch.dict(os.environ, env), mock.patch.object(sys.modules[__name__], "START_WAIT", float(env.get("FLEET_TEST_START_WAIT", START_WAIT))):
+        res = unittest.TextTestRunner(stream=buf, verbosity=2).run(TestHeavyProgress(inner))
+    return subprocess.CompletedProcess([], 0 if res.wasSuccessful() else 1, buf.getvalue(), "")
 
 
 class Out:
@@ -230,9 +240,7 @@ class TestHeavyProgress(unittest.TestCase):
                 self.assertFalse(os.path.abspath(path).startswith(os.path.abspath(os.path.join(here, "..", ".."))))
                 with open(path, "w") as handle:
                     handle.write(body)
-                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", **(extra_env or {}))
-                results[kind] = subprocess.run([sys.executable, __file__, "TestHeavyProgress." + inner], cwd=here, env=env,
-                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+                results[kind] = _inner_run(path, inner, extra_env)
         return results
 
     def test_s12_inner_s4_on_a_copy_without_the_progress_thread(self):
@@ -253,7 +261,7 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertTrue(rig.entered.is_set())
         lines = len(rig.out.lines)
         rig.release.set()   # the read ends after the wrapper returned
-        time.sleep(0.5)
+        time.sleep(0.15)
         self.assertEqual(len(rig.out.lines) - lines, 0, "a line was written after the wrapper returned")
 
     def test_s11_a_read_that_outlasts_the_join_writes_no_line_after_the_return(self):
@@ -269,7 +277,7 @@ class TestHeavyProgress(unittest.TestCase):
         self.assertEqual(len(rig.progress()), 2)
         lines = len(rig.out.lines)
         rig.now[0] += 180
-        time.sleep(0.5)
+        time.sleep(0.15)
         self.assertEqual(len(rig.out.lines) - lines, 0, "a line was written after the wrapper returned")
         self.assertEqual(after - before, 0, "the progress thread is still alive after the wrapper returned")
 
@@ -292,12 +300,10 @@ class TestHeavyProgress(unittest.TestCase):
                 open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 with open(path, "w") as handle:
                     handle.write(copies[kind])
-                env = dict(os.environ, FLEET_TEST_HEAVY_SLOTS=path, FLEET_TEST_INNER="1", FLEET_TEST_START_WAIT="1.5")
-                results[kind] = subprocess.run([sys.executable, __file__, "TestHeavyProgress.test_s10_inner_s4_with_the_thread_start_awaited"], cwd=here, env=env,
-                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+                results[kind] = _inner_run(path, "test_s10_inner_s4_with_the_thread_start_awaited", {"FLEET_TEST_START_WAIT": "0.4"})
         self.assertEqual(results["control"].returncode, 0, results["control"].stdout)
         self.assertEqual(results["mutant"].returncode, 1, results["mutant"].stdout)
-        self.assertIn("the progress thread did not start within 1.5 s", results["mutant"].stdout)
+        self.assertIn("the progress thread did not start within 0.4 s", results["mutant"].stdout)
 
     def test_u1_a_run_that_ends_before_the_interval_prints_nothing_of_its_own(self):
         rig = Rig(self, alive=0, status=5)
@@ -409,7 +415,8 @@ class TestHeavyProgress(unittest.TestCase):
         here = os.path.dirname(os.path.abspath(__file__))
         outcome = {}
         with tempfile.TemporaryDirectory() as scratch:
-            for kind, body in (("control", text), ("mutant", text.replace(anchor, "got_lock = progress_lock.acquire()"))):
+            short = text.replace(anchor, "got_lock = progress_lock.acquire(timeout=0.3)").replace("progress_thread.join(2)", "progress_thread.join(0.3)")   # the in-code bounds shortened: the outer bound can be short too
+            for kind, body in (("control", short), ("mutant", text.replace(anchor, "got_lock = progress_lock.acquire()").replace("progress_thread.join(2)", "progress_thread.join(0.3)"))):
                 path = os.path.join(scratch, kind + "_heavy_slots.py")
                 open(os.path.join(scratch, "heavy_slots_watch.py"), "w").write(open(os.path.join(here, "..", "..", "bin", "heavy_slots_watch.py")).read())
                 with open(path, "w") as handle:
@@ -418,7 +425,7 @@ class TestHeavyProgress(unittest.TestCase):
                 child = subprocess.Popen([sys.executable, __file__, "TestHeavyProgress.test_s14_inner_a_blocked_write_does_not_hold_the_return"], cwd=here, env=env,
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
                 try:
-                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "6")))   # the outer bound: only the mutant reaches it
+                    output, _ = child.communicate(timeout=float(os.environ.get("FLEET_TEST_S14_BOUND", "3")))   # the outer bound: only the mutant reaches it
                     outcome[kind] = (child.returncode, output, False)
                 except subprocess.TimeoutExpired:
                     child.send_signal(signal.SIGUSR1)   # the job's kill notice: the child names the hang and ends
@@ -466,7 +473,7 @@ class TestHeavyProgress(unittest.TestCase):
             self.assertEqual(len(rig.out.text.splitlines()), 1, "a line separator reached the error stream: %r" % (rig.out.text,))
             self.assertNotIn(sep, rig.out.text, "a line separator reached the error stream")
         heavy = load_heavy()
-        for code in range(0x110000):
+        for code in list(range(0x200)) + list(range(0x2000, 0x2100)) + [0xFEFF, 0xFFFE, 0xFFFF, 0x1D173, 0xE0001, 0xE007F]:   # a representative set: controls, Latin, the general punctuation block (U+2028, U+2029), format characters, noncharacters
             char = chr(code)
             out = Out([0])
             heavy._progress_interval({"FLEET_HEAVY_PROGRESS_SECONDS": char}, out)

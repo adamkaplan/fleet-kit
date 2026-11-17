@@ -10,6 +10,7 @@ The families are derived from the code, never listed twice:
 import argparse
 import ast
 import contextlib
+import copy
 import base64
 import datetime as dt
 import hashlib
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,23 +100,31 @@ def quiet_sites(tree):
             if isinstance(n, ast.Return) and isinstance(n.value, ast.Constant) and n.value.value is False]
 
 
+_SOURCE_TREE = ast.parse(load_source())
+_GUARD_COUNT = len(guard_nodes(_SOURCE_TREE))
+_HOLDER = [n for n in _SOURCE_TREE.body if isinstance(n, ast.ClassDef) and any(isinstance(f, ast.FunctionDef) and f.name in FUNCTIONS for f in n.body)]
+assert len(_HOLDER) == 1 and len(guard_nodes(ast.Module(body=_HOLDER, type_ignores=[]))) == _GUARD_COUNT   # every guard lives in the one class
+
+
 def mutant_module(index):
-    """The real source with the index-th plain guard removed; (module, number of guards)."""
-    tree = ast.parse(load_source())
-    guards = guard_nodes(tree)
-    if index >= len(guards):
-        return None, len(guards)
-    target = guards[index]
+    """The real module with the index-th plain guard removed from the class that holds the renewal; (module, number of guards).
+    Only that class is compiled again: the rest of the module is the real one's."""
+    if index >= _GUARD_COUNT:
+        return None, _GUARD_COUNT
+    holder = copy.deepcopy(_HOLDER[0])
+    target = guard_nodes(ast.Module(body=[holder], type_ignores=[]))[index]
 
     class Drop(ast.NodeTransformer):
         def visit_If(self, node):
             if node is target:
                 return ast.copy_location(ast.Pass(), node)
             return self.generic_visit(node)
+    Drop().visit(holder)
     mod = types.ModuleType("cloud_worker_mutant")
+    mod.__dict__.update(cw.__dict__)
     mod.__file__ = SOURCE_PATH
-    exec(compile(ast.fix_missing_locations(Drop().visit(tree)), SOURCE_PATH, "exec"), mod.__dict__)
-    return mod, len(guards)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[holder], type_ignores=[])), SOURCE_PATH, "exec"), mod.__dict__)
+    return mod, _GUARD_COUNT
 
 
 class Harness(base.Base):
@@ -148,10 +158,50 @@ class Harness(base.Base):
                     "    j.dump(st, open(p, 'w'))\n"
                     "sys.stdout.write('two words' if mode == 'space' else %r)\n" % (self.mode_file, self.minted, OLD, self.name + "-run", self.name, self.name, self.name, OTHER_TOKEN, NEW))
         self.set_mode("ok")
+        with open(script) as f:
+            mint_src = f.read()
+        real_run = subprocess.run
+
+        def run_in_process(cmd, *a, **kw):   # the fake mint run here, not in a new interpreter: the same (status, stdout, stderr)
+            if isinstance(cmd, list) and len(cmd) >= 2 and str(cmd[1]).endswith("/app_token.py"):   # the real mint, run here: its pipe end is this process's own
+                p = ta.run_in_process(list(cmd), kw.get("env") or os.environ)
+                subprocess.run = run_in_process   # the helper put the real one back
+                return subprocess.CompletedProcess(cmd, p.returncode, p.stdout, p.stderr)
+            if not (isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == script):
+                return real_run(cmd, *a, **kw)
+            out, err, code = io.StringIO(), io.StringIO(), 0
+            with base._inproc_lock:
+                old = dict(os.environ)
+                os.environ.clear()
+                os.environ.update(kw.get("env") or old)
+                try:
+                    with redirect_stdout(out), redirect_stderr(err):
+                        try:
+                            exec(compile(mint_src, script, "exec"), {"__name__": "__main__"})
+                        except SystemExit as e:
+                            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                finally:
+                    os.environ.clear()
+                    os.environ.update(old)
+            return subprocess.CompletedProcess(cmd, code, out.getvalue(), err.getvalue())
+        patcher = mock.patch("subprocess.run", run_in_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if self.cwm is not cw:
+            self.patch_kube(self.cwm)
         self.env.update(CW_CLOUD_RECORD_DIR=self.records, CW_GIT_TOKEN_CMD="%s %s" % (sys.executable, script),
                         FAKE_KUBE_ECHO=OLD + " " + NEW, FAKE_KUBE_SEEN=os.path.join(d, "seen.jsonl"))
         self.outputs, self.expect_worker = [], WORKER
         self.install_worker()
+        self.initial_state = copy.deepcopy(self.st())
+        with open(os.path.join(self.records, WORKER + ".json"), "rb") as f:
+            self.initial_record = f.read()
+
+    def reset_worker(self):
+        """The default install_worker() again, from the copy taken in setUp: no pod is rendered a second time."""
+        self.write_state(copy.deepcopy(self.initial_state))
+        with open(os.path.join(self.records, WORKER + ".json"), "wb") as f:
+            f.write(self.initial_record)
 
     def set_mode(self, mode):
         with open(self.mode_file, "w") as f:
@@ -238,6 +288,10 @@ class RealMint(Harness):
         cls.keydir = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))
         cls.keyfile = os.path.join(cls.keydir.name, "k.pem")
         subprocess.run(["openssl", "genrsa", "-out", cls.keyfile, "2048"], check=True, capture_output=True)
+        cls.fast_openssl = os.path.join(cls.keydir.name, "openssl-fast")   # no signature is checked here: a stand-in that answers a fixed one
+        with open(cls.fast_openssl, "w") as f:
+            f.write("#!/bin/sh\ncat >/dev/null\nprintf fakesig\n")
+        os.chmod(cls.fast_openssl, 0o700)
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), ta.Stub)
         threading.Thread(target=cls.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
@@ -249,12 +303,14 @@ class RealMint(Harness):
 
     def setUp(self):
         super().setUp()
+        self.addCleanup(setattr, cw, "git_token_sleep", cw.git_token_sleep)
+        cw.git_token_sleep = lambda seconds: None   # a passing failure is tried again at once: the waits (2, 5, 10 s) are not what is tested
         ta.Stub.seen, ta.Stub.redirect, ta.Stub.pad_to, ta.Stub.lookup = [], None, None, None
         ta.Stub.gets, ta.Stub.installs = [], {"acme-org": 678}
         self.answer()
         del self.env["CW_GIT_TOKEN_CMD"]   # the default route: app_token.py OWNER/NAME
         self.env.update(CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile,
-                        CW_GITHUB_API_BASE="http://127.0.0.1:%d" % self.srv.server_port)
+                        CW_GITHUB_API_BASE="http://127.0.0.1:%d" % self.srv.server_port, CW_OPENSSL=self.fast_openssl)
 
     def answer(self, repos=None, perms=None, life=3500):
         ta.Stub.answer = {"token": NEW, "expires_at": ta.iso(life), "permissions": dict(perms if perms is not None else ta.PERMS),
@@ -556,7 +612,7 @@ class Cases(Harness):
         }
 
     def run_case(self, name, setup, kind, text):
-        self.install_worker()
+        self.reset_worker()
         self.set_mode("ok")
         self.expect_worker = WORKER
         self.at(minutes=31)
@@ -620,13 +676,23 @@ class MutantTable(unittest.TestCase):
 
     def test_each_guard_mutant_is_killed(self):
         survivors, total = [], mutant_module(10 ** 6)[1]
+        c = Cases("test_every_case_of_the_table_ends_as_it_says")
+        c.setUp()
+        self.addCleanup(c.doCleanups)
+        self.addCleanup(c.tearDown)
+        env0 = dict(c.env)
         for i in range(total):
             mod, _ = mutant_module(i)
-            inner = type("Inner%d" % i, (Cases,), {"cwm": mod, "fail_fast": True})
-            result = unittest.TestResult()
-            unittest.TestSuite([inner("test_every_case_of_the_table_ends_as_it_says")]).run(result)
-            if result.wasSuccessful():
-                survivors.append(i)
+            c.env.clear()
+            c.env.update(env0)
+            c.cwm = mod
+            c.patch_kube(mod)
+            c.fail_fast = True
+            try:
+                c.test_every_case_of_the_table_ends_as_it_says()
+            except AssertionError:
+                continue
+            survivors.append(i)
         self.assertEqual(survivors, [], "guards whose removal no case notices (of %d)" % total)
 
 

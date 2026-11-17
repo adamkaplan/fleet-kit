@@ -13,9 +13,9 @@ SCRATCH = _roles.GH_REPO
 FLEET = "acct-a"
 MARK = "<!-- fleet-switchboard:from=%s -->"
 
-ONE_CHIEF = {"chief": {"role": "orchestrator", "charter": 1},
+ONE_CHIEF = {"chief": {"role": "chief-of-staff", "charter": 1},
              "lane-a": {"role": "coder", "issue": 12, "reports_to": "chief"}}
-TWO_CHIEFS = dict(ONE_CHIEF, chief2={"role": "orchestrator", "charter": 2})
+TWO_CHIEFS = dict(ONE_CHIEF, chief2={"role": "chief-of-staff", "charter": 2})
 
 
 class TestOutsideCommentRoute(Base):
@@ -85,8 +85,8 @@ class TestOutsideCommentRoute(Base):
         self.assertEqual(self.audit("github.unrouted"), [])
 
     def test_s4_a_chief_lane_of_this_repository_is_chosen_before_a_lane_of_none_or_another(self):
-        agents = dict(ONE_CHIEF, aaa={"role": "orchestrator", "charter": 2, "repo": "org-other/scratch"},
-                      bbb={"role": "orchestrator", "charter": 3})
+        agents = dict(ONE_CHIEF, aaa={"role": "chief-of-staff", "charter": 2, "repo": "org-other/scratch"},
+                      bbb={"role": "chief-of-staff", "charter": 3})
         agents["chief"] = dict(agents["chief"], repo=SCRATCH)
         self.rig(agents=agents)
         self.issue(41, "lane-zz", FLEET)
@@ -134,7 +134,7 @@ class TestOutsideCommentRoute(Base):
         account = str(hub.accounts.account_for(item.repo) or "").lower()
         if not account or facts["author"].lower() != account or str(item.sender or "").lower() == account:
             return None, None, False
-        mine = [n for n in sorted(agents) if sb._is_orchestrator(agents[n])]
+        mine = [n for n in sorted(agents) if (agents[n].fleet or {}).get("role") == "chief-of-staff"]
         if len(mine) != 1:
             hub._chief_audit_once(item, "the Chief of Staff lane is not one lane")
             return None, None, True
@@ -184,7 +184,7 @@ class TestNobodyCanReceiveIt(Base):
         return [e for e in rig.world.audit() if e["event"] == event]
 
     def test_with_a_chief_lane_each_unowned_comment_is_delivered_to_it_and_audited_once(self):
-        rig = self.rig({"chief": {"role": "orchestrator", "charter": 1}})
+        rig = self.rig({"chief": {"role": "chief-of-staff", "charter": 1}})
         facts = rig.hub.facts()
         self.assertEqual({f.recipient for f in facts}, {"chief"})
         self.assertEqual(len({f.key for f in facts}), 40)
