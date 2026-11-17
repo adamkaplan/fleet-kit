@@ -1,5 +1,5 @@
-"""Ask #2457: shape L (limit and request both 6 CPU / 16Gi, nested Docker like M, 0.34 USD/hour) for a land.
-S2 pod, S3 capacity count, S4 old rows byte-equal, S7 no Azure create in the diff, S8 no room, S9 unreadable node list; each with a mutant."""
+"""Asks #2457 and #2562: shape L (requests 6 CPU / 24Gi, limits 8 CPU / 26Gi, nested Docker like M, 0.34 USD/hour) for a land.
+S2 pod and XS/S co-scheduling next to one L, S3 capacity count, S4 old rows byte-equal, S7 no Azure create in the diff, S8 no room, S9 unreadable node list; each with a mutant."""
 import contextlib
 import io
 import os
@@ -17,7 +17,7 @@ cw = base.cw
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 GIB = 1024 ** 3
 NODE = {"cpu_m": 7000, "memory_b": 28 * GIB}
-L_REQ = '"L": {"cpu": "6", "memory": "16Gi"}'
+L_REQ = '"L": {"cpu": "6", "memory": "24Gi"}'
 NOT_SIX = "the L request is not 6 CPU"
 OLD_ROWS = {   # the rows of the base, byte-equal (S4)
     "XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": False},
@@ -28,13 +28,13 @@ OLD_REQUESTS = {"S": {"cpu": "500m", "memory": "2Gi"}, "M": {"cpu": "2", "memory
 
 
 def check_l(mod):
-    """S2: an L pod carries requests equal to its limits, 6 CPU / 16Gi, with and without a stack."""
+    """S2: an L pod carries requests 6 CPU / 24Gi and limits 8 CPU / 26Gi, with and without a stack."""
     for stack in (False, True):
         res = base.resources(base.build_with(mod, base._args(shape="L", stack=stack)))
-        want = {"cpu": "6", "memory": "16Gi"}
+        want = {"cpu": "6", "memory": "24Gi"}
         if res.get("requests") != want:
             raise AssertionError(NOT_SIX + ": " + repr(res.get("requests")))
-        assert res["limits"] == want, res["limits"]
+        assert res["limits"] == {"cpu": "8", "memory": "26Gi"}, res["limits"]
 
 
 def room(nodes, used, shape="L", lib=cw):
@@ -80,8 +80,8 @@ def count(lines, shape="L"):
 
 class Row(unittest.TestCase):
     def test_s2_the_row_and_the_pod(self):
-        self.assertEqual(cw.SHAPES["L"], {"cpu": "6", "memory": "16Gi", "usd_per_hour": 0.34, "stack": True})
-        self.assertEqual(cw.SHAPE_REQUESTS["L"], {"cpu": "6", "memory": "16Gi"})
+        self.assertEqual(cw.SHAPES["L"], {"cpu": "8", "memory": "26Gi", "usd_per_hour": 0.34, "stack": True})
+        self.assertEqual(cw.SHAPE_REQUESTS["L"], {"cpu": "6", "memory": "24Gi"})
         check_l(cw)
 
     def test_s4_old_rows_are_byte_equal_and_the_default_is_xs(self):
@@ -101,11 +101,22 @@ class Row(unittest.TestCase):
 class Capacity(unittest.TestCase):
     def test_s3_three_nodes_then_two_after_one_l_pod(self):
         self.assertEqual(count(room(["a", "b", "c"], {})), 3)
-        used = {"a": {"cpu_m": 6000, "memory_b": 16 * GIB}}
+        used = {"a": {"cpu_m": 6000, "memory_b": 24 * GIB}}
         self.assertEqual(count(room(["a", "b", "c"], used)), 2)   # two L pods never share a node
+        # S2: one L pod on node "a" leaves 1000m / 4Gi, so XS (1 CPU / 2Gi) and S (500m / 2Gi) still fit there
+        self.assertEqual(count(room(["a"], used, shape="XS"), "XS"), 1)
+        self.assertEqual(count(room(["a"], used, shape="S"), "S"), 1)
+
+    def test_s2_a_limit_sized_l_request_starves_xs_and_s_on_the_node(self):
+        original = base.source()
+        mod = base.load(base.mutate(original, L_REQ, '"L": {"cpu": "8", "memory": "26Gi"}'))
+        used = {"a": {"cpu_m": 8000, "memory_b": 26 * GIB}}   # the one L pod at the mutant's own request (its limit)
+        self.assertEqual(mod.SHAPE_REQUESTS["L"], mod.SHAPES["L"] and {"cpu": "8", "memory": "26Gi"})
+        self.assertEqual(count(room(["a"], used, shape="XS", lib=mod), "XS"), 0)
+        self.assertEqual(count(room(["a"], used, shape="S", lib=mod), "S"), 0)
 
     def test_s8_no_room_prints_zero_nodes_and_does_not_refuse(self):
-        used = {n: {"cpu_m": 6000, "memory_b": 16 * GIB} for n in "abc"}
+        used = {n: {"cpu_m": 6000, "memory_b": 24 * GIB} for n in "abc"}
         lines = room(["a", "b", "c"], used)
         self.assertEqual(count(lines), 0, lines)
         body = {"nodes_read": True, "pods_read": True, "nodes": [dict(NODE, name=n) for n in "abc"], "requests": used}
@@ -162,7 +173,7 @@ class Mutants(unittest.TestCase):
         original = base.source()
         check_l(base.load(original))   # the control, first
         with self.assertRaises(AssertionError) as cm:
-            check_l(base.load(base.mutate(original, L_REQ, '"L": {"cpu": "2", "memory": "16Gi"}')))
+            check_l(base.load(base.mutate(original, L_REQ, '"L": {"cpu": "2", "memory": "24Gi"}')))
         self.assertTrue(str(cm.exception).startswith(NOT_SIX), str(cm.exception))
 
     def test_a_request_of_three_cpu_counts_three_nodes_after_one_pod(self):
@@ -171,7 +182,7 @@ class Mutants(unittest.TestCase):
             got = count(room(["a", "b", "c"], used, lib=lib))
             if got != 2:
                 raise AssertionError("S3: nodes with room after one L pod is %d, not 2" % got)
-        check(cw, {"a": {"cpu_m": 6000, "memory_b": 16 * GIB}})   # the control, first
+        check(cw, {"a": {"cpu_m": 6000, "memory_b": 24 * GIB}})   # the control, first
         mod = base.load(base.mutate(original, L_REQ, '"L": {"cpu": "3", "memory": "8Gi"}'))
         with self.assertRaises(AssertionError) as cm:
             check(mod, {"a": {"cpu_m": 3000, "memory_b": 8 * GIB}})   # the one pod of the mutant's own row
@@ -192,7 +203,7 @@ class MoreMutants(unittest.TestCase):
 
     def test_s8_a_capacity_block_that_hides_the_zero_is_caught(self):
         body = {"nodes_read": True, "pods_read": True, "nodes": [dict(NODE, name=n) for n in "abc"],
-                "requests": {n: {"cpu_m": 6000, "memory_b": 16 * GIB} for n in "abc"}}
+                "requests": {n: {"cpu_m": 6000, "memory_b": 24 * GIB} for n in "abc"}}
         def check(text):
             if "shape L: 0 nodes with room" not in text:
                 raise AssertionError("S8: the no-room line is missing")
@@ -225,7 +236,7 @@ class MoreMutants(unittest.TestCase):
     def test_s8_s9_no_room_and_unreadable_never_end_the_launch(self):
         mod = load_bin("m")
         mod._lib = lambda: cw
-        full = {n: {"cpu_m": 6000, "memory_b": 16 * GIB} for n in "abc"}
+        full = {n: {"cpu_m": 6000, "memory_b": 24 * GIB} for n in "abc"}
         body = {"nodes_read": True, "pods_read": True, "nodes": [dict(NODE, name=n) for n in "abc"], "requests": full}
         for name, answer in (("no room", (0, body, "")), ("unreadable", (1, None, "x"))):
             mod.run_launcher = lambda *a, **k: answer
