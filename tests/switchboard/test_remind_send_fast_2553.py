@@ -1,6 +1,7 @@
 """#2553: `remind` and `send` do not run a full pane discovery for a repo-qualified issue or a registered sender, bound their external
 calls with one retry, and write one `cli.timing` audit line when they take over CLI_SLOW_SECONDS."""
 import argparse
+import subprocess
 import threading
 from unittest import mock
 
@@ -105,7 +106,7 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR, captured):
             return code, err.getvalue()
 
         def fresh(self):
-            self.engine._cli_timing = dict.fromkeys(("discover_ms", "gh_ms", "lock_ms", "v2_ms"), 0)   # each command builds its own engine
+            self.sb._CLI_TIMING.update(discover_ms=0, gh_ms=0, lock_ms=0, v2_ms=0)   # each command builds its own engine
 
         def timings(self):
             return [e for e in self.world.audit() if e["event"] == "cli.timing"]
@@ -122,6 +123,8 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR, captured):
             code, err = self.send(hang_first=2)
             self.assertEqual((code, self.sends), (1, 2), err)
             self.assertIn("step v2_send timed out", err)
+            with mock.patch.object(self.engine, "gh_runner", side_effect=subprocess.TimeoutExpired(["gh"], 8)), self.assertRaises(TimeoutError):
+                self.sb.read_ref_state(self.engine, REPO_NAME, 10, "issue")
 
         def test_s2_one_retry_then_a_named_failure(self):
             self.check_retry()

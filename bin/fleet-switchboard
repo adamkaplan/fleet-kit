@@ -1841,7 +1841,6 @@ class Switchboard:
         self.headless_state = None   # #433: a READ-ONLY state directory for the headless records, for a caller (`status`) that must not get a state_dir (which writes)
         if getattr(v2, "on_event", False) is None:   # a real client: its breaker's `v2.backoff` / `v2.resume` go to the audit, once per episode
             v2.on_event = lambda name, detail: self._note(name, "v2", detail)
-        self._cli_timing = {"discover_ms": 0, "gh_ms": 0, "lock_ms": 0, "v2_ms": 0}   # #2553: phase durations of one remind/send
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
         self.feed = None  # the event feed (#290), when this process has one
         self.decision_seeds = {}        # the last derivation's display id -> source seed (memory only; the sync engine's keys)
@@ -2013,12 +2012,13 @@ class Switchboard:
     def phase(self, name):
         began = self.now()
         try: yield
-        finally: self._cli_timing[name] += int(round(max(0.0, float(self.now()) - float(began)) * 1000))
+        finally: _CLI_TIMING[name] = _CLI_TIMING.get(name, 0) + int(round(max(0.0, float(self.now()) - float(began)) * 1000))
 
     def note_cli_timing(self, command, target, started):
         total = max(0.0, float(self.now()) - float(started))
         if total > CLI_SLOW_SECONDS and self.audit is not None:
-            self.audit.append("cli", "cli.timing", target, {"command": command, "total_ms": int(round(total * 1000)), **self._cli_timing})
+            self.audit.append("cli", "cli.timing", target, {"command": command, "total_ms": int(round(total * 1000)), **_CLI_TIMING})
+        for key in ("discover_ms", "gh_ms", "lock_ms", "v2_ms"): _CLI_TIMING[key] = 0
 
     def discover(self, now, entries=None):
         """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`. Also marks the `agents` input (#805): not whole when
@@ -9650,6 +9650,7 @@ GITHUB_QUEUE_LIMIT = 2000
 GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
 GITHUB_ROUTE_READ_TIMEOUT = 8  # seconds for one such lookup
 CLI_CALL_TIMEOUT_SECONDS, CLI_SLOW_SECONDS = 15, 5.0   # #2553: the bound of one remind/send external call; over the second, a cli.timing audit line
+_CLI_TIMING = {"discover_ms": 0, "gh_ms": 0, "lock_ms": 0, "v2_ms": 0}   # #2553: phase durations of this process's one remind/send, mutated in place
 GITHUB_CATCHUP_STUCK_PASSES = 3   # #494: a catch-up that stopped this many passes in a row is said in `status`, not silently starved
 GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
 GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
@@ -13381,6 +13382,20 @@ def run_bounded(work, seconds):
     return True, box.get("result")
 
 
+def deliver_bounded(engine, config, sender, recipient, text, number, repo, interrupt, started):
+    """#2553: the delivery call, bounded, with one retry; None (a named error written, a timing line audited) when both tries timed out."""
+    step = min(config.get("send_timeout_seconds", CLI_CALL_TIMEOUT_SECONDS), CLI_CALL_TIMEOUT_SECONDS)
+    for _ in (1, 2):
+        with engine.phase("v2_ms"):
+            done, outcome = run_bounded(lambda: engine.send(sender, recipient, text, number, repo, interrupt=interrupt), step)
+        if done:
+            return outcome
+    sys.stderr.write("%s: send to %s: step v2_send timed out after %s s (retried once): check `%s pending %s` before sending again\n" % (
+        PROG, _one_line(recipient, 80), step, PROG, _one_line(recipient, 80)))
+    engine.note_cli_timing("send", recipient, started)
+    return None
+
+
 def cmd_send(args, runner, now):
     """`send`, bounded as a whole by `send_timeout_seconds` (default 60 s): past it the command exits 1 saying the delivery did not finish, may
     still complete or have been cut off part way (the state is unknown), never a silent multi-minute wait. FAIL MODE: the timeout fails CLOSED
@@ -13501,6 +13516,7 @@ def _cmd_send(args, runner, now):
 def _send_one(args, runner, now):
     system = load_module("system_sender")   # #2518: a registered system sender is proved by the calling process; the claim variable and --from only NAME one
     claim = os.environ.get(system.SYSTEM_SENDER_ENV) or None
+    args.system_proven = False
     if claim or system.registered(args.sender):
         line = system.refusal(claim or args.sender, args.name, KIT_ROOT, from_name=args.sender)
         if line:
@@ -13520,7 +13536,7 @@ def _send_one(args, runner, now):
         sys.stderr.write("%s: %s\n" % (PROG, refusal))
         return EXIT_USAGE
     if args.sender is not None:
-        if os.environ.get(LAB_ENV) != "1" and not getattr(args, "system_proven", False):
+        if os.environ.get(LAB_ENV) != "1" and not args.system_proven:
             sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
                              % (PROG, LAB_ENV))
             return EXIT_USAGE
@@ -13542,17 +13558,9 @@ def _send_one(args, runner, now):
         return EXIT_USAGE
     with engine.phase("gh_ms"):
         verdict = check_approval(config, runner, now, text, repo, number, sender)   # #951, #1463: every approval hash in the message; only the Chief of Staff's; GETs only; never raises
-    step = min(config.get("send_timeout_seconds", CLI_CALL_TIMEOUT_SECONDS), CLI_CALL_TIMEOUT_SECONDS)
     try:
-        for _ in (1, 2):   # #2553: one bounded retry of the delivery call
-            with engine.phase("v2_ms"):
-                done, outcome = run_bounded(lambda: engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt), step)
-            if done:
-                break
-        else:
-            sys.stderr.write("%s: send to %s: step v2_send timed out after %s s (retried once): check `%s pending %s` before sending again\n" % (
-                PROG, _one_line(args.name, 80), step, PROG, _one_line(args.name, 80)))
-            engine.note_cli_timing("send", args.name, started)
+        outcome = deliver_bounded(engine, config, sender, args.name, text, number, repo, args.interrupt, started)
+        if outcome is None:
             return EXIT_ERROR
     except InterruptRefused as err:
         sys.stderr.write("%s: not interrupted, nothing sent: %s\n" % (PROG, err))
