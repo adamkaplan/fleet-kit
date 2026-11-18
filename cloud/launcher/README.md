@@ -399,6 +399,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_reaper_reload.py` | 4 | parallel |
 | `cloud/launcher/tests/test_wip_root.py` | 1 | parallel |
 | `cloud/launcher/tests/test_startup_taint.py` | 3 | parallel |
+| `cloud/launcher/tests/test_infra_bicep.py` | 1 | parallel |
 
 | `cloud/launcher/tests/test_all_reds.py` | 1 | parallel |
 | `cloud/launcher/tests/test_azure_config_dir.py` | 1 | parallel |
@@ -579,6 +580,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_reaper_reload.py` | 4 | parallel |
 | `cloud/launcher/tests/test_wip_root.py` | 1 | parallel |
 | `cloud/launcher/tests/test_startup_taint.py` | 3 | parallel |
+| `cloud/launcher/tests/test_infra_bicep.py` | 1 | parallel |
 
 | `cloud/launcher/tests/test_all_reds.py` | 1 | parallel |
 | `cloud/launcher/tests/test_azure_config_dir.py` | 1 | parallel |

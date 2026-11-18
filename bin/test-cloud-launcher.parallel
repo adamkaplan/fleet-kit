@@ -126,6 +126,7 @@ cloud/launcher/tests/test_secret_dir.py
 cloud/worker/tests/test_entrypoint.py
 cloud/launcher/tests/test_vault_check_pins.py
 cloud/launcher/tests/test_image_roll.py
+cloud/launcher/tests/test_infra_bicep.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_idle_default_60.py

@@ -6,3 +6,7 @@ __pycache__/
 *.pyc
 scenario-runs/
 .review/
+
+# Real Bicep parameter files stay out of the repo
+infra/*.bicepparam
+!infra/example.bicepparam
