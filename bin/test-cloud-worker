@@ -338,6 +338,7 @@ class Base(unittest.TestCase):
         tmpdir.start()
         self.addCleanup(tmpdir.stop)
         patcher = mock.patch.dict(os.environ, {
+            "CW_REMOTE_BACKEND": "pod", "CW_POD_ROLLBACK_WINDOW": "open",
             "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "cfg"), "XDG_STATE_HOME": str(self.home / "state"),
             "PATH": "%s:/usr/bin:/bin" % self.stub_dir, "FLEET_CLOUD_WORKER_BIN": str(self.stub), "STUB_DIR": str(self.stub_dir),
             "STUB_PASSWORD": PASSWORD, "STUB_URL": self.remote.url, "STUB_STOP_EXIT": "0",
@@ -708,7 +709,7 @@ class TestLiveFindings(Base):
     def test_a_dir_that_is_not_a_pod_path_is_refused_before_anything_is_created(self):
         brief = self.home / "brief.txt"
         brief.write_text("x\n")
-        for bad in (str(self.home), "relative/dir", "/workspace", "/work/../etc", "/workx", "/home/other", "/", "/work/repo/../../etc"):
+        for bad in ("/Users/user/code", "relative/dir", "/workspace", "/work/../etc", "/workx", "/home/other", "/", "/work/repo/../../etc"):
             with self.subTest(dir=bad):
                 code, out, err = self.main("launch", "coder7", "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main",
                                            "--dir", bad, "--brief-file", str(brief))

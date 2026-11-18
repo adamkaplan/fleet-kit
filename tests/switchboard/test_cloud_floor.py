@@ -421,6 +421,41 @@ class TestCloudFloor(FloorCase):
 
 class TestCloudFloorCutover(FloorCase):
 
+    def test_class_defaults_to_production_and_background_is_recorded(self):
+        self.assertEqual(self.launch("c0")[0], 0)
+        self.assertNotIn("priority_class", self.fake.submitted)
+        self.assertEqual(self.record("c0")["priority_class"], "production")
+        self.assertEqual(self.launch("c1", priority_class="background")[0], 0)
+        self.assertEqual(self.fake.submitted["priority_class"], "background")
+        self.assertEqual(self.record("c1")["priority_class"], "background")
+
+    def test_outage_is_for_cos_or_a_person_only(self):
+        self.kind = ("agent", "widget-lead", "orchestrator")
+        self.assertEqual(self.launch("o1", priority_class="outage")[0], 2)
+        self.assertIn(("cloud.outage_refused", "o1"), self.audits)
+        self.assertEqual(self.fake.works, {})
+        for index, kind in enumerate((("agent", "cos", "chief-of-staff"), ("person", "a person at a shell"))):
+            self.kind = kind
+            name = "o%d" % (index + 2)
+            self.assertEqual(self.launch(name, priority_class="outage")[0], 0)
+            self.assertIn(("cloud.outage_allowed", name), self.audits)
+            self.assertEqual(self.fake.submitted["priority_class"], "outage")
+
+    def test_preview_is_only_for_the_preview_repository(self):
+        with mock.patch.dict(os.environ, {"CW_FLOOR_PREVIEW_REPO": REPO_NAME}):
+            self.assertEqual(self.launch("v1", preview=True)[0], 0)
+            self.assertTrue(self.fake.submitted["preview"])
+            self.assertTrue(self.record("v1")["preview"])
+            self.assertEqual(self.launch("v2", preview=True, repo=OTHER_REPO)[0], 2)
+        self.assertEqual(len(self.fake.works), 1)
+
+    def test_a_closed_rollback_window_refuses_a_pod_launch(self):
+        with mock.patch.dict(os.environ, {"CW_REMOTE_BACKEND": "pod", "CW_POD_ROLLBACK_WINDOW": "closed"}):
+            code, out, err = self.launch("r1")
+        self.assertEqual(code, 2)
+        self.assertIn("Floor", err)
+        self.assertEqual((self.pod_calls, self.fake.works), ([], {}))
+
     def test_the_route_rule(self):
         route = self.floor.route_repo
         cases = [({}, "pod"), ({"CW_REMOTE_BACKEND": "floor"}, "floor"), ({"CW_REMOTE_BACKEND": " Pod "}, "pod"),

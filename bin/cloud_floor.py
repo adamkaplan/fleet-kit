@@ -263,8 +263,10 @@ class QueueBlobTransport:
         status, raw = _request("GET", self._url(self.blob, "/msg/%s.json" % urllib.parse.quote(session_id, safe=""), self.blob_sas), None, [("Accept", "application/json")], missing_ok=True)
         return {} if status == 404 else _parse(raw)
 
-    def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", mode=None, env=None, **ignored):
-        command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main", **({"mode": mode} if mode else {}))
+    def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", mode=None, env=None, priority_class=None, preview=False, **ignored):
+        pclass = priority_class or "production"
+        extras = {"class": pclass, "priority_class": pclass} if pclass != "production" else {}
+        command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main", **({"mode": mode} if mode else {}), **extras, **({"preview": True} if preview else {}))
         self._enqueue(command, dict({"brief": brief}, **({"env": env} if env else {})))
         return {"work_id": session_id, "session_id": session_id, "seq": 1}
 
@@ -481,6 +483,25 @@ def _seconds(value, default):
         return default
 
 
+def check_priority_tier(args, engine, runner, now, repo=None, config=None):
+    """The class and preview of a Floor launch, checked before anything is sent."""
+    pclass = getattr(args, "priority_class", None) or "production"
+    if pclass not in ("outage", "production", "background"):
+        raise D["Refusal"]("refused: --class must be outage, production or background; nothing was created")
+    if getattr(args, "preview", False) and repo != (env_of().get("CW_FLOOR_PREVIEW_REPO") or (config or {}).get("intent_repo")):
+        raise D["Refusal"]("refused: --preview is only supported on the configured preview repository (got %s); nothing was created" % repo)
+    if pclass == "outage":
+        kind = D["H"]["gates_caller_kind"](runner, now)
+        by = kind[1] if len(kind) > 1 else "?"
+        ok = kind[0] == "person" or (kind[0] == "agent" and (kind[1] == "cos" or (len(kind) > 2 and str(kind[2]).startswith("chief-of-"))))
+        body = {"caller": by, "kind": kind[0], "priority_class": pclass}
+        if not ok:
+            D["_audit"](engine, "cloud.outage_refused", getattr(args, "name", "?"), body)
+            raise D["Refusal"]("priority class outage is reserved for cos or the owner's shell (caller: %s); raise the outage to cos; nothing was created" % by)
+        D["_audit"](engine, "cloud.outage_allowed", getattr(args, "name", "?"), body)
+    return pclass
+
+
 def launch_floor(args, runner, now, reserve, repo, branch, inner):
     """The Floor half of `launch --cloud`: everything is checked before the one submit, and the record is written only after Floor accepted it."""
     LaunchError, name = D["H"]["LaunchError"], args.name
@@ -488,6 +509,7 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     args.brief_text = brief
     engine, state, config = D["H"]["build_engine"](runner, now, "cli")
     check_floor_admission(args, repo, brief, config)
+    pclass = check_priority_tier(args, engine, runner, now, repo=repo, config=config)
     D["check_allowed"](repo)
     D["cloud_pr_labels"].cloud_base.check(args)   # a base that is not a branch name is refused before anything is sent
     reserve(state)
@@ -500,6 +522,8 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     base = getattr(args, "base", None) or "main"
     mode = verify_mode(args, brief)
     extra = {"mode": mode, "env": {"FLOOR_WORKFLOW": mode}} if mode else {}   # a verify launch: Floor runs it on the heavy executor, nothing is translated to author commits
+    preview = bool(getattr(args, "preview", False))
+    extra.update(**({"priority_class": pclass} if pclass != "production" else {}), **({"preview": True} if preview else {}))
     answer = submit_work(who, launch_key(who, session_id), session_id=session_id, repo=repo, ref=base, branch=branch, title=name,
                          brief=str(brief or "") if mode else translate_brief(brief, repo, branch, base), **extra)
     work_id = answer.get("work_id") if isinstance(answer, dict) else None
@@ -512,7 +536,7 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
         return D["H"]["EXIT_OK"]
     stamp = now()
     record = {"worker": name, "backend": "floor", "session": session_id, "work_id": work_id, "runtime_id": "floor/" + session_id, "url": ENDPOINT_URL,
-              "seq": 1, "repo": repo, "branch": branch, "base": base, "agent": args.agent, **({"mode": mode} if mode else {}),
+              "seq": 1, "repo": repo, "branch": branch, "base": base, "agent": args.agent, **({"mode": mode} if mode else {}), "priority_class": pclass, **({"preview": True} if preview else {}),
               "idle_deadline": _stamp(_seconds(getattr(args, "idle", None), 3600), stamp), "hard_deadline": _stamp(_seconds(getattr(args, "hard", None), 8 * 3600), stamp)}
     if getattr(args, "reports_to", None):
         record.update(reports_to=args.reports_to)
@@ -546,6 +570,8 @@ def _launch_wrapper(inner):
             return inner(args, runner, now, reserve)   # every usage error is the old code's, in its words
         D["use_settings"]()
         if route_repo(repo, None) != "floor":
+            if (env_of().get("CW_POD_ROLLBACK_WINDOW") or "open").strip().lower() == "closed":
+                raise D["Refusal"]("refused: the cloud pod backend is retired (CW_POD_ROLLBACK_WINDOW=closed); route %s to Floor (CW_REMOTE_BACKEND=floor)" % repo)
             return inner(args, runner, now, reserve)
         return launch_floor(args, runner, now, reserve, repo, branch, inner)
     return _launch
