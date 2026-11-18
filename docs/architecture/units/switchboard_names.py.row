@@ -1,0 +1,1 @@
+| `switchboard_names.py` | 0 | the program name and the exit codes every command needs, so a command reads no name of the entry (#1811) | |

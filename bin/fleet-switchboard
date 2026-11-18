@@ -338,15 +338,7 @@ triage_digest = load_triage_digest()
 dead_hint = load_dead_hint()
 
 VERSION = "0.1.0"
-PROG = "fleet-switchboard"
-
-EXIT_OK = 0
-EXIT_ERROR = 1
-EXIT_USAGE = 2
-EXIT_PARTIAL = 4   # `prove`: at least one named scenario was not recorded (a usage error is 2)
-EXIT_HELD = 3   # `send`: the delivery rule says hold; nothing was sent
-EXIT_MEMORY = 5   # `launch`: the memory test refused a NEW launch (the machine cannot take it); `--memory-ok <reason>` overrides
-EXIT_CRASH = 70  # the `crash-after-send` fault stopped the process, as a crash would
+PROG, EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PARTIAL, EXIT_HELD, EXIT_MEMORY, EXIT_CRASH = (getattr(load_module("switchboard_names"), n) for n in ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "EXIT_PARTIAL", "EXIT_HELD", "EXIT_MEMORY", "EXIT_CRASH"))   # bin/switchboard_names.py: the names a command needs
 
 # ------------------------------------------------------------------ the config
 
