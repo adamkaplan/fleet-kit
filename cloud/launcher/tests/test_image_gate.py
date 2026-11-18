@@ -202,7 +202,7 @@ class Gate(Base):
     def test_s5_the_revision_is_asked_of_git_against_the_integration_tip(self):
         self.receipt()
         self.assertEqual(self.roll(load(ROLL))[0], 0)
-        self.assertTrue(any("merge-base --is-ancestor %s origin/integration" % REV in l for l in self.log("git")), self.log("git"))
+        self.assertTrue(any("merge-base --is-ancestor %s origin/main" % REV in l for l in self.log("git")), self.log("git"))
 
     def test_s6_a_reachable_candidate_with_a_fresh_pass_receipt_proceeds_and_no_gate_is_unknown(self):
         self.receipt()

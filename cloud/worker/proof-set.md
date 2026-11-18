@@ -51,21 +51,21 @@ The repository the pod was launched with must be the repository these files belo
 ```
 cw-run start --name proof-npm -- sh -c 'cd /work/repo/server && { [ -d node_modules ] || npm ci --ignore-scripts; }'
 cw-run wait proof-npm 240
-cw-run start --name proof-test-1 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/queue-install.test.ts'
+cw-run start --name proof-test-1 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/platform/queue-install.test.ts'
 cw-run wait proof-test-1 240
-cw-run start --name proof-test-2 -- sh -c 'cd /work/repo/server && /work/repo/scripts/dev/ephemeral-pg.sh -- node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/queue-install-postgres.test.ts'
+cw-run start --name proof-test-2 -- sh -c 'cd /work/repo/server && /work/repo/scripts/dev/ephemeral-pg.sh -- node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/platform/queue-install-postgres.test.ts'
 cw-run wait proof-test-2 240
-cw-run start --name proof-test-3 -- sh -c 'cd /work/repo/server && /work/repo/scripts/dev/ephemeral-pg.sh -- node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/index-facts-postgres.test.ts'
+cw-run start --name proof-test-3 -- sh -c 'cd /work/repo/server && /work/repo/scripts/dev/ephemeral-pg.sh -- node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/server-scripts/index-facts-postgres.test.ts'
 cw-run wait proof-test-3 240
-cw-run start --name proof-test-4 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/demo-checkpoint-repos.test.ts'
+cw-run start --name proof-test-4 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/seed/demo-checkpoint-repos.test.ts'
 cw-run wait proof-test-4 240
-cw-run start --name proof-test-5 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/workroom-clone-real-git.test.ts'
+cw-run start --name proof-test-5 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/workroom/workroom-clone-real-git.test.ts'
 cw-run wait proof-test-5 240
-cw-run start --name proof-test-6 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/workroom-writer-git-env.test.ts'
+cw-run start --name proof-test-6 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/workroom/workroom-writer-git-env.test.ts'
 cw-run wait proof-test-6 240
-cw-run start --name proof-test-7 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/workroom-contract.test.ts'
+cw-run start --name proof-test-7 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/workroom/workroom-contract.test.ts'
 cw-run wait proof-test-7 240
-cw-run start --name proof-test-8 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/pod-setup-script.test.ts'
+cw-run start --name proof-test-8 -- sh -c 'cd /work/repo/server && node --import ./tests/helpers/keep-event-loop-open.mjs --import ../scripts/dev/test-tmp-sandbox.mjs --test tests/guards/pod-setup-script.test.ts'
 cw-run wait proof-test-8 240
 ```
 
@@ -81,14 +81,14 @@ Expected (operator's run in a pod of the previous image, all exit 0): queue-inst
 
 One line each; the `tests` item is `pass` only when every one exits 0.
 
-- tests/queue-install.test.ts
-- tests/queue-install-postgres.test.ts
-- tests/index-facts-postgres.test.ts
-- tests/demo-checkpoint-repos.test.ts
-- tests/workroom-clone-real-git.test.ts
-- tests/workroom-writer-git-env.test.ts
-- tests/workroom-contract.test.ts
-- tests/pod-setup-script.test.ts
+- tests/platform/queue-install.test.ts
+- tests/platform/queue-install-postgres.test.ts
+- tests/server-scripts/index-facts-postgres.test.ts
+- tests/seed/demo-checkpoint-repos.test.ts
+- tests/workroom/workroom-clone-real-git.test.ts
+- tests/workroom/workroom-writer-git-env.test.ts
+- tests/workroom/workroom-contract.test.ts
+- tests/guards/pod-setup-script.test.ts
 
 ## Changing the set
 

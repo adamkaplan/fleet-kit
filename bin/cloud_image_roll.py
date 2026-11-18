@@ -136,7 +136,7 @@ def apply(path, data, new_bytes, now):
 
 
 REVISION_LABEL = "org.opencontainers.image.revision"
-INTEGRATION_REF = "origin/integration"
+INTEGRATION_REF = "origin/main"
 RECEIPT_MAX_AGE = datetime.timedelta(hours=6)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(globals().get("__file__") or os.path.join(os.getcwd(), "bin", "x"))))   # the checkout that holds this file
 
@@ -195,7 +195,7 @@ def check_gate(tool, source, want, env, now):
         raise Refused("the image has no revision label (%s); nothing was changed" % REVISION_LABEL)
     clean = {k: v for k, v in env.items() if not k.startswith("GIT_")}   # no GIT_DIR or the like can point the check at another repository; `git` is the one on PATH
     try:
-        run_crane("git", ["-C", REPO_ROOT, "fetch", "-q", "origin", "integration"], clean, "git fetch", 60)   # best effort: a stale ref only refuses
+        run_crane("git", ["-C", REPO_ROOT, "fetch", "-q", "origin", "main"], clean, "git fetch", 60)   # best effort: a stale ref only refuses
     except Refused:
         pass
     near = run_crane("git", ["-C", REPO_ROOT, "merge-base", "--is-ancestor", revision, INTEGRATION_REF], clean, "git merge-base", 60)
