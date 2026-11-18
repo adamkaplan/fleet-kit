@@ -22,7 +22,7 @@ const NODE_DIR = dirname(process.execPath);
 const baseEnv = () => {
   const env = {};
   for (const k of ["HOME", "PATH", "TMPDIR", "MISE_DATA_DIR", "XDG_DATA_HOME", "LANG"]) if (process.env[k] !== undefined) env[k] = process.env[k];
-  return { ...env, PATH: `${NODE_DIR}:${env.PATH ?? "/usr/bin:/bin"}`, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  return { ...env, PATH: `${NODE_DIR}:${env.PATH ?? "/usr/bin:/bin"}`, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0", COLUMNS: "1000" };
 };
 const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env: { ...baseEnv(), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" }, stdio: ["ignore", "pipe", "pipe"] });
 const put = (base, rel, text, mode) => {
@@ -72,7 +72,7 @@ const spire = (p, args, { env = {}, cwd = p.root } = {}) => {
   return { code: r.status, out: r.stdout, err: r.stderr };
 };
 const guide = readFileSync(join(SKILL, "SKILL.md"), "utf8");
-const SUBCOMMANDS = ["help", "land", "check", "areas", "box", "council", "capture", "workroom", "principles", "doctor", "install", "update"];
+const SUBCOMMANDS = ["help", "land", "check", "areas", "attest", "box", "council", "capture", "workroom", "principles", "doctor", "install", "update"];
 
 test("the guide is a skill: name and description in its frontmatter, and the tool's README points at it", () => {
   assert.match(guide, /^---\nname: spire-land\ndescription: /);
@@ -95,7 +95,7 @@ test("help prints the one guide word for word, with no arguments and with --help
   assert.equal(bad.code, 2);
   assert.match(bad.err, /no such subcommand: nope/);
   // the guide covers the commands a developer is told about
-  for (const word of ["spire land", "spire doctor", "landed <sha>", "held", "--rebut"]) assert.ok(guide.includes(word), `the guide says ${word}`);
+  for (const word of ["spire land", "spire doctor", "landed <sha>", "held", "advice"]) assert.ok(guide.includes(word), `the guide says ${word}`);
 });
 
 test("help without the guide says so and how to get it (exit 1), and still lists the subcommands", () => {
@@ -192,23 +192,23 @@ test("doctor passes a good project without pins (and says the host's tools are u
   const p = project();
   const r = spire(p, ["doctor"]);
   assert.equal(r.code, 0, r.out + r.err);
-  assert.match(r.out, /ok\s+\.spire\/land\.json is valid: 2 areas \(lib, docs\)/);
-  assert.match(r.out, /note\s+the project pins no tool versions/);
-  assert.match(r.out, /ok\s+origin \(.*remote-\d+\.git\) answers; main is [0-9a-f]{10}/);
-  assert.match(r.out, /ok\s+you commit as T <t@t>/);
-  assert.match(r.out, /ok\s+you may push to origin/);
-  assert.match(r.out, /ready: nothing is wrong/);
-  assert.ok(!/PROBLEM/.test(r.out));
+  assert.match(r.out, /OK\s+\.spire\/land\.json is valid: 2 areas \(lib, docs\)/);
+  assert.match(r.out, /WARN\s+the project pins no tool versions/);
+  assert.match(r.out, /OK\s+origin \(.*remote-\d+\.git\) answers; main is [0-9a-f]{10}/);
+  assert.match(r.out, /OK\s+you commit as T <t@t>/);
+  assert.match(r.out, /OK\s+you may push to origin/);
+  assert.match(r.out, /ready: nothing fails/);
+  assert.ok(!/FAIL/.test(r.out));
   // the dry-run probe pushed nothing
   assert.equal(git(p.root, "ls-remote", "origin").includes("spire-doctor-probe"), false);
 });
 
 test("doctor says what the project's box declares (nothing: a checkout), asks nothing of any bundle, and refuses a box.json that is not JSON", () => {
   const p = project();
-  assert.match(spire(p, ["doctor"]).out, /note\s+the project has no \.spire\/box\.json: `box up` is a checkout and nothing else/);
+  assert.match(spire(p, ["doctor"]).out, /WARN\s+the project has no \.spire\/box\.json: `box up` is a checkout and nothing else/);
   put(p.root, ".spire/box.json", JSON.stringify({ box: 1, wrap: { run: "true" }, services: [{ name: "a", start: "true" }] }));
   const wrapped = spire(p, ["doctor"]);
-  assert.match(wrapped.out, /ok\s+\.spire\/box\.json is valid: 1 service\(s\), wrapped/);
+  assert.match(wrapped.out, /OK\s+\.spire\/box\.json is valid: 1 service\(s\), wrapped/);
   assert.doesNotMatch(wrapped.out, /bundle/i, "the tool knows no bundle to ask about");
   put(p.root, ".spire/box.json", "{ not json");
   const old = spire(p, ["doctor"]);
@@ -220,56 +220,56 @@ test("doctor with a pin the host has: names the version it will use; with a pin 
   const have = project({ pin: process.versions.node.split(".")[0] });
   const ok = spire(have, ["doctor"]);
   assert.equal(ok.code, 0, ok.out + ok.err);
-  assert.match(ok.out, new RegExp(`ok\\s+pinned and installed here: node ${process.versions.node.split(".")[0]}\\.\\d+\\.\\d+`));
+  assert.match(ok.out, new RegExp(`OK\\s+pinned and installed here: node ${process.versions.node.split(".")[0]}\\.\\d+\\.\\d+`));
 
   const lack = project({ pin: "99.1.1" });
   const bad = spire(lack, ["doctor"]);
   assert.equal(bad.code, 1);
-  assert.match(bad.out, /PROBLEM\s+node: the project pins 99\.1\.1 \(\.node-version\) and this host has no such version\./);
+  assert.match(bad.out, /FAIL\s+node: the project pins 99\.1\.1 \(\.node-version\) and this host has no such version\./);
   assert.match(bad.out, /Install it: mise install node@99\.1\.1/);
   assert.match(bad.out, /never falls back to the host default/);
-  assert.match(bad.out, /1 problem: fix it/);
+  assert.match(bad.out, /Found \d+ issues? to address \(1 failing/);
 });
 
 test("doctor names each problem and its fix: no land.json, a remote that does not answer, no identity, a host that only edits, a tool edited by hand", () => {
   const none = project({ land: null });
   const r1 = spire(none, ["doctor"]);
   assert.equal(r1.code, 1);
-  assert.match(r1.out, /PROBLEM\s+the project has no .*land\.json/);
+  assert.match(r1.out, /FAIL\s+the project has no .*land\.json/);
   assert.match(r1.out, /fix: write it/);
 
   const remote = project();
   git(remote.root, "remote", "set-url", "origin", join(scratch, "does-not-exist.git"));
   const r2 = spire(remote, ["doctor"]);
   assert.equal(r2.code, 1);
-  assert.match(r2.out, /PROBLEM\s+origin \(.*does-not-exist\.git\) does not answer/);
+  assert.match(r2.out, /FAIL\s+origin \(.*does-not-exist\.git\) does not answer/);
   assert.match(r2.out, /fix: check the URL and your credential: gh auth login/);
 
   const anon = project({ identity: false });
   const r3 = spire(anon, ["doctor"]);
   assert.equal(r3.code, 1);
-  assert.match(r3.out, /PROBLEM\s+git does not know who you are \(user\.name missing, user\.email missing\)/);
+  assert.match(r3.out, /FAIL\s+git does not know who you are \(user\.name missing, user\.email missing\)/);
   assert.match(r3.out, /fix: git config user\.name/);
 
   const bad = project();
   put(bad.root, ".spire/land.json", "{ not json");
   const r5 = spire(bad, ["doctor"]);
   assert.equal(r5.code, 1);
-  assert.match(r5.out, /PROBLEM\s+the project's files are refused: manifest: cannot read .*land\.json/);
+  assert.match(r5.out, /FAIL\s+the project's files are refused: manifest: cannot read .*land\.json/);
   put(bad.root, ".spire/land.json", JSON.stringify({ ...LAND, sensitve: { globs: ["lib/**"] } })); // a typo in a gate key: the Warden would be silently unseated
   const r5b = spire(bad, ["doctor"]);
   assert.equal(r5b.code, 1);
-  assert.match(r5b.out, /PROBLEM\s+the project's files are refused: manifest: .*land\.json has a top-level key no reader of the tool uses: sensitve/);
+  assert.match(r5b.out, /FAIL\s+the project's files are refused: manifest: .*land\.json has a top-level key no reader of the tool uses: sensitve/);
 
   const council = project({ principles: false });
-  assert.match(spire(council, ["doctor"]).out, /PROBLEM\s+the council cannot sit: the project has no \.spire\/principles\.md/);
+  assert.match(spire(council, ["doctor"]).out, /FAIL\s+the council cannot sit: the project has no \.spire\/principles\.md/);
 
   const outside = project();
   const away = join(scratch, "not-a-checkout");
   mkdirSync(away);
   const r6 = spire(outside, ["doctor"], { cwd: away });
   assert.equal(r6.code, 1);
-  assert.match(r6.out, /PROBLEM\s+.* is not inside a git checkout/);
+  assert.match(r6.out, /FAIL\s+.* is not inside a git checkout/);
 });
 
 // --- the law ---
@@ -309,13 +309,13 @@ test("spire principles without the project's file says how to start one (exit 1)
   assert.equal(r.code, 1);
   assert.match(r.err, /no \.spire\/principles\.md: its law is a project-owned file/);
   assert.match(r.err, /cp .*defaults\/principles\.md \.spire\/principles\.md/);
-  assert.match(spire(p, ["doctor"]).out, /PROBLEM\s+the council cannot sit: the project has no \.spire\/principles\.md/);
+  assert.match(spire(p, ["doctor"]).out, /FAIL\s+the council cannot sit: the project has no \.spire\/principles\.md/);
   put(p.root, ".spire/principles.md", "1. **x.** y\n");
-  assert.match(spire(p, ["doctor"]).out, /ok\s+the council's law is there: \.spire\/principles\.md, and viewpoints for /);
+  assert.match(spire(p, ["doctor"]).out, /OK\s+the council's law is there: \.spire\/principles\.md, and viewpoints for /);
   // a project that removed every member asks for no review: no law needed
   const none = project({ principles: false });
   for (const role of ["inspector", "steward", "architect", "designer", "warden"]) put(none.root, `.spire/review/${role}.md`, `---\nrole: ${role}\ncalls: []\n---\nNothing calls it.\n`);
-  assert.match(spire(none, ["doctor"]).out, /note\s+no reviewer is called for any path/);
+  assert.match(spire(none, ["doctor"]).out, /WARN\s+no reviewer is called for any path/);
 });
 
 // --- install / update ---
@@ -356,7 +356,7 @@ test("install and update: plan first, --apply writes the tool and the guide, the
   const help = spawnSync(installed, ["help"], { cwd: target, encoding: "utf8", env: baseEnv() });
   assert.equal(help.stdout, guide, "the installed copy prints the installed guide");
   const doc = spawnSync(installed, ["doctor"], { cwd: target, encoding: "utf8", env: baseEnv() });
-  assert.match(doc.stdout, /ok\s+the tool .* matches its PIN, and so does the guide/);
+  assert.match(doc.stdout, /OK\s+the tool .* matches its PIN, and so does the guide/);
   // the installed copy updates itself from a source it is told about, and refuses plainly when it is told none
   const noSource = spawnSync(installed, ["update"], { cwd: target, encoding: "utf8", env: baseEnv() });
   assert.equal(noSource.status, 2);
@@ -368,7 +368,7 @@ test("install and update: plan first, --apply writes the tool and the guide, the
   writeFileSync(join(target, ".agents/skills/spire-land/SKILL.md"), "edited\n");
   const drift = spawnSync(installed, ["doctor"], { cwd: target, encoding: "utf8", env: baseEnv() });
   assert.equal(drift.status, 1);
-  assert.match(drift.stdout, /PROBLEM\s+the tool or its guide was edited by hand/);
+  assert.match(drift.stdout, /FAIL\s+the tool or its guide was edited by hand/);
   assert.match(drift.stdout, /fix: spire update --apply --discard-edits/);
   assert.equal(spawnSync(installed, ["update", "--source", "/nonexistent"], { cwd: target, encoding: "utf8", env: baseEnv() }).status, 2);
   assert.equal(spawnSync(installed, ["install", "--discard-edits"], { cwd: target, encoding: "utf8", env: baseEnv() }).status, 2);

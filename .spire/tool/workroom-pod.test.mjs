@@ -72,6 +72,7 @@ const LAND_CONFIG = {
           id: "tally",
           dir: ".",
           environment: "tallydb",
+          pass: ["TALLY_PROOF"],
           cmd: ["node", "check.mjs"],
         },
       ],

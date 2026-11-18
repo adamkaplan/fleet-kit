@@ -35,6 +35,7 @@ test("layoutOf: the tool folder, .spire/, the project root and the project's own
     spire: "/p/.spire",
     root: "/p",
     land: "/p/.spire/land.json",
+    areas: "/p/.spire/areas.json",
     box: "/p/.spire/box.json",
     principles: "/p/.spire/principles.md",
     review: "/p/.spire/review",

@@ -3,10 +3,11 @@
 // by path. It would fail if an area were skipped for a path it owns, if an unmapped path were silently dropped, if a document under server/ ran the server's tests, or if the project's file lost
 // an area (a path then falls to the full suite, and the table below says which area it should have been). Oracle: the real project file; no mocks.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { staticDir, touchedAreas } from "./areas.mjs";
+import { staticDir, stepsOf, touchedAreas } from "./areas.mjs";
 import { loadConfig } from "./config.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -106,4 +107,89 @@ test("every area of Spire's file runs something, and every test step lists its f
   for (const gone of ["tests:root", "impact", "select"]) {
     assert.ok(!ids.includes(gone), `${gone} is part of the machinery the areas replaced`);
   }
+});
+
+// --- the project's areas in .spire/areas.json (S2): one declaration of what each area is, the paths and tests it owns, its kind; the steps are the recipe of its kind (land.json `recipes`) ---
+// The fixture is spire-venue's own areas.json and the recipes of its land.json; replay-paths.txt is every path the last 100 landings of that repository touched (deleted ones too).
+const proj = join(here, "../examples/spire-venue-areas");
+const readJson = (f) => JSON.parse(readFileSync(join(proj, f), "utf8"));
+const replayPaths = readFileSync(join(proj, "replay-paths.txt"), "utf8").split("\n").filter(Boolean);
+const loadAreas = () => loadConfig(join(proj, "land.json"), join(here, "fixtures/project"));
+
+test("areas.json is the third file of the view: its areas replace land.json's, with exclude and harnesses; land.json keeps its own fields", async () => {
+  const cfg = await loadAreas();
+  assert.equal(cfg.areas.length, readJson("areas.json").areas.length);
+  assert.ok(cfg.areas.length > 40);
+  assert.deepEqual(cfg.exclude, ["**/*.md"]);
+  assert.deepEqual(cfg.harnesses.always, ["a11y-keyboard", "a11y-focus"]);
+  assert.ok(cfg.recipes.server.length > 0);
+  assert.ok(cfg.paths.tests.length > 0);
+});
+
+test("every path of the last 100 landings maps to an area of areas.json: none is unmapped, none runs the full suite", async () => {
+  const cfg = await loadAreas();
+  assert.ok(replayPaths.length > 1000);
+  const r = touchedAreas(cfg, replayPaths);
+  assert.deepEqual(r.unmapped, []);
+  assert.equal(r.full, false);
+});
+
+test("an area owns its `tests` as well as its `paths`; its static directory comes from `paths` only", () => {
+  const c = { areas: [{ name: "acp", paths: ["server/src/acp/**"], tests: ["server/tests/acp/**"] }, { name: "chat", paths: ["server/src/chat/**"], tests: ["server/tests/chat/**"] }] };
+  assert.deepEqual(touchedAreas(c, ["server/tests/acp/a.test.ts"]).names, ["acp"]);
+  assert.deepEqual(touchedAreas(c, ["server/src/chat/x.ts", "server/tests/acp/a.test.ts"]).names, ["acp", "chat"]);
+  // a path no glob owns finds its area by the directories of `paths`: `server/tests/acp` is a test directory, not an enclosing one
+  const r = touchedAreas(c, ["server/tests/acp/fixtures/x.json"]);
+  assert.deepEqual(r.names, ["acp"]); // owned by the tests glob
+  const loose = touchedAreas(c, ["server/src/acp/deep/x.cfg"]);
+  assert.deepEqual(loose.names, ["acp"]);
+  const unmapped = touchedAreas(c, ["server/tests/helpers/x.ts"]);
+  assert.equal(unmapped.full, true); // `tests` are never an enclosing directory
+});
+
+test("the top-level `exclude` keeps prose out of every area but docs", () => {
+  const c = {
+    exclude: ["**/*.md"],
+    areas: [
+      { name: "docs", kind: "docs", paths: ["docs/**", "**/*.md"] },
+      { name: "acp", paths: ["server/src/acp/**"], tests: ["server/tests/acp/**"] },
+    ],
+  };
+  assert.deepEqual(touchedAreas(c, ["server/src/acp/README.md"]).names, ["docs"]);
+  assert.deepEqual(touchedAreas(c, ["server/tests/acp/notes.md", "server/src/acp/a.ts"]).names, ["docs", "acp"]);
+  assert.deepEqual(touchedAreas(c, ["docs/a.md"]).names, ["docs"]);
+});
+
+test("a recipe expands for an area: {name} in the words, {tests} once per test glob, the area's own steps after the kind's", () => {
+  const recipes = {
+    server: [
+      { id: "tests:{name}", dir: "server", list: ["git", "ls-files", "--", ":(glob){tests}"], cmd: ["node", "--test"], note: "tests of {name}" },
+      { id: "arch", cmd: ["npm", "run", "arch"] },
+      { id: "pg", list: ["bash", "-c", 'git ls-files -- "$@"', "bash", "{tests}"], env: { AREA: "{name}" } },
+    ],
+  };
+  const area = { name: "acp", kind: "server", tests: ["server/tests/acp/**", "server/tests/acp-*.test.ts"], steps: [{ id: "extra", cmd: ["true"] }] };
+  const steps = stepsOf(area, recipes);
+  assert.deepEqual(steps.map((s) => s.id), ["tests:acp", "arch", "pg", "extra"]);
+  assert.deepEqual(steps[0].list, ["git", "ls-files", "--", ":(glob)server/tests/acp/**", ":(glob)server/tests/acp-*.test.ts"]);
+  assert.equal(steps[0].note, "tests of acp");
+  assert.deepEqual(steps[2].list, ["bash", "-c", 'git ls-files -- "$@"', "bash", "server/tests/acp/**", "server/tests/acp-*.test.ts"]);
+  assert.deepEqual(steps[2].env, { AREA: "acp" });
+  assert.equal(recipes.server[0].id, "tests:{name}", "the recipe itself is never changed");
+  // an area of the old form (steps, no kind) is its own steps
+  assert.deepEqual(stepsOf({ name: "x", steps: [{ id: "s" }] }, recipes).map((s) => s.id), ["s"]);
+  // a fault in the project's files is an error, never a silent skip
+  assert.throws(() => stepsOf({ name: "x", kind: "nope" }, recipes), /area x.*kind nope/);
+  assert.throws(() => stepsOf({ name: "x", kind: "server" }, recipes), /area x.*tests/);
+  assert.throws(() => stepsOf({ name: "x" }, recipes), /area x.*no step/);
+});
+
+test("the real recipes expand for every area of areas.json, and the steps of two areas share the ids that are not about the area", async () => {
+  const cfg = await loadAreas();
+  const ids = (name) => stepsOf(cfg.areas.find((a) => a.name === name), cfg.recipes).map((s) => s.id);
+  assert.ok(ids("workroom").includes("tests:workroom"));
+  assert.ok(ids("acp").includes("tests:acp") && ids("acp").includes("tests:acp-pg") && ids("acp").includes("tests:guards"));
+  for (const a of cfg.areas) assert.ok(stepsOf(a, cfg.recipes).length > 0, a.name);
+  const workroom = stepsOf(cfg.areas.find((a) => a.name === "workroom"), cfg.recipes);
+  assert.deepEqual(workroom.find((s) => s.id === "tests:workroom").list.slice(-1), ["server/tests/workroom/**"]);
 });

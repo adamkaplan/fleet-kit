@@ -66963,6 +66963,7 @@ TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
 TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet   # #2055
 TestTriageParkedDigest = importlib.import_module("test_triage_parked_digest").build(Base, TestTriageDigest, sb)   # #2090
+TestDirectToMainCutover = importlib.import_module("test_direct_to_main_cutover_2548").TestDirectToMainCutover   # #2548
 TestTipWatch = importlib.import_module("test_tip_watch").build(Base, World, FAKE_GH, EjectionHub, sb)   # #2247
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
@@ -80321,7 +80322,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestExternalAdapterHygiene", "TestExternalAdapterKeys", "TestExternalAdapterMapping", "TestExternalAdapterOperations", "TestExternalAdapterPort",
     "TestExternalAdapterWork", "TestExternalDecisionConfig", "TestExternalDecisionRules", "TestFakeModule", "TestFeedShape", "TestFileRead",
     "TestFleetHooksSource", "TestFocusedLocalRuns", "TestGateLegs", "TestGhShimSign", "TestGhShimSignRepoFlag", "TestGithubWritingRule",
-    "TestGuardSet", "TestHardening", "TestHeavyCeilings", "TestHeavyFifo", "TestHeavyHolders", "TestHeavyProgress", "TestHeavyQueueLogic",
+    "TestDirectToMainCutover", "TestGuardSet", "TestHardening", "TestHeavyCeilings", "TestHeavyFifo", "TestHeavyHolders", "TestHeavyProgress", "TestHeavyQueueLogic",
     "TestHeavySplit", "TestHeavyWaitRecord", "TestHeavyWatchdog", "TestHeldSummaryFlowchart", "TestHygiene", "TestIdsAndEtags", "TestImpactFloorPure",
     "TestImportOrder", "TestImportSchemaChecker", "TestImportV1Converter", "TestInstallDocs", "TestIntegrationBranchVerdictText", "TestIntentChange",
     "TestIntentParsing", "TestItemVerdicts", "TestJobEndRecord", "TestJobFacts", "TestJobTool", "TestJudgeSample",

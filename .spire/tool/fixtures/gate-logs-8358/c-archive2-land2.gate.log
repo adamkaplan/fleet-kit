@@ -1,0 +1,14 @@
+land: re-run typecheck:app: not a test step: it always runs again
+land: re-run lint:app: not a test step: it always runs again
+land: re-run build:app: not a test step: it always runs again
+land: re-run stylesheet: not a test step: it always runs again
+land: re-run tests:app: (the landed rule)
+land: re-run ssr: not a test step: it always runs again
+land: re-run style: not a test step: it always runs again
+land: re-run lint: not a test step: it always runs again
+land: re-run arch: not a test step: it always runs again
+land: re-run typecheck:server: not a test step: it always runs again
+land: re-run tests:server: (the landed rule)
+land: re-run tests:pg: (the landed rule)
+land: re-run existing-startup: not a test step: it always runs again
+land: re-run sql-gate: not a test step: it always runs again

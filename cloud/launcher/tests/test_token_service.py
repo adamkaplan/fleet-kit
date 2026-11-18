@@ -34,7 +34,7 @@ CHECK_BLOCK = ('    if scheme != "Bearer" or not token:\n'
                '        return 502, None, "the caller review could not be asked"\n'
                '    if authenticated is not True:\n'
                '        return 401, None, "the caller token is not accepted"\n'
-               '    if user != "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"):\n'
+               '    if user not in ("system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):\n'
                '        return 403, None, "the caller is not the operator account"\n')
 
 
@@ -179,6 +179,52 @@ class Served(unittest.TestCase):
         base.Stub.lookup = (500, {"message": "x"})
         self.assertEqual(self.post(port2, {"repo": base.REAL, "role": "worker"})[0], 502)
 
+    def test_lander_role_is_executor_only_and_refreshes_across_hour_expiry(self):
+        executor_token = "k8s-sa-token-heavy-executor-synthetic"
+        executor_user = "system:serviceaccount:cw:floor-heavy-executor"
+        lander_perms = {"contents": "write", "statuses": "write", "metadata": "read"}
+
+        def review_with_executor(token):
+            if token == executor_token:
+                return True, executor_user
+            return fake_review(token)
+
+        port = self.serve(review=review_with_executor)
+        self.assertEqual(self.post(port, {"repo": base.REAL, "role": "lander"}, token=OTHER)[0], 403)
+        self.assertEqual(self.post(port, {"repo": base.REAL, "role": "lander"}, token=OPERATOR)[0], 403)
+        self.assertEqual(self.post(port, {"repo": base.REAL, "role": "worker"}, token=executor_token)[0], 403)
+        self.assertEqual(self.post(port, {"repo": base.REAL, "role": "orchestrator"}, token=executor_token)[0], 403)
+        clock = [1000]
+        minted = []
+
+        def fake_github_step(operation):
+            now_s = clock[0]
+            tok = "ghs_lander_%d" % len(minted)
+            exp = now_s + 3600
+            base.Stub.answer = dict(
+                self.answer,
+                token=tok,
+                expires_at="2026-11-18T%02d:00:00Z" % (len(minted) % 24),
+                permissions=dict(lander_perms),
+            )
+            status, raw = self.post(port, {"repo": base.REAL, "role": "lander"}, token=executor_token)
+            self.assertEqual(status, 200, raw)
+            ans = json.loads(raw)
+            self.assertEqual(ans["permissions"], lander_perms)
+            minted.append({"op": operation, "token": ans["token"], "minted_at": now_s, "exp": exp})
+            self.assertLess(now_s, exp, "expired token must never be used")
+            return ans["token"]
+
+        t1 = fake_github_step("push-temp-ref")
+        clock[0] += 2000
+        t2 = fake_github_step("post-statuses")
+        clock[0] += 2000
+        self.assertGreater(clock[0], minted[0]["exp"], "fake clock passed the 1-hour expiry of the first token")
+        t3 = fake_github_step("push-main-and-verify")
+        self.assertEqual([t1, t2, t3], ["ghs_lander_0", "ghs_lander_1", "ghs_lander_2"])
+        base.Stub.answer = dict(self.answer, permissions={"contents": "write", "metadata": "read"})
+        self.assertEqual(self.post(port, {"repo": base.REAL, "role": "lander"}, token=executor_token)[0], 502)
+
     def test_s2_mutant_without_the_caller_check(self):
         with open(SERVICE) as f:
             original = f.read()
@@ -243,7 +289,7 @@ class Mutants(unittest.TestCase):
             ('    if scheme != "Bearer" or not token:\n', "    if not token:\n", check_scheme),
             ("    if not isinstance(role, str) or role not in app_token.PERMISSIONS_BY_ROLE:\n", "    if not isinstance(role, str):\n", check_role),
             ("    if body_length > MAX_BODY:\n", "    if False:\n", check_limit),
-            ('    if user != "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"):\n', "    if False:\n", check_account),
+            ('    if user not in ("system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):\n', "    if False:\n", check_account),
             ("        cloud_worker.check_repo_allowed(repo, env)\n", "        pass\n", check_allowed),
         ]
         texts = set()

@@ -12,6 +12,7 @@ export function layoutOf(tool = dirname(fileURLToPath(import.meta.url))) {
     spire, // .spire: the project's own files live here
     root: resolve(spire, ".."), // the project root: the checkout the tool runs from (not necessarily the tree under test)
     land: join(spire, "land.json"),
+    areas: join(spire, "areas.json"),
     box: join(spire, "box.json"),
     principles: join(spire, "principles.md"),
     review: join(spire, "review"),

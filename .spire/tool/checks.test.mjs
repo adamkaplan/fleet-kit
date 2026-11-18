@@ -1,6 +1,6 @@
 // Admission: these tests show how checks.sh runs a change's tests by AREA (areas.mjs, classify.mjs, plan.mjs, run-steps.mjs): EVERY test of each area a change touches, nothing narrower and
 // nothing else; a path in two areas runs both; a path in no area runs the full suite; a tree that passed is not run again, but a main that moved after the checks is a NEW tree and the areas run
-// again on it (a test group is carried from the older main only where the same change passed it and the rebase brings nothing into the area: see the second-rebase test); a failed test file is red (exit 13): nothing re-runs it. They would fail if a test were
+// again on it (a test group is carried from the older main only where carry.mjs allows it: see the second-rebase test); a failed test file is red (exit 13): nothing re-runs it. They would fail if a test were
 // narrowed away, if an untouched area ran, if an unmapped path were skipped, if a rebase over a moved main reused an older result, or if a real failure were forgiven.
 // Oracle: the real checks.sh, classify, plan and run-steps and the real node test runner on a small real repository with a project of its own (an iOS app: nothing of Spire is in it); no mocks.
 import assert from "node:assert/strict";
@@ -67,6 +67,27 @@ const mark = (id, code = 0) =>
 const nodeTest = ["node", "--experimental-strip-types", "--test"];
 
 /** A foreign project's world: the mechanism's scripts, its own land.json (areas: ios, android, docs), one commit on main and a change on `work` in ios/. */
+// a test file per area that main already has and the change does not touch: it carries over a rebase, while the change's own test files re-run (carry.mjs)
+function quiet(dir) {
+  const at = git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim();
+  git(dir, "checkout", "-q", "main");
+  for (const a of ["ios", "android"]) {
+    mkdirSync(join(dir, a), { recursive: true });
+    writeFileSync(join(dir, a, "zTests.mjs"), 'import test from "node:test";\ntest("z", () => {});\n');
+  }
+  git(dir, "add", "-A");
+  git(dir, "commit", "-qm", "main has an untouched test file per area");
+  git(dir, "checkout", "-q", at);
+  git(dir, "rebase", "-q", "main");
+}
+
+// the harness's own variables (the runs file, the red switch) reach every step of these projects by the step's own `pass`, as a project's step names what it reads from the host (step-env.mjs)
+const HARNESS = ["RUNS", "RED"];
+const withHarness = (config) => {
+  for (const a of config.areas) for (const s of a.steps) s.pass ??= HARNESS;
+  return config;
+};
+
 function foreign(over = {}) {
   const dir = mkdtempSync(join(tmpdir(), "areas-test-"));
   mkdirSync(join(dir, ".spire"), { recursive: true });
@@ -120,7 +141,7 @@ function foreign(over = {}) {
     environments: {},
     ...over,
   };
-  writeFileSync(join(dir, ".spire/land.json"), JSON.stringify(config));
+  writeFileSync(join(dir, ".spire/land.json"), JSON.stringify(withHarness(config)));
   mkdirSync(join(dir, ".spire/review"));
   writeFileSync(join(dir, ".spire/review/reviewer.md"), '---\nrole: reviewer\ncalls: ["ios/**"]\n---\nLook at the iOS code.\n'); // the project's own viewpoint: the paths that call it are its own
   for (const role of ["inspector", "steward", "architect", "designer", "warden"]) writeFileSync(join(dir, ".spire/review", `${role}.md`), `---\nrole: ${role}\ncalls: []\n---\nremoved by this project\n`); // the project removes the default council
@@ -166,7 +187,7 @@ const setConfig = (dir, edit, message = "the project's file") => {
   const p = join(dir, ".spire/land.json");
   const cfg = JSON.parse(readFileSync(p, "utf8"));
   edit(cfg);
-  writeFileSync(p, JSON.stringify(cfg));
+  writeFileSync(p, JSON.stringify(withHarness(cfg)));
   git(dir, "commit", "-qam", message);
   git(dir, "checkout", "-q", at);
   git(dir, "rebase", "-q", "main");
@@ -325,7 +346,7 @@ test("a path in two areas runs both; a path in no area runs the closest enclosin
   }
 });
 
-// Measured: 90 of 242 landings in a day ended at the council or a red step and then re-ran every step on the same tree (a rebuttal changes no tree). A step that passed on a tree is kept for that tree only:
+// Measured: 90 of 242 landings in a day ended at the council or a red step and then re-ran every step on the same tree (a line in the commit message changes no tree). A step that passed on a tree is kept for that tree only:
 // a run stopped half way keeps what passed, so the next run of the same tree runs what did not; another tree runs every step again (what Land-Checks attests ran on the tree that lands).
 // Oracle: real processes and commits; each step appends its id to a file, so what ran is counted.
 test("a step that passed on a tree is kept for that tree: a red run re-runs only the red step on the same tree; any other tree runs every step", () => {
@@ -403,12 +424,12 @@ test("a tree that passed is not run again, but a main that moved after the check
   }
 });
 
-// Admission: these tests show the cheaper SECOND REBASE. After a rebase onto a moved main the cheap whole-tree steps run again on the new tree, and a test group is carried (not run) only when the same change (its diff's
-// patch-id) passed it on an earlier tree and nothing that differs between that tree and this one is in its area's declared inputs, the tool or the project's files; the line says so by area (`ios:carried from TREE`) and the
+// Admission: these tests show the cheaper SECOND REBASE. After a rebase onto a moved main the cheap whole-tree steps run again on the new tree, and the test files of a group that the change does not add or edit are carried (not run) only when the same change (its diff's
+// patch-id) passed it on an earlier tree and carry.mjs allows it (the rule is there); the line says so by area (`tests:ios(1 re-run of 2, rest carried from TREE)`: the change's own test file runs, the rest is carried) and the
 // tree it names is the one the tests really ran on. There is no switch to carry: the earlier tree is what the runs recorded. They would fail if a group that main's change could affect were carried, if a cheap step were carried,
 // if the line said `kept` or nothing for a carried group, if a retry of the carried tree ran the group again, if a carry named the wrong tree, or if another change were given the pass.
 // Oracle: real commits, the real checks.sh and real `node --test` files that append their id to a file.
-test("a rebase that brings nothing into an area's inputs carries its tests; the cheap checks rerun; one that does, or the tool, or the project's file, or a changed diff, reruns them", () => {
+test("a rebase that brings in none of the change's own files nor a file the rest reaches carries the untouched test files and re-runs the change's own; the cheap checks rerun; one that does, or the tool, or the project's file, or a changed diff, reruns everything", () => {
   const dir = foreign();
   try {
     const testStep = (area) => ({ id: `tests:${area}`, dir: ".", list: ["git", "ls-files", "--", `${area}/*Tests.mjs`], cmd: nodeTest });
@@ -417,6 +438,7 @@ test("a rebase that brings nothing into an area's inputs carries its tests; the 
       c.areas[1].steps = [testStep("android")];
     });
     const body = (id) => `import { appendFileSync } from "node:fs";\nimport test from "node:test";\ntest("t", () => appendFileSync(process.env.RUNS, "${id}\\n"));\n`;
+    quiet(dir);
     writeFileSync(join(dir, "ios/aTests.mjs"), body("tests:ios"));
     writeFileSync(join(dir, "android/bTests.mjs"), body("tests:android"));
     git(dir, "add", "-A");
@@ -444,12 +466,13 @@ test("a rebase that brings nothing into an area's inputs carries its tests; the 
     fresh();
     const a = checksIn(dir);
     assert.equal(a.status, 0, a.stdout + a.stderr);
-    assert.deepEqual(runsOf(dir), ["swiftlint"]);
-    assert.match(a.stdout, new RegExp(`ios:carried from ${t0.slice(0, 12)}`));
-    assert.match(a.stdout, new RegExp(`android:carried from ${t0.slice(0, 12)}`));
+    assert.deepEqual(runsOf(dir).sort(), both);
+    assert.match(a.stdout, /tests:ios\(1 re-run of 2, rest carried from /); // only the change's own test file ran, the untouched one is carried
+    assert.match(a.stdout, /tests:android\(1 re-run of 2, rest carried from /);
+    assert.match(a.stderr, /carried tests:ios: .*; re-run 1 test file\(s\)/);
+    assert.doesNotMatch(a.stdout, /tests:ios\(1\):\ds/); // never the unnarrowed label: the untouched file did not run
     assert.match(a.stdout, /tests=2 /); // the count is the pass that is carried
     assert.match(a.stdout, new RegExp(`tree=${treeOf().slice(0, 12)}`)); // Land-Checks names the tree that lands
-    assert.doesNotMatch(a.stdout, /tests:ios\(1\):\ds/);
     // the same tree again: the marker keyed by the tree keeps the carried pass and nothing runs (the cheap step has a marker now)
     fresh();
     const again = checksIn(dir);
@@ -462,17 +485,19 @@ test("a rebase that brings nothing into an area's inputs carries its tests; the 
     fresh();
     const chain = checksIn(dir);
     assert.equal(chain.status, 0, chain.stdout + chain.stderr);
-    assert.deepEqual(runsOf(dir), ["swiftlint"]);
-    assert.match(chain.stdout, new RegExp(`ios:carried from ${t0.slice(0, 12)}`));
+    assert.deepEqual(runsOf(dir).sort(), both);
+    assert.match(chain.stdout, new RegExp(`tests:ios\\(1 re-run of 2, rest carried from ${t0.slice(0, 12)}`));
 
-    // main moved in a file of ios: its tests run again, android's are carried
+    // main moved in a file of ios that the change does not touch and no test of the change imports (carry.mjs: the rule is the change's own files, not the area's paths): both groups are carried
     onMain("ios/Other.swift", "let c = 1\n", "ios: main moved in the area");
     fresh();
     const b = checksIn(dir);
     assert.equal(b.status, 0, b.stdout + b.stderr);
-    assert.deepEqual(runsOf(dir).sort(), ["swiftlint", "tests:ios"]);
-    assert.match(b.stdout, /android:carried from /);
-    assert.doesNotMatch(b.stdout, /ios:carried/);
+    assert.deepEqual(runsOf(dir).sort(), both);
+    assert.match(b.stdout, /tests:android\(1 re-run of 2, rest carried from /);
+    assert.match(b.stdout, /tests:ios\(1 re-run of 2, rest carried from /);
+    assert.match(b.stderr, /carried tests:ios: /);
+    assert.match(b.stderr, /re-run swiftlint: not a test step/);
 
     // the project's file moved (what an area runs is in it): nothing is carried
     setConfig(dir, (c) => (c.checks.note = "moved"));
@@ -482,21 +507,32 @@ test("a rebase that brings nothing into an area's inputs carries its tests; the 
     assert.deepEqual(runsOf(dir).sort(), both);
     assert.doesNotMatch(cfg.stdout, /carried/);
 
-    // the tool moved: nothing is carried either
-    onMain(".spire/tool/note.txt", "a newer tool\n", "the tool moved");
+    // the tool moved in a file the runner reads (it imports it): nothing is carried either
+    const plan = readFileSync(join(dir, ".spire/tool/plan.mjs"), "utf8");
+    onMain(".spire/tool/plan.mjs", `${plan}\n// a newer tool\n`, "the tool moved");
     fresh();
     const tool = checksIn(dir);
     assert.deepEqual(runsOf(dir).sort(), both);
     assert.doesNotMatch(tool.stdout, /carried/);
+    assert.match(tool.stderr, /plan\.mjs is read by the gate's own runner/);
 
-    // the rebase changed the change's own file in an area (a resolution that differs only by white space inside a line, which a patch-id does not see): that area's tests run, the other's are carried
+    // a file under .spire/ that the runner does not read (no table of .spire/ paths: reach): the groups are carried
+    onMain(".spire/tool/note.txt", "a note nobody reads\n", "the tool has a note");
+    fresh();
+    const note = checksIn(dir);
+    assert.equal(note.status, 0, note.stdout + note.stderr);
+    assert.match(note.stderr, /carried tests:ios: /);
+    assert.match(note.stdout, /tests:android\(1 re-run of 2, rest carried from /);
+
+    // the rebase changed the change's own file (a resolution that differs only by white space inside a line, which a patch-id does not see): an overlap, so every test group runs
     writeFileSync(join(dir, "ios/aTests.mjs"), body("tests:ios").replace("appendFileSync(process", "appendFileSync( process"));
     git(dir, "commit", "-qa", "--amend", "-m", "tests in both areas");
     onMain("docs/c.md", "c\n", "docs: main moved a third time");
     fresh();
     const blank = checksIn(dir);
     assert.equal(blank.status, 0, blank.stdout + blank.stderr);
-    assert.deepEqual(runsOf(dir).sort(), both.filter((x) => x !== "tests:android"));
+    assert.deepEqual(runsOf(dir).sort(), both); // the rule is the change's own files (carry.mjs), not the area's: an overlap runs every test group
+    assert.match(blank.stderr, /re-run tests:android: ios\/aTests\.mjs came in and the change touches it too/);
 
     // another change (its diff is not the one that passed) is given no pass: a fix in ios is another diff, so main moving after it carries nothing from before it
     writeFileSync(join(dir, "ios/App.swift"), "let a = 9\nlet b = 3\n");
@@ -507,6 +543,120 @@ test("a rebase that brings nothing into an area's inputs carries its tests; the 
     assert.equal(other.status, 0, other.stdout + other.stderr);
     assert.deepEqual(runsOf(dir).sort(), both);
     assert.doesNotMatch(other.stdout, /carried/);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+// Admission (carry.mjs): what decides a carry is the change's OWN files and what the incoming files REACH, replayed here on six sequential incoming commits to files the change does not touch (all carried: A3), then on an
+// incoming file the change's test imports (the test re-runs), a lock file (reaches the package's tests) and a file the change touches (runs everything). They would fail if a rebase over unrelated files ran the tests again, or if a reached test or an overlap were carried.
+// Oracle: real commits, the real checks.sh and real `node --test` files that append their id to a file; each run prints one `carried|re-run ID: reason` line per step.
+test("a replay of six incoming commits carries every test step; an overlap and a lock file carry none, and a file a test imports is not read", () => {
+  const dir = foreign();
+  try {
+    const testStep = (area) => ({ id: `tests:${area}`, dir: ".", list: ["git", "ls-files", "--", `${area}/*Tests.mjs`], cmd: nodeTest });
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [c.areas[0].steps[0], testStep("ios")];
+      c.areas[1].steps = [testStep("android")];
+    });
+    const body = (id, imp) => `import { appendFileSync } from "node:fs";\nimport test from "node:test";\n${imp}test("t", () => appendFileSync(process.env.RUNS, "${id}\\n"));\n`;
+    const fresh = () => rmSync(join(dir, "..", `${dir.split("/").pop()}.runs`), { force: true });
+    const onMain = (file, text, message) => {
+      const at = git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim();
+      git(dir, "checkout", "-q", "main");
+      mkdirSync(join(dir, file, ".."), { recursive: true });
+      writeFileSync(join(dir, file), text);
+      git(dir, "add", "-A");
+      git(dir, "commit", "-qm", message);
+      git(dir, "checkout", "-q", at);
+      git(dir, "rebase", "-q", "main");
+    };
+    quiet(dir);
+    onMain("ios/lib/util.mjs", "export const u = 1;\n", "main has the helper");
+    writeFileSync(join(dir, "ios/aTests.mjs"), body("tests:ios", 'import "./lib/util.mjs";\n'));
+    writeFileSync(join(dir, "android/bTests.mjs"), body("tests:android", ""));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "tests in both areas");
+    const first = checksIn(dir);
+    assert.equal(first.status, 0, first.stdout + first.stderr);
+    let carriedSteps = 0;
+    let totalSteps = 0;
+    for (let i = 0; i < 6; i++) {
+      onMain(`android/server/f${i}.txt`, `${i}\n`, `main moved ${i}`);
+      fresh();
+      const r = checksIn(dir);
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      assert.deepEqual(runsOf(dir).sort(), ["swiftlint", "tests:android", "tests:ios"]);
+      const lines = r.stderr.split("\n").filter((l) => /^land: (carried|re-run) /.test(l));
+      assert.equal(lines.length, 3, r.stderr); // one line per step
+      carriedSteps += lines.filter((l) => /^land: carried tests:/.test(l)).length;
+      totalSteps += lines.filter((l) => /tests:/.test(l)).length;
+    }
+    assert.equal(`${carriedSteps}/${totalSteps}`, "12/12"); // 6 rebases x 2 test steps
+    // a file the change's own test imports came in: no import is read; the own test file re-runs against it, so the change to util.mjs is executed (the inspector's case), and the untouched zTests carry
+    onMain("ios/lib/util.mjs", "export const u = 2;\n", "main moved a file a test of the change imports");
+    fresh();
+    const imp = checksIn(dir);
+    assert.equal(imp.status, 0, imp.stdout + imp.stderr);
+    assert.deepEqual(runsOf(dir).sort(), ["swiftlint", "tests:android", "tests:ios"]);
+    assert.match(imp.stderr, /land: carried tests:ios: /);
+    assert.match(imp.stderr, /land: carried tests:android: /);
+    // a lock file
+    onMain("package-lock.json", "{}\n", "main moved the lock file");
+    fresh();
+    const lock = checksIn(dir);
+    assert.deepEqual(runsOf(dir).sort(), ["swiftlint", "tests:android", "tests:ios"]);
+    assert.match(lock.stderr, /carried tests:ios: .*; re-run 2 test file\(s\)/); // the root lock file reaches every test of the tree (no table: reach): both re-run, none is carried
+    assert.match(lock.stderr, /carried tests:android: .*; re-run 2 test file\(s\)/);
+    // overlap: the rebase leaves a file the change touches different from the earlier pass's (a resolution differing by white space, which a patch-id does not see): 0 carried
+    writeFileSync(join(dir, "android/bTests.mjs"), body("tests:android", "").replace("appendFileSync(process", "appendFileSync( process"));
+    git(dir, "commit", "-qa", "--amend", "-m", "tests in both areas");
+    onMain("docs/z.md", "z\n", "main moved a document");
+    fresh();
+    const ov = checksIn(dir);
+    assert.deepEqual(runsOf(dir).sort(), ["swiftlint", "tests:android", "tests:ios"]);
+    assert.equal(ov.stderr.split("\n").filter((l) => /^land: carried /.test(l)).length, 0, ov.stderr);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+// Admission (spire-venue#8358, the real logs said `no earlier pass of this change` on a step that HAD passed on the earlier tree): the record of an earlier pass is keyed by the change and the step's command, and the command of a
+// test step ends in the list of the test files of the TREE. A rebase onto a main that added a test file made another list, so another key, so no record. The key is the change and the step (its id, directory, environment, command
+// WITHOUT the list). They would fail if a test file arriving on main hid the earlier pass of the group that lists it.
+// Oracle: real commits, the real checks.sh; the group that lists the new file prints its decision line.
+test("a rebase onto a main that added a test file to the group's list still finds the earlier pass: the list is no part of the key", () => {
+  const dir = foreign();
+  try {
+    const testStep = (area) => ({ id: `tests:${area}`, dir: ".", list: ["git", "ls-files", "--", `${area}/*Tests.mjs`], cmd: nodeTest });
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [c.areas[0].steps[0], testStep("ios")];
+      c.areas[1].steps = [testStep("android")];
+    });
+    const body = (id) => `import { appendFileSync } from "node:fs";\nimport test from "node:test";\ntest("t", () => appendFileSync(process.env.RUNS, "${id}\\n"));\n`;
+    quiet(dir);
+    writeFileSync(join(dir, "ios/aTests.mjs"), body("tests:ios"));
+    writeFileSync(join(dir, "android/bTests.mjs"), body("tests:android"));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "tests in both areas");
+    const first = checksIn(dir);
+    assert.equal(first.status, 0, first.stdout + first.stderr);
+    const at = git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim();
+    git(dir, "checkout", "-q", "main");
+    writeFileSync(join(dir, "android/cTests.mjs"), body("main:android"));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "main adds a test file to the android group");
+    git(dir, "checkout", "-q", at);
+    git(dir, "rebase", "-q", "main");
+    rmSync(join(dir, "..", `${dir.split("/").pop()}.runs`), { force: true });
+    const r = checksIn(dir);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stderr, /no earlier pass/);
+    assert.match(r.stderr, /land: carried tests:android: /);
+    assert.match(r.stderr, /land: carried tests:ios: /);
+    // the file main added IS run on this tree: a test file that came in re-runs (carry.mjs); the group's other file is carried
+    assert.ok(runsOf(dir).includes("main:android"));
+    assert.deepEqual(runsOf(dir).sort(), ["main:android", "swiftlint", "tests:android", "tests:ios"]);
   } finally {
     cleanup(dir);
   }
@@ -734,24 +884,40 @@ test("checks.install: an install runs when what it makes (`installed`, the proje
   }
 });
 
-test("a variable the project withholds (checks.withhold) never reaches a step that names no environment, in a box or not; one that does gets it", () => {
+test("a step runs in a clean environment: the base and the names its own `pass` lists reach it, nothing else of the caller's shell; a step that names an environment also gets the box's exports", () => {
   const dir = foreign({
     environments: {
       db: { wrap: ["env"], bundle: { have: ["true"], path: ["echo", "unused"] }, ifMissing: "fail" },
     },
   });
+  const seen = (...names) =>
+    node(`const seen = ${JSON.stringify(names)}.filter((n) => process.env[n] !== undefined); require('fs').appendFileSync(process.env.RUNS, process.env.STEP + ':' + seen.join(',') + '\\n')`);
   try {
     setConfig(dir, (c) => {
-      c.checks = { ...(c.checks ?? {}), withhold: ["PRIVATE_THING"] };
+      const probe = (id, extra) => ({ id, dir: ".", env: { STEP: id }, pass: ["RUNS"], cmd: seen("PATH", "HOME", "LANG", "LC_ALL", "SPIRE_EXECUTION_WORKER", "POSTGRES_PORT", "OPENROUTER_BASE_URL", "HOST_SECRETS", "DATABASE_URL", "EXTRA", "BOX_VAR"), ...extra });
       c.areas[0].steps.push(
-        { id: "plain", dir: ".", cmd: node("if (process.env.PRIVATE_THING) process.exit(1)") },
-        { id: "withenv", dir: ".", environment: "db", cmd: node("if (!process.env.PRIVATE_THING) process.exit(1)") },
+        probe("plain"),
+        probe("passes", { pass: ["RUNS", "EXTRA"] }),
+        probe("withenv", { environment: "db" }),
       );
     });
-    const r = checksIn(dir, { PRIVATE_THING: "secret" });
+    const r = checksIn(dir, {
+      LANG: "C.UTF-8",
+      LC_ALL: "C.UTF-8",
+      SPIRE_EXECUTION_WORKER: "0",
+      POSTGRES_PORT: "5999",
+      OPENROUTER_BASE_URL: "http://127.0.0.1:7500",
+      HOST_SECRETS: "OPENROUTER_API_KEY",
+      DATABASE_URL: "db://caller/db",
+      EXTRA: "1",
+      BOX_VAR: "b",
+      LAND_BOX_EXPORTS: "BOX_VAR",
+    });
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /plain:\ds/);
-    assert.match(r.stdout, /withenv:\ds/);
+    const runs = runsOf(dir);
+    assert.ok(runs.includes("plain:PATH,HOME,LANG,LC_ALL"), runs.join("\n"));
+    assert.ok(runs.includes("passes:PATH,HOME,LANG,LC_ALL,EXTRA"), runs.join("\n"));
+    assert.ok(runs.includes("withenv:PATH,HOME,LANG,LC_ALL,BOX_VAR"), runs.join("\n"));
   } finally {
     cleanup(dir);
   }
@@ -785,6 +951,57 @@ test("the independent steps run at the same time; every failure is reported", ()
     assert.equal(red.status, 13, red.stdout + red.stderr);
     assert.match(red.stderr, /check FAILED: one/);
     assert.match(red.stderr, /check FAILED: three/);
+  } finally {
+    cleanup(dir);
+    if (marks) rmSync(marks, { recursive: true, force: true });
+  }
+});
+
+// THE CHEAP CHECKS FIRST: a step marked `first` runs alone before the others start; a red among them is reported at once and nothing else starts (the slowest step is never waited for); green, the others then run side by side.
+// They would fail if a later step started before a `first` step ended, if a red `first` step let the others run, or if a `first` step waited for one that is not.
+// Oracle: real steps that record when they start and end, and append their id to $RUNS.
+test("cheap checks marked first run before everything else, a red among them stops the rest at once, and every landing prints what ran and why", () => {
+  const dir = foreign();
+  let marks;
+  try {
+    marks = mkdtempSync(join(tmpdir(), "marks-"));
+    const stamp = (id, code, first) => ({
+      id,
+      dir: ".",
+      ...(first ? { first: true } : {}),
+      cmd: node(`const fs = require("fs"); fs.appendFileSync(process.env.RUNS, ${JSON.stringify(id + "\n")}); fs.writeFileSync(${JSON.stringify(join(marks, `${id}.start`))}, String(Date.now())); setTimeout(() => { fs.writeFileSync(${JSON.stringify(join(marks, `${id}.end`))}, String(Date.now())); process.exit(${code}); }, 600)`),
+    });
+    const at = (id, k) => Number(readFileSync(join(marks, `${id}.${k}`), "utf8"));
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [stamp("slow-a", 0, false), stamp("lint", 0, true), stamp("slow-b", 0, false), stamp("types", 0, true)];
+    });
+    const green = checksIn(dir);
+    assert.equal(green.status, 0, green.stdout + green.stderr);
+    const lastFirstEnd = Math.max(at("lint", "end"), at("types", "end"));
+    assert.ok(at("slow-a", "start") >= lastFirstEnd && at("slow-b", "start") >= lastFirstEnd, "a later step started before the cheap checks ended");
+    assert.ok(Math.abs(at("lint", "start") - at("types", "start")) < 400, "the cheap checks ran side by side");
+    assert.match(green.stderr, /land: what ran, and why:/);
+    assert.match(green.stderr, /land:   lint:\ds \[cheap, first\]: not a test step: it always runs again/);
+    // red among the cheap checks: reported at once, the others never start
+    for (const f of ["slow-a", "slow-b", "lint", "types"]) for (const k of ["start", "end"]) rmSync(join(marks, `${f}.${k}`), { force: true });
+    writeFileSync(join(dir, "..", `${dir.split("/").pop()}.runs`), "");
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [stamp("slow-a", 0, false), stamp("lint", 1, true), stamp("slow-b", 0, false)];
+    });
+    const red = checksIn(dir);
+    assert.equal(red.status, 13, red.stdout + red.stderr);
+    assert.match(red.stderr, /check FAILED: lint/);
+    assert.match(red.stderr, /cheap checks first: the 2 other step\(s\) did not start/);
+    assert.deepEqual(runsOf(dir), ["lint"]);
+    assert.match(red.stderr, /land: what ran, and why:\nland:   lint: FAILED \[cheap, first\]: not a test step/); // the red path prints it too
+    assert.match(red.stderr, /land:   lint: FAILED[^\n]*\nland:   areas touched: ios \(1 changed path\(s\)\)\nland:   no step ran for the other areas/);
+    // a first step may wait only for another first step
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [stamp("slow-a", 0, false), { ...stamp("lint", 0, true), after: ["slow-a"] }];
+    });
+    const bad = checksIn(dir);
+    assert.equal(bad.status, 13, bad.stdout + bad.stderr);
+    assert.match(bad.stderr, /step lint is `first` but waits for slow-a/);
   } finally {
     cleanup(dir);
     if (marks) rmSync(marks, { recursive: true, force: true });
@@ -866,6 +1083,35 @@ test("the steps run with the project's pinned node, and a pin the host does not 
     const no = checksIn(dir, { MISE_DATA_DIR: data });
     assert.equal(no.status, 1, no.stdout + no.stderr);
     assert.match(no.stderr, /node: the project pins 22\.98 \(\.node-version\) and this host has no such version\. Installed: .*22\.99\.1.*Install it: mise install node@22\.98\./);
+    assert.deepEqual(runsOf(dir), []);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+    cleanup(dir);
+  }
+});
+// ONE python pin for every step: the project pins python once (.tool-versions); a step's plain `python3` is that interpreter, whatever the host's python3 is, and a pin the host lacks stops the run.
+test("the steps' plain python3 is the project's pinned python, and a python pin the host does not have stops the run before any step", () => {
+  const dir = foreign();
+  const data = mkdtempSync(join(tmpdir(), "pins-mise-"));
+  try {
+    const bin = join(data, "installs/python/3.12.16/bin");
+    mkdirSync(bin, { recursive: true });
+    for (const name of ["python3", "python"]) {
+      writeFileSync(join(bin, name), `#!/bin/sh\ncase "$1" in --version) echo Python 3.12.16;; *) echo pinned-python;; esac\n`, { mode: 0o755 });
+    }
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [{ id: "sees", dir: ".", cmd: ["sh", "-c", 'echo "$(python3 -m venv v) $SPIRE_PINNED" >> "$RUNS"'] }];
+    });
+    writeFileSync(join(dir, ".tool-versions"), "python 3.12.16\n");
+    const r = checksIn(dir, { MISE_DATA_DIR: data });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(runsOf(dir), ["pinned-python python@3.12.16"]);
+    assert.match(r.stderr, /spire-land: pins: python 3\.12\.16 \(pin 3\.12\.16 in \.tool-versions\)/);
+    cleanupRuns(dir);
+    writeFileSync(join(dir, ".tool-versions"), "python 3.12.17\n");
+    const no = checksIn(dir, { MISE_DATA_DIR: data });
+    assert.equal(no.status, 1, no.stdout + no.stderr);
+    assert.match(no.stderr, /python: the project pins 3\.12\.17 \(\.tool-versions\) and this host has no such version\..*Install it: mise install python@3\.12\.17\./);
     assert.deepEqual(runsOf(dir), []);
   } finally {
     rmSync(data, { recursive: true, force: true });
@@ -956,4 +1202,295 @@ exec "$@"
     cleanup(dir);
     rmSync(stub, { recursive: true, force: true });
   }
+});
+
+// Admission (carry.mjs, run-steps.mjs): the coverage map is read ONLY from the git ref of origin that checks.coverageMap names (fetched, never a local file) and only when its commit is an ancestor of the base. With such a map a first run runs
+// the test files that reach the change; a map whose commit is not an ancestor (a forged one) runs the whole area, and so does a configuration with no ref even when a map file lies in the state dir.
+// They would fail if the map were read from a file, if a map not built at an ancestor were used, or if a mapped first run ran the whole area.
+test("a first run reads the coverage map from origin's ref: only the tests that reach the change run; a map built at a commit that is not an ancestor of the base, or a local file, never narrows", () => {
+  const dir = foreign();
+  const origin = mkdtempSync(join(tmpdir(), "covmap-origin-"));
+  try {
+    const testStep = { id: "tests:ios", dir: ".", list: ["git", "ls-files", "--", "ios/*Tests.mjs"], cmd: nodeTest };
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [testStep];
+      c.checks.coverageMap = { ref: "coverage-map", maxAgeHours: 24 };
+    });
+    const body = (id) => `import { appendFileSync } from "node:fs";\nimport test from "node:test";\ntest("t", () => appendFileSync(process.env.RUNS, "${id}\\n"));\n`;
+    git(dir, "checkout", "-q", "main");
+    for (const id of ["a", "b", "z"]) writeFileSync(join(dir, `ios/${id}Tests.mjs`), body(id));
+    writeFileSync(join(dir, "ios/lib.mjs"), "export const x = 1;\n");
+    writeFileSync(join(dir, "ios/other.mjs"), "export const y = 1;\n");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "main: three tests and two sources");
+    git(dir, "checkout", "-q", "work");
+    git(dir, "reset", "-q", "--hard", "main"); // the world's own change (App.swift) is another change
+    writeFileSync(join(dir, "ios/lib.mjs"), "export const x = 2;\n\n\n\n\n\nexport const y = 1;\n");
+    git(dir, "commit", "-qam", "change lib");
+    git(origin, "init", "-q", "--bare");
+    git(dir, "remote", "add", "origin", origin);
+    const publish = (commit, built) => {
+      const map = { meta: { commit, built }, files: ["ios/lib.mjs", "ios/other.mjs", "ios/App.swift"], tests: { "ios/aTests.mjs": [0, 2], "ios/bTests.mjs": [1], "ios/zTests.mjs": [1] } };
+      const file = join(dir, "..", `${dir.split("/").pop()}.map.json`);
+      writeFileSync(file, JSON.stringify(map));
+      const h = git(dir, "hash-object", "-w", file).trim();
+      const tree = execFileSync("git", ["mktree"], { cwd: dir, env, encoding: "utf8", input: `100644 blob ${h}\tcoverage-map.json\n` }).trim();
+      const c = git(dir, "commit-tree", tree, "-m", "map").trim();
+      git(dir, "push", "-q", "-f", "origin", `${c}:refs/heads/coverage-map`);
+      rmSync(file, { force: true });
+    };
+    const fresh = () => rmSync(join(dir, "..", `${dir.split("/").pop()}.runs`), { force: true });
+    publish(git(dir, "rev-parse", "main").trim(), new Date(Date.now() - 600000).toISOString());
+    const ok = checksIn(dir);
+    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+    assert.deepEqual(runsOf(dir), ["a"], ok.stderr); // b and z do not reach ios/lib.mjs
+    assert.match(ok.stderr, /land: coverage map age \d+m \(commit [0-9a-f]+\)/);
+    assert.match(ok.stderr, /1 of 3 test file\(s\) reach the change/);
+    // a map of a commit that is not in the base's history is refused: the whole area runs
+    fresh();
+    publish("0".repeat(40), new Date().toISOString());
+    const forged = checksIn(dir);
+    assert.equal(forged.status, 0, forged.stdout + forged.stderr);
+    assert.deepEqual(runsOf(dir).sort(), ["a", "b", "z"]);
+    assert.match(forged.stderr, /not an ancestor of the base/);
+  } finally {
+    rmSync(origin, { recursive: true, force: true });
+    cleanup(dir);
+  }
+});
+
+test("a coverage map file in the state dir is never read: with no checks.coverageMap.ref the whole area runs and the line names the map", () => {
+  const dir = foreign();
+  try {
+    const testStep = { id: "tests:ios", dir: ".", list: ["git", "ls-files", "--", "ios/*Tests.mjs"], cmd: nodeTest };
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [testStep];
+    });
+    const body = (id) => `import { appendFileSync } from "node:fs";\nimport test from "node:test";\ntest("t", () => appendFileSync(process.env.RUNS, "${id}\\n"));\n`;
+    git(dir, "checkout", "-q", "main");
+    for (const id of ["a", "b"]) writeFileSync(join(dir, `ios/${id}Tests.mjs`), body(id));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "tests");
+    git(dir, "checkout", "-q", "work");
+    git(dir, "rebase", "-q", "main");
+    const state = join(dir, ".git/spire-land");
+    mkdirSync(state, { recursive: true });
+    writeFileSync(join(state, "coverage-map.json"), JSON.stringify({ meta: { built: Date.now(), commit: git(dir, "rev-parse", "main").trim() }, tests: { "ios/aTests.mjs": ["ios/App.swift"] } }));
+    const r = checksIn(dir);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(runsOf(dir).sort(), ["a", "b"]);
+    assert.match(r.stderr, /no coverage map \(checks\.coverageMap\.ref is not set\)/);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("a first run by reach: only the tests a change reaches run, a change that reaches none runs none, the step's own runner inputs run it whole, and the line says what ran and why", () => {
+  const dir = foreign();
+  try {
+    const nodeTestWith = [...nodeTest];
+    // the step's command preloads ios/preload.mjs under every test: a change to it is a change to every test
+    const step = (area, glob) => ({ id: `tests:${area}`, dir: ".", select: "reach", list: ["git", "ls-files", "--", glob], cmd: [...nodeTestWith.slice(0, 1), "--import", "./ios/preload.mjs", ...nodeTestWith.slice(1)] });
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [step("ios", "ios/*Tests.mjs")];
+      c.areas[1].steps = [{ ...step("android", "android/*Tests.mjs"), cmd: nodeTest }];
+    });
+    const body = (id, imp) => `import { appendFileSync } from "node:fs";\n${imp}import test from "node:test";\ntest("t", () => appendFileSync(process.env.RUNS, "${id}\\n"));\n`;
+    git(dir, "checkout", "-q", "main");
+    writeFileSync(join(dir, "ios/preload.mjs"), "export const p = 1;\n");
+    writeFileSync(join(dir, "ios/lib.mjs"), "export const x = 1;\n");
+    writeFileSync(join(dir, "ios/lonely.mjs"), "export const l = 1;\n");
+    writeFileSync(join(dir, "ios/aTests.mjs"), body("a", 'import "./lib.mjs";\n'));
+    writeFileSync(join(dir, "ios/bTests.mjs"), body("b", ""));
+    writeFileSync(join(dir, "ios/cTests.mjs"), body("c", ""));
+    writeFileSync(join(dir, "android/dTests.mjs"), body("d", ""));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "main: tests and sources");
+    git(dir, "checkout", "-q", "work");
+    git(dir, "rebase", "-q", "main");
+    const edit = (file, text, msg) => {
+      git(dir, "reset", "-q", "--hard", "main");
+      writeFileSync(join(dir, file), text);
+      git(dir, "add", "-A");
+      git(dir, "commit", "-qm", msg);
+    };
+    const fresh = () => rmSync(join(dir, "..", `${dir.split("/").pop()}.runs`), { force: true });
+    const check = (msg) => {
+      fresh();
+      const r = checksIn(dir);
+      assert.equal(r.status, 0, `${msg}\n${r.stdout}${r.stderr}`);
+      return r;
+    };
+    // a source file one test imports: that test runs, the others do not; the line says N of M and why
+    edit("ios/lib.mjs", "export const x = 2;\n", "change lib");
+    let r = check("lib");
+    assert.deepEqual(runsOf(dir), ["a"], r.stderr);
+    assert.match(r.stderr, /land:   tests:ios\(1 of 3 by reach\):\ds: selected 1 of 3 test file\(s\): 1 changed file\(s\)/);
+    assert.match(r.stderr, /land:   areas touched: ios \(1 changed path\(s\)\)/);
+    assert.match(r.stderr, /no step ran for the other areas \(no changed path of theirs\): android, docs/);
+    // a source file nothing imports: no test of the step runs (the runner is never started on an empty list), and the line says so
+    edit("ios/lonely.mjs", "export const l = 2;\n", "change lonely");
+    r = check("lonely");
+    assert.deepEqual(runsOf(dir), []);
+    assert.match(r.stderr, /tests:ios\(0 of 3 by reach\):none: selected 0 of 3 test file\(s\)/);
+    // a test file nothing imports selects itself
+    edit("ios/cTests.mjs", body("c", "") + "// edited\n", "change c");
+    check("c");
+    assert.deepEqual(runsOf(dir), ["c"]);
+    // a change in another area runs that area's tests and none of ios's
+    edit("android/dTests.mjs", body("d", "") + "// edited\n", "change d");
+    r = check("android");
+    assert.deepEqual(runsOf(dir), ["d"]);
+    assert.doesNotMatch(r.stderr, /tests:ios/);
+    // the file the step preloads under every test: the whole step
+    edit("ios/preload.mjs", "export const p = 2;\n", "change preload");
+    r = check("preload");
+    assert.deepEqual(runsOf(dir).sort(), ["a", "b", "c"]);
+    assert.match(r.stderr, /is what the step runs under .*: the whole step runs/);
+    // a green selected step is kept on the same tree (its marker holds the list it ran), and a rebase is a new first run
+    edit("ios/lib.mjs", "export const x = 3;\n", "change lib again");
+    check("again");
+    r = checksIn(dir);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stderr, /tests:ios\(1 of 3 by reach\):kept/);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+// Admission: a step that passed on a tree is kept for that tree wherever the tree is checked: the push gate runs the same tree in a scratch worktree of its own, at a path of its own, and a step whose command names
+// `{root}` (the venue's test groups run `{root}/scripts/ci/group-runner.mjs`) must not run again for the path. The key of the marker is the tree and the step's command with the project root as `{root}`, never as a path.
+// It would fail if the root's path were part of the key: every test group of the venue ran again in every push gate, though main had not moved. Oracle: a real clone, a real second worktree of it, the real checks.sh in both.
+test("a step that passed on a tree is kept in another worktree of the same clone: the project root's path is no part of its key", () => {
+  const dir = foreign();
+  const other = `${dir}-wt`;
+  try {
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [{ id: "rooted", dir: ".", cmd: ["node", "{root}/ios/rooted.mjs"] }]; // a command that names the root, as the venue's groups do
+    });
+    git(dir, "checkout", "-q", "main");
+    writeFileSync(join(dir, "ios/rooted.mjs"), 'import { appendFileSync } from "node:fs";\nappendFileSync(process.env.RUNS, "rooted\\n");\n');
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "main: the step");
+    git(dir, "checkout", "-q", "work");
+    git(dir, "rebase", "-q", "main");
+    const first = checksIn(dir);
+    assert.equal(first.status, 0, first.stdout + first.stderr);
+    assert.deepEqual(runsOf(dir), ["rooted"]);
+    git(dir, "worktree", "add", "-q", "-f", "--detach", other, "HEAD");
+    const again = spawnSync(join(other, ".spire/tool/checks.sh"), ["main"], { cwd: other, env: { ...env, RUNS: join(dir, "..", `${dir.split("/").pop()}.runs`) }, encoding: "utf8" });
+    assert.equal(again.status, 0, again.stdout + again.stderr);
+    assert.deepEqual(runsOf(dir), ["rooted"], "the same tree in another worktree ran the step again");
+    assert.match(again.stdout, /rooted:kept/);
+  } finally {
+    git(dir, "worktree", "remove", "-f", other);
+    cleanup(dir);
+  }
+});
+
+// Admission: a step marked `select: "reach"` is carried over a rebase too (carry.mjs): of the tests the change reaches on the rebased tree, the ones that passed before and that nothing incoming reaches are carried, the others run.
+// It would fail if a rebase ran the selection again whole (the tests that passed run again), if an incoming file's test were carried, if a test that never ran were carried, or if a red incoming file were not caught on the final tree.
+// Oracle: real commits, the real checks.sh, real `node --test` files that append their id to a file.
+test("a step marked select reach is carried over a rebase: only the selected tests an incoming file reaches, and the ones that never ran, run again; a red there fails the final tree", () => {
+  const dir = foreign();
+  try {
+    setConfig(dir, (c) => {
+      c.areas[0].steps = [{ id: "tests:ios", dir: ".", select: "reach", list: ["git", "ls-files", "--", "ios/*Tests.mjs"], cmd: nodeTest }];
+    });
+    const body = (id, imp) => `import { appendFileSync } from "node:fs";\n${imp}import test from "node:test";\ntest("t", () => appendFileSync(process.env.RUNS, "${id}\\n"));\n`;
+    git(dir, "checkout", "-q", "main");
+    writeFileSync(join(dir, "ios/lib.mjs"), "export const x = 1;\n\n\n\n\n\nexport const y = 1;\n");
+    writeFileSync(join(dir, "ios/dep.mjs"), "export const d = 1;\n");
+    writeFileSync(join(dir, "ios/aTests.mjs"), body("a", 'import "./lib.mjs";\nimport "./dep.mjs";\n'));
+    writeFileSync(join(dir, "ios/bTests.mjs"), body("b", 'import "./lib.mjs";\n'));
+    writeFileSync(join(dir, "ios/cTests.mjs"), body("c", ""));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "main: tests and sources");
+    git(dir, "checkout", "-q", "work");
+    git(dir, "reset", "-q", "--hard", "main"); // the world's own change (App.swift) is another change
+    writeFileSync(join(dir, "ios/lib.mjs"), "export const x = 2;\n\n\n\n\n\nexport const y = 1;\n");
+    git(dir, "commit", "-qam", "change lib");
+    const onMain = (file, text, msg) => {
+      git(dir, "checkout", "-q", "main");
+      writeFileSync(join(dir, file), text);
+      git(dir, "add", "-A");
+      git(dir, "commit", "-qm", msg);
+      git(dir, "checkout", "-q", "work");
+      git(dir, "rebase", "-q", "main");
+    };
+    const check = () => {
+      rmSync(join(dir, "..", `${dir.split("/").pop()}.runs`), { force: true });
+      return checksIn(dir);
+    };
+    let r = check();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(runsOf(dir).sort(), ["a", "b"], r.stderr);
+    // main moved in a document nothing reaches: the selection is the same two tests, both passed before: nothing runs
+    onMain("docs/a.md", "a\nmore\n", "docs: main moved");
+    r = check();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(runsOf(dir), [], "both selected tests are carried");
+    assert.match(r.stderr, /carried tests:ios: .*: 0 of 2 other test file\(s\) the change reaches reach them/);
+    assert.match(r.stdout, /ios:carried from /);
+    // main moved in a file one of them imports: that test runs, the other is carried
+    onMain("ios/dep.mjs", "export const d = 2;\n", "main: dep");
+    r = check();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(runsOf(dir), ["a"]);
+    assert.match(r.stdout, /tests:ios\(1 re-run of 2, rest carried from /);
+    // main added a test that reaches the change: it never ran, so it runs; the two that passed are carried
+    onMain("ios/eTests.mjs", body("e", 'import "./lib.mjs";\n'), "main: a new test");
+    r = check();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(runsOf(dir), ["e"]);
+    // a test the change reaches that main added without the step ever having passed it is not carried; a file that makes a selected test red runs it on the final tree: the gate fails
+    onMain("ios/dep.mjs", 'throw new Error("red");\n', "main: a dep that breaks its importer");
+    r = check();
+    assert.equal(r.status, 13, r.stdout + r.stderr);
+    assert.match(r.stderr, /FAILED: tests:ios\(1 re-run of 3, rest carried from /, "only the test that imports the incoming file ran (it throws before it can say so), and the gate is red");
+    assert.match(r.stderr, /failed files of tests:ios[^\n]*\n\s+ios\/aTests\.mjs/);
+    // an overlap is selected again as a first run (the tests that reach the change, never the whole step), not carried
+    git(dir, "checkout", "-q", "main");
+    writeFileSync(join(dir, "ios/dep.mjs"), "export const d = 3;\n");
+    git(dir, "commit", "-qam", "main: dep fixed");
+    git(dir, "checkout", "-q", "work");
+    git(dir, "rebase", "-q", "main");
+    writeFileSync(join(dir, "ios/lib.mjs"), "export const x = 3;\n\n\n\n\n\nexport const y = 1;\n");
+    git(dir, "commit", "-qam", "change lib again");
+    assert.equal(check().status, 0, "the new change passes its first run");
+    onMain("ios/lib.mjs", "export const x = 1;\n\n\n\n\n\nexport const y = 7;\n", "main: lib moved too, elsewhere in the file");
+    r = check();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(runsOf(dir).sort(), ["a", "b", "e"], "an overlap is no carry: the tests that reach the change run");
+    assert.match(r.stderr, /re-run tests:ios: ios\/lib\.mjs came in and the change touches it too; selected 3 of 4 test file\(s\)/);
+    // main DELETED a file a selected test still imports (the test is not changed under it): the deleted file is an incoming file the test reaches, and the test runs on the final tree and is red
+    git(dir, "checkout", "-q", "main");
+    git(dir, "rm", "-q", "ios/dep.mjs");
+    git(dir, "commit", "-qm", "main: dep deleted");
+    git(dir, "checkout", "-q", "work");
+    git(dir, "rebase", "-q", "main");
+    r = check();
+    assert.equal(r.status, 13, r.stdout + r.stderr);
+    assert.match(r.stderr, /FAILED: tests:ios\(1 re-run of 3, rest carried from /);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("the files every test of a step runs under are the ones its command, its list command and its environment's recipe name", async () => {
+  const { runnerInputs } = await import("./plan.mjs");
+  const tracked = new Set(["scripts/ci/group-runner.mjs", "scripts/ci/postgres-suites.mjs", "scripts/dev/sandbox.mjs", "server/tests/helpers/reset.ts", "scripts/dev/ephemeral-pg.sh", "scripts/pg/bundle.sh", "server/tests/a.test.ts", "scripts/ci/unrelated.mjs", "scripts/ci/shard-plan.json"]);
+  const step = {
+    dir: "server",
+    environment: "postgres",
+    files: ["tests/a.test.ts"],
+    argv: ["node", "/r/scripts/ci/group-runner.mjs", "--import", "../scripts/dev/sandbox.mjs", "--test", "--group-reset=tests/helpers/reset.ts", "tests/a.test.ts"],
+    listKey: ["bash", "-c", "node scripts/ci/postgres-suites.mjs unit | sed 's#^#server/#'"],
+    runsUnder: ["scripts/ci/shard-plan*"],
+  };
+  const environments = { postgres: { wrap: ["{root}/scripts/dev/ephemeral-pg.sh", "--"], bundle: { path: ["{root}/scripts/pg/bundle.sh", "--path"] } }, other: { wrap: ["scripts/ci/unrelated.mjs"] } };
+  const got = runnerInputs({ step, environments, tracked, root: "/r" }).sort();
+  assert.deepEqual(got, ["scripts/ci/group-runner.mjs", "scripts/ci/postgres-suites.mjs", "scripts/dev/ephemeral-pg.sh", "scripts/dev/sandbox.mjs", "scripts/pg/bundle.sh", "server/tests/helpers/reset.ts", "scripts/ci/shard-plan.json"].sort());
+  // the step's own test files are not runner inputs, nor is another environment's recipe
+  assert.ok(!got.includes("server/tests/a.test.ts") && !got.includes("scripts/ci/unrelated.mjs"));
 });

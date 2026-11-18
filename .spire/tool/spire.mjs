@@ -4,6 +4,7 @@
 //   land | box | council    the entries of this folder, arguments passed through, exit status = theirs
 //   check [--retest] [BASE] the areas' tests of the change, with no council and no push (checks.sh; BASE defaults to origin/main)
 //   areas [BASE] [--json]   which areas the change touches (classify.mjs, said in words)
+//   attest [RANGE]          the audit of the record on the landed commits: the share that carries a record of the tree that landed (attest.mjs)
 //   capture [...]           box capture: the pictures of the screens at the head of the tree
 //   workroom up | down      the shared environment of a Workroom: the project's own box (its `workroom.prepare` first), kept for a day
 //   principles [ROLE]       the law a change is built and judged by: the project's .spire/principles.md in full, then each reviewer's viewpoint with the principle numbers it enforces (ROLE: that viewpoint whole)
@@ -17,14 +18,16 @@ import { fileURLToPath } from "node:url";
 import { doctor, guideOf, treeOf } from "./doctor.mjs";
 import { layout } from "./layout.mjs";
 import { fromDisk, loadReviewers, PRINCIPLES_PATH } from "./reviewers.mjs";
+import { APP_KEY_ENV } from "./app-env.mjs";
 import { PinError, spawn, spawnSync } from "./versions.mjs";
 
 /** The subcommands, in the order the list is printed: [name, usage, what it does]. */
 export const COMMANDS = [
   ["help", "help [COMMAND]", "print the one guide (or one command's usage)"],
-  ["land", 'land [--retest] [--rebut "ROLE=PRINCIPLE: REASON"] [--dry-run]', "check, review and land your commits on main"],
+  ["land", 'land [--retest] [--dry-run]', "check, review and land your commits on main"],
   ["check", "check [--retest] [BASE]", "run the tests of the areas your change touches (no review, no push)"],
   ["areas", "areas [BASE] [--json]", "say which areas your change touches"],
+  ["attest", "attest [--brief] [--all] [--json] [RANGE]", "the share of the landed commits (default: the last 300 of origin/main) that carry a record of the tree that landed, and which do not"],
   ["box", "box up|run|land|capture|refresh|reset|status|down ...", "the project's environment, as its .spire/box.json declares it (none declared: a checkout and nothing else)"],
   ["council", "council [--base REF] [--head REF] [--roles a,b]", "the review members your change's paths call for, alone"],
   ["capture", "capture [--scene S] [--out DIR] [--box ID]", "the pictures of the screens (box capture)"],
@@ -49,10 +52,12 @@ class Refusal extends Error {
 
 /** Run a command with inherited stdio under the project's pins; resolves to its exit status. Signals sent to us go to the child. */
 function exec(cmd, args, { env, cwd } = {}) {
+  // the fleet App's private key goes to `land` alone (it hands it to the push); every other entry is started without it
+  const { [APP_KEY_ENV]: _key, ...rest } = env ?? process.env;
   return new Promise((done) => {
     let child;
     try {
-      child = spawn(cmd, args, { stdio: "inherit", env, cwd });
+      child = spawn(cmd, args, { stdio: "inherit", env: cmd === entry("land") ? (env ?? process.env) : rest, cwd });
     } catch (e) {
       if (e instanceof PinError) {
         err(`spire-land: ${e.message}`);
@@ -158,7 +163,7 @@ function principles(args) {
     out(`calls: ${r.calls.join(", ") || "(none: nothing calls it)"}\nenforces: ${r.enforces.map((n) => `P${n}`).join(" ") || "(none named)"}${r.reads.length ? `\nreads: ${r.reads.join(", ")}` : ""}\n\n${r.body}`);
     return 0;
   }
-  out(`== the project's principles (${PRINCIPLES_PATH}: the project's own law; a finding and a rebuttal cite a rule by its number, P3) ==\n`);
+  out(`== the project's principles (${PRINCIPLES_PATH}: the project's own law; a finding cites a rule by its number, P3) ==\n`);
   out(text.trimEnd());
   out(`\n== the reviewers' viewpoints (what each looks for, which paths call it, which principles it enforces; spire principles ROLE prints one whole) ==\n`);
   for (const r of reviewers.values()) {
@@ -265,6 +270,8 @@ export async function main(argv) {
     }
     case "areas":
       return areas(args);
+    case "attest":
+      return exec("node", [entry("attest.mjs"), ...args], { cwd });
     case "workroom":
       return workroom(args);
     case "principles":

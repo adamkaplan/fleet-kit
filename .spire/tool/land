@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# land [--retest] [--rebut "ROLE=PRINCIPLE: REASON"] [--dry-run]: the one command. Commit, then run `land` in your worktree.
+# land [--retest] [--dry-run] [--why-not TEXT] [--override REASON]: the one command. Commit, then run `land` in your worktree.
 #   1 find the test AREAS the change's paths touch   2 run the council (.spire/tool/council: the members
-#   the change's PATHS call for (each reviewer's own `calls`: the Warden, on the project's sensitive paths, by default; never the change's size), synchronously, fast Model classes; none when no path calls for one (docs, tests); a blocking finding stops the landing, exit 18; the repair
-#   loop is yours: edit, commit, land again, or rebut a finding with --rebut citing a principle; a finding rated fix or block closes only by a fix its member re-reviews clean or a rebuttal its member accepts;
-#   only the members with a finding to close run again; a finding stays open until it is closed (exit 18 each time);
-#   there is NO flag that skips the council or the checks, and none that overrides a result, and no count of rounds that lets a finding through: a project may mark paths `held` for a person in its file (exit 22), never a skip)
+#   the change's PATHS call for (each reviewer's own `calls`: the Warden, on the project's sensitive paths, by default; never the change's size), synchronously, fast Model classes; none when no path calls for one (docs, tests);
+#   the council's findings are ADVICE, never a gate (captain ruling, 15 Nov 2026, again 17 Nov 2026: the agent decides and records why not): the advice is printed ONCE and recorded in the Land-Council trailer (member, rating, principle number), and the land goes on:
+#   follow it in a follow-up commit, or say in ONE line why not (`--why-not TEXT`, optional: it is written as a Land-Why-Not trailer). A member that could not answer (or no model route) is recorded there as `unable to review`; it never stops the land.
+#   There is NO flag that skips the council or the checks, none that overrides a red check, and no count of rounds: a project may mark paths `held` for a person in its file (exit 22), never a skip.
+#   ONE flag goes past a stop, and only the held-path one: `--override REASON` (the owner's route for a path the project holds for a person). The checks and the council run as for any landing, a red check still refuses (13), and the
+#   REASON is written as an `Override:` trailer on every commit, beside Land-Checks and Land-Council. A change that holds nothing says the flag is ignored and writes no Override.
 #   3 AT THE SAME TIME run EVERY test of each touched area (the project's `areas`; a path in no area runs the full suite); the first red result stops the other
 #   4 write the attestation (unsigned trailers Land-Checks and Land-Council) on the tip commit   5 hand the commits to the landing step
 #   (`push`, beside this file: rebase onto origin/main (land has already rebased, so the areas and the council ran on that combination and the gate is green at once; a main that moved since is a new tree: run-steps.mjs says what runs again and what is carried), re-run the gate on the exact combination, push main as a plain fast-forward; the push is the lock;
@@ -14,32 +16,43 @@
 # LAND_VIA_PR=1 is the only PR path: after the checks and the attestation it pushes your branch and opens a PR instead (exit 20), landing nothing.
 # A red result is never a reason to push: iterate (in the Workroom) until every touched area is green; there is no flag that lands past a failing area.
 # Exit: 0 landed | 1 stopped with a plain message | 2 bad input (dirty tree, nothing to land) | 11 rebase conflict (files named; fix, commit, land again)
-#   | 12 refused by the lander | 13 a check or an area's test failed (an area's own step: a browser job, say) | 14 held or frozen | 15 a council member could not answer (run land again) | 16 main moved faster than the lander could validate (run land again)
+#   | 12 refused by the lander | 13 a check or an area's test failed (an area's own step: a browser job, say) | 14 held or frozen | 16 main moved faster than the lander could validate (run land again)
 #   | (14 reads this clone's own hold or freeze: `push --hold`, `push --freeze`)
-#   | 18 the council has a finding rated fix or block to close (printed; main not moved)
 #   | 22 a path of the change is `held` for a person by the project's file (land.json `held`): the reason is printed, nothing was started
 #   | 20 LAND_VIA_PR=1 only: branch pushed and PR opened, nothing landed. The last stdout line is JSON: {"result","exit",...}.
+# Every exit, whatever its code (a signal too), appends ONE line to <git common dir>/spire-land/metrics.jsonl (metrics.mjs says what is in it): the clock of a landing is measured, not modelled. LAND_COMMISSION (the venue's commission id, if the caller has one) is written to it.
 set -uo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/lib/app-key.sh"; app_key_take   # the fleet App's key leaves the environment at once: the checks and the council never see it; only the push (and the early check) is handed it
 # the project's pinned tool versions first (versions.mjs): every command below, the checks, the council and the lander included, runs with them; a pin the host cannot honour stops here
 . "$(cd "$(dirname "$0")" && pwd)/versions.sh"; spire_versions "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
-retest=; rebut=(); passthru=()
+retest=; whynot=; override=; passthru=()
 while [ $# -gt 0 ]; do case $1 in
-  --rebut) rebut+=(--rebut "${2:?--rebut needs ROLE=PRINCIPLE: REASON}"); shift;;
+  --why-not) shift; whynot=$(printf '%s' "${1:-}" | tr '\r\n' '  '); [ -n "$whynot" ] || { echo "usage: land [--why-not TEXT]: TEXT is one line" >&2; exit 2; };; # the one line that says why the council's advice was not followed
+  --override) shift; override=$(printf '%s' "${1:-}" | tr '\r\n' '  '); [ -n "${override// /}" ] || { echo "usage: land [--override REASON]: REASON is one line, who owns the held path and why it lands" >&2; exit 2; };; # the owner's route past a HELD path (22), and nothing else
   --retest) retest=1;; # run ONLY the steps and test files that failed last time (checks.sh --retest), until green: no council, no push
   --dry-run) passthru+=(--dry-run);;
-  *) echo "usage: land [--retest] [--rebut \"ROLE=PRINCIPLE: REASON\"] [--dry-run]" >&2; exit 2;; esac; shift; done
+  *) echo "usage: land [--retest] [--dry-run] [--why-not TEXT] [--override REASON]" >&2; exit 2;; esac; shift; done
 here=$(cd "$(dirname "$0")" && pwd); top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "land: not in a git worktree" >&2; exit 2; }; cd "$top"
 # inside a workroom instance (`box land` sets LAND_INSTANCE_URL, its app, and LAND_INSTANCE_DB, its database server): the checks use them; nothing else is started
 t0=$(date +%s); say() { echo "land: $*"; }
+run_id=$t0-$$; export LAND_RUN=$run_id # the measurement record's key of this run: `push` writes it too (metrics.mjs)
+result=; kt0=; sha=; base=; branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
 # every temp file of this run lives in one directory that is removed when the run ends, by any exit, interrupt or terminate; a killed run's is removed by the next run (owned-tmp.sh)
 . "$here/owned-tmp.sh"; owned_tmp_reap land-run.; ltmp=$(owned_tmp_make land-run.) || { echo "land: cannot make a temp directory" >&2; exit 1; }
 land_stop() { local p; for p in "$@"; do [ -z "$p" ] || kill -TERM -- "-$p" 2>/dev/null || true; done; } # a job of its own process group (set -m below)
-land_cleanup() { [ -e "$ltmp/checks.rc" ] || land_stop "${cpid:-}"; [ -e "$ltmp/council.rc" ] || land_stop "${kpid:-}"; rm -rf "$ltmp"; }
+# the measurement record (a dry run lands nothing: no sha in it), at EVERY exit (the trap runs for a signal's `exit` too), before the temp directory goes: after the run's last line of output, never a reason to change an exit code
+land_metrics() { local mf lsha=$sha; [ ${#passthru[@]} -eq 0 ] || lsha=; mf=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/spire-land || return 0; mkdir -p "$mf" 2>/dev/null || return 0
+  node "$here/metrics.mjs" land "file=$mf/metrics.jsonl" "run=$run_id" "start=$t0" "exit=$1" "result=${result:-interrupted}" "commission=${LAND_COMMISSION:-}" "branch=$branch" "subject=$(git log --reverse --format=%s "${base:-HEAD}..HEAD" 2>/dev/null | head -n1 | head -c 100)" \
+    "base=${base:0:12}" "tip=$(git rev-parse --short=12 HEAD 2>/dev/null)" "tree=$(git rev-parse --short=12 'HEAD^{tree}' 2>/dev/null)" "lines=${prod:-}" "files=${files:-}" "tmp=$ltmp" "kt0=$kt0" "sha=$lsha" >/dev/null 2>&1 || true; }
+land_cleanup() { local rc=$?; land_metrics "$rc"; [ -e "$ltmp/checks.rc" ] || land_stop "${cpid:-}"; [ -e "$ltmp/council.rc" ] || land_stop "${kpid:-}"; rm -rf "$ltmp"; }
 trap land_cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 finish() { # finish EXIT RESULT [extra json]
+  result=$2
   printf '{"result":"%s","exit":%s,"lines":%s%s,"seconds":%s}\n' "$2" "$1" "${prod:-0}" "${3:+,$3}" "$(( $(date +%s) - t0 ))"; exit "$1"; }
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { say "uncommitted changes: commit them first (only commits land)"; finish 2 bad-input; }
 git fetch -q origin main || { say "cannot fetch origin main"; finish 1 error; }
+# the App check, early: a host with FLEET_APP_ID set whose app cannot make a token stops here, not after the checks (no fallback to a human identity; app-push.mjs)
+[ -n "$retest" ] || FLEET_APP_PRIVATE_KEY=$fleet_app_key node "$here/app-push.mjs" check "$top" origin || { say "the push would be made by the fleet App and it cannot be: nothing was checked or pushed"; finish 1 error; }
 base=$(git merge-base HEAD origin/main) && [ "$(git rev-parse HEAD)" != "$base" ] || { say "nothing to land: HEAD has no commit beyond origin/main"; finish 2 bad-input; }
 # rebase FIRST: the checks and the council then run once, on the combination the lander will push (its gate finds the tree green and its rebase a no-op)
 if [ "$base" != "$(git rev-parse origin/main)" ]; then
@@ -62,57 +75,57 @@ j() { printf '%s' "$info" | node -e 'const o=JSON.parse(require("fs").readFileSy
 prod=$(j prod); files=$(j files)
 # paths the project's file holds for a person (`held`): stop at once with the reason; there is no flag that lands them
 heldmsg=$(printf '%s' "$info" | node -e 'const h=JSON.parse(require("fs").readFileSync(0,"utf8")).held;console.log([...new Set(h.map((x)=>x.reason))].map((r)=>`${r} (${h.filter((x)=>x.reason===r).map((x)=>x.path).slice(0,5).join(", ")})`).join("; "))')
-[ -z "$heldmsg" ] || { say "held for a person: $heldmsg. Nothing was checked or pushed; a person lands it"; finish 22 held-for-a-person; }
+if [ -n "$heldmsg" ]; then
+  [ -n "$override" ] || { say "held for a person: $heldmsg. Nothing was checked or pushed; a person lands it (the owner: land --override REASON)"; finish 22 held-for-a-person; }
+  say "held for a person: $heldmsg"; say "--override: landing it anyway; the checks and the council run as for any landing, and the reason is recorded as an Override: trailer"
+elif [ -n "$override" ]; then say "--override: nothing is held; ignored (no Override is recorded)"; override=; fi
 areas=$(printf '%s' "$info" | node -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8")).areas;console.log(a.names.join(", ")+(a.full?"  (the FULL suite: unmapped "+a.unmapped.slice(0,5).join(", ")+")":""))')
 say "$prod production lines in $files files; areas: $areas"
 
 # the areas' tests, on the submitter's tree, which is already the latest main plus the change (a tree that already passed is not run again; a main that moved is a new tree)
-export LAND_CHECKS_OUT=$ltmp/checks
+export LAND_CHECKS_OUT=$ltmp/checks LAND_STEPS_OUT=$ltmp/steps.jsonl
 # --retest: the loop between fixes. Only the steps and files that failed last time run (their prerequisites with them); the council never starts and nothing is attested or pushed.
 # Green here means "those are fixed": a plain `land` then runs every test of the touched areas ONCE on the final tree, the council, and the push.
 if [ -n "$retest" ]; then
   "$here/checks.sh" --retest origin/main && { say "$(cat "$LAND_CHECKS_OUT")"; finish 0 retest-green; }
   rc=$?; say "retest still red (exit $rc): fix those, commit, land --retest again; nothing was reviewed or pushed"; finish "$rc" retest-red
 fi
-# the council and the checks run AT THE SAME TIME, each in its own process group, from the rebased tree. The first red result stops the land at once and stops the other: a council finding (a seconds-long
-# model call) kills the checks, which would otherwise run minutes on a tree its fix will change (measured: checks.test.mjs); a red
-# check kills the council (it is not waited for). What is kept between rounds: run-steps.mjs. It always runs: no flag skips the council or the checks.
+# the council and the checks run AT THE SAME TIME, each in its own process group, from the rebased tree. A red check stops the land at once and stops the council (it is not waited for). The council never stops anything:
+# its advice is printed and recorded, a member that could not answer is recorded as unable to review. What is kept between runs: run-steps.mjs. It always runs: no flag skips the council or the checks.
 rc_of() { cat "$ltmp/$1.rc" 2>/dev/null; }
-set -m
+set -m; kt0=$(date +%s)
 ( "$here/checks.sh" origin/main >"$ltmp/checks.out" 2>"$ltmp/checks.err"; echo $? >"$ltmp/checks.rc.tmp"; mv "$ltmp/checks.rc.tmp" "$ltmp/checks.rc" ) & cpid=$!
-( "$here/council" --base "$base" --loop "${rebut[@]}" >"$ltmp/council.out" 2>"$ltmp/council.err"; echo $? >"$ltmp/council.rc.tmp"; mv "$ltmp/council.rc.tmp" "$ltmp/council.rc" ) & kpid=$!
+( "$here/council" --base "$base" >"$ltmp/council.out" 2>"$ltmp/council.err"; echo $? >"$ltmp/council.rc.tmp"; mv "$ltmp/council.rc.tmp" "$ltmp/council.rc" ) & kpid=$!
 set +m
 while :; do
   crc=$(rc_of checks); krc=$(rc_of council)
-  [ -z "$krc" ] || [ "$krc" = 0 ] || break # a finding, or a member that could not answer
   [ -z "$crc" ] || [ "$crc" = 0 ] || break # a red check
-  [ -z "$krc" ] || [ -z "$crc" ] || break  # both are done, both green
+  [ -z "$krc" ] || [ -z "$crc" ] || break  # both are done
   sleep 1
 done
-if [ -n "$krc" ] && [ "$krc" != 0 ]; then
-  [ -n "$crc" ] || { land_stop "$cpid"; say "a council finding stops the checks (they would run on a tree its fix changes)"; }
-  grep -v '^{' "$ltmp/council.out"; cat "$ltmp/council.err" >&2; [ -z "$crc" ] || { cat "$ltmp/checks.out"; cat "$ltmp/checks.err" >&2; }
-  say "council did not pass (exit $krc): fix what it found (a finding rated fix stops the landing like a block), commit, land again"; finish "$krc" council-stopped
-fi
 if [ -n "$crc" ] && [ "$crc" != 0 ]; then
   [ -n "$krc" ] || { land_stop "$kpid"; say "a failed check stops the council"; }
+  [ -z "$krc" ] || { grep -v '^{' "$ltmp/council.out"; cat "$ltmp/council.err" >&2; }
   cat "$ltmp/checks.out"; cat "$ltmp/checks.err" >&2; say "checks failed (exit $crc): fix, commit, land again"; finish "$crc" checks-failed
 fi
 grep -v '^{' "$ltmp/council.out"; cat "$ltmp/council.err" >&2; cat "$ltmp/checks.out"; cat "$ltmp/checks.err" >&2
 checks=$(cat "$LAND_CHECKS_OUT"); say "checks ok: $checks"
 cl=$(tail -n1 "$ltmp/council.out" | node -e 'try{console.log(JSON.parse(require("fs").readFileSync(0,"utf8")).trailer??"")}catch{}')
+if [ "$krc" != 0 ]; then # the council itself did not run (a crash, a bad setting): a note, never a stop
+  cl="unable to review (the council exited $krc)"; say "council did not run (exit $krc): recorded as unable to review in the Land-Council trailer; it did not block this landing"
+fi
 [ -n "$cl" ] || cl="not recorded"
 
 # the attestation: unsigned trailers on the tip commit (re-running land replaces them)
-# an `Override:` trailer is never kept: nothing in land writes one and none passes through
+# an `Override:` trailer is never kept from a commit's own message: only the one land writes from --override, for a held path it was asked to go past
 msg=$(git log -1 --format=%B | grep -v '^Override: ')
-printf '%s\n' "$msg" | git interpret-trailers --if-exists replace --trailer "Land-Checks: $checks" --trailer "Land-Council: $cl" \
+printf '%s\n' "$msg" | git interpret-trailers --if-exists replace --trailer "Land-Checks: $checks" --trailer "Land-Council: $cl" ${whynot:+--trailer "Land-Why-Not: $whynot"} ${override:+--trailer "Override: $override"} \
   | git commit -q --amend -F - || { say "cannot write the attestation"; finish 1 error; }
 say "attestation on $(git rev-parse --short HEAD): Land-Checks / Land-Council (unsigned)"
 # the gate on main reads every commit of a push: the evidence goes on each commit of the range, not only the tip (env, so no text is re-parsed by a shell)
 if [ "$(git rev-list --count "$base..HEAD")" -gt 1 ]; then
-  export LAND_EV_CHECKS="$(git log -1 --format=%B | git interpret-trailers --parse | sed -n 's/^Land-Checks: //p')" LAND_EV_COUNCIL="$cl"
-  git rebase -q "$base" --exec 'git log -1 --format=%B | grep -v "^Override: " | git interpret-trailers --if-exists replace --trailer "Land-Checks: $LAND_EV_CHECKS" --trailer "Land-Council: $LAND_EV_COUNCIL" | git commit -q --amend -F -' >/dev/null 2>&1 \
+  export LAND_EV_CHECKS="$(git log -1 --format=%B | git interpret-trailers --parse | sed -n 's/^Land-Checks: //p')" LAND_EV_COUNCIL="$cl" LAND_EV_OVERRIDE="$override"
+  git rebase -q "$base" --exec 'git log -1 --format=%B | grep -v "^Override: " | git interpret-trailers --if-exists replace --trailer "Land-Checks: $LAND_EV_CHECKS" --trailer "Land-Council: $LAND_EV_COUNCIL" ${LAND_EV_OVERRIDE:+--trailer "Override: $LAND_EV_OVERRIDE"} | git commit -q --amend -F -' >/dev/null 2>&1 \
     || { git rebase --abort 2>/dev/null; say "cannot write the attestation on every commit"; finish 1 error; }
 fi
 
@@ -120,14 +133,15 @@ fi
 if [ "${LAND_VIA_PR:-}" = 1 ]; then
   b=$(git symbolic-ref -q --short HEAD || true); case $b in ""|main) b=land/$(git log -1 --format=%s | tr -c 'A-Za-z0-9\n' - | tr A-Z a-z | cut -c1-40 | sed 's/-*$//')-$(git rev-parse --short HEAD);; esac
   say "LAND_VIA_PR=1: pushing branch $b and opening a PR (nothing lands)"
-  git push -q origin "HEAD:refs/heads/$b" || { say "cannot push branch $b"; finish 1 error; }
+  FLEET_APP_PRIVATE_KEY=$fleet_app_key node "$here/app-push.mjs" push "$top" origin "HEAD:refs/heads/$b" || { say "cannot push branch $b"; finish 1 error; }
   url=$(gh pr create --base main --head "$b" --fill 2>&1 | tail -1 | tr -d '"\\') || true; case $url in https://*) say "PR: $url";; *) say "PR not opened by gh ($url): open one for branch $b"; url=;; esac
   finish 20 pr-opened "\"branch\":\"$b\",\"pr\":\"$url\""
 fi
 
 # the lander: rebase, the gate on the exact combination, a plain fast-forward push to main (the push is the lock; a lost race rebases and retries)
 log=$ltmp/lander
-"$here/push" "${passthru[@]}" 2>&1 | tee "$log" | grep --line-buffered -v '^{'; rc=${PIPESTATUS[0]}
+FLEET_APP_PRIVATE_KEY=$fleet_app_key "$here/push" "${passthru[@]}" 2>&1 | tee "$log" | grep --line-buffered -v '^{'; rc=${PIPESTATUS[0]}
 sha=$(sed -n 's/^{"sha":"\([0-9a-f]*\)".*/\1/p' "$log" | tail -1)
-[ "$rc" != 0 ] || { say "landed ${sha:0:12}"; finish 0 landed "\"sha\":\"$sha\""; }
+# the audit of the record on main, printed with each landing (three lines; `spire attest` says everything): it only reads, and never changes the exit
+[ "$rc" != 0 ] || { say "landed ${sha:0:12}"; [ ${#passthru[@]} -ne 0 ] || { git fetch -q origin main 2>/dev/null; node "$here/attest.mjs" --brief 2>&1 | sed 's/^/land: /' || true; }; finish 0 landed "\"sha\":\"$sha\""; }
 finish "$rc" stopped

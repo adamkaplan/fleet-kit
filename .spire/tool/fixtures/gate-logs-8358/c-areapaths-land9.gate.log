@@ -1,0 +1,7 @@
+land: re-run style: not a test step: it always runs again
+land: re-run lint: not a test step: it always runs again
+land: re-run arch: not a test step: it always runs again
+land: re-run typecheck:server: not a test step: it always runs again
+land: re-run tests:server: (the landed rule)
+land: re-run tests:scripts: (the landed rule)
+land: re-run py:ci: not a test step: it always runs again

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """token-service: a small HTTP service that mints the GitHub App installation token for the operator account (ask #2002).
 
-POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
-The caller is REVIEWED (the cluster's TokenReview API): only the account system:serviceaccount:<namespace>:cw-operator is served.
+POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"|"lander"} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
+The caller is REVIEWED (the cluster's TokenReview API): only system:serviceaccount:<namespace>:cw-operator (for worker and orchestrator) or system:serviceaccount:<namespace>:floor-heavy-executor / CW_HEAVY_EXECUTOR_SA (for lander) is served.
 The repository must be on CW_ALLOWED_REPOS (the launcher's own check), the role in PERMISSIONS_BY_ROLE, the body at most 4096 bytes,
 and the body carries no other key. The answer is GitHub's own: the token, the repositories, the permissions and the expiry.
 The App id and key are read by the commands CW_APP_ID_CMD and CW_APP_KEY_CMD (default: cat of the files mounted from the cluster Secret).
@@ -92,6 +92,7 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
     auth = headers.get("X-Caller-Token") or ""
     scheme, _, token = auth.partition(" ")
     token = token.strip()
+    user = None
     if scheme != "Bearer" or not token:
         return 401, None, "no caller token"
     try:
@@ -100,7 +101,7 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
         return 502, None, "the caller review could not be asked"
     if authenticated is not True:
         return 401, None, "the caller token is not accepted"
-    if user != "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"):
+    if user not in ("system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):
         return 403, None, "the caller is not the operator account"
     try:
         body = json.loads(raw)
@@ -111,6 +112,10 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
     repo, role = body["repo"], body["role"]
     if not isinstance(role, str) or role not in app_token.PERMISSIONS_BY_ROLE:
         return 400, None, "unknown role"
+    if user is not None:
+        executor_sa = env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))
+        if (role == "lander") != (user == executor_sa):
+            return 403, None, "only the heavy executor account may mint the lander role"
     if not isinstance(repo, str) or not app_token.valid_target(repo):
         return 400, None, "the repository is not OWNER/NAME"
     try:

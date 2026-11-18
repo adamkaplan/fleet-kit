@@ -74,7 +74,7 @@ export function rulesOf(principles) {
   return [...seen.values()];
 }
 
-/** What a finding or rebuttal's cite names: `P3`, `3`, `principle 3`, `P3 Single source`, or the rule's bold name. Returns the canonical `P3` when the principles hold that number, else null. */
+/** What a finding's cite names: `P3`, `3`, `principle 3`, `P3 Single source`, or the rule's bold name. Returns the canonical `P3` when the principles hold that number, else null. */
 export function citeOf(principles, cite) {
   const rules = rulesOf(principles);
   const text = String(cite ?? "").replace(/\*\*/g, "").trim();

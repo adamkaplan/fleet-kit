@@ -96,3 +96,37 @@ test("the example project's box listens where BOX_BIND_HOST says (its app), so a
   assert.match(svc("app").start, /SPIRE_LISTEN_HOST="\$BOX_BIND_HOST"/);
   assert.equal(svc("app").env?.SPIRE_LISTEN_HOST, undefined, "no second, literal address");
 });
+
+// --- .spire/areas.json: the third file of the view ---
+const withAreas = (areas) => {
+  const c = copies(() => {});
+  writeFileSync(join(c.dir, "areas.json"), JSON.stringify(areas));
+  return { ...c, areas: join(c.dir, "areas.json") };
+};
+
+test("areas.json is read after land.json: its `areas` replace land.json's, `exclude` and `harnesses` join the view, its `_` and `version` do not override land.json's", () => {
+  const c = withAreas({ _: "prose of areas.json", version: 7, exclude: ["**/*.md"], harnesses: { always: ["a"] }, areas: [{ name: "only", paths: ["x/**"], kind: "k" }] });
+  const view = loadManifest([c.box, c.land, c.areas]);
+  assert.deepEqual(view.areas, [{ name: "only", paths: ["x/**"], kind: "k" }]);
+  assert.deepEqual(view.exclude, ["**/*.md"]);
+  assert.deepEqual(view.harnesses, { always: ["a"] });
+  assert.equal(view.version, read(real.land).version);
+  assert.equal(view._, read(real.land)._);
+  assert.deepEqual(view.sensitive, read(real.land).sensitive);
+});
+
+test("land.json keeps `recipes` (a known key); areas.json with a misspelled top-level key is refused naming the file and the key", () => {
+  assert.ok(LAND_KEYS.includes("recipes"));
+  const c = withAreas({ version: 1, excludes: ["**/*.md"], areas: [] });
+  assert.throws(() => loadManifest([c.box, c.land, c.areas]), /areas\.json.*excludes/);
+});
+
+test("loadConfig reads the areas.json that sits beside land.json; without one land.json's areas stand", async () => {
+  const c = withAreas({ version: 1, exclude: ["**/*.md"], areas: [{ name: "only", paths: ["x/**"], kind: "k" }] });
+  const cfg = await loadConfig(c.land, join(repo, "tool/fixtures/project"));
+  assert.deepEqual(cfg.areas.map((a) => a.name), ["only"]);
+  assert.deepEqual(cfg.exclude, ["**/*.md"]);
+  const plain = copies(() => {});
+  const cfg2 = await loadConfig(plain.land, join(repo, "tool/fixtures/project"));
+  assert.deepEqual(cfg2.areas, read(real.land).areas);
+});

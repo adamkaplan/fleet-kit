@@ -6282,6 +6282,8 @@ Rationale: the owner's order of 23 October (with that of 22 October): a clear re
 
 ## Batching: the integration branch and the batch pull request (#834)
 
+**Retired (#2548).** The `integration` branch and the daily batch pull request are retired: all pull requests now target `main` (the default branch) directly, with no daily batch hour, no batch freeze and no `integration` staging branch. Everything below is kept for historical records and opt-in legacy tests only; do not follow it for new work, and do not open a pull request with `--base integration`.
+
 Typical work reaches the default branch in batches, so the owner clears one pull request per repository and can test a whole batch in one stack. This section is the procedure; it changes no gate, no hold and no workflow. It applies only to a repository that has an `integration` branch: batching is opt-in per repository, the Chief of Staff's lane creates the branch (`git push origin origin/<default>:refs/heads/integration`, once, with the owner's word), and a repository without it merges as today.
 
 ### What batches and what goes straight

@@ -1,8 +1,8 @@
 // The policy front of the Copilot bridge (ask #2341). Node standard library only. The ONLY listener a pod can reach: the bridge
 // (copilot-api 0.7.0) is bound to 127.0.0.1 and this front forwards to it. No secret is read, held or logged here.
 // Forwards only POST /chat/completions and POST /v1/chat/completions; answers GET /usage; every other path or method is 404.
-// Model policy: an id containing "opus" (any case) is refused 403; claude-haiku-5.5 passes with the caller's effort; every other id
-// becomes claude-sonnet-5.5 with the effort forced to medium. The bridge passes the whole body on to Copilot unchanged, so BOTH
+// Model policy: an id containing "opus" (any case) is refused 403; every other id becomes claude-haiku-5.5 (Fast class)
+// with the caller's effort (council default low; omitted when the caller sends none). The bridge passes the whole body on to Copilot unchanged, so BOTH
 // reasoning.effort and reasoning_effort are set. Log: one count line per request, never a body, an answer, a header or a token.
 import http from "node:http";
 import fs from "node:fs";
@@ -46,8 +46,7 @@ const send = (res, status, obj) => {
 const policy = (id) => {
   const norm = id.toLowerCase();
   if (norm.includes("opus")) return { refuse: true };
-  if (norm.split("/").pop() === HAIKU) return { model: HAIKU, effort: null };
-  return { model: SONNET, effort: "medium" };
+  return { model: HAIKU, effort: null };
 };
 
 const server = http.createServer((req, res) => {
@@ -102,6 +101,8 @@ const server = http.createServer((req, res) => {
       for (const k of FIELDS) if (Object.prototype.hasOwnProperty.call(body, k)) out[k] = body[k];
       if (typeof out.max_tokens === "number" && out.max_tokens > MAX_TOKENS) out.max_tokens = MAX_TOKENS;
       if (effort) { out.reasoning = { effort }; out.reasoning_effort = effort; }
+      const chk = (v, d) => { if (d > 64) throw new RangeError(); if (v && typeof v === "object") for (const x of (Array.isArray(v) ? v : Object.values(v))) chk(x, d + 1); };
+      chk(out, 0);
       payload = Buffer.from(JSON.stringify(out));
     } catch { row.requests -= 1; row.models[verdict.model] -= 1; return answer(400, { error: "the body cannot be processed" }); }
     const up = http.request({ host: UP_HOST, port: UP_PORT, method: "POST", path: "/chat/completions", timeout: TIMEOUT_MS,

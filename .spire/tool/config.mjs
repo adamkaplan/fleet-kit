@@ -62,10 +62,11 @@ export async function loadConfig(
   path = process.env.LAND_CONFIG ?? layout.land,
   root = projectRoot,
 ) {
-  // the manifest: this file and its sibling box.json as ONE view (manifest.mjs)
+  // the manifest: this file and its siblings box.json and areas.json as ONE view (manifest.mjs)
   const cfg = loadManifest([
     process.env.BOX_CONFIG ?? join(dirname(path), "box.json"),
     path,
+    join(dirname(path), "areas.json"),
   ]);
   // the one project predicate that is code, not a pattern: which paths can reach a check at all (docs that CI's own scope skips). Named by the project.
   const rb = cfg.readByChecks;

@@ -196,3 +196,11 @@ test("the plan line names the CPU source too", () => {
   assert.match(planLine({ ...base, cpuSource: "cgroup v1" }), /4 cores\/2 cpu cgroup v1,/);
   assert.match(planLine({ ...base, cpuSource: "host" }), /4 cores\/2 cpu host,/);
 });
+
+test("the memory budget of a step is its area's, else its kind's (areas.json names forty areas of one kind), else the default", () => {
+  const checks = { workerBudgetMB: { app: 1536, server: 512, workroom: 900 } };
+  assert.equal(budgetBytes(checks, "app"), 1536 * 1024 * 1024);
+  assert.equal(budgetBytes(checks, "acp", "server"), 512 * 1024 * 1024);
+  assert.equal(budgetBytes(checks, "workroom", "server"), 900 * 1024 * 1024);
+  assert.equal(budgetBytes(checks, "acp", "nope"), budgetBytes({}, "acp"));
+});

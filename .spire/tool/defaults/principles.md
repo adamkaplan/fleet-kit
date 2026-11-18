@@ -5,7 +5,7 @@ learns (add a rule, rewrite one, delete one) by a landed change like any other. 
 it only shows you what the new default changed. Builders (people, Spire specialists, agents)
 read it before they build; every council reviewer judges against it; nobody keeps a copy.
 
-A rule is cited by its number: **P3**. A review finding cites one; a rebuttal cites one (`--rebut "inspector=P3: why"`).
+A rule is cited by its number: **P3**. A review finding cites one.
 If you renumber, update the viewpoints in `.spire/review/` that name numbers (`enforces:`).
 
 1. **One owner, one path, one definition.** Each thing has one owner, one way of being done, one definition of each state.
@@ -25,8 +25,10 @@ If you renumber, update the viewpoints in `.spire/review/` that name numbers (`e
    touches run. Proof that cannot fail, or never reaches the changed line, is not proof.
 9. **Small slices.** A landing is one whole small step that leaves main working. Large work is a series of such steps
    (`--slice N/M`), each landed on its own.
-10. **No override, no skip.** Nothing lands past a red check or an open finding: there is no flag, variable, label or trailer
-    that skips a test or a review. A refusal is a final answer, not an obstacle; the fix is to make the change right.
+10. **No override, no skip.** Nothing lands past a red check, and the review is always asked (a reviewer that cannot answer is recorded, never skipped): there is no flag, variable, label or
+    trailer that skips a test or a review. A refusal is a final answer, not an obstacle; the fix is to make the change right.
+    The council's findings are **advice, never a gate**: the land prints them once and records them in the Land-Council trailer, and the change lands;
+    the agent follows them in a follow-up or says in one line why not. A reviewer that could not answer is recorded as unable to review, never a stop.
 11. **Fail loudly.** An error is raised where it happens and says what is wrong and what to do; it is never swallowed,
     downgraded or retried into silence.
 12. **The mechanism is product-agnostic.** The tool and this default law hold no fact about a product. What differs between

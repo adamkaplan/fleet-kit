@@ -693,9 +693,11 @@ class TestGitShim(Base):
          "reads the entrypoint's text for the helper line (#2371): writes no git configuration"),
         ("cloud/worker/tests/test_pre_push_hook.py", " " * 8 + 'self.assertTrue(e[i[0] + 1].startswith("  git con' + "fig --" + _G + ' core.hooksPath /usr/local/lib/cw-hooks"))',
          "reads the entrypoint's text for the hooksPath line (#2371): writes no git configuration"),
-        # The vendored spire tool test, exactly this one added line of that one file: isolates a child process from the user's git config (points both variables at /dev/null).
-        (".spire/tool/spire.test.mjs", "  return { ...env, PATH: `${NODE_DIR}:${env.PATH ?? \"/usr/bin:/bin\"}`, GIT_CONFIG_" + _G.upper() + ': "/dev/null", GIT_CONFIG_' + _S.upper() + ': "/dev/null", GIT_TERMINAL_PROMPT: "0" };',
+        # The vendored spire tool test and step-env doc comment, exactly these lines of those vendored files: isolates a child process from the user's git config (points both variables at /dev/null).
+        (".spire/tool/spire.test.mjs", "  return { ...env, PATH: `${NODE_DIR}:${env.PATH ?? \"/usr/bin:/bin\"}`, GIT_CONFIG_" + _G.upper() + ': "/dev/null", GIT_CONFIG_' + _S.upper() + ': "/dev/null", GIT_TERMINAL_PROMPT: "0", COLUMNS: "1000" };',
          "vendored as-is: isolates the child process from the user's git config"),
+        (".spire/tool/step-env.mjs", " * The families of names kept whole: the locale (LC_ALL, LC_CTYPE, ...) and git's configuration (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_" + _S.upper() + ", GIT_CONFIG_" + _G.upper() + ", GIT_CONFIG_COUNT and its KEY_n/VALUE_n): a Workroom",
+         "vendored as-is: doc comment in .spire/tool/step-env.mjs naming the git config environment variables"),
     )
 
     @classmethod

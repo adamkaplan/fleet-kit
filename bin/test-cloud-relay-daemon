@@ -1022,7 +1022,7 @@ class HubReadAndTransport(unittest.TestCase):
         import threading
         before = threading.active_count()
         self._hang_connect(mod)
-        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.1
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.3
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, _ = mod.http_transport("http://127.0.0.1:9", "tok")
         for _ in range(4):

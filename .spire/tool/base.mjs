@@ -7,6 +7,10 @@
 //                              the image's when the hash of its `files` in the tree equals the hash it was built from, else it is installed now, as the build
 //                              does (so a changed lock file costs that set only). --cold starts from the bare `warm.from` image and installs everything: what a
 //                              project without a base disk pays, the number the base disk is measured against. --image TAG uses an image built earlier (a branch's tree against main's base). The image is built from the files of the HEAD commit, the tree the workroom gets..
+//   base up --link-only [--env-file F]   W2, the outside caller's path (a pod that IS the image: no container, no tree copy): each dependency set is the baked one
+//                              ($BASE_WARM_ROOT, /opt/warm) when its `files` in the checkout hash to what it was built from, else it is installed now into
+//                              <git common dir>/spire-land/warm/NAME (a set whose lock file changed: that set only; kept for the next call), and the links are
+//                              written in the checkout. The sets' env as shell text goes to stdout (or F). A full `base up` from a pod is not the call to make.
 //   base exec NAME -- CMD...   CMD in the workroom's /workspace with the dependency sets' env (`warm.deps[].env`)
 //   base run [--cold] -- CMD   up, CMD, down on EVERY exit path; exit status = CMD's
 //   base status | base down NAME    the workroom containers this tool made / destroy one BY ITS OWN NAME (only a container that carries this tool's label)
@@ -16,9 +20,14 @@
 // A set is made in $WARM_DIR (/opt/warm/<name> in the image) with `files` copied into it at their repo paths and `run` run there; `env` values may use $WARM_DIR and $PATH;
 // `link` makes repo/PATH a symlink to the set's path (a dependency directory). Not here yet: a warm repo clone (the workroom's tree is the caller's checkout; the clone through the host gateway is slice 5).
 // DESTROYS WHAT IT CREATES, BY ITS OWN NAME: the container is --rm, labelled with the run, ends itself after BASE_TTL_MIN (120), and `down` removes it by name with -v.
-// The image is persistent on purpose and keyed by content. DOCKER is the docker command (default `docker`). Exit: 0 ok | 1 failed | 2 usage.
+// The image is keyed by content and reused. Each build that succeeds then removes the older ones of ITS project (the label io.spire.workroom.base.project: the root commit): it keeps its own tag and the newest two others of the label
+// io.spire.workroom.base=1, and `docker rmi`s the rest BY ID, never forced (an image a workroom still uses is refused, and kept). So `base up --image TAG`
+// wants a tag from a recent build: one older than the newest two of the host is gone, and `base build` on its checkout makes it again.
+// DOCKER is the docker command (default `docker`). Exit: 0 ok | 1 failed | 2 usage.
 import { createHash, randomBytes } from "node:crypto";
 import {
+  existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -26,10 +35,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadManifest } from "./manifest.mjs";
-import { applyPins, spawnSync } from "./versions.mjs";
+import { applyPins, spawn, spawnSync } from "./versions.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const DOCKER = (process.env.DOCKER ?? "docker").split(" ");
@@ -100,6 +109,85 @@ export function tagOf(top, warm) {
   return `workroom-base:${h.digest("hex").slice(0, 12)}`;
 }
 
+/** What the image's .fingerprint holds for a set: the one shell definition (`fingerprint`) run over the checkout's own files. */
+export function fingerprintOf(top, d) {
+  for (const f of d.files) {
+    if (!lstatSync(join(top, f), { throwIfNoEntry: false })?.isFile()) {
+      throw new Error(`warm.deps ${d.name}: ${f} is not a regular file in the checkout`);
+    }
+  }
+  const r = sh("sh", ["-c", fingerprint(d, top)]);
+  if (r.status !== 0) {
+    throw new Error(`warm.deps ${d.name}: fingerprint failed: ${r.stderr}`);
+  }
+  return r.stdout.trim();
+}
+
+const envLines = (d) =>
+  Object.entries(d.env ?? {}).map(
+    ([k, v]) => `export ${k}="${v.replace(/[\\"`]/g, "\\$&")}"`,
+  );
+
+/** The sentence for a set the image does not hold: what was done, and who rebuilds (the caller, when it is convenient: nobody waits). */
+export const behindLock = (names) =>
+  `the image is behind the lock: ${names.join(", ")} installed now from the tree's own lock files (the image is not rebuilt for you: run \`base build\` when convenient)`;
+
+/**
+ * `base up --link-only` (W2): no container, no copy of the tree. Each set is the baked one when the checkout's files hash to its fingerprint (W3: else
+ * only that set is installed now, kept under `home` for the next call), then the links are written in the checkout. Returns the sets' env as shell text
+ * and the names of the sets that were not the image's.
+ */
+export function linkOnly(top, warm, { baked, home, say: tell = () => {} }) {
+  const behind = [];
+  const env = [];
+  for (const d of warm.deps) {
+    const has = (dir) => sh("sh", ["-c", isBaked(d, dir, top)]).status === 0;
+    let dir = join(baked, d.name);
+    if (has(dir)) {
+      tell(`warm ${d.name}`);
+    } else {
+      dir = join(home, d.name);
+      if (has(dir)) {
+        tell(`kept ${d.name}`);
+      } else {
+        behind.push(d.name);
+        tell(`install ${d.name}`);
+        rmSync(dir, { recursive: true, force: true });
+        const r = sh("sh", ["-c", makeSet(d, dir, top)], { cwd: top });
+        if (r.status !== 0) {
+          rmSync(dir, { recursive: true, force: true });
+          throw new Error(
+            `installing ${d.name} failed:\n${(r.stderr || r.stdout).split("\n").slice(-20).join("\n")}`,
+          );
+        }
+        writeFileSync(join(dir, ".fingerprint"), `${fingerprintOf(top, d)}\n`);
+      }
+    }
+    env.push(`export WARM_DIR=${q(dir)}`, ...envLines(d));
+    const ln = linkSet(d, dir, top);
+    if (ln) {
+      const r = sh("sh", ["-c", ln]);
+      if (r.status !== 0) {
+        throw new Error(r.stderr.trim());
+      }
+    }
+  }
+  return { env: `${env.join("\n")}\n`, behind };
+}
+
+// Where a set's links go, written once: the shell of the image's start and of --link-only. A real file at a link is never replaced.
+const linkSet = (d, dir, root, dirIsVar = false) =>
+  Object.entries(d.link ?? {})
+    .map(([at, to]) => {
+      const dst = q(`${root}/${at}`);
+      return [
+        `if [ -e ${dst} ] && [ ! -L ${dst} ]; then echo ${q(`warm.deps ${d.name}: ${at} exists and is not a link: not replaced`)} >&2; exit 1; fi`,
+        `mkdir -p ${q(dirname(`${root}/${at}`))}`,
+        `ln -sfn ${dirIsVar ? `"${dir}/"` : `${q(`${dir}/`)}`}${q(to)} ${dst}`,
+      ].join(" && ");
+    })
+    .join("\n");
+
 // What one dependency set does, in the image at build and in a workroom whose files differ: the same shell, so the two cannot drift.
 const makeSet = (d, dir, from) =>
   [
@@ -113,10 +201,21 @@ const makeSet = (d, dir, from) =>
     "export WARM_DIR",
     d.run,
   ].join(" && ");
+// The one rule for "this set is the baked one": the files under `root` hash to what `baked`/.fingerprint holds (the shell of the image's start and of --link-only).
+const isBaked = (d, baked, root) =>
+  `[ -f ${q(`${baked}/.fingerprint`)} ] && [ "$(${fingerprint(d, root)})" = "$(cat ${q(`${baked}/.fingerprint`)})" ]`;
 const fingerprint = (d, dir) =>
   `cat ${d.files.map((f) => q(`${dir}/${f}`)).join(" ")} | sha256sum | cut -d' ' -f1`;
 
-function dockerfile(warm) {
+/** The project a base image belongs to: its root commit (the same in every clone and worktree of it), so a prune never reaches another project's images. */
+const projectOf = (top) =>
+  git(["-C", top, "rev-list", "--max-parents=0", "HEAD"])
+    .stdout.split("\n")
+    .filter(Boolean)
+    .sort()[0]
+    ?.slice(0, 12) ?? "none";
+
+function dockerfile(warm, project) {
   const run = (cmd) => `RUN ${JSON.stringify(["sh", "-c", cmd])}`;
   const out = [`FROM ${warm.from}`, "USER root", run(warm.install || "true")];
   for (const d of warm.deps) {
@@ -131,8 +230,61 @@ function dockerfile(warm) {
   out.push(
     run(`install -d -o ${OWNER} -g ${OWNER} /workspace`),
     "LABEL io.spire.workroom.base=1",
+    `LABEL io.spire.workroom.base.project=${project}`,
   );
   return `${out.join("\n")}\n`;
+}
+
+/** The base images of THIS project (its label) this host keeps besides the one just built: the newest of the others (by creation time), the rest are removed by id. Never forced: an image in use is refused and stays; an image of another project, or made before the project label, is never listed. */
+const BASE_KEEP = 2;
+function pruneBases(keepTag, project) {
+  const listed = docker([
+    "image",
+    "ls",
+    "--filter",
+    "label=io.spire.workroom.base=1",
+    "--filter",
+    `label=io.spire.workroom.base.project=${project}`,
+    "--format",
+    "{{.ID}}\t{{.Repository}}:{{.Tag}}",
+  ]);
+  if (listed.status !== 0) {
+    // loud: the build is made (a rerun finds it built), but the older images stay, and nobody should think they went
+    die(`${keepTag} is built, but the older base images could not be listed to remove: ${listed.stderr.trim()}`);
+  }
+  const rows = listed.stdout.split("\n").map((l) => l.split("\t"));
+  const images = [];
+  for (const [id, ref] of rows) {
+    if (!id || !ref?.startsWith("workroom-base:")) {
+      continue;
+    }
+    const made = docker(["image", "inspect", "-f", "{{.Created}}", ref]);
+    const at = Date.parse(made.stdout.trim());
+    if (made.status !== 0 || Number.isNaN(at)) {
+      // an image whose age is not known is not ranked: it is kept, and said
+      say(`kept ${ref}: its age is not known (${made.stderr.trim().split("\n")[0] || "no creation time"})`);
+      continue;
+    }
+    images.push({ id, ref, at });
+  }
+  const newest = images
+    .filter((i) => i.ref !== keepTag)
+    .sort((a, b) => b.at - a.at);
+  const kept = new Set([
+    ...rows.filter(([, ref]) => ref === keepTag).map(([id]) => id),
+    ...newest.slice(0, BASE_KEEP).map((i) => i.id),
+  ]);
+  for (const i of newest.slice(BASE_KEEP)) {
+    if (kept.has(i.id)) {
+      continue; // the same image under another tag is a kept one
+    }
+    const r = docker(["rmi", i.id]);
+    say(
+      r.status === 0
+        ? `removed the older base image ${i.ref}`
+        : `kept ${i.ref}: ${r.stderr.trim().split("\n")[0]}`,
+    );
+  }
 }
 
 function build(top, force = false) {
@@ -151,9 +303,9 @@ function build(top, force = false) {
         writeFileSync(join(ctx, d.name, f), atHead(top, f));
       }
     }
-    // run-hygiene: the base image is one persistent, shared tag keyed by content, built on purpose; a workroom container is labelled below
+    // run-hygiene: the base image is a shared tag keyed by content, built on purpose and pruned below (pruneBases); a workroom container is labelled in up()
     const r = docker(["build", "-q", "-t", tag, "-f", "-", ctx], {
-      input: dockerfile(warm),
+      input: dockerfile(warm, projectOf(top)),
     });
     if (r.status !== 0) {
       die(
@@ -164,6 +316,7 @@ function build(top, force = false) {
     rmSync(ctx, { recursive: true, force: true });
   }
   say(`built ${tag} in ${Date.now() - t0} ms`);
+  pruneBases(tag, projectOf(top));
   return tag;
 }
 
@@ -182,7 +335,7 @@ function startScript(warm, cold) {
       cold
         ? install.join("\n")
         : [
-            `if [ -f ${q(`${baked}/.fingerprint`)} ] && [ "$(${fingerprint(d, "/workspace")})" = "$(cat ${q(`${baked}/.fingerprint`)})" ]; then`,
+            `if ${isBaked(d, baked, "/workspace")}; then`,
             `WARM_DIR=${q(baked)}; echo "warm ${d.name}" >&2`,
             "else",
             ...install,
@@ -195,14 +348,10 @@ function startScript(warm, cold) {
       "cat >>/tmp/workroom.env <<'ENV'",
     );
     out.push(
-      ...Object.entries(d.env ?? {}).map(
-        ([k, v]) => `export ${k}="${v.replace(/[\\"`]/g, "\\$&")}"`,
-      ),
+      ...envLines(d),
       "ENV",
     );
-    for (const [at, to] of Object.entries(d.link ?? {})) {
-      out.push(`ln -sfn "$WARM_DIR/"${q(to)} ${q(`/workspace/${at}`)}`);
-    }
+    out.push(linkSet(d, "$WARM_DIR", "/workspace", true));
   }
   return `${out.join("\n")}\n`;
 }
@@ -305,28 +454,46 @@ function down(id) {
   return 0;
 }
 
-const exec = (id, cmd) => {
-  const run = '. /tmp/workroom.env; exec "$@"';
-  return (
-    spawnSync(
-      DOCKER[0],
-      [
-        ...DOCKER.slice(1),
-        "exec",
-        "-i",
-        "-w",
-        "/workspace",
-        id,
-        "sh",
-        "-c",
-        run,
-        "sh",
-        ...cmd,
-      ],
-      { stdio: "inherit" },
-    ).status ?? 1
-  );
-};
+const execArgs = (id, cmd) => [
+  ...DOCKER.slice(1),
+  "exec",
+  "-i",
+  "-w",
+  "/workspace",
+  id,
+  "sh",
+  "-c",
+  '. /tmp/workroom.env; exec "$@"',
+  "sh",
+  ...cmd,
+];
+const exec = (id, cmd) =>
+  spawnSync(DOCKER[0], execArgs(id, cmd), { stdio: "inherit" }).status ?? 1;
+
+/** `base up --link-only`: the checkout is the workroom; see linkOnly. */
+function linkUp(top, rest) {
+  if (rest.includes("--cold") || rest.includes("--image")) {
+    return die("usage: base up --link-only [--env-file F] (not with --cold or --image)", 2);
+  }
+  const at = rest.indexOf("--env-file");
+  if (at >= 0 && !rest[at + 1]) {
+    return die("usage: base up --link-only [--env-file F]", 2);
+  }
+  const common = git(["-C", top, "rev-parse", "--git-common-dir"]).stdout.trim();
+  const r = linkOnly(top, warmOf(top), {
+    baked: process.env.BASE_WARM_ROOT ?? "/opt/warm",
+    home: join(resolve(top, common), "spire-land", "warm"),
+    say,
+  });
+  if (r.behind.length) {
+    say(behindLock(r.behind));
+  }
+  if (at >= 0) {
+    writeFileSync(rest[at + 1], r.env);
+  } else {
+    process.stdout.write(r.env);
+  }
+}
 
 function main(argv) {
   const [c, ...rest] = argv;
@@ -341,6 +508,9 @@ function main(argv) {
       case "build":
         return console.log(build(top(), rest.includes("--force")));
       case "up":
+        if (rest.includes("--link-only")) {
+          return linkUp(top(), rest);
+        }
         return console.log(
           up(
             top(),
@@ -362,11 +532,17 @@ function main(argv) {
         }
         const id = up(top(), cold);
         const done = () => down(id);
-        process.on("SIGINT", () => (done(), process.exit(130)));
-        process.on("SIGTERM", () => (done(), process.exit(143)));
-        const rc = exec(id, cmd);
-        done();
-        return process.exit(rc);
+        // the command runs as a child (never `spawnSync`, which would hold every signal until it ended): the workroom goes on every exit path
+        for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143], ["SIGHUP", 129]]) {
+          process.on(sig, () => (done(), process.exit(code)));
+        }
+        return spawn(DOCKER[0], execArgs(id, cmd), { stdio: "inherit" })
+          .on("error", (e) => {
+            say(`cannot run the command: ${e.message}`);
+            done();
+            process.exit(1);
+          })
+          .on("exit", (status) => (done(), process.exit(status ?? 1)));
       }
       case "down":
         return rest[0] ? down(rest[0]) : die("usage: base down NAME", 2);
@@ -384,7 +560,7 @@ function main(argv) {
         return die(
           readFileSync(join(here, "base.mjs"), "utf8")
             .split("\n")
-            .slice(1, 13)
+            .slice(1, 18)
             .map((l) => l.replace(/^\/\/ ?/, ""))
             .join("\n"),
           c ? 2 : 0,

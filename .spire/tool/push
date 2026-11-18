@@ -8,16 +8,25 @@
 #
 # What it does: hold? -> fetch -> frozen? -> rebase the commits onto origin/main in this run's own scratch worktree (<git common dir>/spire-land/run.<pid>.<random>/wt, removed at exit)
 #   -> the gate (the tool's checks.sh of THAT tree, which is origin/main's own: a commit cannot loosen what judges it) on that exact combination -> fetch again: main moved during the gate = rebase and
-#   check again -> `git push origin <sha>:main`, a plain fast-forward (no force anywhere). A lost race rebases and retries; a refusal that is not a lost race is final.
+#   check again -> STAMP (the Land-Checks of every commit becomes the gate's own line on the final tree, when `land`'s names another tree: a message-only amend, the trees are compared before and after) -> `git push origin <sha>:main`, a plain fast-forward (no force anywhere). A lost race rebases and retries; a refusal that is not a lost race is final.
+# The commit statuses (janus-infra/janus-platform#1009), the DUAL WRITE of the rollout: in app mode the attestation is also posted as the statuses land/checks and land/council on the commit that becomes main's tip (statuses.mjs). In order:
+#   the commits go to a temporary ref refs/land/<run> -> the statuses are posted on the tip -> `git push origin <sha>:main` (a plain fast-forward: a ruleset that requires the statuses sees them) -> the temporary ref is deleted (on every way out).
+#   The trailers stay in the commit message. An App that may not post statuses (Commit statuses: write missing) is SAID ONCE ("statuses not permitted: trailer only") and the landing goes on by the trailers.
+#   FLEET_LAND_STATUSES=required makes that a stop (exit 1, before main moves); =off posts none. A tip with no Land-Checks / Land-Council has nothing to post (said; a stop when required).
 # There is NO flag that skips the gate, overrides a result or lands past a red check: land fixes the code and lands again.
 #
+# Who pushes: with FLEET_APP_ID set (app mode, `doppler run -p fleet -c <config> -- ...`) the push is made by the fleet's GitHub App with a short-lived installation token (app-push.mjs, the one helper; land's LAND_VIA_PR uses it too).
+#   App mode on and the app not usable = "app not configured" and a stop (exit 1) BEFORE the gate: there is no fallback to the human identity. App mode off (no FLEET_APP_ID) = the plain `git push` of the host's own identity, as always.
 # Exit: 0 landed | 1 stopped with a plain message | 2 bad input | 11 rebase conflict (files named) | 13 the gate fails (nothing lands) | 14 held or frozen.
 # The LAST line of stdout is JSON: {"sha","commits","gate_seconds","result","exit"} (result: landed, would-land, conflict, gate, held, error).
 # Where it lives: this file is .spire/tool/push; TOOL is its folder, nothing is resolved against the current directory (LAYOUT.md).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib/app-key.sh"; app_key_take   # the fleet App's key leaves the environment at once: the gate, its steps and every other child never see it (only app-push.mjs gets it, below)
 . "$here/lib/freeze.sh"
 remote=origin; base=main
+apppush() { FLEET_APP_PRIVATE_KEY=$fleet_app_key node "$here/app-push.mjs" "$@"; }
+case "${FLEET_LAND_STATUSES:-}" in required|REQUIRED) smode=required;; off|OFF) smode=off;; *) smode=auto;; esac   # the one reader of FLEET_LAND_STATUSES (app-env.mjs)
 
 usage() { echo "usage: push [--dry-run] [<rev>] | --hold REASON | --release | --freeze REASON --owner NAME --for DURATION | --thaw | --status | --version" >&2; exit 2; }
 dry=0; op=; opreason=; owner=; dur=; args=()
@@ -31,13 +40,15 @@ while [ $# -gt 0 ]; do case $1 in
 [ ${#args[@]} -le 1 ] || usage
 rev=${args[0]:-HEAD}
 
-wt=; sha=; ncommits=; gate_s=; result=error; t0=$(date +%s); run=; attempt=0; already=0
+tmpref=; said_np=0; wt=; sha=; ncommits=; gate_s=; result=error; t0=$(date +%s); run=; attempt=0; already=0; walls=; first_red=null; landed_at=
 json_num() { [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$1" || printf null; }
 json_str() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]] && printf '"%s"' "$1" || printf null; }
 onexit() {
   local c=$?
+  drop_tmpref
   if [ -z "$op" ]; then
-    [ -z "${state:-}" ] || [ ! -d "${state:-}" ] || printf '{"ts":%s,"result":"%s","commits":%s,"commit":%s,"attempts":%s,"gate_s":%s,"total_s":%s}\n' "$(date +%s)" "$result" "$(json_num "$ncommits")" "$(json_str "${tip0:-}")" "$(json_num "$([ "$attempt" = 0 ] || echo "$attempt")")" "$(json_num "$gate_s")" "$(( $(date +%s) - t0 ))" >> "$state/metrics.jsonl" 2>/dev/null || true
+    # the measurement record (metrics.mjs owns its shape): one line at every exit, joined to the `land` that started this run by `land_run`; `walls` is the gate's seconds of each attempt (a re-run after main moved is one more), `first_red` the first step that failed
+    [ -z "${state:-}" ] || [ ! -d "${state:-}" ] || node "$here/metrics.mjs" push "file=$state/metrics.jsonl" "start=$t0" "land_run=${LAND_RUN:-}" "result=$result" "exit=$c" "commits=$ncommits" "commit=${tip0:-}" "attempts=$attempt" "walls=$walls" "first_red=$first_red" "landed_at=$landed_at" "gate_s=$gate_s" >/dev/null 2>&1 || true
     printf '{"sha":%s,"commits":%s,"gate_seconds":%s,"result":"%s","exit":%s}\n' "$(json_str "$sha")" "$(json_num "$ncommits")" "$(json_num "$gate_s")" "$result" "$c"
   fi
   # this run's scratch worktree always goes (through git, never `worktree prune`: the clone is shared); the run directory with it
@@ -47,6 +58,10 @@ onexit() {
   fi
 }
 trap onexit EXIT
+# the temporary ref (refs/land/<run>) lives only between its push and the end of the push to main, whatever the way out: a failure to delete it is said and never changes the result
+drop_tmpref() { [ -n "$tmpref" ] || return 0
+  local r=$tmpref; tmpref=
+  apppush push "$top" "$remote" ":$r" 2>/dev/null || echo "push: note: could not delete the temporary ref $r (it holds a commit that is not on main; delete it: git push $remote :$r)" >&2; }
 stop() { local code=$1; result=$2; shift 2; echo "push: $*" >&2; exit "$code"; }
 die() { stop 1 error "$*"; }
 badinput() { echo "push: $*" >&2; exit 2; }
@@ -93,6 +108,9 @@ fetch_main() { local i rc=0
 holdcheck
 git -C "$top" remote get-url "$remote" >/dev/null 2>&1 || badinput "no remote named $remote"
 fetch_main "$top" || die "cannot fetch $remote $base"
+if ! apppush check "$top" "$remote" 2>"$run/app.log"; then cat "$run/app.log" >&2; stop 1 error "the push would be made by the fleet App and it cannot be: nothing was checked or pushed"; fi
+cat "$run/app.log" >&2
+[ "$smode" != required ] || [ -n "${FLEET_APP_ID:-}" ] || stop 1 error "FLEET_LAND_STATUSES=required: the statuses are posted by the fleet's App and FLEET_APP_ID is not set: nothing was checked or pushed"
 export LAND_TOP=$top LAND_BASE_REF=$remote/$base LAND_STATE_DIR=$state LAND_RUN_DIR=$run
 
 tip0=$(git -C "$top" rev-parse --verify -q "$rev^{commit}") || badinput "no such revision: $rev"
@@ -111,6 +129,42 @@ freezecheck
 # the scratch worktree: ours, by path. Never `git worktree prune`: the clone is shared with other lanes' worktrees.
 wt=$run/wt; git -C "$top" worktree add -q -f --detach "$wt" "$remote/$base"
 g() { git -C "$wt" "$@"; }
+# stamp: the gate is green on the exact combination, so its own line (checks.sh wrote it to $run/checks: `tree=` of THIS tree, and the steps it carried from an earlier tree, named as such) is the Land-Checks of the TIP of the push, and
+# an earlier commit of the push gets the same line + `part-of=<the tip's tree>` (the unit of attestation is the push: its intermediate trees are not gated one by one). attest.mjs restamp rebuilds the commits with `commit-tree`, the message
+# the only difference, the working tree the gate left is not touched. The gate's verdict stands for what lands because no tree changes: that is CHECKED, not assumed: the trees of the commits are listed before and after and must be the same.
+# Each attempt resets to the original commits, so the stamp is made on the attempt that pushes. A gate that wrote no line (a stub) stamps nothing.
+# `land` already wrote the line of the tree it checked: when main did not move that is this tree, its line is the record of the run that did the work (its seconds), and it stands as the tip's line.
+stamp() { local before after new line cur n; before=$(g log --format=%T "$bsha..HEAD"); n=$(g rev-list --count "$bsha..HEAD")
+  cur=$(g log -1 --format=%B | git interpret-trailers --parse | sed -n 's/^Land-Checks: //p'); line=$cur
+  case " $cur " in *" tree=${before:0:12} "*) ;; *) [ -s "$run/checks" ] || return 0; line=$(cat "$run/checks");; esac
+  [ "$n" -gt 1 ] || [ "$line" != "$cur" ] || return 0
+  new=$(cd "$wt" && node "$here/attest.mjs" restamp "$bsha" "$line") || die "cannot stamp the gate's line on the commits"
+  g reset -q --soft "$new"
+  after=$(g log --format=%T "$bsha..HEAD")
+  [ "$before" = "$after" ] || die "the stamp changed a tree: nothing lands"
+  echo "push: Land-Checks of the $n commit(s) is the gate's line on the final tree ${before:0:12}$([ "$n" -le 1 ] || echo "; the earlier ones are part-of the tip's tree")"; }
+# dual_write: the first half of the dual write (see the header): the temporary ref, then the statuses on the tip $sha. Returns 0 to go on to main (by the trailers alone when no status could be posted and it is not required); a stop is a `die`.
+dual_write() {
+  [ -n "${FLEET_APP_ID:-}" ] && [ "$smode" != off ] || return 0
+  local ck co ov rc=0 id=${run##*/run.}
+  ck=$(g log -1 --format=%B "$sha" | git interpret-trailers --parse | sed -n 's/^Land-Checks: //p' | tail -n1)
+  co=$(g log -1 --format=%B "$sha" | git interpret-trailers --parse | sed -n 's/^Land-Council: //p' | tail -n1)
+  ov=$(g log -1 --format=%B "$sha" | git interpret-trailers --parse | sed -n 's/^Override: //p' | tail -n1)
+  if [ -z "$ck" ] || [ -z "$co" ]; then
+    [ "$smode" != required ] || die "FLEET_LAND_STATUSES=required, and the tip has no Land-Checks and Land-Council to post: nothing lands"
+    echo "push: no statuses: the tip has no Land-Checks and Land-Council to post" >&2; return 0
+  fi
+  apppush push "$wt" "$remote" "$sha:refs/land/run-${id//./-}" 2>"$run/tmpref.log" || { cat "$run/tmpref.log" >&2; die "cannot push the temporary ref refs/land/run-${id//./-}: nothing landed"; }
+  tmpref=refs/land/run-${id//./-}
+  LAND_STATUS_CHECKS=$ck LAND_STATUS_COUNCIL=$co LAND_STATUS_OVERRIDE=$ov FLEET_APP_PRIVATE_KEY=$fleet_app_key node "$here/statuses.mjs" post "$wt" "$remote" "$sha" 2>"$run/statuses.log" || rc=$?
+  case $rc in
+    0) ;;
+    71) if [ "$smode" = required ]; then cat "$run/statuses.log" >&2; die "statuses not permitted: FLEET_LAND_STATUSES=required, so nothing lands (the App needs Commit statuses: write on this repository)"; fi
+        if [ "$said_np" = 0 ]; then said_np=1; cat "$run/statuses.log" >&2; echo "push: statuses not permitted: trailer only" >&2; fi
+        drop_tmpref;;
+    *) cat "$run/statuses.log" >&2; die "the statuses could not be posted: nothing landed (FLEET_LAND_STATUSES=off lands by the trailers alone)";;
+  esac
+}
 while :; do
   attempt=$((attempt + 1))
   fetch_main "$wt" || die "cannot fetch $remote $base"
@@ -123,15 +177,22 @@ while :; do
   if [ "$(g rev-parse HEAD)" = "$bsha" ]; then already=1; sha=$bsha; break; fi   # every commit is already in main (a crash after an accepted push, a rerun): nothing to rebuild or test
   # the gate on the exact combination, with the tool of THAT tree (main's own, plus the change when it edits the tool)
   gate=$wt/.spire/tool/checks.sh; [ -x "$gate" ] || stop 13 gate "$wt has no .spire/tool/checks.sh: nothing could gate this landing"
-  ts=$(date +%s)
-  (cd "$wt" && "$gate" "$remote/$base") >"$run/gate.log" 2>&1 || { tail -15 "$run/gate.log" >&2; stop 13 gate "the gate fails on the rebased commits (log: $run/gate.log); nothing lands."; }
-  gate_s=$(( $(date +%s) - ts ))
+  ts=$(date +%s); rm -f "$run/steps.jsonl" "$run/checks"
+  (cd "$wt" && LAND_STEPS_OUT=$run/steps.jsonl LAND_CHECKS_OUT=$run/checks "$gate" "$remote/$base") >"$run/gate.log" 2>&1 || { gate_s=$(( $(date +%s) - ts )); walls="$walls${walls:+,}$gate_s"; first_red=$(node "$here/metrics.mjs" first-red "$run/steps.jsonl" "$t0" 2>/dev/null || echo null)
+    tail -15 "$run/gate.log" >&2; stop 13 gate "the gate fails on the rebased commits (log: $run/gate.log); nothing lands."; }
+  gate_s=$(( $(date +%s) - ts )); walls="$walls${walls:+,}$gate_s"
   sha=$(g rev-parse HEAD)
   fetch_main "$wt" || die "cannot fetch $remote $base"
   if ! g merge-base --is-ancestor "$remote/$base" HEAD; then echo "push: $base moved during the gate: rebasing and checking again (attempt $attempt)"; continue; fi
   holdcheck; freezecheck   # the verdict is only good while nobody has held or frozen landing
+  stamp   # what lands carries the line of THIS gate (the final tree), not the line `land` wrote before the rebase
+  sha=$(g rev-parse HEAD)
   [ "$dry" = 0 ] || break
-  if git -C "$wt" push -q "$remote" "$sha:refs/heads/$base" 2>"$run/push.log"; then break; fi   # a plain push: the remote refuses what is not a fast-forward, and that refusal is the arbiter between landers
+  dual_write
+  prc=0; apppush push "$wt" "$remote" "$sha:refs/heads/$base" 2>"$run/push.log" || prc=$?
+  drop_tmpref   # the temporary ref has done its work whatever the push said
+  if [ "$prc" = 70 ]; then cat "$run/push.log" >&2; die "the App's token could not be made at the push: nothing was pushed"; fi
+  if [ "$prc" = 0 ]; then [ -z "${FLEET_APP_ID:-}" ] || fetch_main "$wt" || true; break; fi   # (a push by URL does not move origin/main: fetch it) a plain push: the remote refuses what is not a fast-forward, and that refusal is the arbiter between landers
   # refused: ask the remote. Our commit in it = accepted after all; main moved on = lost the race, again; neither = a real refusal, not retried
   fetch_main "$wt" || die "cannot fetch $remote $base"
   if g merge-base --is-ancestor "$sha" "$remote/$base"; then echo "push: the push reported a failure but ${sha:0:12} is in $base: landed"; break; fi
@@ -140,8 +201,8 @@ while :; do
   echo "push: lost the race for $base: rebasing and checking again (attempt $attempt)" >&2
   sleep "$(awk -v n="$attempt" -v r="$RANDOM" 'BEGIN { m = n / 2; if (m > 10) m = 10; printf "%.2f", m * r / 32768 }')"   # jitter, so losers do not collide again
 done
-if [ "$already" = 1 ]; then result=landed; echo "push: already landed: every commit of $rev is in $base (${sha:0:12}); nothing to do"; exit 0; fi
+if [ "$already" = 1 ]; then result=landed; landed_at=$(date +%s); echo "push: already landed: every commit of $rev is in $base (${sha:0:12}); nothing to do"; exit 0; fi
 if [ "$dry" = 1 ]; then result=would-land; echo "push: dry run: would land ${sha:0:12} (gate ${gate_s}s); nothing pushed"; exit 0; fi
-result=landed
+result=landed; landed_at=$(date +%s) # the second the push was accepted, for the record
 echo "push: ${sha:0:12} is $base: $ncommits commit(s), gate ${gate_s}s"
 echo "push: your branch still holds the pre-rebase commits ($base has them rebased): start the next task from a fresh worktree off $remote/$base"

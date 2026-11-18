@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Read-only parity check of the `land/*` commit statuses (#2560, #2570).
+
+Usage: tools/land-status-parity [--repo OWNER/REPO] [--count N] [--commits SHA1,SHA2] [--contexts C1,C2] [--bot LOGIN] [--fixture PATH] [--json]
+
+Every checked commit must carry `state == "success"` for each required context (default: `land/checks,land/council` for Spire Land
+statuses, or `land/gates,land/reviews,land/merge-gate` when `--contexts pr-merge` is given), each created by the bot (`--bot LOGIN`,
+default: any login ending in `[bot]`), and when `land/checks` is checked and the commit's tree SHA is present, `tree=<12 hex>` in its
+description must prefix-match the commit's tree. Exit 0 only when all pass. Writes nothing.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+LAND_CONTEXTS = ("land/checks", "land/council")
+PR_MERGE_CONTEXTS = ("land/gates", "land/reviews", "land/merge-gate")
+CONTEXTS = LAND_CONTEXTS
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+TREE_RE = re.compile(r"(?:^|\s)tree=([0-9a-f]{12,40})(?:\s|$)")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+MAX_FIXTURE_BYTES = 10 * 1024 * 1024
+MAX_API_BYTES = 10 * 1024 * 1024
+MAX_COMMITS = 1000
+
+
+def valid_repo(repo):
+    if not isinstance(repo, str) or not REPO_RE.match(repo):
+        return False
+    return all(p not in (".", "..") and not p.startswith(".") and not p.endswith(".") and not p.endswith(".git") for p in repo.split("/"))
+
+
+def clean(text, limit=80):
+    """Text safe to print: every control, escape or odd character becomes `?`."""
+    return re.sub(r"[^A-Za-z0-9._:/\[\]-]", "?", str(text))[:limit]
+
+
+def gh_json(path):
+    done = subprocess.run(["gh", "api", path], capture_output=True, timeout=60)
+    if done.returncode != 0:
+        raise RuntimeError("gh api %s failed (exit %d)" % (path.split("?")[0], done.returncode))
+    if len(done.stdout) > MAX_API_BYTES:
+        raise RuntimeError("gh api answer oversize")
+    return json.loads(done.stdout)
+
+
+def from_api(repo, count, shas=None):
+    commits = []
+    if shas:
+        items = []
+        for sha in shas:
+            if not SHA_RE.match(sha):
+                raise RuntimeError("malformed commit sha")
+            c = gh_json("repos/%s/commits/%s" % (repo, sha))
+            items.append(c)
+    else:
+        listing = gh_json("repos/%s/commits?per_page=%d" % (repo, count))
+        if not isinstance(listing, list):
+            raise RuntimeError("commit list is not a list")
+        items = listing[:count]
+    for item in items:
+        sha = item.get("sha") if isinstance(item, dict) else None
+        if not isinstance(sha, str) or not SHA_RE.match(sha):
+            raise RuntimeError("malformed commit item")
+        tree = ((item.get("commit") or {}).get("tree") or {}).get("sha") if isinstance(item.get("commit"), dict) else None
+        statuses = gh_json("repos/%s/commits/%s/statuses?per_page=100" % (repo, sha))
+        if isinstance(statuses, dict) and isinstance(statuses.get("statuses"), list):
+            statuses = statuses["statuses"]
+        if not isinstance(statuses, list):
+            raise RuntimeError("malformed status answer")
+        commits.append({"sha": sha, "tree": tree, "statuses": statuses})
+    return commits
+
+
+def bot_ok(login, bot):
+    return login == bot if bot else isinstance(login, str) and login.endswith("[bot]")
+
+
+def parse_contexts(spec):
+    if not spec or spec == "spire-land":
+        return LAND_CONTEXTS
+    if spec == "pr-merge":
+        return PR_MERGE_CONTEXTS
+    parts = tuple(c.strip() for c in spec.split(",") if c.strip())
+    if not parts:
+        raise ValueError("empty --contexts")
+    return parts
+
+
+def check(commit, bot, contexts=None):
+    """(list of problems, the bot logins seen) for one commit."""
+    if contexts is None:
+        raw_list = commit.get("statuses") if isinstance(commit.get("statuses"), list) else []
+        seen_ctx = {s.get("context") for s in raw_list if isinstance(s, dict)}
+        contexts = PR_MERGE_CONTEXTS if ("land/gates" in seen_ctx and "land/checks" not in seen_ctx) else LAND_CONTEXTS
+    problems, bots = [], []
+    raw = commit.get("statuses")
+    statuses = [s for s in (raw if isinstance(raw, list) else []) if isinstance(s, dict)]
+    commit_tree = commit.get("tree")
+    for context in contexts:
+        mine = [s for s in statuses if s.get("context") == context]
+        if not mine:
+            problems.append((context, "no such status"))
+            continue
+        latest = mine[0]   # GitHub lists newest first: only the latest status of a context counts
+        login = (latest.get("creator") or {}).get("login")
+        if latest.get("state") != "success":
+            problems.append((context, "state is %s, not success" % clean(latest.get("state"))))
+        elif not bot_ok(login, bot):
+            problems.append((context, "creator %s is not the bot" % clean(login)))
+        elif context == "land/checks" and isinstance(commit_tree, str) and SHA_RE.match(commit_tree):
+            m = TREE_RE.search(str(latest.get("description") or ""))
+            if not m or not commit_tree.startswith(m.group(1)):
+                problems.append((context, "tree mismatch in description"))
+            else:
+                bots.append(login)
+        else:
+            bots.append(login)
+    return problems, bots
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="read-only parity check of the land/* commit statuses")
+    parser.add_argument("--repo")
+    parser.add_argument("--count", type=int, default=10)
+    parser.add_argument("--commits", help="comma-separated 40-hex commit SHAs to check")
+    parser.add_argument("--contexts", default=None, help="comma-separated contexts, 'spire-land' (default), or 'pr-merge'")
+    parser.add_argument("--bot")
+    parser.add_argument("--fixture")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    opts = parser.parse_args(argv)
+    if not 1 <= opts.count <= 100:
+        print("land-status-parity: --count must be from 1 to 100", file=sys.stderr)
+        return 2
+    if opts.repo is not None and not valid_repo(opts.repo):
+        print("land-status-parity: --repo must be OWNER/REPO", file=sys.stderr)
+        return 2
+    try:
+        contexts = parse_contexts(opts.contexts) if opts.contexts else None
+        shas = [s.strip() for s in opts.commits.split(",") if s.strip()] if opts.commits else None
+        if opts.fixture:
+            with open(opts.fixture, "rb") as handle:
+                raw = handle.read(MAX_FIXTURE_BYTES + 1)
+            if len(raw) > MAX_FIXTURE_BYTES:
+                raise ValueError("fixture oversize")
+            commits = json.loads(raw)
+        elif opts.repo:
+            commits = from_api(opts.repo, opts.count, shas=shas)
+        else:
+            parser.error("give --repo or --fixture")
+    except (OSError, ValueError, RuntimeError, KeyError, AttributeError, subprocess.SubprocessError) as err:
+        print("land-status-parity: cannot read the commits (%s)" % type(err).__name__, file=sys.stderr)
+        return 2
+    if not isinstance(commits, list) or not commits:
+        print("land-status-parity: no commits to check", file=sys.stderr)
+        return 2
+    if len(commits) > MAX_COMMITS:
+        print("land-status-parity: too many commits (limit %d)" % MAX_COMMITS, file=sys.stderr)
+        return 2
+    gaps = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            print("land-status-parity: malformed commit entry", file=sys.stderr)
+            return 2
+        sha = clean(commit.get("sha", ""), 12)
+        problems, bots = check(commit, opts.bot, contexts=contexts)
+        if problems:
+            for context, reason in problems:
+                gaps.append({"sha": sha, "context": context, "reason": reason})
+                if not opts.as_json:
+                    print("MISSING %s: %s (%s)" % (sha, context, reason))
+        elif not opts.as_json:
+            used = contexts or LAND_CONTEXTS
+            print("OK %s: %s by %s" % (sha, ", ".join(used), clean(bots[0] if bots else "?")))
+    if opts.as_json:
+        print(json.dumps({"ok": len(gaps) == 0, "checked": len(commits), "gaps": gaps}, sort_keys=True))
+    elif not gaps:
+        print("PARITY OK (%d commits checked)" % len(commits))
+    return 1 if gaps else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

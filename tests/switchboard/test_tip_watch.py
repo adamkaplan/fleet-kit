@@ -1,4 +1,4 @@
-"""#2247 S3: the integration tip watch. A merge that turns the tip's CI red raises ONE notice naming the merge, its pull request and the failed jobs, to the Chief of Staff and the
+"""#2247 S3: the main tip watch. A merge that turns the tip's CI red raises ONE notice naming the merge, its pull request and the failed jobs, to the Chief of Staff and the
 merging lane; the same red on the next head raises none; a new failing job on a red tip raises one. The class borrows the host file's Base, World and fakes (build())."""
 import json
 import subprocess
@@ -13,7 +13,7 @@ class TipGh:
         self.sb, self.runs, self.jobs, self.calls, self.fault = sb, [], {}, [], False
         self.fail, self.total, self.between, self.files, self.logs = [], None, {}, {}, {}   # head -> [(sha, pr)] merged since the run before it; pr -> [file names]; job id -> log text
 
-    def add(self, now, run_id, head, pr, jobs=(), conclusion=None, age=60, status="completed", branch="integration", done=None, kind="failure"):
+    def add(self, now, run_id, head, pr, jobs=(), conclusion=None, age=60, status="completed", branch="main", done=None, kind="failure"):
         failed = [j for j in jobs]
         self.runs.append({"id": run_id, "head_sha": head, "head_branch": branch, "status": status, "event": "workflow_dispatch",
                           "conclusion": conclusion or ("failure" if failed else "success"), "created_at": self.sb.iso(now - age), "updated_at": self.sb.iso(now - (age if done is None else done)),
@@ -28,7 +28,7 @@ class TipGh:
             return done("", 1)
         if self.fault and "/jobs" in path:
             return done("", 1)
-        if path.startswith("repos/acme/widget/actions/runs?branch=integration"):
+        if path.startswith("repos/acme/widget/actions/runs?branch=main"):
             return done(json.dumps({"workflow_runs": self.runs}))
         if path.startswith("repos/acme/widget/compare/"):
             head = path.split("...")[1].split("?")[0]
@@ -165,10 +165,10 @@ def build(Base, World, FAKE_GH, EjectionHub, sb):
             self.assertIn("not known", self.sent[0][1])
 
         def test_history_a_cancelled_run_a_run_still_going_and_another_branch_tell_nobody(self):
+            self.add(4, "d" * 40, 14, ["x"], branch="integration", age=250)
             self.add(1, "a" * 40, 11, ["unit tests"], age=self.module.WAKE_WINDOW + 500)
             self.add(2, "b" * 40, 12, conclusion="cancelled", age=200)
             self.add(3, "c" * 40, 13, ["x"], status="in_progress", conclusion="failure", age=100)
-            self.add(4, "d" * 40, 14, ["x"], branch="main", age=50)
             self.go()
             self.assertEqual(self.sent, [])
 

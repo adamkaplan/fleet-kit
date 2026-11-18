@@ -20,25 +20,119 @@
         "tools/**",
         "docs/guard-set.json"
       ],
-      "exclude": ["**/*.md", "bin/cloud_*.py", "bin/decisions_pull.py", "bin/fleet_health.py", "bin/health_records.py"],
+      "exclude": [
+        "**/*.md",
+        "bin/cloud_*.py",
+        "bin/decisions_pull.py",
+        "bin/fleet_health.py",
+        "bin/health_records.py"
+      ],
       "steps": [
-        {"name": "public-names", "cmd": "python3 bin/check-public-names"},
-        {"name": "guard-set", "cmd": "tools/guard-set --run"},
-        {"name": "suites-of-the-change", "cmd": "python3 bin/fleet-switchboard heavy --changed --base {base}"},
-        {"name": "gh-hold", "cmd": "bin/test-gh-hold"}
+        {
+          "id": "public-names",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/check-public-names && git log --format=%B {base}..HEAD | python3 bin/check-public-names --stdin commit-messages"
+          ]
+        },
+        {
+          "id": "size-and-role-ceilings",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/size_ceilings.py check --tip {base} --head HEAD"
+          ]
+        },
+        {
+          "id": "guard-set",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSupportRebinding TestEveryTestFileIsWired TestArchitectureDocument TestTheBinSetClassesAreAllInTheTable TestV2LightGuards TestHygiene TestOwnMarkerNotHonoured TestTheEntryGuard && python3 tools/derive-closure --check"
+          ]
+        },
+        {
+          "id": "suites-of-the-change",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSpireLandCutover2570 TestDirectToMainCutover TestTipWatch"
+          ]
+        },
+        {
+          "id": "gh-hold",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-gh-hold"
+          ]
+        }
       ]
     },
     {
       "name": "cloud",
-      "paths": ["cloud/**", "bin/cloud_*.py", "bin/cloud-*", "bin/test-cloud-*", "bin/decisions_pull.py", "bin/test-decisions-pull", "bin/test-app-mint"],
-      "exclude": ["**/*.md"],
+      "paths": [
+        "cloud/**",
+        "bin/cloud_*.py",
+        "bin/cloud-*",
+        "bin/test-cloud-*",
+        "bin/decisions_pull.py",
+        "bin/test-decisions-pull",
+        "bin/test-app-mint"
+      ],
+      "exclude": [
+        "**/*.md"
+      ],
       "steps": [
-        {"name": "public-names", "cmd": "python3 bin/check-public-names"},
-        {"name": "cloud-neutral-names", "cmd": "bin/test-cloud-neutral-names"},
-        {"name": "cloud-worker", "cmd": "bin/test-cloud-worker"},
-        {"name": "cloud-tests", "cmd": "env CLOUD_TEST_SKIP_DOCKER=1 cloud/tests/test-cloud"},
-        {"name": "cloud-launcher", "cmd": "bin/test-cloud-launcher"},
-        {"name": "suites-of-the-change", "cmd": "python3 bin/fleet-switchboard heavy --changed --base {base}"}
+        {
+          "id": "public-names",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/check-public-names && git log --format=%B {base}..HEAD | python3 bin/check-public-names --stdin commit-messages"
+          ]
+        },
+        {
+          "id": "size-and-role-ceilings",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/size_ceilings.py check --tip {base} --head HEAD"
+          ]
+        },
+        {
+          "id": "cloud-neutral-names",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-cloud-neutral-names"
+          ]
+        },
+        {
+          "id": "cloud-worker",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-cloud-worker"
+          ]
+        },
+        {
+          "id": "cloud-tests",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; env KUBECONFIG=/dev/null CLOUD_TEST_SKIP_DOCKER=1 cloud/tests/test-cloud"
+          ]
+        },
+        {
+          "id": "cloud-launcher",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 cloud/launcher/tests/test_mint_roles.py && python3 cloud/launcher/tests/test_token_service.py && python3 cloud/launcher/tests/test_copilot_front.py && python3 cloud/launcher/tests/test_copilot_manifest.py"
+          ]
+        }
       ]
     },
     {
@@ -53,56 +147,287 @@
         "bin/test-heartbeat",
         "bin/test-health-records"
       ],
-      "exclude": ["**/*.md"],
+      "exclude": [
+        "**/*.md"
+      ],
       "steps": [
-        {"name": "public-names", "cmd": "python3 bin/check-public-names"},
-        {"name": "heartbeat", "cmd": "bin/test-heartbeat"},
-        {"name": "health-records", "cmd": "bin/test-health-records"},
-        {"name": "fleet-doctor", "cmd": "bin/test-fleet-doctor"},
-        {"name": "fleet-doctor-config", "cmd": "bin/test-fleet-doctor-config"},
-        {"name": "fleet-doctor-heartbeat", "cmd": "bin/test-fleet-doctor-heartbeat"}
+        {
+          "id": "public-names",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/check-public-names && git log --format=%B {base}..HEAD | python3 bin/check-public-names --stdin commit-messages"
+          ]
+        },
+        {
+          "id": "size-and-role-ceilings",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/size_ceilings.py check --tip {base} --head HEAD"
+          ]
+        },
+        {
+          "id": "heartbeat",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-heartbeat"
+          ]
+        },
+        {
+          "id": "health-records",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-health-records"
+          ]
+        },
+        {
+          "id": "fleet-doctor",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-fleet-doctor"
+          ]
+        },
+        {
+          "id": "fleet-doctor-config",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-fleet-doctor-config"
+          ]
+        },
+        {
+          "id": "fleet-doctor-heartbeat",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-fleet-doctor-heartbeat"
+          ]
+        }
       ]
     },
     {
       "name": "plugins",
-      "paths": ["plugins/**"],
-      "exclude": ["**/*.md"],
+      "paths": [
+        "plugins/**"
+      ],
+      "exclude": [
+        "**/*.md"
+      ],
       "steps": [
-        {"name": "public-names", "cmd": "python3 bin/check-public-names"},
-        {"name": "hooks", "cmd": "node --test plugins/fleet-hooks/index.test.mjs"},
-        {"name": "decisions-tui", "cmd": "node --test plugins/fleet-decisions-tui/health.test.mjs plugins/fleet-decisions-tui/click.test.mjs plugins/fleet-decisions-tui/kind.test.mjs"}
+        {
+          "id": "public-names",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/check-public-names && git log --format=%B {base}..HEAD | python3 bin/check-public-names --stdin commit-messages"
+          ]
+        },
+        {
+          "id": "size-and-role-ceilings",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/size_ceilings.py check --tip {base} --head HEAD"
+          ]
+        },
+        {
+          "id": "hooks",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; node --test plugins/fleet-hooks/index.test.mjs"
+          ]
+        },
+        {
+          "id": "decisions-tui",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; node --test plugins/fleet-decisions-tui/health.test.mjs plugins/fleet-decisions-tui/click.test.mjs plugins/fleet-decisions-tui/kind.test.mjs"
+          ]
+        }
       ]
     },
     {
       "name": "docs",
-      "paths": ["docs/**", "skills/**", "agents/**", "*.md", "**/*.md"],
-      "exclude": ["docs/guard-set.json"],
+      "paths": [
+        "docs/**",
+        "skills/**",
+        "agents/**",
+        "*.md",
+        "**/*.md"
+      ],
+      "exclude": [
+        "docs/guard-set.json"
+      ],
       "steps": [
-        {"name": "public-names", "cmd": "python3 bin/check-public-names"},
-        {"name": "doc-consistency", "cmd": "python3 bin/test-switchboard TestArchitectureDocument TestHygiene TestWorkerRulesInSkills TestSkillsSync TestCommissioningDocs TestReviewLawsStarterSet TestAgentDefinitions TestArchitectureSafetyNet"},
-        {"name": "path-suites-docs", "cmd": "bin/test-path-suites -k TestSkillsAndDocs"},
-        {"name": "cloud-docs-wording", "cmd": "python3 cloud/launcher/tests/test_cloud_docs_wording.py"}
+        {
+          "id": "public-names",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/check-public-names && git log --format=%B {base}..HEAD | python3 bin/check-public-names --stdin commit-messages"
+          ]
+        },
+        {
+          "id": "size-and-role-ceilings",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/size_ceilings.py check --tip {base} --head HEAD"
+          ]
+        },
+        {
+          "id": "doc-consistency",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestArchitectureDocument TestHygiene TestWorkerRulesInSkills TestSkillsSync TestCommissioningDocs TestReviewLawsStarterSet TestAgentDefinitions TestArchitectureSafetyNet"
+          ]
+        },
+        {
+          "id": "path-suites-docs",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-path-suites -k TestSkillsAndDocs"
+          ]
+        },
+        {
+          "id": "cloud-docs-wording",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 cloud/launcher/tests/test_cloud_docs_wording.py"
+          ]
+        }
       ]
     },
     {
       "name": "all",
-      "paths": ["**"],
+      "paths": [
+        "**"
+      ],
       "exclude": [
         "**/*.md",
-        "bin/fleet-switchboard", "bin/fleet-switchboard.parts", "bin/switchboard/**", "bin/switchboard-trial", "bin/*.py", "bin/ci-test-files.txt",
-        "bin/test-switchboard", "bin/test-gh-hold", "bin/test-path-suites", "bin/test-impact-brief", "bin/test-host-liveness",
-        "shims/**", "tests/**", "tools/**", "docs/guard-set.json",
-        "cloud/**", "bin/cloud-*", "bin/test-cloud-*", "bin/test-decisions-pull", "bin/test-app-mint",
-        "bin/fleet-doctor*", "bin/fleet-heartbeat", "bin/heartbeat-ack", "bin/test-fleet-doctor*", "bin/test-heartbeat", "bin/test-health-records",
-        "plugins/**", "docs/**", "skills/**", "agents/**"
+        "bin/fleet-switchboard",
+        "bin/fleet-switchboard.parts",
+        "bin/switchboard/**",
+        "bin/switchboard-trial",
+        "bin/*.py",
+        "bin/ci-test-files.txt",
+        "bin/test-switchboard",
+        "bin/test-gh-hold",
+        "bin/test-path-suites",
+        "bin/test-impact-brief",
+        "bin/test-host-liveness",
+        "shims/**",
+        "tests/**",
+        "tools/**",
+        "docs/guard-set.json",
+        "cloud/**",
+        "bin/cloud-*",
+        "bin/test-cloud-*",
+        "bin/test-decisions-pull",
+        "bin/test-app-mint",
+        "bin/fleet-doctor*",
+        "bin/fleet-heartbeat",
+        "bin/heartbeat-ack",
+        "bin/test-fleet-doctor*",
+        "bin/test-heartbeat",
+        "bin/test-health-records",
+        "plugins/**",
+        "docs/**",
+        "skills/**",
+        "agents/**"
       ],
       "steps": [
-        {"name": "public-names", "cmd": "python3 bin/check-public-names"},
-        {"name": "guard-set", "cmd": "tools/guard-set --run"},
-        {"name": "scenario-validate", "cmd": "bin/fleet-scenario validate"},
-        {"name": "scenario-coverage", "cmd": "bin/fleet-scenario coverage --enforce --through-pr 4"},
-        {"name": "workflow-split", "cmd": "bin/test-workflow-split"}
+        {
+          "id": "public-names",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/check-public-names && git log --format=%B {base}..HEAD | python3 bin/check-public-names --stdin commit-messages"
+          ]
+        },
+        {
+          "id": "size-and-role-ceilings",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/size_ceilings.py check --tip {base} --head HEAD"
+          ]
+        },
+        {
+          "id": "guard-set",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSupportRebinding TestEveryTestFileIsWired TestArchitectureDocument TestTheBinSetClassesAreAllInTheTable TestV2LightGuards TestHygiene TestOwnMarkerNotHonoured TestTheEntryGuard && python3 tools/derive-closure --check"
+          ]
+        },
+        {
+          "id": "scenario-validate",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/fleet-scenario validate"
+          ]
+        },
+        {
+          "id": "scenario-coverage",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/fleet-scenario coverage --enforce --through-pr 4"
+          ]
+        },
+        {
+          "id": "workflow-split",
+          "cmd": [
+            "sh",
+            "-c",
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; bin/test-workflow-split"
+          ]
+        }
       ]
     }
-  ]
+  ],
+  "paths": {
+    "tests": [
+      "tests/**",
+      "bin/test-*",
+      "cloud/**/test*",
+      "plugins/**/*.test.mjs"
+    ],
+    "prose": [
+      "**/*.md"
+    ],
+    "notProd": [
+      "**/*.md",
+      "tests/**",
+      "scenarios/**"
+    ]
+  },
+  "sensitive": {
+    "globs": [
+      "shims/**",
+      "cloud/launcher/**",
+      ".spire/**",
+      ".github/workflows/**"
+    ],
+    "nameGlobs": [
+      "**/*{credential,secret,token}*"
+    ],
+    "always": [
+      ".spire/principles.md"
+    ]
+  },
+  "review": {
+    "models": ".spire/review/models.json"
+  }
 }

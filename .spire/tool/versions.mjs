@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // versions.mjs: every command the tool runs uses the PROJECT'S pinned tool versions, never the host's defaults.
 //
-//   The pins are read from the project root: .node-version, .nvmrc, mise.toml / .mise.toml ([tools]), .tool-versions, package.json (volta.node, engines.node).
-//   Each pinned tool is looked up among the versions installed on this host (mise's installs: $MISE_DATA_DIR or ~/.local/share/mise, installs/<tool>/<version>;
-//   for node also the directories of PATH, each asked for its real version); the highest installed version that satisfies EVERY pin of the tool is put first
+//   The pins are read from the project root: .node-version, .nvmrc, mise.toml / .mise.toml ([tools]), .tool-versions, package.json (volta.node, engines.node), and the
+//   PIN SOURCES the project's manifest names (`pins`, in references/project.md): the version of a Dockerfile's `FROM python:X` lines, the one production is built from, so there is
+//   no second file to keep equal. A source that cannot be read, has no such line, or whose tag names no version, REFUSES.
+//   Each pinned tool is looked up among the versions installed on this host (where: LAYOUT.md rule 6); the highest installed version that satisfies EVERY pin of the tool is put first
 //   in PATH for every child process. A pin no installed version satisfies REFUSES, with the tool, the pin, what is installed and how to install it: there is
 //   no fallback to the host's default, ever. A tool the project pins nothing for runs as the host has it (the startup line says so).
 //
@@ -26,8 +27,9 @@ import {
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadManifest } from "./manifest.mjs";
 
 /** A pin the host cannot honour: the message is the plain reason, printed as it is. */
 export class PinError extends Error {}
@@ -122,7 +124,7 @@ const firstLine = (f) =>
   readFileSync(f, "utf8").split("\n")[0].replace(/#.*/, "").trim();
 
 /** The project's pins: [{tool, spec, source}] in order of precedence. */
-export function readPins(root) {
+export function readPins(root, env = process.env) {
   const pins = [];
   const add = (tool, spec, source) => {
     const s = String(spec ?? "").trim();
@@ -174,7 +176,89 @@ export function readPins(root) {
     add("node", pkg.volta?.node, "package.json volta.node");
     add("node", pkg.engines?.node, "package.json engines.node");
   }
+  for (const p of sourcePins(root, env)) {
+    add(p.tool, p.spec, p.source);
+  }
   return pins;
+}
+
+/** The pin sources the project declares (land.json `pins`: [{source, from}]) as [{tool, spec, source}]; throws PinError for one that cannot be resolved. */
+function sourcePins(root, env) {
+  // the project's manifest, read as every other reader of it does (manifest.mjs: box.json and land.json as one view; BOX_CONFIG and LAND_CONFIG name other files)
+  let declared;
+  try {
+    declared = loadManifest([
+      env.BOX_CONFIG ?? join(root, ".spire/box.json"),
+      env.LAND_CONFIG ?? join(root, ".spire/land.json"),
+    ]).pins;
+  } catch (e) {
+    throw new PinError(`cannot read the project's files to find its pin sources: ${e.message}`);
+  }
+  if (declared === undefined) {
+    return [];
+  }
+  if (!Array.isArray(declared)) {
+    throw new PinError(`pins in .spire/land.json: must be a list of {"source": "ear/Dockerfile", "from": "python"}`);
+  }
+  return declared.flatMap((entry, i) => dockerfilePins(root, entry, i + 1));
+}
+
+/** The pins of one source entry: the version of each `FROM <from>:TAG` line of the Dockerfile (the tool is the image's name). */
+function dockerfilePins(root, entry, n) {
+  const bad = (why) =>
+    new PinError(`pins in .spire/land.json: entry ${n} ${why}: it is {"source": "path/in/the/project/Dockerfile", "from": "python"}`);
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+    throw bad("is not an object");
+  }
+  const { source, from } = entry;
+  if (typeof source !== "string" || !source || isAbsolute(source) || source.split("/").includes("..")) {
+    throw bad("has no `source` path inside the project");
+  }
+  if (typeof from !== "string" || !/^[A-Za-z0-9_-]+$/.test(from)) {
+    throw bad("has no `from` image name (python, node)");
+  }
+  const where = `pin source ${source} (FROM ${from})`;
+  let text;
+  try {
+    const real = realpathSync(join(root, source));
+    const rel = relative(realpathSync(root), real);
+    if (rel === ".." || rel.startsWith("../") || isAbsolute(rel)) {
+      throw new PinError(`${where}: the file is outside the project (a link out of it). A pin source is a file of the project.`);
+    }
+    if (!statSync(real).isFile()) {
+      throw new PinError(`${where}: it is not a file. A pin source is a Dockerfile of the project.`);
+    }
+    text = readFileSync(real, "utf8");
+  } catch (e) {
+    if (e instanceof PinError) {
+      throw e;
+    }
+    throw new PinError(`${where}: no such file in the project. Fix the path in .spire/land.json, or remove the entry.`);
+  }
+  const out = [];
+  text.split("\n").forEach((raw, i) => {
+    const m = /^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+\S+)?\s*$/i.exec(raw);
+    if (!m) {
+      return;
+    }
+    const noDigest = m[1].split("@")[0];
+    const image = noDigest.split("/").pop();
+    const colon = image.indexOf(":");
+    if ((colon < 0 ? image : image.slice(0, colon)) !== from) {
+      return; // another image, or a stage of this file: not this pin
+    }
+    const tag = colon < 0 ? "" : image.slice(colon + 1);
+    const v = /^(\d+(?:\.\d+){0,2})(?:[-+].*)?$/.exec(tag)?.[1];
+    if (!v) {
+      const why = tag ? `"${tag}" names no version` : `${m[1]} names no version (${m[1].includes("@") ? "it is pinned by digest only" : "it has no tag"})`;
+      throw new PinError(`${where}, line ${i + 1}: ${why}. The tag after \`${from}:\` must start with the version (${from}:3.11-slim): spire-land never chooses one itself.`);
+    }
+    out.push({ tool: from, spec: v, source: `${source} FROM ${from}` });
+  });
+  if (!out.length) {
+    throw new PinError(`${where}: no \`FROM ${from}:VERSION\` line in it. Name the file the ${from} version is built from, or remove the entry.`);
+  }
+  return out;
 }
 
 const miseInstalls = (env) =>
@@ -201,14 +285,36 @@ function nodeVersionOf(bin) {
   return /^\d+\.\d+\.\d+/.test(v) ? v : "";
 }
 
+/** The executables that stand for a tool in a bin directory: python is `python3` where a distribution ships no `python`. */
+const exeNames = (tool) => (tool === "python" ? ["python3", "python"] : [tool]);
+
+/** The real version a tool's executable in `binDir` reports (node: its own --version; another tool: the first version `EXE --version` prints), or "" when there is none or it does not run. */
+function probeVersion(tool, binDir) {
+  if (tool === "node") {
+    return nodeVersionOf(join(binDir, "node"));
+  }
+  for (const exe of exeNames(tool)) {
+    if (!isExec(join(binDir, exe))) {
+      continue;
+    }
+    const r = cp.spawnSync(join(binDir, exe), ["--version"], { encoding: "utf8", timeout: 20_000 });
+    const v = r.status === 0 ? /\d+(\.\d+)+/.exec(`${r.stdout}${r.stderr}`)?.[0] : "";
+    if (v) {
+      return v;
+    }
+  }
+  return "";
+}
+
 /** The versions of a tool installed on this host, highest first: [{version, binDir, via}], one per real bin directory. */
 export function installed(tool, env = process.env) {
   const out = [];
   const seen = new Set();
   const take = (dir, via, named) => {
     let binDir;
+    let real;
     try {
-      const real = realpathSync(dir);
+      real = realpathSync(dir);
       binDir = existsSync(join(real, "bin")) ? join(real, "bin") : real;
     } catch {
       return;
@@ -217,8 +323,9 @@ export function installed(tool, env = process.env) {
       return;
     }
     seen.add(binDir);
-    // node: the binary's own word, not its directory's name
-    const version = tool === "node" ? nodeVersionOf(join(binDir, "node")) : named;
+    // node: the binary's own word, not its directory's name; another tool: mise's short names ("3.12") are links to the real install, which names the full version
+    const dirName = basename(real);
+    const version = tool === "node" ? probeVersion(tool, binDir) : via === "mise" && /^v?\d+(\.\d+)*$/.test(dirName) ? dirName : named;
     if (/^v?\d+(\.\d+)*$/.test(version)) {
       out.push({ version: strip(version), binDir, via });
     }
@@ -231,10 +338,11 @@ export function installed(tool, env = process.env) {
       }
     }
   }
-  if (tool === "node") {
+  // The directories of PATH are candidates for every pinned tool (an image's recipe puts its python or node on PATH, not in mise's installs): each is asked for its real version.
+  if (/^[A-Za-z0-9_-]+$/.test(tool)) {
     for (const d of (env.PATH ?? "").split(":").filter(Boolean)) {
-      if (!isShims(d) && isExec(join(d, "node"))) {
-        take(d, "PATH");
+      if (!isShims(d) && exeNames(tool).some((e) => isExec(join(d, e)))) {
+        take(d, "PATH", tool === "node" ? undefined : probeVersion(tool, d));
       }
     }
   }
@@ -255,9 +363,8 @@ export function installed(tool, env = process.env) {
         take(prevBins[i], "PATH");
       } else {
         // the version is READ from the probe (the first number of its output) and must equal the record
-        const r = cp.spawnSync(join(prevBins[i], tool), ["--version"], { encoding: "utf8", timeout: 20_000 });
-        const probed = /\d+(\.\d+)+/.exec(`${r.stdout}${r.stderr}`)?.[0];
-        if (r.status === 0 && probed === strip(v)) {
+        const probed = probeVersion(tool, prevBins[i]);
+        if (probed && probed === strip(v)) {
           take(prevBins[i], "PATH", probed);
         }
       }
@@ -275,7 +382,7 @@ const hostDefault = (env) => {
 /** Resolve the project's pins against this host: {root, tools: [{tool, pin, source, version, binDir, via}], bins}. Throws PinError with the plain reason. */
 export function resolvePins(root, env = process.env) {
   const byTool = new Map();
-  for (const p of readPins(root)) {
+  for (const p of readPins(root, env)) {
     byTool.set(p.tool, [...(byTool.get(p.tool) ?? []), p]);
   }
   const tools = [];

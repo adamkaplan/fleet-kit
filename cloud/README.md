@@ -801,7 +801,7 @@ dependency by integrity and the image installs with `npm ci --ignore-scripts --o
 every interface by default; its HTTP server reads the `HOST` variable, so the entrypoint sets `HOST=127.0.0.1` for it. The policy front
 (`cloud/copilot-bridge/bridge-front.mjs`, Node standard library only) is the only listener a pod can reach: it forwards `POST /chat/completions` and
 `POST /v1/chat/completions` only, answers `GET /usage`, refuses a body over `BRIDGE_MAX_BODY` (400000 bytes), refuses an id containing `opus` (any case) with
-403 and `model banned from the council: opus`, maps every other model to `claude-sonnet-5.5` at `medium` (`claude-haiku-5.5` passes with the caller's effort),
+403 and `model banned from the council: opus`, maps every non-`opus` model to `claude-haiku-5.5` with the caller's effort (council default `low`),
 answers 429 past `BRIDGE_DAILY_BUDGET` requests a day (default 500), and logs one count line per request: never a body, an answer, a header or a token.
 The bridge forwards the whole body to Copilot unchanged, so the front sets both `reasoning.effort` and `reasoning_effort`.
 

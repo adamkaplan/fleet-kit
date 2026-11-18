@@ -14,13 +14,14 @@ const MB = 1024 * 1024;
 const GB = 1024 * MB;
 const gb = (bytes) => (bytes >= GB ? `${Math.round((bytes / GB) * 10) / 10} GB` : `${Math.round(bytes / MB)} MB`);
 
-/** The per-worker memory budget of an area, in bytes: the project's `checks.workerBudgetMB` (a number, or a map by area name), else DEFAULT_BUDGET_MB. A value that is not a positive number is an error, never a fallback. */
-export function budgetBytes(checks, area) {
+/** The per-worker memory budget of an area, in bytes: the project's `checks.workerBudgetMB` (a number, or a map by area name, else by the area's kind), else DEFAULT_BUDGET_MB. A value that is not a positive number is an error, never a fallback. */
+export function budgetBytes(checks, area, kind) {
   const set = checks?.workerBudgetMB;
   const byArea = typeof set === "object" && set !== null;
-  const mb = (byArea ? set[area] : set) === undefined ? DEFAULT_BUDGET_MB : byArea ? set[area] : set;
+  const named = byArea ? (set[area] === undefined && kind !== undefined ? kind : area) : area;
+  const mb = (byArea ? set[named] : set) === undefined ? DEFAULT_BUDGET_MB : byArea ? set[named] : set;
   if (typeof mb !== "number" || !Number.isFinite(mb) || mb <= 0) {
-    throw new Error(`checks.workerBudgetMB${byArea ? `.${area}` : ""} must be a positive number of megabytes, not ${JSON.stringify(mb)}`);
+    throw new Error(`checks.workerBudgetMB${byArea ? `.${named}` : ""} must be a positive number of megabytes, not ${JSON.stringify(mb)}`);
   }
   return Math.round(mb * MB);
 }

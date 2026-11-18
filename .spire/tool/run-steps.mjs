@@ -5,20 +5,25 @@
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
-  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { appendLine } from "./metrics.mjs";
 import { join, relative } from "node:path";
 import { layout } from "./layout.mjs";
 import { loadConfig, matcher } from "./config.mjs";
+import { decide, parseMap } from "./carry.mjs";
+import { buildGraph } from "./reach.mjs";
 import { patchId } from "./patch-id.mjs";
-import { planSteps } from "./plan.mjs";
+import { recipeEnv, stepEnv } from "./step-env.mjs";
+import { planSteps, restrict, runnerInputs } from "./plan.mjs";
 import { applyPins, spawn, spawnSync } from "./versions.mjs";
 import { failedFilesOf } from "./failed-files.mjs";
 import { availableBytes, cpuCores, limitSource, budgetBytes, hostShareBytes, memoryMaxBytes, groupCap, peakLine, planLine, scopeCommand, scopeWorks, uncappedLine, watchPeak } from "./workers.mjs";
@@ -51,14 +56,13 @@ const run = (dir, argv, env = process.env, timeout = 0) => {
   });
   return { rc: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 };
-// A step that names no environment is given none of the variables the project withholds (`checks.withhold` of land.json) nor of what the box's wrap provides (LAND_BOX_EXPORTS: wrap.exports of box.json):
-// inside a box (`box land`) they are the box's own server, a secret that belongs to the steps whose recipe attaches to it (`environment`), and a test that is told "it is here" without the key it then needs stops the whole group.
-const envOf = (s) => {
-  const rest = { ...process.env };
-  for (const k of [...(cfg.checks?.withhold ?? []), ...(process.env.LAND_BOX_EXPORTS ?? "").split(/\s+/).filter(Boolean)]) delete rest[k];
-  // the step's own variables come last: the unit tests need the ones CI's unit shards set (a database URL that is only checked for, a session secret), which no caller's own can stand in for
-  return { ...(s.environment ? process.env : rest), ...(s.env ?? {}) };
-};
+// A step runs in a CLEAN environment (step-env.mjs: the one place): a step that names an environment also gets what that recipe gives it, and the step's own variables come last: the unit tests need the ones CI's unit shards
+// set (a database URL that is only checked for, a session secret), which no caller's own can stand in for.
+const envOf = (s) => ({
+  ...stepEnv(process.env, s.pass),
+  ...(s.environment ? recipeEnv(process.env, cfg.environments[s.environment]) : {}),
+  ...(s.env ?? {}),
+});
 const runAsync = (dir, argv, env = process.env, measure = false) =>
   new Promise((resolve) => {
     const c = spawn(argv[0], argv.slice(1), { cwd: dir, env });
@@ -81,7 +85,15 @@ const countTests = (out) => {
 };
 const secs = (t) => `${Math.round((Date.now() - t) / 1000)}s`;
 const ran = [];
+// the measurement record (metrics.mjs): each step's end as it happens, one line in the file the caller names (land: its temp directory; push: its run directory), so a run that is killed or ends red has said what it saw. Never an error, never slower than a write.
+const noteStep = (id, state, took) => {
+  if (!process.env.LAND_STEPS_OUT) return;
+  try {
+    appendLine(process.env.LAND_STEPS_OUT, { id, at: Date.now() / 1000, took_s: took, state });
+  } catch {}
+};
 const fail = (label, dir, argv, out, exit = true) => {
+  if (exit) noteStep(label, "red", null);
   process.stderr.write(`${out.trim().split("\n").slice(-40).join("\n")}\n`);
   process.stderr.write(
     `land: check FAILED: ${label} (${dir}: ${argv.join(" ")}); nothing lands\n`,
@@ -91,30 +103,50 @@ const fail = (label, dir, argv, out, exit = true) => {
   }
 };
 
-// dependencies: the project's `checks.install` names the directories, the lock file, what an install makes there (`installed`: with none, the install runs every time) and the command. Link the submitter's (same lock file) when the lander
-// runs us in its scratch worktree, else install
+// dependencies: the project's `checks.install` names the directories, the lock file, what an install makes there (`installed`: with none, the install runs every time) and the command. A tree installs ITS OWN, never links or
+// copies another tree's (the submitter's): `npm ci` empties the directory it is given, and a step of the gate that runs it (a browser job that finds its lock file newer than what is installed) emptied the SUBMITTER's node_modules
+// when the gate's tree was given a link to it, under the steps running beside it and under the next run. An install is seconds (the package cache), the price of a gate that cannot damage what it was started from.
+// What this tool installs is stamped with the lock file it was made for (`.land-lock`, in the directory it made): a retry's tree, rebased onto a main that moved the lock file, is installed again; a directory with no stamp
+// (the builder's own) is kept, and so is a link in the builder's own tree; the lander's scratch tree (LAND_TOP) drops a link.
 const inst = cfg.checks?.install;
+const lockId = (d) => {
+  try {
+    return createHash("sha1").update(readFileSync(join(d, inst.lock))).digest("hex");
+  } catch {
+    return undefined; // no lock file to name: nothing to compare
+  }
+};
 for (const d of inst?.dirs ?? []) {
   const made = inst.installed ?? "";
-  if (made && existsSync(join(d, made))) {
-    continue;
-  }
-  const top = process.env.LAND_TOP;
-  const same = (f) =>
-    existsSync(join(top ?? "", d, inst.lock)) &&
-    readFileSync(join(d, inst.lock)).equals(
-      readFileSync(join(top, d, inst.lock)),
-    );
-  if (made && top && existsSync(join(top, d, made)) && same()) {
-    symlinkSync(join(top, d, made), join(d, made));
-  } else {
-    const t = Date.now();
-    const r = run(d, inst.cmd);
-    if (r.rc) {
-      fail(`install:${d}`, d, inst.cmd, r.out);
+  const dir = join(d, made);
+  const lock = lockId(d);
+  if (made) {
+    let st = lstatSync(dir, { throwIfNoEntry: false });
+    if (st?.isSymbolicLink() && process.env.LAND_TOP) {
+      unlinkSync(dir); // the lander's scratch tree (LAND_TOP) never keeps a link, nor installs through one (a tracked one, say): the link goes, never what it points to
+      st = undefined;
     }
-    ran.push(`install:${d}:${secs(t)}`);
+    if (st) {
+      let own;
+      try {
+        own = st.isSymbolicLink() ? undefined : readFileSync(join(dir, ".land-lock"), "utf8");
+      } catch {
+        own = undefined;
+      }
+      if (own === undefined || lock === undefined || own === lock) {
+        continue;
+      }
+      rmSync(dir, { recursive: true, force: true }); // installed here for an older lock file (a retry on a moved main)
+    }
   }
+  const t = Date.now();
+  const r = run(d, inst.cmd);
+  if (r.rc) {
+    fail(`install:${d}`, d, inst.cmd, r.out);
+  }
+  if (made && lock !== undefined && existsSync(dir)) writeFileSync(join(dir, ".land-lock"), lock);
+  ran.push(`install:${d}:${secs(t)}`);
+  noteStep(`install:${d}`, "ran", Math.round((Date.now() - t) / 1000));
 }
 
 // LAND_STATE_DIR: where checks.sh keeps the failed steps and files of the last run (failed.json). `--retest` (LAND_RETEST=1) runs ONLY those, with their prerequisites.
@@ -177,15 +209,14 @@ const environment = async (name) => {
   return { wrap: recipe.map((a) => sub(a).replaceAll("{bundle}", bundle)) };
 };
 
-// A step that passed on THIS tree (the git tree id of HEAD) is not run again on it: a round after a rebuttal re-runs nothing (only the council), and a run stopped half way (a council finding, a red
+// A step that passed on THIS tree (the git tree id of HEAD) is not run again on it: a land after advice that left the tree alone re-runs nothing (only the council), and a run stopped half way (a council finding, a red
 // step) keeps what had passed, so `land` after a red step re-runs that step alone. Another tree is another run: what Land-Checks attests ran on the tree that lands, or says where it was carried from
 // (below). The key is the tree, the step's id and its command; a marker is a file in the git common dir, kept three days. Steps that wait for one another (`after`) are kept
 // or re-run together: the output of one is what the other reads. A kept step prints `id:kept` in the checks line.
 //
-// A REBASE onto a moved main makes another tree, not another change: a test group (a step with a `list`) that passed on an earlier tree of the same change (the same diff by its patch-id: the council keeps its verdicts the same way)
-// and whose area's declared inputs (the `paths` of every area that carries the step, the tool and the project's files in `.spire/`) are the same in that tree and this one is CARRIED: this tree is given the pass (its marker, so a retry
-// of it keeps it) and the checks line says `AREA:carried from TREE`, the tree it really ran on. The proof is the two trees, never a word of the caller: nothing but what the steps recorded here names the earlier tree, and what
-// came in from main is their difference. The cheap whole-tree steps (typecheck, lint, ratchets: every step that is not a test group) run again whatever came in. A group of test steps that wait for one another is carried whole or not at all.
+// A REBASE onto a moved main makes another tree, not another change: a test group (a step with a `list`), or a step that names what it reads (`reads`), that passed on an earlier tree of the same change (the same diff by its patch-id: the council keeps its verdicts the same way)
+// may be CARRIED to this tree (a step marked `select: "reach"`: its tests that passed and that nothing incoming reaches; a step with no `reads` that is not a test always runs again). The rule is in tool/carry.mjs (the one decision) and nowhere else. A carried group gives this tree the pass (its marker, so a retry of it keeps it), the checks line says `AREA:carried from TREE`, the tree it
+// really ran on, and one line `carried|re-run ID: reason` per step goes to stderr. The proof is the two trees, never a word of the caller. A group of test steps that wait for one another is carried whole or not at all.
 // Nothing is carried by --retest, nor when what came in cannot be read.
 const keep = process.env.LAND_STATE_DIR ? join(process.env.LAND_STATE_DIR, "step-green") : "";
 const reusable = new Map();
@@ -203,17 +234,27 @@ const counts = (x) => {
   const m = marker(x);
   return m ? (m.count ?? 0) : undefined;
 };
-const commandOf = (x) => [x.id, x.dir, x.environment, x.env, x.argv.map((a) => String(a).replace(/land-step-\w+/g, "land-step-"))];
+// what names a step: ONE definition. The marker of a tree adds the step's whole command (the list of the tree's test files included); the record of a change's earlier pass adds the step's unexpanded command
+// template (cmdKey: no list, no {base}), because main adding a test file or a rebase is no other step.
+const stepName = (x) => [x.id, x.dir, x.environment, x.env];
+// the project root is `{root}` in the key, never a path: the push gate checks the same tree in a scratch worktree of its own, at a path of its own, and a step that names the root (a test group's runner) is the same step there
+const commandOf = (x) => [...stepName(x), x.argv.map((a) => String(a).replace(/land-step-\w+/g, "land-step-").replaceAll(layout.root, "{root}"))];
+const stepKeyOf = (x) => [...stepName(x), x.cmdKey];
 const sha = (v) => createHash("sha1").update(JSON.stringify(v)).digest("hex");
 const writeMarker = (file, body) => {
   writeFileSync(`${file}.${process.pid}.tmp`, JSON.stringify(body)); // whole or absent: written aside, then renamed
   renameSync(`${file}.${process.pid}.tmp`, file);
 };
 // a pass of a test group: its marker on this tree, and the name of this tree as the latest one this change's group passed on
+// (a step marked `select: "reach"` names the test files its pass was of: x.passedFiles, absent when it passed whole; carry.mjs reads them back as `passed`)
 const passed = (x, tree, body) => {
   writeMarker(reusable.get(x.id), body);
-  if (lastPass.has(x.id)) writeMarker(lastPass.get(x.id), { tree, ...body });
+  if (lastPass.has(x.id)) writeMarker(lastPass.get(x.id), { tree, ...body, ...(x.passedFiles ? { files: x.passedFiles } : {}) });
 };
+// a step that is not a test and says what it reads (`reads` in land.json) is carried over a rebase by the same rule as a test group (carry.mjs); one that does not always runs again
+const carryable = (x) => x.retry !== "test" && Array.isArray(x.reads) && x.reads.length > 0;
+const said = new Map(); // step id -> the decision line (one per step): what ran and why
+const narrow = new Map(); // step id -> its test files the change itself adds or edits (the only ones a carried step runs)
 let tree = "";
 if (keep && !retest) {
   mkdirSync(keep, { recursive: true });
@@ -224,35 +265,133 @@ if (keep && !retest) {
   for (const x of steps) reusable.set(x.id, join(keep, sha([tree, ...commandOf(x)])));
   const patch = spawnSync("git", ["diff", base, "HEAD"], { encoding: "utf8", maxBuffer: 1 << 28 });
   const change = patch.status === 0 ? patchId(patch.stdout) : "";
-  if (change) for (const x of steps) if (x.retry === "test") lastPass.set(x.id, join(keep, `last-${sha([change, ...commandOf(x)])}`));
+  if (change) for (const x of steps) if (x.retry === "test" || carryable(x)) lastPass.set(x.id, join(keep, `last-${sha([change, ...stepKeyOf(x)])}`));
   const group = new Map(steps.map((x) => [x.id, x.id]));
   const root = (id) => (group.get(id) === id ? id : root(group.get(id)));
   for (const x of steps) for (const a of x.after ?? []) if (group.has(a)) group.set(root(a), root(x.id));
   const sameGroup = (x) => steps.filter((y) => root(y.id) === root(x.id));
-  const own = `${relative(layout.root, layout.spire)}/`;
+  // what a file reaches (reach.mjs): built once, from this tree, the first time a step has files that came in to weigh; null when the tree cannot be read (the decision then re-runs)
+  let graph;
+  const reach = () => {
+    if (graph === undefined) {
+      const listed = run(".", ["git", "ls-files", "-z"]);
+      try {
+        if (listed.rc !== 0) throw new Error(listed.out);
+        // the change's deleted files stay in the graph as names: a file that still imports one reaches it, and a test that does is then selected (a deleted file is a change); so do the files that main deleted under the change (the
+        // incoming files this tree no longer has): a test that still imports one is reached by it
+        const tracked = listed.out.split("\0").filter(Boolean);
+        const here = new Set(tracked);
+        const gone = [...earlierTrees].flatMap((t) => (came(t) ?? []).filter((f) => !here.has(f)));
+        graph = buildGraph({ files: [...tracked, ...(deleted ?? []), ...gone], isProse: cfg.isProse, read: (f) => { try { return readFileSync(f, "utf8"); } catch { return null; } } });
+      } catch (e) {
+        process.stderr.write(`land: cannot read what the incoming files reach: ${String(e.message).trim().split("\n")[0]}\n`);
+        graph = null;
+      }
+    }
+    return graph;
+  };
+  const earlierTrees = new Set(); // the trees the steps of this change passed on before (their records): what came in since is what differs from each
+  for (const x of steps) {
+    try {
+      const t = JSON.parse(readFileSync(lastPass.get(x.id), "utf8")).tree;
+      if (t !== tree && run(".", ["git", "cat-file", "-e", `${t}^{tree}`]).rc === 0) earlierTrees.add(t);
+    } catch {
+      // no earlier pass of this step: nothing came in for it
+    }
+  }
   const incoming = new Map(); // an earlier tree -> the files that differ between it and this one (null: cannot be read)
-  const touches = (x, before) => {
+  const came = (before) => {
     if (!incoming.has(before)) {
       const d = run(".", ["git", "diff", "--name-only", "-z", before, tree]);
       incoming.set(before, d.rc === 0 ? d.out.split("\0").filter(Boolean) : null);
     }
-    const files = incoming.get(before);
-    const inputs = matcher(cfg.areas.filter((a) => a.steps.some((s) => s.id === x.id)).flatMap((a) => a.paths));
-    return !files || files.some((f) => f.startsWith(own) || inputs(f));
+    return incoming.get(before);
   };
+  // no rename detection: a renamed file is its old path deleted and its new path added (the files that name the old one reach it)
+  const own_ = run(".", ["git", "diff", "--name-only", "--no-renames", "-z", base, "HEAD"]);
+  const changed = own_.rc === 0 ? own_.out.split("\0").filter(Boolean) : null;
+  const gone = run(".", ["git", "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D", base, "HEAD"]);
+  const deleted = gone.rc === 0 ? gone.out.split("\0").filter(Boolean) : null; // unreadable: unknown, so the first run runs the full area (never less)
+  // the coverage map: published on a git ref of origin (checks.coverageMap.ref, a branch or ref; checks.coverageMap.file, default coverage-map.json), fetched here, never read from a local file and never in main
+  const cm = cfg.checks?.coverageMap;
+  let mapText = null;
+  let readError = "";
+  if (cm?.ref) {
+    const got = run(".", ["git", "fetch", "--quiet", "origin", cm.ref]);
+    const shown = got.rc === 0 ? run(".", ["git", "show", `FETCH_HEAD:${cm.file ?? "coverage-map.json"}`]) : got;
+    if (shown.rc === 0) mapText = shown.out;
+    else readError = `cannot fetch ${cm.ref} from origin: ${shown.out.trim().split("\n")[0]}`;
+  }
+  let map = readError ? { ok: false, reason: `coverage map unreadable (${readError})` } : !cm?.ref ? { ok: false, reason: "no coverage map (checks.coverageMap.ref is not set)" } : parseMap({ text: mapText, now: Date.now(), maxAgeHours: cm.maxAgeHours ?? 24 });
+  // a map is used only when the commit it was built at is an ancestor of the base (a hand-written or foreign map is not)
+  if (map.ok && !(/^[0-9a-f]{7,40}$/.test(map.commit) && run(".", ["git", "merge-base", "--is-ancestor", map.commit, base]).rc === 0)) map = { ok: false, reason: `coverage map built at ${map.commit}, which is not an ancestor of the base` };
+  if (map.ok) process.stderr.write(`land: coverage map age ${map.age} (commit ${map.commit})\n`);
   const earlier = new Map();
+  const selected = new Map(); // step id -> the test files the selection chose (a first run)
+  const how = new Map(); // step id -> what chose them ("reach", "coverage map")
   for (const x of steps) {
-    if (!lastPass.has(x.id) || counts(x) !== undefined) continue;
+    if (counts(x) !== undefined) {
+      said.set(x.id, `carried ${x.id}: already passed on this tree`);
+      continue;
+    }
+    let m;
     try {
-      const m = JSON.parse(readFileSync(lastPass.get(x.id), "utf8"));
-      if (m.tree !== tree && run(".", ["git", "cat-file", "-e", `${m.tree}^{tree}`]).rc === 0 && !touches(x, m.tree)) earlier.set(x.id, m);
+      m = lastPass.has(x.id) ? JSON.parse(readFileSync(lastPass.get(x.id), "utf8")) : undefined;
     } catch {
-      // no earlier pass of this change's group, or a record cut short: it runs
+      m = undefined; // no earlier pass of this change's group, or a record cut short: it runs
+    }
+    const known = m !== undefined && m.tree !== tree && run(".", ["git", "cat-file", "-e", `${m.tree}^{tree}`]).rc === 0;
+    const reading = carryable(x) ? matcher(x.reads) : undefined;
+    const d = decide({ step: { id: x.id, retry: x.retry, select: x.select, deepFor: x.deepFor ? matcher(x.deepFor) : undefined, reads: reading }, passed: known && Array.isArray(m.files) ? m.files : undefined, earlier: known, incoming: known ? came(m.tree) : [], changed, files: x.files ?? null, graph: known || x.select === "reach" ? reach() : null, runner: `${relative(layout.root, layout.tool)}/run-steps.mjs`, own: `${relative(layout.root, layout.spire)}/`, map, deleted, preload: x.select === "reach" && x.retry === "test" && graph ? runnerInputs({ step: x, environments: cfg.environments, tracked: graph.files, root: layout.root }) : [] });
+    if (d.select) {
+      selected.set(x.id, d.select);
+      how.set(x.id, d.by ?? "coverage map");
+    }
+    if (d.carry) earlier.set(x.id, m);
+    if (d.carry && d.rerun.length) narrow.set(x.id, d.rerun);
+    if (d.carry && x.select === "reach") x.passedFiles = d.universe; // what this tree's pass will be of (carried and re-run alike)
+    said.set(x.id, `${d.carry ? "carried" : "re-run"} ${x.id}: ${d.reason}${d.carry ? `; re-run ${d.rerun.length} test file(s)` : ""}`);
+  }
+  // a group of steps that wait for one another is carried whole or not at all: the test steps of it by themselves (as before), a step that is not a test with every step of its group (the build one reads is the build the other made)
+  for (let moved = true; moved; ) {
+    moved = false;
+    for (const x of steps) {
+      const needed = sameGroup(x).filter((y) => x.retry !== "test" || y.retry === "test");
+      if (!earlier.has(x.id) || needed.every((y) => earlier.has(y.id))) continue;
+      earlier.delete(x.id);
+      narrow.delete(x.id);
+      said.set(x.id, `re-run ${x.id}: a step it waits for re-runs`);
+      moved = true;
     }
   }
   for (const x of steps) {
-    if (!earlier.has(x.id) || !sameGroup(x).filter((y) => y.retry === "test").every((y) => earlier.has(y.id))) continue;
+    if (!selected.has(x.id)) continue;
+    const total = x.files.length;
+    const chosen = new Set(selected.get(x.id));
+    Object.assign(x, restrict(x, (f) => chosen.has(f)));
+    // it runs part of its list: its marker is of THAT list (the key holds the command); a record of a pass of the change's group names the list, or (a selection by a coverage map) there is none: it cannot stand for the whole step, which a rebase would carry
+    x.partial = true;
+    if (x.select === "reach") x.passedFiles = x.files; // a step marked `select: "reach"` keeps the list it ran, so a rebase carries what passed (carry.mjs); another selection (a coverage map's) cannot stand for the step
+    else lastPass.delete(x.id);
+    reusable.set(x.id, join(keep, sha([tree, ...commandOf(x)])));
+    x.label = `${x.id}(${x.files.length} of ${total} by ${how.get(x.id)})`;
+    // nothing selected: the step does not run (a runner given no file would run every test of its directory)
+    x.none = x.files.length === 0;
+  }
+  for (const x of steps) process.stderr.write(`land: ${said.get(x.id)}\n`);
+  for (const x of steps) {
+    if (!earlier.has(x.id)) continue;
     const m = earlier.get(x.id);
+    if (narrow.has(x.id)) {
+      // carried but for the change's own test files: the step runs ONLY those (the same restriction --retest makes), and its pass stands for the whole step
+      const own_files = new Set(narrow.get(x.id));
+      const total = x.passedFiles?.length ?? x.files.length; // a step marked `select: "reach"`: of the tests it had to pass on this tree
+      Object.assign(x, restrict(x, (f) => own_files.has(f))); // the same restriction --retest makes
+      x.earlierCount = m.count ?? 0;
+      x.earlierRanOn = m.ranOn ?? m.tree;
+      x.label = `${x.id}(${x.files.length} re-run of ${total}, rest carried from ${x.earlierRanOn.slice(0, 12)})`;
+      continue;
+    }
     carried.set(x.id, { count: m.count ?? 0, ranOn: m.ranOn ?? m.tree });
     passed(x, tree, carried.get(x.id));
   }
@@ -273,7 +412,7 @@ const freeBytes = availableBytes();
 const caps = new Map();
 try {
   for (const s of steps.filter((x) => x.retry === "test")) {
-    const budget = budgetBytes(cfg.checks, s.area);
+    const budget = budgetBytes(cfg.checks, s.area, s.kind);
     caps.set(s.id, { budget, cap: groupCap({ cores, groups: nTests, freeBytes, budgetBytes: budget }) });
   }
 } catch (e) {
@@ -284,19 +423,22 @@ const gates = new Map(steps.map((s) => [s.id, Promise.withResolvers()]));
 const runStep = async (s) => {
   // a step that needs another's output (the stylesheet test after the app build) waits for it; one that failed is not waited on in vain
   await Promise.all((s.after ?? []).map((id) => gates.get(id)?.promise));
+  const began = Date.now();
   const r = await runStepNow(s);
   gates.get(s.id).resolve();
+  noteStep(s.id, r.bad !== undefined ? "red" : r.skipped ? "skipped" : carried.has(s.id) ? "carried" : kept.has(s.id) ? "kept" : s.none ? "none" : "ran", Math.round((Date.now() - began) / 1000));
   return r;
 };
 const runStepNow = async (s) => {
   const mark = reusable.get(s.id);
   if (carried.has(s.id) || kept.has(s.id)) {
     const ranOn = marker(s)?.ranOn; // a pass carried over a rebase says so, however often this tree is run
-    return { s, took: ranOn ? `${s.area}:carried from ${ranOn.slice(0, 12)}` : `${s.label}:kept`, count: counts(s) };
+    return { s, took: ranOn ? `${s.retry === "test" ? s.area : s.id}:carried from ${ranOn.slice(0, 12)}` : `${s.label}:kept`, count: counts(s) };
   }
+  if (s.none) return { s, took: `${s.label}:none`, count: 0 }; // a step that ran nothing says so, never a time
   const r = await runStepOnce(s);
   if (mark && r.took) {
-    passed(s, tree, { count: r.count ?? 0 });
+    passed(s, tree, s.earlierRanOn ? { count: s.earlierCount, ranOn: s.earlierRanOn } : { count: r.count ?? 0 });
   }
   return r;
 };
@@ -349,13 +491,25 @@ const runStepOnce = async (s) => {
   }
   return { s, argv, bad: r.out, files: s.retry === "test" ? failedFilesOf(r.out) : [] };
 };
-const results = await Promise.all(steps.map(runStep));
-// EVERY step finished (a failure stops none of the others): one report of all of them, and the failed steps and files kept for `land --retest`
-const bad = results.filter((r) => r.bad !== undefined);
-if (bad.length) {
+// THE CHEAP CHECKS FIRST (a step the project marks `first: true`: style, lint, typecheck, the small ratchets): they run alone, side by side; a red among them is reported AT ONCE and nothing else starts, so a lint failure
+// costs seconds, not the minutes of the slowest test group. Only when they are green do the other steps start (all at the same time, as before). A `first` step may wait only for another `first` step.
+// WHAT RAN AND WHY, one line per step, on every landing, red or green: the step as it ran (the files it ran of its list, its seconds, a carry) and the reason the selection gave
+const whatRan = (done) => {
+  process.stderr.write("land: what ran, and why:\n");
+  for (const r of done) {
+    const why = (said.get(r.s.id) ?? "").replace(/^(?:carried|re-run) \S+: /, "") || (r.s.retry === "test" ? "every test of the area" : "a check always runs");
+    const state = r.bad !== undefined ? `${r.s.label}: FAILED` : r.skipped ? `${r.s.label}: skipped` : r.took ?? r.s.label;
+    process.stderr.write(`land:   ${state}${r.s.first ? " [cheap, first]" : ""}: ${why}\n`);
+  }
+  const touched = info.areas.names;
+  process.stderr.write(`land:   areas touched: ${touched.map((n) => `${n} (${(info.areas.byArea?.[n] ?? []).length} changed path(s))`).join(", ") || "none"}${info.areas.full ? " [a path in no area: every area runs]" : ""}\n`);
+  const idle = cfg.areas.map((x) => x.name).filter((n) => !touched.includes(n));
+  if (idle.length) process.stderr.write(`land:   no step ran for the other areas (no changed path of theirs): ${idle.join(", ")}\n`);
+};
+const reportBad = (bad, note, done) => {
   const nfiles = bad.reduce((n, r) => n + (r.files ?? []).length, 0);
   process.stderr.write(
-    `land: ===== ${bad.length} step(s) FAILED${nfiles ? `, ${nfiles} test file(s)` : ""}: ${bad.map((r) => r.s.label).join(", ")} =====\n`,
+    `land: ===== ${bad.length} step(s) FAILED${nfiles ? `, ${nfiles} test file(s)` : ""}: ${bad.map((r) => r.s.label).join(", ")} =====${note}\n`,
   );
   for (const r of bad) {
     fail(r.s.label, r.s.dir, r.argv, r.bad, false);
@@ -376,11 +530,32 @@ if (bad.length) {
       `land: the failed steps and files are kept (${failedFile}): fix them, then \`land --retest\` runs only those until green, and \`land\` runs the whole touched set once on the final tree\n`,
     );
   }
+  whatRan(done);
   process.exit(13);
+};
+const firstIds = new Set(steps.filter((s) => s.first).map((s) => s.id));
+for (const s of steps.filter((x) => x.first)) {
+  const late = (s.after ?? []).find((a) => !firstIds.has(a) && steps.some((y) => y.id === a));
+  if (late) {
+    process.stderr.write(`land: cannot plan the checks: step ${s.id} is \`first\` but waits for ${late}, which is not\n`);
+    process.exit(13);
+  }
 }
+const quick = steps.filter((s) => s.first);
+const quickResults = await Promise.all(quick.map(runStep));
+const quickBad = quickResults.filter((r) => r.bad !== undefined);
+if (quickBad.length) {
+  const waiting = steps.length - quick.length;
+  reportBad(quickBad, waiting ? ` (cheap checks first: the ${waiting} other step(s) did not start)` : "", quickResults);
+}
+const results = [...quickResults, ...(await Promise.all(steps.filter((s) => !s.first).map(runStep)))];
+// EVERY other step finished (a failure stops none of the others): one report of all of them, and the failed steps and files kept for `land --retest`
+const bad = results.filter((r) => r.bad !== undefined);
+if (bad.length) reportBad(bad, "", results);
 if (failedFile) {
   rmSync(failedFile, { force: true });
 }
+whatRan(results);
 const tests = results.reduce((n, r) => n + (r.count ?? 0), 0);
 const files = steps.reduce((n, s) => n + (s.files?.length ?? 0), 0);
 console.log(

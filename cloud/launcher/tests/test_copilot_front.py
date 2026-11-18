@@ -132,8 +132,8 @@ class ModelPolicy(Base):
             status, text = f.request("POST", "/chat/completions", chat(model, effort), {"Authorization": "Bearer " + TOKEN, "content-type": "application/json"})
             self.assertEqual(status, 200, text)
             self.assertIn(ANSWER, text)
-        got = [(s["body"]["model"], s["body"]["reasoning"]["effort"], s["body"]["reasoning_effort"]) for s in self.fake.seen]
-        self.assertEqual(got, [("claude-sonnet-5.5", "medium", "medium"), ("claude-sonnet-5.5", "medium", "medium"), ("claude-haiku-5.5", "low", "low")])
+        got = [(s["body"]["model"], s["body"].get("reasoning", {}).get("effort"), s["body"].get("reasoning_effort")) for s in self.fake.seen]
+        self.assertEqual(got, [("claude-haiku-5.5", "high", "high"), ("claude-haiku-5.5", None, None), ("claude-haiku-5.5", "low", "low")])
         for banned in ("anthropic/claude-opus-5.5", "Claude-OPUS-5", "OPUS"):
             status, text = f.request("POST", "/v1/chat/completions", chat(banned, "low"))
             self.assertEqual(status, 403)
@@ -169,7 +169,7 @@ class Paths(Base):
         usage = json.loads(text)
         day = usage["day"]
         self.assertEqual(usage["days"][day]["requests"], 1)
-        self.assertEqual(usage["days"][day]["models"], {"claude-sonnet-5.5": 1})
+        self.assertEqual(usage["days"][day]["models"], {"claude-haiku-5.5": 1})
         for s in (ANSWER, "hello", "messages", "xxxx"):
             self.assertNotIn(s, text)
 
@@ -187,7 +187,7 @@ class Hardening(Base):
         b.update({"models": ["claude-opus-5"], "fallback": "opus", "extra_body": {"model": "opus"}, "route": "x", "max_tokens": 10 ** 9})
         self.assertEqual(f.request("POST", "/chat/completions", raw=json.dumps(b).replace('{"model"', '{"__proto__": {"model": "opus"}, "model"', 1).encode())[0], 200)
         sent = self.fake.seen[0]["body"]
-        self.assertEqual(sorted(sent), ["max_tokens", "messages", "model", "reasoning", "reasoning_effort", "stream", "tools"])
+        self.assertEqual(sorted(sent), ["max_tokens", "messages", "model", "stream", "tools"])
         self.assertEqual(sent["max_tokens"], 64000)
 
     def test_a_body_nested_too_deep_is_refused_and_the_front_lives(self):

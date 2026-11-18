@@ -1,0 +1,7 @@
+{
+  "classes": {
+    "fast": { "model": "anthropic/claude-haiku-5.5" },
+    "everyday": { "model": "deepseek/deepseek-v4.1-flash-1017" },
+    "frontier": { "model": "anthropic/claude-sonnet-5.5" }
+  }
+}
