@@ -48,6 +48,10 @@ API_SUB = frozenset("issues pulls comments commits contents git refs trees blobs
                     "assignees invitations keys comments pending_deployments approvals dependencies blocked_by blocking copilot".split())
 
 
+# Classes the daemon's own request counter writes as `api <word>` that are not a GitHub path: kept under their own label (#1787), not folded into `api repo`.
+COUNTER_CLASSES = frozenset({"merge-gate", "unknown"})
+
+
 def reduce_endpoint(text):
     """`api issues/#` for a call whatever its form (a URL with a host, a leading slash, a query, a repository path, a name anywhere): only allow-listed words
     survive. `api <top word>` for orgs, users, teams, search and the like (the name after it is dropped); a repository path keeps its own words after
@@ -70,7 +74,7 @@ def reduce_endpoint(text):
         return "api repo"
     if segs[0] == "repos":
         segs = segs[3:]
-    elif segs[0] in API_TOP:
+    elif segs[0] in API_TOP or segs[0] in COUNTER_CLASSES:
         return "api " + segs[0]
     kept = []
     for seg in segs[:12]:
