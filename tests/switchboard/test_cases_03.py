@@ -1683,7 +1683,7 @@ class TestWorkSyncPump(unittest.TestCase):
                 self.cycle(1000)
             self.assertEqual(self.sink.attempts, 2)
             self.sink.refuse = None
-            self.cycle(1000)
+            self.host.agent_list = [worker(issue=status, status="idle")]
             self.assertEqual(self.cycle(1000)["permanent"], 0)
 
     def test_a_transient_error_keeps_retrying_and_is_not_permanent(self):
