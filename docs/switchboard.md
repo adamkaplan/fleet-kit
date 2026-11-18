@@ -616,7 +616,7 @@ Agents the switchboard manages do not use `heartbeat-ack`.
 | Surface | Shows |
 |---|---|
 | herdr sidebar | Status (from herdr's integration) and an unread count per pane |
-| herdr toast | An item held longer than 15 minutes and why; a blocked worker; an Intent change; a switchboard fault |
+| herdr toast | An item held longer than 15 minutes and why; a blocked worker; an Intent change (told once per edit: not again for the same edit stamp while it is pending); a switchboard fault |
 | `fleet-switchboard status` | Every fleet agent: session, pane, status, pending and held items with reasons; GitHub watches |
 | `fleet-switchboard audit` | The decision history for one agent or one issue |
 | `fleet-switchboard intents` | Every open ask, one line each with its Done-when (PR 6) |

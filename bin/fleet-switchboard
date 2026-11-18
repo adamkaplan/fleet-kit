@@ -2985,6 +2985,8 @@ class Switchboard:
                 result["reply"] = reply
             if reply["shown"] or reply["reason"] == "disabled":
                 self.toasted[name] = reason  # shown, or herdr has toasts off for good
+                if reason.startswith("intent edit #"):
+                    self.__dict__.setdefault("toasted_edits", set()).add((name, reason))
             report["toasts"].append({"agent": name, "reason": reason, "shown": reply["shown"],
                                      "why": reply["reason"]})
             return  # rate_limited, busy, no_foreground_client: owed, tried again next pass
@@ -8408,10 +8410,17 @@ def note_unreachable(engine, recipient, fresh, why):
 def collect_source_toasts(engine):
     """What the fact sources and this pass's re-checks ask the human to be told."""
     found = {}
+    pending = set()
+    shown = engine.__dict__.setdefault("toasted_edits", set())   # (agent, reason) of an Intent edit already toasted: told once per edit
     for source in engine.sources:
         toasts = getattr(source, "toasts", None)
         for agent, reason, title, body in toasts() if toasts else []:
+            if reason.startswith("intent edit #"):
+                pending.add((agent, reason))
+                if (agent, reason) in shown:
+                    continue
             found[agent] = (reason, title, body)
+    shown &= pending   # an edit no longer pending is forgotten
     found.update(engine.pass_toasts)
     return found
 
