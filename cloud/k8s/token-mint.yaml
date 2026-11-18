@@ -1,0 +1,145 @@
+# The token service (ask #2002): holds the GitHub App's id and key and mints the one-repository token for the operator account.
+# The owner applies this file and publishes the image (the worker image, which holds python and openssl). The Secret token-mint-app
+# (keys app-id and app-key) is created by the owner and is read by this service's account alone.
+# The cluster-wide review permission is in token-mint-review.yaml (also the owner's).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: token-mint
+  namespace: cw
+  labels:
+    app: token-mint
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: token-mint-secret
+  namespace: cw
+  labels:
+    app: token-mint
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["token-mint-app"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: token-mint-secret
+  namespace: cw
+  labels:
+    app: token-mint
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: token-mint-secret
+subjects:
+  - kind: ServiceAccount
+    name: token-mint
+    namespace: cw
+---
+# The operator account may POST to the proxy of THIS ONE service and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: token-mint-call
+  namespace: cw
+  labels:
+    app: token-mint
+rules:
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    resourceNames: ["token-mint:8080"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: token-mint-call
+  namespace: cw
+  labels:
+    app: token-mint
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: token-mint-call
+subjects:
+  - kind: ServiceAccount
+    name: cw-operator
+    namespace: cw
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: token-mint
+  namespace: cw
+  labels:
+    app: token-mint
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: token-mint
+  template:
+    metadata:
+      labels:
+        app: token-mint
+    spec:
+      serviceAccountName: token-mint
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: token-mint
+          # The operator replaces this placeholder by the published image's digest before applying.
+          image: registry.invalid/cw-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["python3", "/opt/cloud/launcher/token_service.py"]
+          env:
+            - name: CW_ALLOWED_REPOS
+              value: REPLACE_WITH_THE_LAUNCHERS_ALLOWED_LIST
+            - name: CW_CLOUD_NAMESPACE
+              value: cw
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: app
+              mountPath: /etc/token-mint
+              readOnly: true
+      volumes:
+        - name: app
+          secret:
+            secretName: token-mint-app
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: token-mint
+  namespace: cw
+  labels:
+    app: token-mint
+spec:
+  type: ClusterIP
+  selector:
+    app: token-mint
+  ports:
+    - port: 8080
+      targetPort: 8080

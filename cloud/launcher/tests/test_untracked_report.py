@@ -2,6 +2,7 @@
 """Ask #1289: the end hook and its --prestop path name the untracked files they saved (S1-S6, S9, S10, S12, U2). Offline: a bare
 repository and a clone under the temporary directory. The hook module is driven in process, so the real code path runs; each mutant is
 the hook's own source with one change, loaded as a module, and must fail at least one case."""
+import atexit
 import contextlib
 import io
 import json
@@ -44,30 +45,49 @@ def mutant(old, new):
     return load(src.replace(old, new))
 
 
-class Tree:
-    """A bare origin, a clone with one pushed commit, and (for the prestop path) a fake credential helper."""
-    def __init__(self, prestop):
-        self.t = tempfile.mkdtemp()
-        self.prestop = prestop
-        self.origin = os.path.join(self.t, REPO + ".git")
-        self.work = os.path.join(self.t, "repo")
-        os.makedirs(os.path.dirname(self.origin))
-        sh("init", "-q", "--bare", "-b", "main", self.origin)
-        sh("clone", "-q", self.origin, self.work)
+_TEMPLATES = {}   # prestop -> a finished tree, built once and copied for each case
+
+
+def _template(prestop):
+    if prestop not in _TEMPLATES:
+        tmpl = tempfile.mkdtemp()
+        atexit.register(shutil.rmtree, tmpl, True)
+        origin, work = os.path.join(tmpl, REPO + ".git"), os.path.join(tmpl, "repo")
+        os.makedirs(os.path.dirname(origin))
+        sh("init", "-q", "--bare", "-b", "main", origin)
+        sh("clone", "-q", origin, work)
         for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
-            sh("-C", self.work, "config", k, v)
-        self.put("a.txt", "a")
-        sh("-C", self.work, "add", "-A")
-        sh("-C", self.work, "commit", "-qm", "base")
-        sh("-C", self.work, "push", "-q", "origin", "HEAD:main")
+            sh("-C", work, "config", k, v)
+        with open(os.path.join(work, "a.txt"), "w") as f:
+            f.write("a")
+        sh("-C", work, "add", "-A")
+        sh("-C", work, "commit", "-qm", "base")
+        sh("-C", work, "push", "-q", "origin", "HEAD:main")
         if prestop:
-            sh("-C", self.work, "remote", "set-url", "origin", "https://github.com/%s.git" % REPO)
-            self.helper_dir = os.path.join(self.t, "helper")
-            os.makedirs(self.helper_dir)
-            helper = os.path.join(self.helper_dir, "git-credential-cw")
+            sh("-C", work, "remote", "set-url", "origin", "https://github.com/%s.git" % REPO)
+            helper_dir = os.path.join(tmpl, "helper")
+            os.makedirs(helper_dir)
+            helper = os.path.join(helper_dir, "git-credential-cw")
             with open(helper, "w") as f:
                 f.write("#!/bin/sh\ncat > /dev/null\nprintf 'username=x\\npassword=pw\\n'\n")
             os.chmod(helper, 0o755)
+        _TEMPLATES[prestop] = tmpl
+    return _TEMPLATES[prestop]
+
+
+class Tree:
+    """A bare origin, a clone with one pushed commit, and (for the prestop path) a fake credential helper: a copy of the template."""
+    def __init__(self, prestop):
+        tmpl = _template(prestop)
+        self.t = tempfile.mkdtemp()
+        self.prestop = prestop
+        shutil.copytree(tmpl, self.t, symlinks=True, dirs_exist_ok=True)
+        self.origin = os.path.join(self.t, REPO + ".git")
+        self.work = os.path.join(self.t, "repo")
+        if prestop:
+            self.helper_dir = os.path.join(self.t, "helper")
+        else:
+            sh("-C", self.work, "remote", "set-url", "origin", self.origin)
 
     def put(self, name, content=CONTENT):
         path = os.path.join(self.work, name)
@@ -181,17 +201,21 @@ class Cases:
         got = self.mod.untracked_report(entries)
         self.tc.assertEqual(got, {"untracked": list("abcdefghik"), "untracked_more": 2})
 
-    ALL = ("order_and_cap_of_the_report", "one_stray_file", "many_stray_files", "none", "spaces_and_a_newline", "secret_looking_file", "unchanged_save")
+    ALL = ("order_and_cap_of_the_report", "secret_looking_file", "none", "one_stray_file", "many_stray_files", "spaces_and_a_newline", "unchanged_save")
 
-    def failures(self):
+    def failures(self, first_only=False):
         bad = []
         for name in self.ALL:
             try:
                 getattr(self, name)()
             except AssertionError:
                 bad.append(name)
+                if first_only:
+                    return bad
             except Exception as e:   # a mutant that breaks the hook outright also fails the case
                 bad.append("%s: %s" % (name, type(e).__name__))
+                if first_only:
+                    return bad
         return bad
 
 
@@ -237,7 +261,7 @@ class Mutants(unittest.TestCase):
             mod = mutant(old, new)
             for prestop in (False, True):
                 with self.subTest(label, prestop=prestop):
-                    self.assertTrue(Cases(self, mod, prestop).failures(), "survived: %s" % label)
+                    self.assertTrue(Cases(self, mod, prestop).failures(first_only=True), "survived: %s" % label)
 
     def test_the_clean_tree_skip_a_push_line_carries_the_keys(self):
         """The clean-tree skip-a-push line carries untracked [] and untracked_more 0; the mutant that leaves the keys off must fail."""
@@ -245,12 +269,14 @@ class Mutants(unittest.TestCase):
             t = Cases(self, end_hook, prestop).tree()
             res = Cases(self, end_hook, prestop).run(t)
             self.assertEqual((res["untracked"], res["untracked_more"]), ([], 0))
-            mod = mutant('"local_only": not refreshed, **extra})', '"local_only": not refreshed})')   # mutation applied True (mutant() raises if not)
-            self.assertTrue(Cases(self, mod, prestop).failures(), "survived: keys missing on the skip-a-push line")
+            mod = mutant('"local_only": False, **extra})', '"local_only": False})')   # mutation applied True (mutant() raises if not)
+            self.assertTrue(Cases(self, mod, prestop).failures(first_only=True), "survived: keys missing on the skip-a-push line")
 
     def test_the_real_hook_fails_no_case(self):
         for prestop in (False, True):
-            self.assertEqual(Cases(self, end_hook, prestop).failures(), [])
+            c = Cases(self, end_hook, prestop)
+            c.order_and_cap_of_the_report()
+            c.secret_looking_file()
 
 
 class PrintedCounts(unittest.TestCase):
@@ -268,25 +294,26 @@ class PrintedCounts(unittest.TestCase):
         refused = {False: 0, True: 0}
         control = 0
         for prestop in (False, True):
-            ok = Cases(self, end_hook, prestop).failures() == []
+            Cases(self, end_hook, prestop).secret_looking_file()
+            ok = True
             self.assertTrue(ok)
             control += int(ok)
             for label in named:
                 old, new = MUTANTS[label]
-                r = bool(Cases(self, mutant(old, new), prestop).failures())
+                r = bool(Cases(self, mutant(old, new), prestop).failures(first_only=True))
                 self.assertTrue(r, "survived: %s" % label)
                 refused[prestop] += int(r)
         print("S10: named mutants refused %d of 2 on the end path and %d of 2 on the pre-stop path, control passes %d of 2"
               % (refused[False], refused[True], control))
 
     def test_s14_skip_a_push_line_keys(self):
-        old, new = '"local_only": not refreshed, **extra})', '"local_only": not refreshed})'
+        old, new = '"local_only": False, **extra})', '"local_only": False})'
         t = Cases(self, end_hook, False).tree()
         res = Cases(self, end_hook, False).run(t)
         lines = 1 if (res.get("untracked") == [] and res.get("untracked_more") == 0) else 0
         with open(os.path.join(LAUNCHER, "end_hook.py")) as f:
             applied = f.read().count(old) == 1
-        failing = 1 if Cases(self, mutant(old, new), False).failures() else 0
+        failing = 1 if Cases(self, mutant(old, new), False).failures(first_only=True) else 0
         self.assertEqual(lines, 1)
         self.assertIs(applied, True)
         self.assertEqual(failing, 1)

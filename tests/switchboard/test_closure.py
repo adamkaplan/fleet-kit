@@ -6,8 +6,12 @@ derivation in both directions, that a change to a closure definition inside a pa
 moving a definition without regenerating fails, and the floor of the assembled closure. Nothing here runs the daemon.
 """
 import ast
+import contextlib
 import difflib
+import functools
+import hashlib
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -16,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -27,16 +32,47 @@ MATRIX = "docs/review-laws/impact-matrix.json"
 PARTS = "bin/switchboard/"
 
 
-def run(*args):
-    done = subprocess.run([sys.executable, str(TOOL)] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-    return done.returncode, done.stdout
+_PARSED = {}   # (file name, hash of the text) -> its tree: an unchanged file of the daemon (24k lines) is parsed once for the run; the tool only reads the trees
+_HELD = {}     # id of a parsed tree -> (tree, held_names(tree)): the tool asks again for every closure name
 
 
+def _cached_parse(source, filename="<unknown>", *args, **kwargs):
+    if args or kwargs or not isinstance(source, str):
+        return ast.parse(source, filename, *args, **kwargs)
+    key = (filename, hashlib.sha1(source.encode("utf-8")).hexdigest())
+    if key not in _PARSED:
+        _PARSED[key] = ast.parse(source, filename)
+    return _PARSED[key]
+
+
+@functools.lru_cache(maxsize=None)
 def tool_module():
     loader = importlib.machinery.SourceFileLoader("derive_closure_t", str(TOOL))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader("derive_closure_t", loader))
     loader.exec_module(module)
+    cached = types.ModuleType("ast")
+    cached.__dict__.update(vars(ast))
+    cached.parse = _cached_parse
+    module.ast = cached
+    real_held = module.held_names
+
+    def held_names(tree):
+        if id(tree) not in _HELD:
+            _HELD[id(tree)] = (tree, real_held(tree))
+        return _HELD[id(tree)][1]
+    module.held_names = held_names
     return module
+
+
+def run(*args):
+    """The tool's exit code and its output (stdout and stderr together), run in this process."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        try:
+            code = tool_module().main(list(args))
+        except SystemExit as stop:
+            code = stop.code
+    return (code or 0) if not isinstance(code, str) else 1, out.getvalue()
 
 
 def counts(out):
@@ -45,6 +81,7 @@ def counts(out):
     return tuple(int(x) for x in found.groups())
 
 
+@functools.lru_cache(maxsize=None)
 def clear():
     spec = importlib.util.spec_from_file_location("delegated_clear_t", str(REPO / "bin" / "delegated_clear.py"))
     module = importlib.util.module_from_spec(spec)

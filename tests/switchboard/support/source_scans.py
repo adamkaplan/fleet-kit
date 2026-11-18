@@ -142,6 +142,8 @@ BLOCKED_GUARD_KILLERS = {
     'blocked_tick:set(found) - waiting': 'test_held_sends_of_an_agent_no_longer_blocked_are_forgotten_and_a_blocked_agents_are_kept',
     'blocked_tick:boss and boss_seen is not None and not hold_reason(boss_seen)': 'test_a_chief_of_staff_that_is_blocked_is_not_told_about_itself_and_none_is_added_to_nobody',
     'blocked_tick:cos and cos not in recipients': 'test_a_boss_that_cannot_be_reached_leaves_the_chief_of_staff_alone_told',
+    'blocked_tick:observation.name == cos and event != "blocked.end"': 'test_a_blocked_worker_leaves_no_owner_alarm',
+    'blocked_tick:observation.name == cos and event == "blocked.end"': 'test_a_blocked_chief_of_staff_is_recorded_for_the_owner_once_and_the_end_is_recorded',
     'blocked_tick:engine.audit is not None': 'test_a_block_that_ends_with_messages_still_held_says_so',
     'blocked_tick:seen.status != "blocked"': 'test_a_block_that_ends_with_messages_still_held_says_so',
     'blocked_tick:not isinstance(entry, dict) or entry.get("session") != seen.session_id or not _is_number(entry.get("since"))': 'test_a_block_that_ends_with_messages_still_held_says_so',

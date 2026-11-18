@@ -66,6 +66,7 @@ class Scratch(unittest.TestCase):
         git(self.work, "add", "-A")
         git(self.work, "commit", "-q", "-m", "first")
         git(self.work, "push", "-q", "origin", "base")   # the remote holds the first commit; origin/base tracks it
+        git(t, "-C", self.bare, "config", "core.hooksPath", os.path.join(self.bare, "hooks"))   # a global core.hooksPath (the pod's) must not hide the counting hook
         hook = os.path.join(self.bare, "hooks", "pre-receive")
         with open(hook, "w") as f:
             f.write("#!/bin/sh\necho attempt >> %s\nexit 1\n" % self.log)   # from now on the remote refuses every push, after counting it
@@ -124,6 +125,7 @@ class S7Fetch(Scratch):
         self.remote = os.path.join(t, "o", "r.git")
         os.rename(self.bare, self.remote)
         self.bare = self.remote
+        git(t, "-C", self.bare, "config", "core.hooksPath", os.path.join(self.bare, "hooks"))   # the moved repository names its own hooks again
         git(self.work, "remote", "set-url", "origin", "https://github.com/o/r.git")
         git(self.work, "fetch", "-q", self.remote, "+refs/heads/*:refs/remotes/origin/*")
         helper_dir = os.path.join(t, "bin")
@@ -146,12 +148,24 @@ class S7Fetch(Scratch):
     def lines(self, p):
         return [l for l in p.stdout.splitlines() if l.startswith("cw-prestop:")]
 
+    def side_branch_with_unpushed_work(self):
+        """A local branch holding a commit no remote branch has, HEAD back on base (whose commit the remote has). Since #2237 a clean tree
+        whose HEAD is the clone's starting commit is decided with no remote call at all (clean_local); a pod that holds unpushed work elsewhere is
+        not clean, so the fetch is made and the rest of the decision (stale refs, a refused fetch) is what these tests look at."""
+        git(self.work, "checkout", "-q", "-b", "side")
+        with open(os.path.join(self.work, "side.txt"), "w") as f:
+            f.write("s\n")
+        git(self.work, "add", "-A")
+        git(self.work, "commit", "-q", "-m", "side")
+        git(self.work, "checkout", "-q", "base")
+
     def test_a_clean_tree_with_a_working_fetch_says_nothing_to_push(self):
         p = self.prestop()
         print("count (a): attempts=%d lines=%r exit=%d" % (self.attempts(), self.lines(p), p.returncode))
         self.assertEqual((p.returncode, self.attempts(), self.lines(p)), (0, 0, ["cw-prestop: nothing to push"]))
 
     def test_a_refused_fetch_decides_from_local_references_in_one_line(self):
+        self.side_branch_with_unpushed_work()
         os.rename(self.remote, self.remote + ".moved")   # the remote is unreachable: the fetch fails
         p = self.prestop()
         print("count (b): attempts=%d lines=%r exit=%d" % (self.attempts(), self.lines(p), p.returncode))
@@ -159,7 +173,13 @@ class S7Fetch(Scratch):
         self.assertIn("local references", self.lines(p)[0])
         self.assertFalse(os.path.exists(self.log))
 
+    def test_a_clean_tree_at_the_starting_commit_makes_no_remote_call_even_when_the_remote_is_gone(self):
+        os.rename(self.remote, self.remote + ".moved")
+        p = self.prestop()
+        self.assertEqual((p.returncode, self.attempts(), self.lines(p)), (0, 0, ["cw-prestop: nothing to push"]))   # decided locally: no "fetch failed" note
+
     def test_a_stale_remote_tracking_ref_after_the_remote_branch_is_deleted_tries_the_push(self):
+        self.side_branch_with_unpushed_work()
         git(self.remote, "update-ref", "-d", "refs/heads/base")   # deleted after the last fetch: origin/base is STALE
         p = self.prestop()
         print("count (c): attempts=%d exit=%d" % (self.attempts(), p.returncode))

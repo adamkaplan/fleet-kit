@@ -131,6 +131,9 @@ class FakeKube:
         self.log.append("get_pod")
         return None if self.deleted else self.pod
 
+    def get_workload(self, name):
+        return None   # one pod, no workload
+
     def pod_events(self, name):
         self.log.append("pod_events")
         if self.deleted:   # the cluster's events of a deleted pod are no longer read
@@ -150,6 +153,11 @@ class FakeKube:
         return None
 
     delete_secret = delete_run_secret = get_secret
+
+    def get_pdb(self, name):
+        return None   # no budget in this fake
+
+    delete_pdb = get_pdb
 
     def delete(self, name, uid=None):
         self.log.append("delete")

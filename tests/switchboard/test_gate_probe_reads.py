@@ -7,10 +7,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from support.loader import captured, sb
 
 REPO = Path(__file__).resolve().parents[2]
 PROBE_LIMIT = 3.0   # the shim's limit, in seconds
-DELAY = 0.6         # what the fake hub takes for each read
+DELAY = 0.25        # what the fake hub takes for each read
 HEAD = "a" * 40
 
 GH_SCRIPT = """#!/usr/bin/env python3
@@ -62,8 +65,13 @@ class TestGateProbeReads(unittest.TestCase):
                    FLEET_SWITCHBOARD_STATE=str(self.tmp / "state"))
         if self.log.exists():
             self.log.unlink()
-        done = subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "gates-check", "acme/app#7", "--for", kind, "--json"],
-                              capture_output=True, text=True, env=env, timeout=60)
+        argv = ["gates-check", "acme/app#7", "--for", kind, "--json"]
+        with mock.patch.dict(os.environ, env), captured() as (out, err):   # the entry's main in this process: no interpreter start and import per check
+            try:
+                code = sb.main(argv)
+            except SystemExit as stop:
+                code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        done = subprocess.CompletedProcess(argv, code or 0, out.getvalue(), err.getvalue())
         reads = [json.loads(l) for l in self.log.read_text().splitlines()] if self.log.exists() else []
         return done, reads
 

@@ -1,4 +1,5 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): offline_fakes."""
+import contextlib
 import fcntl
 import fnmatch
 import json
@@ -77,10 +78,55 @@ class OfflineRun:
         def client_init(client, *args, **kwargs):
             original_init(client, *args, **kwargs)
             client.clock = lambda: float(world.clock.t)
-        with mock.patch.object(os.path, "realpath", realpath), mock.patch.object(sb.V2Client, "__init__", client_init):
+        # The 3m-8m offline scripts are written for the 60s `batch_seconds` window; the synchronized :00/:30 UTC buckets of an
+        # orchestrator would need half-hour waits (thousands of simulated ticks). They run on the legacy window unless they opt in.
+        legacy = (lambda observation: False) if not self.scenario.get("utc_buckets") else sb.is_orchestrator
+        with mock.patch.object(os.path, "realpath", realpath), mock.patch.object(sb.V2Client, "__init__", client_init), \
+                mock.patch.object(sb, "is_orchestrator", legacy):
             if getattr(world.engine, "v2", None) is not None and hasattr(world.engine.v2, "calls"):
                 world.engine.v2.clock = lambda: float(world.clock.t)   # the engine made in __init__
+            # the ticks this scenario cannot notice (no cloud pod, no impact, pane health, chat, health file or call record anywhere in it) have
+            # nothing to find on any pass: quiet them once for the whole play
+            ticks = self.quiet_ticks()
+            text = json.dumps(self.scenario).lower()
+            if ticks:
+                with contextlib.ExitStack() as stack:
+                    for name in ticks:
+                        stack.enter_context(mock.patch.object(sb, name, (lambda _e, d, *_a, **_k: d) if name == "sweep_decisions" else (lambda *a, **k: None)))
+                    if not any(w in text for w in ("unconsumed", "steer")):
+                        stack.enter_context(mock.patch.object(sb.Switchboard, "steer_unconsumed", lambda *_a, **_kw: None))
+                    if not any(w in text for w in ("unread", "badge")):
+                        stack.enter_context(mock.patch.object(sb.Switchboard, "render_badges", lambda *_a, **_kw: None))
+                    self._outer_patched = True
+                    try:
+                        return self._play()
+                    finally:
+                        self._outer_patched = False
             return self._play()
+
+    def quiet_ticks(self):
+        text = json.dumps(self.scenario).lower()
+        ticks = [] if (self.world.state / "cloud").exists() or "cloud" in text else list(self.CLOUD_TICKS)
+        for name, words in self.OPTIONAL_TICKS:
+            if not any(word in text for word in words):
+                ticks.append(name)
+        return ticks
+
+    OPTIONAL_TICKS = (("impact_would_hold_pass", ("impact", "would_hold", "would-hold")), ("pane_health_pass", ("pane_health", "detach", "fleetpane", "close-agent", "adopt", "exit")),
+                      ("chat_clear_pass", ("chat", "clear")), ("health_write", ("health",)), ("record_v2_calls", ("call", "budget")),
+                      ("record_github_calls", ("call", "budget")),
+                      ("sweep_decisions", ("sweep", "awaiting", "decision", "decisions", "escalate", "resolve", "answer", "supersede", "question")),
+                      ("early_decisions", ("sweep", "awaiting", "decision", "decisions", "triage", "escalate", "resolve", "answer", "supersede", "question", "decide", "edit-cos-orders")),
+                      ("publish_decisions", ("sweep", "awaiting", "decision", "decisions", "triage", "escalate", "resolve", "answer", "supersede", "question", "decide", "edit-cos-orders",
+                                             "impact", "would_hold", "would-hold", "pane_health", "detach", "fleetpane", "close-agent", "adopt", "exit", "orphan",
+                                             "chat", "clear", "pr_state", "pr-state", "pull", "webhook", "merge", "ci_record", "verdict", "gates", "plan", "clear_notice", "cleared")),
+                      ("triage_pass", ("triage",)), ("pr_events_pass", ("pr_state", "pr-state", "pull", "webhook", "merge")),
+                      ("ci_record_pass", ("ci_record", "verdict", "gates", "plan")), ("clear_notice_pass", ("clear_notice", "cleared", "clear")),
+                      ("publish_cockpit", ("cockpit", "panel", "tui")), ("write_catching_up", ("catching_up", "catching-up", "catch")),
+                      ("schedule_judge_warm", ("judge", "jev", "warm")), ("friction_tick", ("friction",)),
+                      ("load_tick", ("load_tick", "load", "overload")), ("blocked_tick", ("blocked",)),
+                      ("held_sends_tick", ("held", "hold")), ("undelivered_wake_tick", ("undelivered", "overdue")), ("feed_tick", ("feed",)))
+    CLOUD_TICKS = ("lost_worker_tick", "push_watch_tick", "pod_silence_tick", "cloud_watch_tick", "cloud_end_tick", "cloud_stall_tick", "cloud_turn_tick")
 
     def _play(self):
         steps = list(self.scenario["steps"])
@@ -244,7 +290,13 @@ class OfflineRun:
         os.environ[sb.FAULT_ENV] = ",".join(sorted(set(self.faults) | set(step_faults)))
         first = len(self.world.v2.writes)
         try:
-            self.world.engine.run_pass()
+            if getattr(self, "_outer_patched", False):
+                self.world.engine.run_pass()
+            else:
+                with contextlib.ExitStack() as stack:   # a pass run alone (a step) is quieted the same way
+                    for name in self.quiet_ticks():
+                        stack.enter_context(mock.patch.object(sb, name, (lambda _e, d, *_a, **_k: d) if name == "sweep_decisions" else (lambda *a, **k: None)))
+                    self.world.engine.run_pass()
         except sb.SimulatedCrash:
             self.crashed_writes.update(range(first, len(self.world.v2.writes)))
             self.world.engine = self.world.new_engine()

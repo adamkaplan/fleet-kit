@@ -6,6 +6,8 @@ import pathlib
 import argparse
 import datetime as dt
 import http.server
+import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -14,6 +16,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +25,76 @@ sys.path.insert(0, LAUNCHER)
 import cloud_worker as cw  # noqa: E402
 import end_hook  # noqa: E402
 import token_mint  # noqa: E402
+
+FAKE_KUBECTL = os.path.join(HERE, "fake_kubectl")
+_fk_loader = importlib.machinery.SourceFileLoader("fake_kubectl_mod", FAKE_KUBECTL)
+_fake_kubectl_mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("fake_kubectl_mod", _fk_loader))
+sys.modules["fake_kubectl_mod"] = _fake_kubectl_mod
+_fk_loader.exec_module(_fake_kubectl_mod)
+_inproc_lock = threading.RLock()   # one in-process fake kubectl at a time: it swaps argv, stdin, stdout and the environment
+
+
+def _inproc_ok(kube, cmd):
+    e = kube.env
+    return (kube.bin == FAKE_KUBECTL and "port-forward" not in cmd and not e.get("FAKE_KUBE_HANG")
+            and not e.get("FAKE_KUBE_EXEC_SLEEP") and os.environ.get("FAKE_KUBE_SUBPROCESS") != "1")
+
+
+def _inproc_call(kube, cmd, stdin):
+    """The fake kubectl run in this process (no interpreter start); the same (code, stdout, stderr) a subprocess gives."""
+    out, err = io.StringIO(), io.StringIO()
+    with _inproc_lock:
+        old_env, old_argv, old_in = dict(os.environ), sys.argv, sys.stdin
+        os.environ.clear()
+        os.environ.update(kube.env)
+        sys.argv = list(cmd)
+        code = 0
+        try:
+            with redirect_stdout(out), redirect_stderr(err), warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)   # a stray warning must not land in the fake's stderr
+                try:
+                    _fake_kubectl_mod.main(cmd[1:], stdin or "")
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                    if isinstance(e.code, str):
+                        err.write(e.code + "\n")
+        finally:
+            sys.argv, sys.stdin = old_argv, old_in
+            os.environ.clear()
+            os.environ.update(old_env)
+    return code, out.getvalue(), err.getvalue()
+
+
+def patch_kube_module(m):
+    """The Kube of module m (the real one, or a mutant's fresh copy) runs the fake kubectl in this process. Idempotent."""
+    if getattr(m.Kube._run, "_fast", False):
+        return
+    orig_run, orig_raw = m.Kube._run, m.Kube._raw
+
+    def prefix(k):
+        return [k.bin] + (["--kubeconfig", k.kubeconfig] if k.kubeconfig else []) + ["--context", k.context, "-n", k.ns]
+
+    def fast_run(kube, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
+        if not kube.context or not _inproc_ok(kube, prefix(kube) + list(args)):
+            return orig_run(kube, args, stdin, ok_missing, keep_stdout, timeout, missing_what)
+        code, out, err = _inproc_call(kube, prefix(kube) + list(args), stdin)
+        if code != 0:
+            if keep_stdout and out.strip():
+                return out
+            if ok_missing and m._not_found_exactly(err, missing_what):
+                return None
+            last = (kube.scrub(err, limit=m.SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
+            raise m.CloudError("kubectl %s: %s" % (args[0], kube.scrub(last)))
+        return out
+
+    def fast_raw(kube, args, timeout=120):
+        if not kube.context or not _inproc_ok(kube, prefix(kube) + list(args)):
+            return orig_raw(kube, args, timeout)
+        return _inproc_call(kube, prefix(kube) + list(args), None)
+
+    fast_run._fast = fast_raw._fast = True
+    m.Kube._run, m.Kube._raw = fast_run, fast_raw
+
 
 T0 = dt.datetime(2026, 10, 14, 12, 0, 0, tzinfo=dt.timezone.utc)
 
@@ -35,6 +108,9 @@ class Clock:
 
     def advance(self, **kw):
         self.t += dt.timedelta(**kw)
+
+
+patch_kube_module(cw)   # at import: every Kube call of the real module runs in process
 
 
 class Base(unittest.TestCase):
@@ -55,6 +131,12 @@ class Base(unittest.TestCase):
                     "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal",
                     "CW_KUBE_CONTEXT": "acme-cw", "CW_ALLOWED_REPOS": "a/b,acme-org/widget-service", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
         self.clock = Clock()
+        self.patch_kube(cw)
+
+    def patch_kube(self, m):   # the Kube of module m (the real one, or a mutant's copy) runs the fake kubectl in this process
+        self.addCleanup(setattr, m.Kube, "_run", m.Kube._run)
+        self.addCleanup(setattr, m.Kube, "_raw", m.Kube._raw)
+        patch_kube_module(m)
 
     def write_state(self, st):
         with open(self.state, "w") as f:
@@ -430,12 +512,29 @@ class S5EndHook(Base):
         self.assertEqual((code, json.loads(out)["pushed"]), (0, False))
         self.assertEqual(self.run_cli("delete", "coder7")[0], 0)  # gone: idempotent
 
+    def stale_ref_repo(self, name, upstream_gone):
+        """HEAD is a second commit that origin/main holds; a commit made and then reset away leaves a reflog entry no remote ref reaches, so the
+        tree is not clean (clean_local) and the hook must look at the remote. With upstream_gone, main is deleted upstream after the last fetch."""
+        work, origin = make_repo(self.tmp.name, name, dirty=False)
+        g = lambda *a: subprocess.run(["git", "-C", work, *a], check=True, capture_output=True)
+        g("commit", "--allow-empty", "-m", "second")
+        g("push", "origin", "HEAD:main")
+        g("fetch", "origin")
+        g("commit", "--allow-empty", "-m", "made then reset away")
+        g("reset", "--hard", "HEAD~1")
+        if upstream_gone:
+            subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/heads/main"], check=True)
+        return work, origin
+
     def test_stale_remote_ref_does_not_make_unpushed_work_look_safe(self):
-        work, origin = make_repo(self.tmp.name, "r", dirty=False)
-        subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/heads/main"], check=True)  # gone upstream
+        work, origin = self.stale_ref_repo("r", upstream_gone=True)
         res = end_hook.run(work, "coder7")
         self.assertEqual((res["pushed"], res["wip_branch"]), (True, "coder7/wip"))
         subprocess.run(["git", "-C", origin, "rev-parse", "--verify", "coder7/wip"], check=True, capture_output=True)
+        # the control: the same tree with main still upstream has nothing to push, so the push above comes from the refreshed reference
+        work2, _ = self.stale_ref_repo("r2", upstream_gone=False)
+        res2 = end_hook.run(work2, "coder7")
+        self.assertEqual((res2["pushed"], res2["wip_branch"]), (False, None))
 
     def test_hook_error_text_is_printable_and_short(self):
         class Fake(cw.Kube):
@@ -718,7 +817,7 @@ class S7Interrupt(Base):
         self.assertIn("secret/%s-pw" % name, err)
         last = self.audit_lines()[-1]
         self.assertEqual(last["action"], "create.interrupted")
-        self.assertIn("REMAINS: pod/%s, secret/%s-pw" % (name, name), last["reason"])
+        self.assertIn("REMAINS: pod/%s, poddisruptionbudget/%s-pdb, secret/%s-pw" % (name, name, name), last["reason"])
 
     def test_failed_cleanup_after_a_cloud_error_exits_nonzero_and_names_remains(self):
         self.patch_state(never_ready=True)

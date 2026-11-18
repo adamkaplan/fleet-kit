@@ -200,7 +200,8 @@ class TestOpenListDerivedText(Base):
     def load(self, edit, tag):
         tmp = tempfile.mkdtemp()   # kept until the test ends: the entry loads its modules lazily
         self.addCleanup(shutil.rmtree, tmp, True)
-        shutil.copytree(str(Path(__file__).resolve().parents[2] / "bin"), tmp, dirs_exist_ok=True)   # the entry and the modules it loads by name
+        shutil.copytree(str(Path(__file__).resolve().parents[2] / "bin"), tmp, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "test-*", "proof-*"))   # the large test programs are not helpers of the copy   # the entry and the modules it loads by name
         copy_entry(tmp)
         entry = Path(tmp) / "fleet-switchboard"
         edited = edit_program(tmp, edit)
@@ -260,7 +261,10 @@ def drain_two_with_a_failing_first(mod, notes_out):
             mock.patch.object(mod, "pr_events_pass", quiet), mock.patch.object(mod, "ci_record_pass", quiet), mock.patch.object(mod, "pane_health_pass", quiet), \
             mock.patch.object(mod, "decision_store", lambda e: types.SimpleNamespace(publish=lambda *a, **k: True)), \
             mock.patch.object(mod, "chat_clear_pass", quiet), mock.patch.object(mod, "apply_notice_effects", quiet), mock.patch.object(mod, "prune_escalations_pass", quiet), \
-            mock.patch.object(mod, "sync_external", lambda *a, **k: []), mock.patch.object(mod, "work_sync_external", quiet):
+            mock.patch.object(mod, "sync_external", lambda *a, **k: []), mock.patch.object(mod, "work_sync_external", quiet), \
+            mock.patch.object(mod, "pane_exit_pass", quiet), mock.patch.object(mod, "adoption_pass", quiet), \
+            mock.patch.object(mod, "impact_would_hold_pass", quiet), mock.patch.object(mod, "clear_notice_pass", quiet), \
+            mock.patch.object(mod, "load_module", lambda name: types.SimpleNamespace(NEEDS=(), run_pass=quiet)):
         mod.publish_decisions(engine)
     return seen
 

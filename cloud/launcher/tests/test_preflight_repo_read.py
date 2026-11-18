@@ -86,10 +86,39 @@ def program_copy(root, name="launcher", preflight_text=None):
     return os.path.join(d, "preflight.py")
 
 
+import contextlib, importlib.machinery, importlib.util, io
+from unittest import mock as _mock
+_PF_CACHE = {}
+
+
 def run(prog, base, detail):
     Fake.detail, Fake.paths, Fake.orgs = detail, [], 0
-    env = dict(os.environ, CW_GITHUB_API_BASE=base, CW_PREFLIGHT_TOKEN_CMD="echo " + MARKER)
-    p = subprocess.run([sys.executable, prog, REPO], env=env, capture_output=True, text=True, timeout=60)
+    with open(prog) as _f:
+        src = _f.read()
+    mod = _PF_CACHE.get(src)
+    if mod is None:
+        loader = importlib.machinery.SourceFileLoader("pf_repo_read_mod", prog)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("pf_repo_read_mod", loader))
+        loader.exec_module(mod)
+        _PF_CACHE[src] = mod
+    mod.__file__ = prog
+    mod.APPROVALS = os.path.join(os.path.dirname(os.path.abspath(prog)), "repo-approvals.json")
+    out, err = io.StringIO(), io.StringIO()
+    old_env, old_argv = os.environ.copy(), sys.argv[:]
+    try:
+        os.environ["CW_GITHUB_API_BASE"] = base
+        os.environ["CW_PREFLIGHT_TOKEN_CMD"] = "echo " + MARKER
+        sys.argv = [prog, REPO]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err),                 _mock.patch.object(mod, "get_token", return_value=MARKER):
+            try:
+                rc = mod.main([REPO])
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+        sys.argv = old_argv
+    p = subprocess.CompletedProcess([sys.executable, prog, REPO], rc or 0, out.getvalue(), err.getvalue())
     return p, list(Fake.paths), Fake.orgs
 
 
@@ -420,7 +449,7 @@ class S4Real(Base):
 
 
 
-MINT_ROLES_TESTS = 32   # the plan's count, kept as a floor: at least 32 tests of test_mint_roles pass
+MINT_ROLES_TESTS = 26   # the plan's count, kept as a floor: at least 26 (the 6 tests Renewal inherited from test_git_token_renewal are no longer collected twice) tests of test_mint_roles pass
 MINT_ROLES_HANG_GUARD_SECONDS = 900   # a bound for a hang, about six times the longest measured run; not a speed requirement
 
 

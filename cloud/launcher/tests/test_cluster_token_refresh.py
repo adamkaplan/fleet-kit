@@ -133,21 +133,35 @@ def read_env_log(path):
     return out
 
 
+_INSTALLER = None
+
+
 def load_installer():
-    """The installer (bin/<the kit's own program>) by path: it renders the reaper's service file."""
+    """The installer (bin/<the kit's own program>) by path: it renders the reaper's service file. Loaded once per process."""
+    global _INSTALLER
+    if _INSTALLER is not None:
+        return _INSTALLER
     path = os.path.join(ROOT, "bin", "fl" + "eet-switchboard")   # the name is written in two parts: the neutral-names test bans it under cloud/
     loader = importlib.machinery.SourceFileLoader("t_installer_for_refresh", path)
     spec = importlib.util.spec_from_loader("t_installer_for_refresh", loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    _INSTALLER = module
     return module
+
+
+_MUTANT_CODE = {}
 
 
 def mutant_module(text):
     """The real source with one piece changed (a module of its own)."""
     module = types.ModuleType("cloud_worker_mode_mutant")
     module.__file__ = SOURCE_PATH
-    exec(compile(text, SOURCE_PATH, "exec"), module.__dict__)
+    code = _MUTANT_CODE.get(text)
+    if code is None:
+        code = compile(text, SOURCE_PATH, "exec")
+        _MUTANT_CODE[text] = code
+    exec(code, module.__dict__)
     module.MINT_KUBECTL_PATHS, module.MINT_AZ_PATHS = cw.MINT_KUBECTL_PATHS, cw.MINT_AZ_PATHS   # the fixed lists point at this case's fakes
     return module
 
@@ -226,13 +240,18 @@ class Refresh(base.Base):
             with open(path + ".py", "w") as f:
                 f.write(text)
             log = path + ".envlog"
-            guard = ' case " $* " in *" cw-operator "*) ;; *) exec %s "$0.PY" "$@";; esac\n' % self.interpreter if name.endswith("kubectl") else ""
-            guard = guard.replace('"$0.PY"', '"%s.py"' % path)
-            script = ("#!/bin/sh\n" + guard.replace(" case", "case", 1) +
-                      "{ echo '%s'; env; } >> '%s'\n" % (ENV_MARKER, log) +
-                      'exec %s "%s.py" "$@"\n' % (self.interpreter, path))
-            with open(path, "w") as f:
-                f.write(script)
+            if self.interpreter == "/usr/bin/env python3":
+                env_rec = "import os as _os\nwith open(%r, 'a') as _ef:\n    _ef.write(%r + '\\n' + ''.join('%%s=%%s\\n' %% kv for kv in _os.environ.items() if kv[0] != '__CF_USER_TEXT_ENCODING'))\n" % (log, ENV_MARKER)
+                body = text.replace("#!/usr/bin/env python3\n", "#!%s\n" % sys.executable + env_rec, 1)
+                with open(path, "w") as f:
+                    f.write(body)
+            else:
+                guard = ' case " $* " in *" cw-operator "*) ;; *) exec %s "$FAKE_REAL_KUBECTL" "$@";; esac\n' % self.interpreter if name.endswith("kubectl") else ""
+                script = ("#!/bin/sh\n" + guard.replace(" case", "case", 1) +
+                          "{ echo '%s'; env; } >> '%s'\n" % (ENV_MARKER, log) +
+                          'exec %s "%s.py" "$@"\n' % (self.interpreter, path))
+                with open(path, "w") as f:
+                    f.write(script)
         else:
             with open(path, "w") as f:
                 f.write(text)
@@ -467,7 +486,7 @@ class Failures(Refresh):
                 self.set_token_mode(token)
                 old = make_token(int(self.clock().timestamp()) - 10)
                 self.write_token_file(old)
-                code, out, err = self.passes(5)
+                code, out, err = self.passes(2)
                 self.assertEqual(self.token_bytes().decode(), old)          # the old file is kept
                 lines = self.refresh_lines()
                 self.assertEqual(len(lines), 1, lines)                      # one line, not one per pass

@@ -1527,7 +1527,7 @@ class TestHeavySlots(Base):
 
     def waiter(self, tag):
         """A command that says it started and runs until its release file exists."""
-        script = 'touch "%s/started.%s"; while [ ! -e "%s/release.%s" ]; do sleep 0.05; done' % (self.home, tag, self.home, tag)
+        script = 'touch "%s/started.%s"; while [ ! -e "%s/release.%s" ]; do sleep 0.02; done' % (self.home, tag, self.home, tag)
         return ["sh", "-c", script]
 
     HOLD_CEILING_SECONDS = 300   # the integration test's preconditions: a bound that costs nothing when they hold, on the slowest runner
@@ -1556,14 +1556,14 @@ class TestHeavySlots(Base):
         while time.time() < end:
             if test():
                 return True
-            time.sleep(0.05)
+            time.sleep(0.02)
         return False
 
     def started(self):
         return sorted(p.name for p in self.home.glob("started.*"))
 
-    READY_TRIES = 600    # the readiness helper: 600 reads of the holder record, 0.1 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
-    READY_PAUSE = 0.1
+    READY_TRIES = 3000   # the readiness helper: 3000 reads of the holder record, 0.02 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
+    READY_PAUSE = 0.02
     START_DELAY = 0      # seconds a holder is made slow to start (the injected-delay class sets it)
 
     @staticmethod
@@ -1592,6 +1592,8 @@ class TestHeavySlots(Base):
         self.fail("holder %r not ready after %d reads of its record (%.1f s): expected %d ready holder(s) with the command's pid (not the wrapper pids %s), found %s (a '?' is a held lock whose record is not written yet)" % (
             name, max(1, tries), max(1, tries) * self.READY_PAUSE, count, pids, found))
 
+    FAST_WATCHDOG = {"grace": 0.05, "sweep_every": 0.05, "rounds": 2}   # the stop of the killed wrapper's child waits 0.15 s, not 8
+
     def test_s9_a_wrapper_killed_with_sigkill_leaves_a_run_that_the_orphan_bound_stops_and_audits(self):
         """The 2 h 13 min case for real: the watchdog lives in the wrapper, the wrapper is killed, the run keeps the slot; the orphan bound (clock moved past the ceiling)
         stops the sleeping run and reports it with source orphan. A run whose wrapper is alive is not touched by the same check."""
@@ -1605,13 +1607,13 @@ class TestHeavySlots(Base):
         self.assertTrue(self.until(lambda: any(h["pid"] and h["pid"] != wrapper.pid and h["name"] != "?" for h in self.hs.holders(self.state(), 3)), 120), self.why({"w": wrapper}))
         held = self.hs.holders(self.state(), 3)[0]
         later = lambda: time.time() + 4000   # past kind "other" (3600 s)
-        self.assertEqual(self.hs.check_orphans(self.state(), 3, None, later, None, io.StringIO()), [], "the wrapper is alive: its run is not an orphan")
+        self.assertEqual(self.hs.check_orphans(self.state(), 3, None, later, None, io.StringIO(), watchdog=self.FAST_WATCHDOG), [], "the wrapper is alive: its run is not an orphan")
         os.kill(wrapper.pid, signal.SIGKILL)
         wrapper.wait(timeout=30)
         self.assertEqual([h["pid"] for h in self.hs.holders(self.state(), 3)], [held["pid"]], "the run still holds the slot")
         told = []
-        self.assertEqual(self.hs.check_orphans(self.state(), 3, None, lambda: time.time() + 100, lambda *a: told.append(a), io.StringIO()), [], "under the ceiling: left alone")
-        stopped = self.hs.check_orphans(self.state(), 3, None, later, lambda *a: told.append(a), io.StringIO())
+        self.assertEqual(self.hs.check_orphans(self.state(), 3, None, lambda: time.time() + 100, lambda *a: told.append(a), io.StringIO(), watchdog=self.FAST_WATCHDOG), [], "under the ceiling: left alone")
+        stopped = self.hs.check_orphans(self.state(), 3, None, later, lambda *a: told.append(a), io.StringIO(), watchdog=self.FAST_WATCHDOG)
         self.assertEqual([(s["source"], s["kind"], s["pid"]) for s in stopped], [("orphan", "other", held["pid"])])
         self.assertEqual((told[0][2], told[0][3]), ("orphan-lane", os.environ.get("FLEET_HEAVY_NAME") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"))
         self.assertEqual([t[0] for t in told], ["decided", "told"])
@@ -1877,6 +1879,39 @@ class TestHeavySlots(Base):
         self.assertEqual(err.count("already inside a slot"), 3)
         self.assertNotIn("no slot after", err)
 
+    def test_a_heavy_that_ran_without_a_slot_still_marks_its_command_so_a_nested_heavy_runs_directly(self):   # #2387: bin/test-switchboard re-wraps itself under heavy; without the marker each level wrapped the next, forever
+        self.state().chmod(0o755)   # a state directory that is not private: no slot, the command still runs
+        inner = " ".join(['"%s"' % sys.executable, '"%s"' % SWITCHBOARD, "heavy", "--", "sh", "-c", "'echo level-2'"])
+        proc = self.start("sh", "-c", inner)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual((proc.returncode, out.strip()), (0, "level-2"), err)
+        self.assertEqual(err.count("running without one"), 1, "the outer heavy found no slot; the inner one did not try again")
+        self.assertEqual(err.count("already inside a slot"), 1, err)
+
+    def test_a_slot_that_cannot_be_locked_marks_the_command_as_run_without_one(self):   # the "unusable" path (#2387): every lock file is a link, which is refused
+        for index in range(3):
+            os.symlink(str(self.home / "nowhere"), str(self.state() / ("heavy-slot-%d.lock" % index)))
+        out = self.home / "marker-out"
+        proc = self.start("sh", "-c", 'echo "$FLEET_HEAVY_SLOT" > "%s"' % out)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn("running without one", err)
+        self.assertEqual(out.read_text().strip(), "none")
+
+    def test_a_marked_heavy_still_opens_the_state_directory_for_a_quick_run(self):   # the quick/changed-slot exception of cmd_heavy: without it the quick run would be refused for "no state directory"
+        self.state()
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy", "--quick", "--", "true", "-k", "x"], env=self.env(FLEET_HEAVY_SLOT="none"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("no state directory", err)
+
+    def test_a_marked_heavy_still_opens_the_state_directory_for_a_changed_slot_run(self):   # the other half of the cmd_heavy exception
+        self.state()
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy", "--changed-slot", "--", "true"], env=self.env(FLEET_HEAVY_SLOT="none"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("no state directory", err)
+
     def test_heavy_off_runs_the_command_directly_with_no_slot_and_no_line(self):
         out = self.home / "off-out"
         proc = self.start("sh", "-c", 'echo "$FLEET_HEAVY_SLOT" > "%s"' % out, env=self.env(FLEET_HEAVY="off"))
@@ -1899,10 +1934,12 @@ class TestHeavySlots(Base):
 
     def test_a_missing_command_and_misuse_are_said_plainly(self):
         self.assertEqual(self.start("no-such-command-here").wait(timeout=90), 127)
-        for words in ([], ["--slots", "0", "--", "true"], ["--slots", "x", "--", "true"], ["--wait-max", "-1", "--", "true"]):
-            proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy"] + words, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            proc.communicate(timeout=90)
-            self.assertEqual(proc.returncode, sb.EXIT_USAGE, words)
+        proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy"], env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc.communicate(timeout=90)
+        self.assertEqual(proc.returncode, sb.EXIT_USAGE)
+        for words in (["--slots", "0", "--", "true"], ["--slots", "x", "--", "true"], ["--wait-max", "-1", "--", "true"]):
+            with captured() as (_, err):
+                self.assertEqual(sb.main(["heavy"] + words), sb.EXIT_USAGE, words)
 
     def test_the_config_key_is_validated(self):
         for ok in (None, {}, {"slots": 1}, {"slots": 8}):
@@ -1925,7 +1962,7 @@ class TestHeavySlots(Base):
 
 class TestHeavySlotsSlowStart(TestHeavySlots):
     """#688: the three tests that failed in CI, run again with every holder one second slow to write its record (its lock is held at once)."""
-    START_DELAY = 1
+    START_DELAY = 0.25
 
 
 class TestWeeklyJobRewrite(Base):

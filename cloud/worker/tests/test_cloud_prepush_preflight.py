@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests of the preflight step, the bounds, the identical-failure count and the child environment of
 bin/cloud-prepush (ask #1284). Throwaway repositories under the temporary directory only."""
+import atexit
 import os
 import shutil
 import subprocess
@@ -18,8 +19,13 @@ PASS = "import sys\nsys.exit(0)\n"
 PLANT = "PLANTED_" + "TOK" + "EN_VALUE"  # assembled at runtime; a fake value only
 
 
-def git(cwd, *a):
-    p = subprocess.run(["git"] + list(a), cwd=cwd, capture_output=True, text=True, env=ENV)
+GIT_FLAGS = ("-c", "maintenance.auto=0", "-c", "gc.auto=0")
+
+
+def git(cwd, *a, runner=None):
+    if runner is not None:
+        return runner(["git", *GIT_FLAGS, *a])
+    p = subprocess.run(["git", *GIT_FLAGS, *a], cwd=cwd, capture_output=True, text=True, env=ENV)
     assert p.returncode == 0, (a, p.stderr)
 
 
@@ -31,8 +37,23 @@ def put(repo, rel, text, mode=0o755):
     os.chmod(path, mode)
 
 
+_TEMPLATE = None
+
+
 def make_repo(tmp, tests):
+    global _TEMPLATE
     repo = os.path.join(tmp, "repo")
+    if tests == TESTS:
+        if _TEMPLATE is None or not os.path.exists(_TEMPLATE):
+            _TEMPLATE = tempfile.mkdtemp(prefix="prepush-tpl-")
+            atexit.register(shutil.rmtree, _TEMPLATE, True)
+            _build_repo(os.path.join(_TEMPLATE, "repo"), tests)
+        shutil.copytree(os.path.join(_TEMPLATE, "repo"), repo)
+        return repo
+    return _build_repo(repo, tests)
+
+
+def _build_repo(repo, tests):
     os.makedirs(repo)
     git(repo, "init", "-q", "-b", "trunk")
     put(repo, "a.txt", "one\n", 0o644)
@@ -77,6 +98,19 @@ class PreflightStep(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="prepush-pf-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
+    def test_git_helper_disables_auto_maintenance(self):
+        seen = []
+        git(self.tmp, "status", runner=seen.append)
+
+        def mutant_git(cwd, *a, runner=None):   # omits maintenance.auto=0
+            return runner(["git", "-c", "gc.auto=0", *a])
+        mutant_seen = []
+        mutant_git(self.tmp, "status", runner=mutant_seen.append)
+        good = " ".join(seen[0])
+        self.assertIn("-c maintenance.auto=0", good)
+        self.assertIn("-c gc.auto=0", good)
+        self.assertNotIn("-c maintenance.auto=0", " ".join(mutant_seen[0]))
+
     def test_failing_preflight_prints_its_lines_and_runs_no_test(self):
         repo = make_repo(self.tmp, TESTS)
         p = run(repo, preflight="print('PREFLIGHT-LINE-ONE')\nraise SystemExit(1)\n")
@@ -113,16 +147,16 @@ class PreflightStep(unittest.TestCase):
     def test_slow_preflight_ends_at_its_own_bound(self):
         repo = make_repo(self.tmp, TESTS)
         t = time.monotonic()
-        p = run(repo, preflight=self.SLOW, env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "2", "CLOUD_PREPUSH_TIMEOUT": "20"})
-        self.assertLess(time.monotonic() - t, 2 + 8)
+        p = run(repo, preflight=self.SLOW, env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "1", "CLOUD_PREPUSH_TIMEOUT": "20"})
+        self.assertLess(time.monotonic() - t, 1 + 8)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-        self.assertIn("could not run the preflight: timed out after 2s", p.stdout)
-        self.assertIn("preflight running (0 s of 2)", p.stderr)
+        self.assertIn("could not run the preflight: timed out after 1s", p.stdout)
+        self.assertIn("preflight running (0 s of 1)", p.stderr)
         self.assertNotIn("run 1,", p.stdout)
 
     def test_total_shortens_the_preflight_bound(self):
         repo = make_repo(self.tmp, TESTS)
-        p = run(repo, preflight=self.SLOW, env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "20", "CLOUD_PREPUSH_TOTAL": "2"})
+        p = run(repo, preflight=self.SLOW, env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "20", "CLOUD_PREPUSH_TOTAL": "1"})
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertRegex(p.stdout, r"timed out after [12]s")
 
@@ -140,10 +174,10 @@ class PreflightStep(unittest.TestCase):
         self.assertNotEqual(mut, text)
         t = time.monotonic()
         p = run(repo, preflight=self.SLOW, script_text=mut,
-                env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "2", "CLOUD_PREPUSH_TIMEOUT": "6"})
+                env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "1", "CLOUD_PREPUSH_TIMEOUT": "3"})
         # the mutant ends at the per-test bound, not at the preflight bound: the first test's assertions fail
-        self.assertGreaterEqual(time.monotonic() - t, 5)
-        self.assertNotIn("timed out after 2s", p.stdout)
+        self.assertGreaterEqual(time.monotonic() - t, 2.5)
+        self.assertNotIn("timed out after 1s", p.stdout)
 
     def test_mutant_skipping_preflight_fails(self):
         s = open(SCRIPT).read()
@@ -170,9 +204,9 @@ class Bounds(unittest.TestCase):
             self.assertEqual(p.returncode, 2, (bad, p.stdout, p.stderr))
 
     def test_deadline_lists_unreached_tests_as_could_not_run(self):
-        t = {TD + "test_a.py": "# a.txt\nimport time\ntime.sleep(3)\n", TD + "test_b.py": "# a.txt\n" + PASS}
+        t = {TD + "test_a.py": "# a.txt\nimport time\ntime.sleep(1.5)\n", TD + "test_b.py": "# a.txt\n" + PASS}
         repo = make_repo(self.tmp, t)
-        p = run(repo, preflight=PASS, env={"CLOUD_PREPUSH_TOTAL": "2"})
+        p = run(repo, preflight=PASS, env={"CLOUD_PREPUSH_TOTAL": "1"})
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("could not run", p.stdout)
         self.assertRegex(p.stdout, "COULD NOT RUN")

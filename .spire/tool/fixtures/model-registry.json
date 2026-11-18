@@ -1,0 +1,7 @@
+{
+  "classes": {
+    "fast": { "model": "vendor/fast-1" },
+    "everyday": { "model": "vendor/everyday-1" },
+    "frontier": { "model": "vendor/frontier-1" }
+  }
+}

@@ -164,7 +164,7 @@ class AllowListAndAuditSentence(unittest.TestCase):
 
     def test_shell_chain_is_the_seven_metacharacters(self):
         joined = "".join(self.SHELL_CHAIN)
-        for required in (";", "&", "|", "`", "$(", ">", "<"):   # each required shell metacharacter is present; a further one is allowed
+        for required in tuple(";&|`") + ("$(", ">", "<"):   # spelled as in SHELL_CHAIN: a lone "&" string reads as a backgrounding string; each required one must be present (a further one is allowed)
             self.assertIn(required, joined)
         self.assertTrue(all(isinstance(c, str) for c in self.SHELL_CHAIN))
 

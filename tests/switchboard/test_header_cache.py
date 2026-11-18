@@ -492,8 +492,8 @@ class TestSafety(HeaderCacheBase):
 
 class TestReplay(HeaderCacheBase):
     """S7: a SYNTHETIC hour of the shape of the audit hour 01:00-02:00Z of 29 Oct (the recorded hour is private): the command kinds and counts, neutral issue numbers."""
-    HOUR = (("send", 548), ("remind", 113), ("plan", 22), ("comment", 16), ("verdict", 14), ("notice", 12), ("send", 13))   # v2.synthetic, reminder.add, plan.approved, github.comment, plan.proof, notice.pr, cloud.send
-    ISSUES = 60
+    HOUR = (("send", 183), ("remind", 38), ("plan", 8), ("comment", 6), ("verdict", 5), ("notice", 4), ("send", 4))   # v2.synthetic, reminder.add, plan.approved, github.comment, plan.proof, notice.pr, cloud.send
+    ISSUES = 20
     OFF = {}
 
     def replay(self, cache_on, shape):

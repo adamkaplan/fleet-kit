@@ -141,6 +141,32 @@ class TestPushWatch(Case):
         self.run_pass(NOW + 1)
         self.assertEqual(len([t for t in self.to("lane-a") if "pushed" in t]), 1)
 
+    def test_the_sent_audit_line_names_the_branch_and_the_full_head_and_the_end_notice_reader_takes_it(self):
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW)
+        self.run_pass(NOW + 1)
+        sent = [l for l in self.engine.audit.lines if l[0] == "push_watch.sent" and l[1] == "w-a"]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0][2]["branch"], sent[0][2]["head"], sent[0][2]["sha"]), ("w-a/wip", SHA_A, SHA_A[:8]))
+        path = Path(self.tmp.name) / "audit.jsonl"
+        path.write_text(json.dumps({"event": "push_watch.sent", "subject": "w-a", "detail": sent[0][2]}) + "\n")
+        reader = importlib.util.module_from_spec(importlib.util.spec_from_file_location("cea_2267", REPO / "bin" / "cloud_end_alert.py"))
+        reader.__spec__.loader.exec_module(reader)
+        self.assertEqual(reader.push_reader(str(path), json.loads)("w-a"), ("w-a/wip", SHA_A))
+
+    def test_a_hostile_branch_is_cleaned_at_the_write_site_and_a_plain_one_is_kept(self):
+        for ref, want in (("w-a/wip", "w-a/wip"), ("w-a/wip`<x>@y\"" + "z" * 200, None)):
+            self.setUp()   # a fresh fixture per case
+            self.world.refs = {ref: SHA_A}
+            self.run_pass(NOW)
+            self.run_pass(NOW + 1)
+            sent = [l[2]["branch"] for l in self.engine.audit.lines if l[0] == "push_watch.sent" and l[1] == "w-a"]
+            self.assertEqual(len(sent), 1, ref)
+            self.assertNotRegex(sent[0], r"[\x00-\x1f`<>@\"]")
+            self.assertLessEqual(len(sent[0]), 100)
+            self.assertTrue(sent[0].startswith("w-a/wip"))
+            if want:
+                self.assertEqual(sent[0], want)
 
     def test_s2_the_launching_lane_gets_one_item_and_the_other_lane_none(self):
         self.world.refs = {"w-a/wip": SHA_A}
@@ -498,7 +524,7 @@ class TestPushWatch(Case):
 
     def test_fix3_pc4_a_failed_quiet_send_is_retried_at_the_next_pass(self):
         self.assertEqual(len(self._quiet_send()), 1)
-        mutant = self.mutant('                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"', '                b["quiet"] = True\n                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"')
+        mutant = self.mutant('                told = tell(lane, item_text(name, branch, b["sha"], {}, "quiet"', '                b["quiet"] = True\n                told = tell(lane, item_text(name, branch, b["sha"], {}, "quiet"')
         self._fails(lambda: self.assertEqual(len(self._quiet_send(mutant)), 1, "the quiet item was marked before a failed send"), "the quiet item was marked before a failed send")
 
     def _both_fail(self, module=None, recover=False):
@@ -764,7 +790,7 @@ class TestPushWatch(Case):
             audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
             lines = []
             engine = types.SimpleNamespace(audit=audit, actor="daemon", now=lambda: NOW, hub=types.SimpleNamespace(gh_api=lambda *a, **k: []))
-            result = module.push_watch_tick(engine, None)
+            result = module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={}))
             self.assertEqual((result, lines, list(Path(tmp).iterdir())), ([], [], []))
 
     def test_fix1_an_engine_without_config_runs_the_pass_with_no_audit_line(self):
@@ -792,7 +818,7 @@ class TestPushWatch(Case):
         module, engine = self._hub_tick(hub)
         os.environ["CW_CLOUD_AUDIT"] = self.launcher
         self.addCleanup(os.environ.pop, "CW_CLOUD_AUDIT", None)
-        module.push_watch_tick(engine, None)
+        module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={}))
         self.assertTrue(self.world.requests)
         self.assertFalse([l for l in engine.audit.lines if "read_failed" in l[0]], engine.audit.lines)
 
@@ -809,14 +835,14 @@ class TestPushWatch(Case):
         Path(self.tmp.name, module.RETIRED_FILE).write_text(json.dumps({"w-b": {"at": 1, "reason": "finished", "session": "s"}}))
         os.environ["CW_CLOUD_AUDIT"] = self.launcher
         self.addCleanup(os.environ.pop, "CW_CLOUD_AUDIT", None)
-        module.push_watch_tick(engine, None)
+        module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={}))
         told = {to for to, _ in engine.sent}
         self.assertNotIn("lane-b", told)
         self.assertIn("lane-a", told)
 
     def test_fix2_no_hub_skips_with_one_line(self):
         module, engine = self._hub_tick(None)
-        self.assertEqual(module.push_watch_tick(engine, None), [])
+        self.assertEqual(module.push_watch_tick(engine, types.SimpleNamespace(problems=[], agents={})), [])
         self.assertEqual([l[0] for l in engine.audit.lines], ["push_watch.skipped"])
 
     def _world(self, made_before_launch):

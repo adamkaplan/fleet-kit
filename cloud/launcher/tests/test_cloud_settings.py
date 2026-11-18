@@ -1,7 +1,7 @@
 """The settings file (#876, slice 1): the one reader `apply_settings`, its refusals, and the driver's use of it. Offline, no cluster.
 
 Every set below is derived from the code's own tables (SETTINGS, SECRET_SHAPES), with a completeness test, so a new member that has no case here fails."""
-import contextlib, io, json, os, re, stat, sys, tempfile, unittest
+import contextlib, functools, io, json, os, re, stat, sys, tempfile, unittest
 import urllib.parse as urllib_parse
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -19,6 +19,7 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
+                    "CW_TOKEN_SERVICE_URL": "https://token-service.cw.svc:8443", "CW_TOKEN_SERVICE_CALLER_TOKEN_CMD": "cat /home/user/cluster-token",
                     "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_VAULT_BLOCK_DURATION": "10m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
                     "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
                     "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
@@ -26,6 +27,16 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
 OPTIONAL_SAMPLES["CW_FINAL_NOTE_MINUTES"] = "10"   # ask #1757: the final note's minutes
 OPTIONAL_SAMPLES["CW_REPO_MIN_SHAPE"] = "acme-org/widget-service=S"
 OPTIONAL_SAMPLES["CW_READONLY_ROOT_LANES"] = "lane-a,lane-b"
+OPTIONAL_SAMPLES["CW_SECRET_DIR"] = os.path.join(os.path.expanduser("~"), "cw-secrets")   # ask #2357: the secret directory (under the home)
+OPTIONAL_SAMPLES["CW_AZURE_CONFIG_DIR"] = "/tmp"   # an existing directory; the setting is refused when it is missing
+OPTIONAL_SAMPLES["CW_COUNCIL_URL"] = "http://copilot-bridge.cw.svc:8080"   # ask #2341
+OPTIONAL_SAMPLES["CW_LONG_RUN_DENY"] = "*longcmd*,*other.sh*"   # ask #2369
+OPTIONAL_SAMPLES["CW_LAND_REPORT_ISSUE"] = "owner/repo#7"   # ask #2448
+OPTIONAL_SAMPLES["CW_LAND_REPORT_SMALL_LINES"] = "50"
+OPTIONAL_SAMPLES["CW_LAND_REPORT_GIT_DIR"] = "/srv/checkout"
+OPTIONAL_SAMPLES["CW_LAND_REPORT_BRANCH"] = "origin/main"
+OPTIONAL_SAMPLES["CW_LAND_REPORT_OWN_AUTHORS"] = "acme-bot[bot],worker-two"
+OPTIONAL_SAMPLES["CW_LAND_REPORT_FIRST_REPO"] = "acme-org/widget-service"
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -68,6 +79,8 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLOUD_SPEND_CAP_USD": ["0", "-1", "1e3", "100001", "1.2.3", "abc", "0.0"],
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
+    "CW_TOKEN_SERVICE_URL": ["http://example.com:8443", "ftp://token-service.cw.svc", "https://u:p@token-service.cw.svc", "https://token-service.cw.svc/x?q=1", "https://token-service.cw.svc/#f", "-x"],
+    "CW_TOKEN_SERVICE_CALLER_TOKEN_CMD": ["-x", "--x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
     "CW_READONLY_ROOT_LANES": ["Lane", "a/b", "lane;x", "-lane", "a,,b!"],
     "CW_REPO_MIN_SHAPE": ["acme-org/widget-service", "acme-org/widget-service=L", "widget-service=S", "acme-org/a=S,ACME-ORG/A=M"],
@@ -84,6 +97,16 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_MAX_PERSISTENT": ["0", "21", "00", "01", "+5", "-5", "-1", "\u0662", "\u0661\u0662", "2\x01", "2\t", "1.5", "abc", "100"],
     "CW_VAULT_BLOCK_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "10", "m", "10s", "1.5h", "10 m", "/tmp/10m", "10m5s", "\u0662\u0660m", "-1h", "0h"],
 }
+HOSTILE["CW_SECRET_DIR"] = ["secrets", "/tmp/cw-secrets", "/etc", "-x", os.path.expanduser("~") + "/../x"]   # relative, outside the home, an option, a .. segment
+HOSTILE["CW_AZURE_CONFIG_DIR"] = ["azure", "/a/../b", "-x", "/no/such/dir-azure-test"]   # relative, a .. segment, an option, a missing directory
+HOSTILE["CW_COUNCIL_URL"] = ["ftp://bridge.example", "bridge.example:8080", "http://", "http://user@bridge.example", "http://bridge.example?x=1", "http://bridge.example#f", "https://bridge.example/a/b", "file:///etc/passwd", "http://bridge example", "http://bridge.example/opaque-segment", "http://bridge.example/.."]   # ask #2341
+HOSTILE["CW_LONG_RUN_DENY"] = [",".join("*p%d*" % i for i in range(9)), "*a b*", "*a;b*", "*" + "a" * 80, "*a*,", ",*a*", "*a*,,*b*", "$(x)"]   # ask #2369: 9 patterns, a space, a semicolon, 81 characters, an empty entry, a substitution
+HOSTILE["CW_LAND_REPORT_ISSUE"] = ["7", "#7", "o/r#0", "o/r#", "o/r#1x", "o r/x#1", "../r#1"]   # ask #2448
+HOSTILE["CW_LAND_REPORT_SMALL_LINES"] = ["0", "-5", "1.5", "abc", "1000000", "05", "\u0662"]
+HOSTILE["CW_LAND_REPORT_GIT_DIR"] = ["relative", "/a/../b", "-x"]
+HOSTILE["CW_LAND_REPORT_FIRST_REPO"] = ["-x/y", "a b/c", "a;b/c", "noslash", "a/" + "b" * 101]
+HOSTILE["CW_LAND_REPORT_OWN_AUTHORS"] = ["-x", "a;b", "$(x)", "a" * 101, "a,,b", "a,-b"]
+HOSTILE["CW_LAND_REPORT_BRANCH"] = ["-x", "a b", "a;b", "$(x)", "a" * 101]
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 
@@ -682,6 +705,8 @@ NOT_SETTINGS = {
     "CW_AUDIT_RUNTIME_ID": "set by the launcher into the pod's environment (pod/NAME): an identifier, not a choice",
     "CW_CLOUD_TOKEN_FILE": "set by the launch wiring for its child from the in-memory mint (a private temp file it removes); no operator names it",
     "CW_AGENT": "set by the launcher into an orchestrator pod's environment from --agent (worker or orchestrator); the entrypoint reads it inside the pod",
+    "CW_PR_LABELS": "set by the launcher into the pod's environment from the --pr-label options (ask #2269); the end hook reads it inside the pod; no operator names it",
+    "CW_PR_RECORD": "set by the launcher into the pod's environment: the fixed path of the file the pod's client appends pull request numbers to (ask #2277); read inside the pod",
     "FLEET_CLOUD_CHANNEL_URL": "set by the launcher into an orchestrator pod's environment from the CW_HUB_CHANNEL_URL row (or its default); the cloud command reads it in the pod",
     "FLEET_CLOUD_TOKEN_FILE": "set by the launcher into an orchestrator pod's environment: the fixed path of the channel secret's file in the pod's memory-backed directory",
     "CW_REVIEW_COMMENT": "set by the launcher into the pod's environment from cloud/launcher/repo-review-comments.json (optional, per repository, absent = not set); the end hook reads it inside the pod",
@@ -730,11 +755,16 @@ def names_in(text):
     return {n.value for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Constant) and isinstance(n.value, str) and NAME.fullmatch(n.value)}
 
 
+@functools.lru_cache(maxsize=None)
+def _file_names(path):
+    with open(path) as f:
+        return frozenset(names_in(f.read()))
+
+
 def derived():
     out = set()
     for path in source_files():
-        with open(path) as f:
-            out |= names_in(f.read())
+        out |= _file_names(path)
     return out
 
 
@@ -764,9 +794,9 @@ class Complete(unittest.TestCase):
 
     def test_s16_mutant_a_made_up_environment_read_fails(self):
         for path in source_files():
-            with self.subTest(path=os.path.basename(path)), open(path) as f:
-                text = f.read() + "\nimport os\n_x = os.environ.get('CW_MADE_UP_SETTING')\n"
-                self.assertEqual(unaccounted(names_in(text)), ["CW_MADE_UP_SETTING"])
+            with self.subTest(path=os.path.basename(path)):
+                text = "\nimport os\n_x = os.environ.get('CW_MADE_UP_SETTING')\n"
+                self.assertEqual(unaccounted(_file_names(path) | names_in(text)), ["CW_MADE_UP_SETTING"])
 
     def test_s18_every_prefix_has_a_member_in_the_code_and_the_launcher_variable_is_listed_with_its_reason(self):
         for prefix in PREFIXES:
@@ -779,9 +809,9 @@ class Complete(unittest.TestCase):
     def test_s18_mutant_a_made_up_read_of_each_prefix_fails(self):
         for prefix in PREFIXES:
             for path in source_files():
-                with self.subTest(prefix=prefix, path=os.path.basename(path)), open(path) as f:
-                    text = f.read() + "\nimport os\n_x = os.environ.get('%sMADE_UP')\n" % prefix
-                    self.assertEqual(unaccounted(names_in(text)), [prefix + "MADE_UP"])
+                with self.subTest(prefix=prefix, path=os.path.basename(path)):
+                    text = "\nimport os\n_x = os.environ.get('%sMADE_UP')\n" % prefix
+                    self.assertEqual(unaccounted(_file_names(path) | names_in(text)), [prefix + "MADE_UP"])
 
     def test_s18_mutant_a_scan_restricted_to_cw_misses_the_made_up_read(self):
         """The scan a build with only the CW_ prefix would run: it finds nothing for a made-up read of the switchboard prefix, which this test calls a failure."""

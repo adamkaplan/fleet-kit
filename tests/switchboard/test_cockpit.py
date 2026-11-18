@@ -434,7 +434,7 @@ class TestBranches(Fixture):
         self.assertEqual(len(lanes), len(sb.COCKPIT_LANE_STATES))
 
     def test_a_publish_that_raises_is_reported_and_the_rest_of_the_pass_runs(self):
-        names = ["prune_delivered_reminders", "friction_tick", "load_tick", "prune_report_riders", "cloud_watch_tick", "cloud_end_tick", "cloud_turn_tick", "pod_silence_tick", "lost_worker_tick", "push_watch_tick", "publish_decisions", "schedule_judge_warm", "write_catching_up", "health_write"]
+        names = ["prune_delivered_reminders", "friction_tick", "load_tick", "prune_report_riders", "cloud_watch_tick", "cloud_end_tick", "cloud_stall_tick", "cloud_turn_tick", "pod_silence_tick", "lost_worker_tick", "push_watch_tick", "publish_decisions", "schedule_judge_warm", "write_catching_up", "health_write"]
         calls = []
         patches = [mock.patch.object(sb, n, side_effect=lambda *a, _n=n, **k: calls.append(_n)) for n in names]
         patches.append(mock.patch.object(sb, "publish_cockpit", side_effect=RuntimeError("boom")))
@@ -634,6 +634,10 @@ class TestHardening(Fixture):
             "ops\uff20example.com",                                                                   # fullwidth at-sign: email
             "ghp\uff3f" + "A" * 20,                                                                   # fullwidth underscore: a token
             ]
+
+    def setUp(self):
+        super().setUp()
+        sb._COCKPIT_EPISODE.update(unreadable=False, withheld=False)
 
     def test_nfkc_runs_before_the_patterns_and_each_sample_is_removed_only_because_of_it(self):
         for sample in self.NFKC:

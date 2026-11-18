@@ -10,14 +10,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, LAUNCHER)
+sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
+import stub_support  # noqa: E402
 import cloud_worker as cw  # noqa: E402
 
 SUB = "00000000-0000-0000-0000-000000000001"
 REFUSAL = "ERROR: (Forbidden) Client address is not authorized and caller is not a trusted service. Code: Forbidden Inner error: ForbiddenByFirewall"
 BEHAVIOURS = {
     "refuse": 'echo "%s" > /dev/stderr; exit 1' % REFUSAL,
-    "slow-refuse": 'sleep 1; echo "%s" > /dev/stderr; exit 1' % REFUSAL,
-    "slow-ok": 'sleep 1; echo "config-body"',
+    "slow-refuse": 'sleep 0.2; echo "%s" > /dev/stderr; exit 1' % REFUSAL,
+    "slow-ok": 'sleep 0.2; echo "config-body"',
     "ok": 'echo "config-body"',
     "missing": 'echo "ERROR: (SecretNotFound) A secret with (name/id) was not found in this key vault." > /dev/stderr; exit 1',
     "login": 'echo "ERROR: Please run az login to setup account." > /dev/stderr; exit 1',
@@ -163,7 +165,7 @@ def scenario_s6(t, module):
             "import types\nm = types.ModuleType('mod'); m.__file__ = %r; sys.modules['mod'] = m\nexec(compile(open(%r).read(), %r, 'exec'), m.__dict__)\n"
             "import os\ntry:\n    m.cluster_token(dict(os.environ), '20m')\nexcept m.ClusterLogin as e:\n    print(e.kind)\n") % (LAUNCHER, REAL, getattr(module, "TEXT_PATH", REAL), REAL)
     env = dict(t.env)
-    procs = [subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) for _ in range(10)]
+    procs = [stub_support.start(t, [sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) for _ in range(10)]
     outs = []
     try:
         for p in procs:
@@ -225,7 +227,7 @@ class Scenarios(Fake):
         self.expire()
         self.mode("slow-ok")
         result = []
-        probe = threading.Thread(target=lambda: result.append(self.refused()))
+        probe = threading.Thread(target=lambda: result.append(self.refused()), daemon=True)
         probe.start()
         try:
             end = time.time() + 20
@@ -254,7 +256,7 @@ class Scenarios(Fake):
         self.assertEqual(self.calls(), 2)
 
     def test_s3_a_lock_of_a_killed_command_is_ignored_at_once(self):
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = stub_support.start(self, [sys.executable, "-c", "pass"])
         dead.wait()
         os.makedirs(os.path.dirname(self.lock_path()), exist_ok=True)
         with open(self.lock_path(), "w") as f:
@@ -553,12 +555,12 @@ class ProbeLock(Fake):
              "try:\n    m.cluster_token(dict(os.environ), '20m')\n    kind = 'ok'\nexcept m.ClusterLogin as e:\n    kind = e.kind\n"
              "print('%%s %%.2f' %% (kind, time.time() - t))\n")
 
-    def run_child(self, module_text=REAL):
+    def run_child(self, module_text=REAL, timeout=10):
         """Run one command in a child with a 10 second limit; return (seconds, stderr) or (None, ...) when it had to be killed."""
         code = self.CHILD % (LAUNCHER, REAL, module_text, REAL)
         proc = subprocess.Popen([sys.executable, "-c", code], env=dict(self.env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            out, err = proc.communicate(timeout=10)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             out, err = proc.communicate()
@@ -615,7 +617,7 @@ class ProbeLock(Fake):
         with open(path, "w") as f:
             f.write(mutated)
         self.make_lock("fifo")
-        seconds, _ = self.run_child(path)
+        seconds, _ = self.run_child(path, timeout=1.5)
         self.assertIsNone(seconds, "the blocking open hangs")
 
     def test_a_clock_set_back_a_year_never_lengthens_the_block(self):

@@ -46,9 +46,9 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
 NO_COMMIT_OPTION = "--no-commit"   # the pod is launched NOT to commit (a measure or a read): the launcher sends it no wip note
 CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "persistent": "--persistent", "issue": "--issue", "no_wait": "--no-wait"}
-LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
-LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
-MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
+LAUNCHER_SHAPES = ("XS", "S", "M", "L", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
+LAUNCHER_STACK_SHAPES = ("S", "M", "L")   # the rows with stack: true; --stack with another shape is refused here, before any call
+MAX_M_PER_LANE = 10  # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -559,7 +559,7 @@ CLUSTER_NAMES = (
     "VAULT_LOCK_POLL", "VAULT_OWNER", "MAX_TOKEN_SECONDS", "HANDLED_SIGNALS", "TOKEN_CMD_SECONDS", "CLUSTER_DROP", "POD_RE", "MODEL_PROVIDER", "_LIB",
     "_lib", "_scrub_lib", "use_settings", "_OWNER_RE", "_NAME_RE", "_repo_key", "check_allowed", "_capture", "_jwt_lifetime", "_duration",
     "firewall_refused", "VaultRecovery", "_token_refusal", "cluster_token", "_cluster_token_bounded", "private_root", "_ps", "stop_recorded_tunnels",
-    "sweep_stale", "Cluster", "tunnel",
+    "sweep_stale", "Cluster", "tunnel", "_audit_model_nondefault",
     "unknown_report_to",
     "check_report_to",
 )
@@ -621,7 +621,7 @@ def stack_model_secret(env=None):
             raise Refusal("the stack model secret %s could not be read: %s; nothing was created" % (name, err.line)) from None
         ran = None
         try:
-            ran = _capture(["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
+            ran = lib.secret_or_capture(env, name, _capture, ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
                            env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
         finally:
             flight.done(ran)
@@ -729,7 +729,7 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
-    choice = H["launch_model_cloud"](args, MODEL_PROVIDER) if (getattr(args, "model", None) is not None or getattr(args, "reasoning", None) is not None) else {}   # #1642: before any setting, token or cluster call
+    choice = H["launch_model_cloud"](args, MODEL_PROVIDER, _audit_model_nondefault)   # #1642: before any setting, token or cluster call
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     issue = getattr(args, "issue", None)
@@ -738,14 +738,14 @@ def _launch(args, runner, now, reserve):
     check_allowed(repo)   # before anything is read, minted or created
     if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
         raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
-    if args.shape == "M":   # the per-lane cap on shape M: a directory read, only for a new name, before the preflight mints a token
+    if args.shape in ("M", "L"):   # the per-lane cap on shapes M and L: a directory read, only for a new name, before the preflight mints a token
         cap_state = H["ensure_state_dir"]()
         if load_record(cap_state, name) is None:
             lane = args.reports_to or "(no boss)"
-            held = lane_m_workers(cap_state, lane)
-            if len(held) >= MAX_M_PER_LANE:
-                raise Refusal("lane %s already holds %d shape-M cloud workers (%s): retire one (retire NAME) or launch a smaller shape (--shape S)"
-                              % (lane, MAX_M_PER_LANE, ", ".join(held[:10])))
+            held = lane_m_workers(cap_state, lane, args.shape)
+            if len(held) >= {"M": MAX_M_PER_LANE, "L": 2}[args.shape]:
+                raise Refusal("lane %s already holds %d shape-%s cloud workers (%s): retire one (retire NAME) or launch a smaller shape (--shape S)"
+                              % (lane, {"M": MAX_M_PER_LANE, "L": 2}[args.shape], args.shape, ", ".join(held[:10])))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -785,6 +785,7 @@ def _launch(args, runner, now, reserve):
     options += cloud_launch_again.no_wait_options(args)   # --no-wait (#1619)
     if getattr(args, "no_commit", False) or getattr(args, "role", None) in ("tester", "reviewer"):   # a measure or a read never commits
         options.append(NO_COMMIT_OPTION)
+    options += cloud_pr_labels.create_options(args)   # --pr-label (#2269)
     if persistent:   # only on request: any other launch hands the launcher exactly what it always did
         options.append(CREATE_OPTION["persistent"])
     if os.environ.get("CW_PULL_SECRET"):
@@ -822,7 +823,7 @@ def _launch(args, runner, now, reserve):
                     os.close(write_fd)
             del model, token, run_secrets
             if code != 0:
-                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160)})
+                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160), **({"boss": args.reports_to} if args.reports_to else {})})   # #2303: the launching lane
                 raise LaunchError("the cloud worker was not created: %s" % _reason(code, note))
             try:
                 password = _read_password(read_fd)
@@ -836,7 +837,7 @@ def _launch(args, runner, now, reserve):
             record = _record_from_create(name, body)
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
-            record["repo"], record["branch"] = repo, branch
+            record["repo"], record["branch"], record["issue"] = repo, branch, None if args.issue is None else int(args.issue)   # ask #2393: the issue names the ask the pod's end is posted on
             if stack_model:
                 record["stack_model_secret"], record["stack_model_key"] = stack_model[0], "delivered"   # the name and that it was delivered; nothing else
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
@@ -844,6 +845,7 @@ def _launch(args, runner, now, reserve):
                 record["reports_to"] = args.reports_to
             if isinstance(args.shape, str) and args.shape:
                 record["shape"] = args.shape
+            cloud_pr_labels.record_labels(record, args)   # #2269
             save_record(state, record)
         except (CloudError, OSError) as err:
             remove_record(state, name)
@@ -881,7 +883,7 @@ def _launch(args, runner, now, reserve):
                         raise CloudError("the hub entry could not be given the session: %s" % _reason(hcode, hnote))
                 if brief:
                     brief = _without_pod_header(brief)   # #2205: the two header lines are sent once, at the top of the preamble
-                    v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
+                    v2.prompt(session, H["setup_with_land"](SETUP_PREAMBLE, engine.config, repo) % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
             stopped = _stop_after_failure(engine, runner, name, run_id, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
             if stopped:
@@ -941,7 +943,7 @@ def _print_capacity(runner, cluster):
             body = body if code == 0 else None
         except CloudError:
             body = None
-        lines = capacity_block(body, lib.SHAPES, lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
+        lines = capacity_block(body, getattr(lib, "capacity_shapes", lambda: lib.SHAPES)(), lib._quantity, skip=(lib.DEFAULT_ORCHESTRATOR_SHAPE,))
         print("\n".join(lines), file=sys.stderr)
     except Exception:
         print("cloud capacity before the create: not read", file=sys.stderr)
@@ -981,7 +983,7 @@ def _limits_note(args, record):
         return "%dh" % (seconds // 3600) if seconds % 3600 == 0 else "%dm" % (seconds // 60) if seconds % 60 == 0 else "%ds" % seconds
     def limit(label, value, key):
         text = str(value)[:20] if value else applied(record.get(key))
-        return "%s limit %s%s" % (label, text, "" if value else " (default)" if text != "not reported" else "")
+        return "%s limit %s%s" % (label, text, "" if value else (" (default for shape L)" if getattr(args, "shape", None) == "L" and label == "hard" else " (default)") if text != "not reported" else "")
     stops = []
     for key in ("idle_deadline", "hard_deadline"):
         try:
@@ -1163,11 +1165,11 @@ def cmd_read(args, runner, now):
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
-        with Cluster() as cluster, tunnel(cluster, record) as live:
-            messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
-        for message in reversed([m for m in messages if isinstance(m, dict)]):
-            print(message_line(message))
-        return H["EXIT_OK"]
+        try:
+            with Cluster() as cluster, tunnel(cluster, record) as live:
+                messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        except Exception as err:   # ask #2392: an ended pod answers from its run record when it has one; none keeps the failure
+            return _retired().read_ended(args.name, record, state, runner, now, err)
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
         known = {} if seen else H["known_agent"](state, args.name)
@@ -1179,8 +1181,7 @@ def cmd_read(args, runner, now):
             if retired is not None:
                 return _retired().read_run_record(args.name, retired, state, runner, now)
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
-        v2 = engine.v2
-    messages = v2.message_list(session, limit=limit, order="desc") or []
+        messages = engine.v2.message_list(session, limit=limit, order="desc") or []
     for message in reversed([m for m in messages if isinstance(m, dict)]):
         print(message_line(message))
     return H["EXIT_OK"]
@@ -1429,16 +1430,15 @@ _BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
 def _final_message(engine, state, record, name, reason, body=None):
-    """Ask #1788: after a successful retire, ONE message to the recorded boss: the pod, the reason, and its last text (cut, scrubbed, framed as
-    untrusted: cloud_retired.last_message). Never raises: a failed send is said in the audit and the retire goes on."""
+    """Ask #1788: after a successful retire, ONE message to the boss with the pod's last text (cloud_retired.last_message); never raises."""
     boss = record.get("reports_to")
-    if not isinstance(boss, str) or not _BOSS_NAME_RE.fullmatch(boss):
-        return
+    boss = boss if isinstance(boss, str) and _BOSS_NAME_RE.fullmatch(boss) else None   # ask #2393: a pod without a boss still has its end posted on its ask
     try:
         where = body.get("record") if isinstance(body, dict) else None   # THIS stop's record, as the launcher's answer names it (PC-7); never a lookup by name
         block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
+        _retired().post_end(engine, state, record, name, reason, body, H["post_ask_comment"], lambda why_: _audit(engine, "cloud.end_post_failed", name, {"why": why_}), lambda why_: _audit(engine, "cloud.end_names_unchecked", name, {"why": why_}))   # ask #2393: once, on the pod's ask
         text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
-        engine.send("switchboard", boss, text)
+        boss and engine.send("switchboard", boss, text)
     except Exception as err:
         _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
 
@@ -1471,6 +1471,7 @@ def cmd_retire(args, runner, now, record):
         raise LaunchError("%s: the record is kept" % err) from None
     _audit(engine, "cloud.stopped", args.name, {"exit": code, "reason": reason, "runtime_id": record.get("runtime_id"),
                                                 "pushed": (body or {}).get("pushed"), "wip_branch": (body or {}).get("wip_branch")})
+    code, body = (0, {"pod_gone": True}) if code == 1 and _pod_is_gone(runner, record) else (code, body)   # no pod, no end hook: not a failed push (#2404)
     if code == 1:
         save = "%s-save" % args.name
         message = ("Commit the working tree of /work/repo as ONE commit on the new branch %s (a name that does not exist on origin), push it with a plain "
@@ -1552,6 +1553,7 @@ def cmd_cloud_clear(args, runner, now):
 
 # ---------------------------------------------------------------- inspect: what a pod of the caller is doing now (ask #2115, bin/cloud_inspect.py)
 
+cloud_pr_labels = _load_part("cloud_pr_labels")
 cloud_inspect = _load_part("cloud_inspect")
 for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
     globals()[_name] = getattr(cloud_inspect, _name)
@@ -1560,5 +1562,5 @@ for _name in ("INSPECT_SECONDS", "_inspect_short", "cmd_inspect"):
 # ---------------------------------------------------------------- the shape-M count of a lane (ask #2259, bin/cloud_lane_cap.py)
 
 cloud_lane_cap = _load_part("cloud_lane_cap")
-for _name in ("lane_m_workers", "_ended", "_stopped_ids"):
+for _name in ("lane_m_workers", "_ended", "_stopped_ids", "_pod_is_gone"):
     globals()[_name] = getattr(cloud_lane_cap, _name)

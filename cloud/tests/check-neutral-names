@@ -8,7 +8,7 @@ case-insensitively as a regular expression, `case:<regex>` for case-sensitive, `
 
 It builds the surfaces from the real code, then scans each one:
   image/       the image build context (Dockerfile and what it copies), plus --build-log if given
-  manifests/   cloud/k8s/*.yaml and the rendered pod spec
+  manifests/   cloud/k8s/*.yaml, cloud/k8s/patches/ and the rendered pod spec
   labels.txt   pod labels and annotations (keys and values)
   env.txt      the injected environment variables (names and values)
   logs/        the audit lines and the launcher's own output
@@ -58,7 +58,11 @@ def build_surfaces(out, build_log):
         shutil.copy(build_log, os.path.join(out, "image", "build.log"))
     k8s = os.path.join(CLOUD, "k8s")
     for f in sorted(os.listdir(k8s)) if os.path.isdir(k8s) else []:
-        shutil.copy(os.path.join(k8s, f), os.path.join(out, "manifests", f))
+        src = os.path.join(k8s, f)
+        if os.path.isdir(src):  # e.g. cloud/k8s/patches/: scan its files too
+            shutil.copytree(src, os.path.join(out, "manifests", f))
+        else:
+            shutil.copy(src, os.path.join(out, "manifests", f))
     shutil.copytree(os.path.join(CLOUD, "launcher"), os.path.join(out, "sources", "launcher"),
                     ignore=shutil.ignore_patterns("__pycache__", "tests"))
     if os.path.exists(os.path.join(CLOUD, "README.md")):

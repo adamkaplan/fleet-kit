@@ -604,18 +604,22 @@ def build(Base, TestSteerToWorking):
                 self.assertNotIn("reminder:%s" % ids[0], engine.reminder_memory, "the reminder map is not capped")
                 self.assertEqual(len(engine.reminder_memory), cap, "the reminder map is not capped")
 
+        SCALED_CAP = 50   # the eviction is the same at any cap: 51 ids against a cap of 50 take a tenth of the ledger writes that 501 against 500 take
+
         def test_low2_the_daemon_cap_is_500_after_501_ids_the_oldest_is_gone(self):
-            self.cap_engine_case(sb.Switchboard.UNCONSUMED_CAP)
+            self.assertEqual(sb.Switchboard.UNCONSUMED_CAP, 500, "the daemon's own cap")
+            self.cap_engine_case(self.SCALED_CAP)
 
         def test_low2_mutant_cap_5000_keeps_the_oldest(self):
             with open(SOURCE, encoding="utf-8") as handle:
                 text = handle.read()
             real = sb.Switchboard.UNCONSUMED_CAP
+            self.assertEqual(real, 500, "the daemon's own cap")
             old = "    UNCONSUMED_CAP = %d\n" % real
             self.assertEqual(text.count(old), 1, "the mutation did not apply")
-            self.cap_engine_case(real)   # control first
+            self.cap_engine_case(self.SCALED_CAP)   # control first
             with self.assertRaises(AssertionError) as caught:
-                self.cap_engine_case(real * 10, items=real + 1)   # the mutant: a cap ten times larger keeps the oldest
+                self.cap_engine_case(self.SCALED_CAP * 10, items=self.SCALED_CAP + 1)   # the mutant: a cap ten times larger keeps the oldest
             self.assertIn("is not capped", str(caught.exception))
 
         def scenario_cached_consumed(self):

@@ -358,6 +358,7 @@
         "bin/switchboard/faults.py",
         "bin/switchboard/shadow_classifier.py",
         "bin/switchboard/worktree_lifecycle.py",
+        "bin/switchboard/worktree_root.py",
         "bin/switchboard/review_laws.py",
         "bin/switchboard/job_runs.py",
         "bin/switchboard/standing_authority.py",
@@ -375,7 +376,9 @@
         "bin/switchboard/plan_notice.py",
         "bin/switchboard/heavy_budget.py",
         "bin/switchboard/config_reload.py",
-        "bin/switchboard/labels_ensure.py"
+        "bin/switchboard/labels_ensure.py",
+        "bin/switchboard/land.py",
+        "bin/switchboard/land_gate.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -538,16 +541,20 @@
           "merge_reminder_copies",
           "merge_wake",
           "merge_wake_facts",
+          "next_tick",
+          "note_self_wake",
           "pass_stale",
           "pass_subject",
           "read_record_file",
           "read_reminders",
-          "reminder_bound",
+          "rearm_item",
           "reminders_lock",
+          "remove_delivered",
           "remove_reminders",
-          "stale_working",
+          "self_poll_chain",
           "wake_class_of",
-          "write_reminders"
+          "write_reminders",
+          "write_text_atomic"
         ],
         "bin/switchboard/plan_review.py": [
           "ReviewError",
@@ -622,6 +629,7 @@
           "MessageTooLong",
           "Plan",
           "_line_of",
+          "bucket_target",
           "clock_day",
           "clock_utc",
           "collapse_riders",
@@ -630,11 +638,16 @@
           "decide",
           "delayed_since",
           "describe_items",
+          "fact_tier",
           "finding_part",
           "finding_parts",
           "hold_reason",
           "in_late_scope",
+          "is_orchestrator",
           "is_withdrawal",
+          "mark_bucket_targets",
+          "orchestrator_jitter",
+          "orchestrator_ready_at",
           "orders_note",
           "sent_at",
           "steers_into_turn",
@@ -685,6 +698,12 @@
           "worktree_session_in_use",
           "worktree_session_index",
           "worktree_sweep"
+        ],
+        "bin/switchboard/worktree_root.py": [
+          "_inside",
+          "_real",
+          "_root_problem",
+          "validate_worktree_root"
         ],
         "bin/switchboard/review_laws.py": [
           "_private_parse",
@@ -808,6 +827,12 @@
           "ensure_labels",
           "label_names",
           "read_open_items"
+        ],
+        "bin/switchboard/land.py": [
+          "validate_land_repos"
+        ],
+        "bin/switchboard/land_gate.py": [
+          "validate_land_gate"
         ]
       },
       "registrar_allow": {

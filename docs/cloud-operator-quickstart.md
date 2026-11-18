@@ -31,6 +31,11 @@ What the file must be (anything else refuses, naming the file and the problem, b
 
 Known limits (not checked): only the file's own directory is checked for owner and write bits, so a group-writable grandparent such as `~/.config` at `0770`, and a symlink in the directory path (it is followed), are not caught; and with `CW_CLUSTER_TOKEN_CMD` set the two vault settings are still required, validated and then unused.
 
+To point `CW_CLOUD_IMAGE` at a newly published image, run `bin/cloud_image_roll.py SOURCE@sha256:DIGEST REGISTRY TAG` (`cw-image-roll`; `--dry-run` shows the change): it copies with `crane`, compares the destination digest, and changes the one line of the file (with a backup) only when both agree.
+
+Before a roll, prove the image: `bin/cloud_image_proof.py DIGEST` (ask #2418) launches one proof pod on exactly that digest (the settings file is not touched), runs the proof set of `cloud/worker/proof-set.md`, retires the pod and writes a receipt (mode 0600) in your state directory; `bin/cloud_image_roll.py` then refuses, before any copy, an image without a revision label reachable from `origin/integration` or without a passing receipt for its digest younger than 6 hours (there is no flag to skip this).
+The proof command launches its pod with `fleet-switchboard launch --cloud` (the one command that makes the git token and the cluster login), naming the candidate image for that one launch in a scratch configuration directory (`XDG_CONFIG_HOME` of the launch only: a copy of `cloud.env` with the candidate on the `CW_CLOUD_IMAGE` line, every other entry linked), removes that directory at the end whatever the verdict, and retires the pod with `fleet-switchboard retire NAME --close`; the real settings file is never written, the brief is `cloud/worker/proof-brief.md` and the proof set's commands are ones the pod's shell rules allow (ask #2440).
+
 Create it so that nobody else can ever read it (the template is below; fill in your own values):
 
 ```sh
@@ -70,6 +75,8 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_STACK_PULL_CLIENT_ID`, `CW_STACK_PULL_TENANT_ID` | no | guid | the pull identity's client id and tenant id (GUIDs, not secrets); set together with `CW_STACK_REGISTRY` |
 | `CW_MAX_PERSISTENT` | no | number | the most persistent orchestrators the namespace holds (an integer from 1 to 20, default 2; see "A persistent orchestrator") |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
+| `CW_SECRET_DIR` | no | path | a private directory under your home (mode 0700) of files named as the vault's secrets (`cw-app-id`, `cw-app-key`, `cw-minter-kubeconfig`, ...), each mode 0600 and holding the raw secret; the vault reads then read the files, never `az`; unset, the vault is read as before |
+| `CW_AZURE_CONFIG_DIR` | no | path | the `az` sign-in directory every vault read of a launch uses: an absolute path of an existing directory; it replaces the caller's `AZURE_CONFIG_DIR` (needed when the shell's own sign-in cannot read the vault) |
 
 How the installation is found: the mint signs a short-lived App token and asks GitHub which installation covers the repository (`GET /repos/OWNER/REPO/installation`), then mints the one-repository token for that installation. The answer must be one installation whose account is the repository's owner. A repository the App is not installed on is refused before any pod is created, with a message that says so. To cover a new repository, install the App on the account that owns it (an App installed on two accounts serves both) and add the repository to the installation; nothing in the vault changes.
 
@@ -117,6 +124,10 @@ CW_CLOUD_NAMESPACE=cw
 # CW_VAULT_CHECK_DIR=/home/user/vault-check
 # optional: the most persistent orchestrators the namespace holds (1 to 20, default 2)
 # CW_MAX_PERSISTENT=2
+# optional: read the vault's secrets from 0600 files of this private directory (under your home, mode 0700) instead of the vault
+# CW_SECRET_DIR=/home/user/.cw-secrets
+# optional: the az sign-in directory every vault read uses (an absolute path of an existing directory; replaces the shell's AZURE_CONFIG_DIR)
+# CW_AZURE_CONFIG_DIR=/home/user/.azure-vault
 ```
 
 Before reading the vault, do whatever your deployment requires (for example a sign-in or an access request). This repository does not
@@ -156,7 +167,7 @@ The child sees only:
 
 `CW_GITHUB_API_BASE`, `CW_PREFLIGHT_TOKEN_CMD`, `CW_GIT_TOKEN_CMD`, proxy variables, `GH_`/`GITHUB_` token variables, `HOME` and `PATH` set in your shell are ignored by `launch --cloud` and `run-task`: nothing in the environment can point the check at another host, and your `HOME`, `PATH` and `PYTHON*` cannot run code inside it. The token route's own settings (`CW_APP_*_CMD`, `CW_OPENSSL`, `AZURE_CONFIG_DIR`) are trusted operator configuration: they are run or read as given.
 
-**The cap on shape M per lane (ask #1640).** A lane may hold at most 4 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 4 shape-M cloud workers (A, B, C, D): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
+**The cap on shape M per lane (ask #1640).** A lane may hold at most 10 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 10 shape-M cloud workers (A, B, C, D, E, F, G, H, I, J): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
 
 ## 2b. The vault access check
 
@@ -202,7 +213,7 @@ fleet-switchboard retire coder7
 
 ### The light shape (`XS`) and the other shapes
 
-A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `O` when `--shape` is not given.
+A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) and `L` (6 CPU, 16 GiB, for a land: see `cloud/README.md`) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `O` when `--shape` is not given.
 
 The orchestrator row is `O` (250m CPU, 768 MiB, 0.02 USD/hour), a list-price estimate (requests equal limits, no nested Docker). The one rule that chooses it: an orchestrator launch with no `--shape` takes `O`; an explicit `--shape S` (or `XS` or `M`) still wins; a worker launch and a stack launch are unchanged. `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory. Cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day (a list-price estimate, not a billed figure; the node's own price is not included).
 
@@ -233,7 +244,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 
 - `--stack` is handed to the launcher's `create` and only then: a launch without it builds exactly the pod it always did.
 - The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
-- With `--stack`, `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
+- With `--stack`, `--shape` is `S` (2 CPU, 4 GiB), `M` (4 CPU, 8 GiB) or `L` (6 CPU, 16 GiB). Leave it out for `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
 - The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as a retry fits in a window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); a fresh node can take 3 to 5 minutes. If the window ends, the launcher says so once (the attempts and the seconds spent) and leaves no pod. You do not retry it.
 - `--stack` needs `--cloud`, and an unknown `--shape`, and `XS`, are refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
 - `--no-commit` (with `--cloud`): the pod is launched NOT to commit (a measure or a read), and the launcher never sends it the minute-40 note that orders a push. `--role tester` and `--role reviewer` imply it.
@@ -506,7 +517,7 @@ The launcher reads the live model credential from OpenCode's own store with `ope
 
 What to know before you run it:
 
-- **A worker can read the credential.** For the life of its pod, the worker can read the one-entry array (the access entry and its refresh token) at `/run/cw/model-auth` and the store under `XDG_DATA_HOME`. The worker's shell deny rules are not a guard against that. Whether it could send the value out depends on the pod's network egress, which this change does not restrict.
+- **A worker can read the credential.** For the life of its pod, the worker can read the one-entry array (the access entry and its refresh token) at `/run/cw/model-auth` and the store under `XDG_DATA_HOME`. The pod's rules are not a guard against that. Whether it could send the value out depends on the pod's network egress, which this change does not restrict.
 - **The pod holds a snapshot taken at launch.** Nothing re-reads your store. A credential that is revoked or rotated ends that pod's turns; a refresh token you rotate afterwards is not pushed to a running pod. Launch a new run to pick it up.
 - **A stale `CW_MODEL_AUTH_FILE` is retired, and what happens depends on where it is.** In a settings file it is refused as an unknown setting. In the process environment it is silently ignored (the launcher drops it), so the credential that is active in your store is used with no message.
 - **Image and launcher must match.** An old image with the new launcher answers on the free model (it never imports the credential). The old launcher with the new image refuses at the import (`worker: the model credential import failed; refusing to start`).
@@ -634,3 +645,7 @@ The alternative causes and the read that rules each in or out:
 **What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
 
 **What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.
+
+### The image proof command reaches the cluster as `cw-operator`
+
+`bin/cloud_image_proof.py` no longer runs the plain `kubectl` with whatever sign-in your shell holds. By default it reads the minter kubeconfig (`cw-minter-kubeconfig`, from `CW_SECRET_DIR`, by the launcher's own reader) after it launches the pod, mints a short-lived `cw-operator` token with `kubectl -n <namespace> create token cw-operator` and a short `--duration`, and builds, in memory only, a small kubeconfig (the minter's server and CA, the token as the user credential, a context for the namespace) that each `kubectl` call reads through a pipe descriptor (`KUBECONFIG=/dev/fd/N`). The token is not on any command line, not in any environment variable text, not on disk and not printed; it exists in this command's memory, in the pipe, and in the memory of `kubectl` itself, which a user of the same account can read. Each call's process group is killed when the call ends. `CW_KUBECTL` still overrides this and then uses that program as it is. Every `kubectl` call runs with its input closed and a hard timeout (120 seconds; `CW_PROOF_KUBECTL_TIMEOUT` changes it). When `kubectl` cannot be used (no minter kubeconfig, a refused token, a sign-in prompt, or no answer in time) the command prints one line naming the cause, retires the proof pod it launched and exits with status 2; it never waits on a device login. `bin/cloud_image_roll.py` makes no `kubectl` call, so it is unchanged.

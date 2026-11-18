@@ -1,0 +1,1 @@
+| `cloud_image_roll.py` | 5 | the operator's image roll: copy by digest, check the destination, then change the one image line of the settings file | |

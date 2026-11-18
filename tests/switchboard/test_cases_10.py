@@ -50,7 +50,7 @@ from unittest import mock
 from support.core import Base, SAFE_PATH
 from support.fake_jev import GIT_SHIM, SHIM
 from support.installs_and_keys import GOOD_DONE_WHEN, GOOD_PLAN
-from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, sb, switchboard_source
+from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, captured, sb, switchboard_source
 from support.paths import BIN, REPO
 
 
@@ -439,11 +439,14 @@ class TestRecordJsonReaders(unittest.TestCase):
     BIN = REPO / "bin"
     # readers of record text and the shared helpers: each must call parse_bounded (the helpers ARE the parse)
     READERS = {"agent_presence.py:read_record": "agent_presence", "switchboard/reminders.py:read_reminders": "reminders",
-               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry"}
+               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry",
+               "switchboard/decisions_a.py:read_escalated_checked": "decisions_a"}
     HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
     # path_suites.py:check_manual and load_manual read the repository's OWN checked-in manual (tools/path-suites.json), a trusted repo file, not untrusted record text
+    # cloud_image_proof.py:prove, _prove_in (the launcher's own one-line stdout, size-bounded), read_revision and cloud_image_roll.py:check_gate read the output of a command they ran (`crane config`, the launcher's `--json` answer), not a record file another process writes (#2391, #2418)
+    # cloud_image_proof.py:operator_config parses the output of `kubectl config view --minify --raw -o json` (a command the proof ran against the minter kubeconfig, size-bounded by kube_run), not a record file another process writes; it reads only clusters[0].cluster (server, CA) (ask #2440)
     # cloud_lane_cap.py:_stopped_ids is the launcher audit tail, read-only, to free a stopped worker's shape-M slot (#2259)
     EXEMPT = """
 agent_calls.py:_read_json
@@ -460,6 +463,10 @@ cloud_lane_cap.py:_stopped_ids
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
+cloud_image_proof.py:_prove_in
+cloud_image_proof.py:operator_config
+cloud_image_proof.py:read_revision
+cloud_image_roll.py:check_gate
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
 cloud_way_back_check.py:main
@@ -484,6 +491,7 @@ switchboard/plan_notice.py:__init__
 fleet-switchboard:_api
 switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
+fleet-switchboard:_forwarder_hooks
 switchboard/docker_reaper.py:_docker_inspect
 switchboard/caches.py:_fresh
 switchboard/docker_reaper.py:_last
@@ -1384,6 +1392,8 @@ class TestArchitectureSafetyNet(unittest.TestCase):
     TOOLS = REPO / "tools"
     BEFORE = "A = 1\n\n\ndef one():\n    return 1\n\n\ndef two():\n    return 2\n"
 
+    _TOOLS_LOADED = {}
+
     def load(self, name):
         loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(self.TOOLS / name))
         module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
@@ -1401,9 +1411,12 @@ class TestArchitectureSafetyNet(unittest.TestCase):
                 path.write_text(text)
                 paths.append(str(path))
             sides.append(paths)
-        proc = subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check"), "--before"] + sides[0] + ["--after"] + sides[1],
-                              capture_output=True, text=True)
-        return proc.returncode, proc.stdout
+        if "arch-split-check" not in self._TOOLS_LOADED:   # the tool is loaded once and its main runs in this process
+            self._TOOLS_LOADED["arch-split-check"] = self.load("arch-split-check")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self._TOOLS_LOADED["arch-split-check"].main(["--before"] + sides[0] + ["--after"] + sides[1])
+        return code or 0, out.getvalue()
 
     def test_a_move_across_files_and_a_reorder_pass(self):
         code, out = self.split_check([self.BEFORE], ["def two():\n    return 2\n", "A = 1\n\n\ndef one():\n    return 1\n"])
@@ -1466,11 +1479,11 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         helps = [command for command in commands if command[-1] == "--help"]
         verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
         self.assertGreater(len(verbs), 40)
-        first = record([[verb, "--help"] for verb in verbs])   # the --help of every verb, recorded once; the full run of every command is golden-cli compare's job
+        # the --help of every verb is no longer recorded here (the recording was never compared: the run of every command is golden-cli compare's job); the list is checked below
         listed = {tuple(c) for c in commands}
         for verb in verbs:
             self.assertIn((verb, "--help"), listed, "the command list has no --help of the verb %s" % verb)
-        sample = helps[:4] + helps[-4:] + commands[-4:]   # a small fixed sample, recorded a second time
+        sample = helps[:1] + commands[-1:]   # a small fixed sample, recorded twice (#2525)
         self.assertEqual(golden.differences(record(sample), record(sample)), [], "two recordings of one entry differ")
 
     def fake_repo(self, text):
@@ -1678,6 +1691,16 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno <= line <= n.end_lineno]
         return min(spans)[1] if spans else None
 
+    _SITES_CACHE = {}   # (path, text) -> the bare gh sites found in it
+    _AST_CACHE = {}   # (path, text) -> its tree: the scan only reads a tree, and the 26k-line daemon file is parsed once for every test of the class
+
+    @classmethod
+    def parsed(cls, path, text):
+        key = (path, text)
+        if key not in cls._AST_CACHE:
+            cls._AST_CACHE[key] = ast.parse(text)
+        return cls._AST_CACHE[key]
+
     @classmethod
     def bare_gh_sites(cls, sources):
         """(path, line) of every place a command is built whose first argv element is the literal "gh". CLOSED rule, by AST over `sources` ({path: text}):
@@ -1690,17 +1713,22 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         config["gh"] (own_gh_path) and by the behaviour tests around it, which this scan does not replace."""
         found = []
         for path, text in sources.items():
-            tree = ast.parse(text)
+            if (path, text) in cls._SITES_CACHE:   # a source the scan has already walked (the same text) gives the same sites: only a mutated file is walked again
+                found.extend(cls._SITES_CACHE[(path, text)])
+                continue
+            tree, here = cls.parsed(path, text), []
             for node in ast.walk(tree):
                 if isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == "gh":
                     if (path, cls.enclosing_function(tree, node.lineno)) in cls.ALLOWED_BARE_GH:
                         continue
-                    found.append((path, node.lineno))
+                    here.append((path, node.lineno))
                 elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     fn = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
                     first = node.args[0].value
                     if fn in cls.SUBPROCESS_CALLS and (first == "gh" or first.startswith("gh ")):
-                        found.append((path, node.lineno))
+                        here.append((path, node.lineno))
+            cls._SITES_CACHE[(path, text)] = here
+            found.extend(here)
         return found
 
     def test_no_bare_gh_argv_remains_in_the_switchboard_sources(self):
@@ -1715,7 +1743,7 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         for (path, name), (argv, reason) in sorted(self.ALLOWED_BARE_GH.items()):
             self.assertIn(path, self.BARE_GH_SOURCES)
             self.assertTrue(reason)
-            tree = ast.parse((REPO / path).read_text())
+            tree = self.parsed(path, (REPO / path).read_text())
             funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
             self.assertEqual(len(funcs), 1, "the allowed function %s is not in %s" % (name, path))
             lists = [n for n in ast.walk(funcs[0]) if isinstance(n, ast.List) and n.elts and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "gh"]
@@ -1736,7 +1764,9 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         for path, old, new in (("bin/fleet-switchboard", 'runner([ctx.config["gh"], "pr", "diff", str(ctx.number)', 'runner(["gh", "pr", "diff", str(ctx.number)'),
                                ("bin/fleet-switchboard", 'runner([real_gh, "pr", "view"', 'runner(["gh", "pr", "view"')):
             self.assertIn(old, sources[path])
-            mutant = dict(sources, **{path: sources[path].replace(old, new, 1)})
+            idx = sources[path].index(old)
+            snippet = "def _mut_probe(runner, ctx, real_gh):\n    " + sources[path][idx:sources[path].find("\n", idx)].replace(old, new, 1) + "\n"
+            mutant = dict(sources, **{path: snippet})
             self.assertEqual(len(self.bare_gh_sites(mutant)), 1, old)
         self.assertIn("bin/ci_runs.py", sources)
         old = 'subprocess.run([GH, "api", "repos/%s/actions/runs/%d"'
@@ -1789,10 +1819,14 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
                 sb.own_gh_path("gh", {"PATH": str(shimdir), "FLEET_REAL_GH": str(shimdir / "gh")})
             with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
                 sb.own_gh_path(str(shimdir / "gh"), {"PATH": str(shimdir)})
-            done = subprocess.run([sys.executable, str(SWITCHBOARD), "run", "--once"], capture_output=True, text=True, timeout=60,
-                                  env={"PATH": str(shimdir), "HOME": tmp, "XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp})
-            self.assertNotEqual(done.returncode, 0)
-            self.assertIn("no real gh behind the shim", done.stderr)
+            environ = {"PATH": str(shimdir), "HOME": tmp, "XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp}
+            with mock.patch.dict(os.environ, environ, clear=True), captured() as (out, err):   # the entry's main in this process: no interpreter start and import
+                try:
+                    code = sb.main(["run", "--once"])
+                except SystemExit as stop:
+                    code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+            self.assertNotEqual(code, 0)
+            self.assertIn("no real gh behind the shim", err.getvalue())
 
     def test_an_absolute_real_gh_is_used_as_it_is_and_a_real_gh_behind_the_shim_is_found(self):
         with tempfile.TemporaryDirectory() as tmp:

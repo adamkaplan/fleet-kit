@@ -1817,9 +1817,10 @@ API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|
 REST_SIGNED_METHODS = {label: ("POST", "PATCH", "DELETE") for label, _p in SIGNED_API + SIGNED_API_MORE}   # every signed shape: the old tests use POST, PATCH and DELETE on all of them
 REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned REST write shapes lanes use (N, NAME: one path segment)
     ("issue-create", r"issues", ("POST",)), ("issue-update", r"issues/[^/]+", ("PATCH", "POST")), ("issue-labels", r"issues/[^/]+/labels", ("POST", "PUT", "DELETE")),
-    ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)),
+    ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)), ("sub-issue-unlink", r"issues/[0-9]+/sub_issue", ("DELETE",)),   # ask #2475: unlink ONE sub-issue (closed ones still count toward GitHub's 100 limit); the one field sub_issue_id=N is checked in api_decide
     ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)), ("label-delete", r"labels/[^/]+", ("DELETE",)),
-    ("deployment-gate", r"actions/runs/[0-9]+/pending_deployments", ("POST",)))   # approving a deployment gate: its 'comment' field is not a comment body
+    ("deployment-gate", r"actions/runs/[0-9]+/pending_deployments", ("POST",)),   # approving a deployment gate: its 'comment' field is not a comment body
+    ("webhook-delete", r"hooks/[0-9]+", ("DELETE",)))   # a `cli` hook with the forwarder url (any forwarder's, not only the caller's): shims/gh_body.py reads the hook first and passes only a `cli` hook with the forwarder url
 
 
 def api_scan(args, headers=None):
@@ -2115,6 +2116,8 @@ def api_decide(args, namer, previous):
             api_refuse_unknown(effective or "(no method)", "the endpoint (%s)" % raw[:60])
         if effective not in found[1]:
             api_refuse_unknown(effective or "(no method)", "the endpoint %s (%s allows %s)" % (raw[:60], found[0], "/".join(found[1])))
+        if found[0] == "sub-issue-unlink" and (has_input or "?" in raw or len(raw_positionals) != 1 or len(fields) != 1 or not re.fullmatch(r"sub_issue_id=[0-9]+", fields[0])):
+            raise Refused("a DELETE of issues/N/sub_issue passes only as `gh api -X DELETE repos/O/R/issues/N/sub_issue -F sub_issue_id=NUMBER` (that one field, no --input, no query string)")
         if found[2] and effective in ("POST", "PATCH"):
             query = raw.partition("#")[0].partition("?")[2]
             query_keys = [urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query) if part]
@@ -2941,11 +2944,32 @@ def hold_probe(args, lookup, gh, write):
         return (RETRY_HOLD if write else None), None, None
 
 
+def body_read_env(gh, lookup, args, write):
+    """The env_of of the body guard's read: the account of the write it guards, worked out ONCE (a failure too, which is raised again, not looked up again), strictly
+    like the write (#2256). A lookup that fails is retried once with a fresh deadline and then raises; the guard turns that into a refusal of the write that names the
+    exception's type. It never leaves a WRITE's read to the inherited or stored login, which may be an account that cannot read the repository (HTTP 404, exit 1)."""
+    done = []
+
+    def env_of():
+        if not done:
+            try:
+                try:
+                    done.append((account_env(gh, lookup, strict=write, args=args), None))
+                except AccountLookupFailed:   # only a strict (write) lookup raises this
+                    done.append((account_env(gh, Lookup(write=True), strict=True, args=args), None))
+            except Exception as err:
+                done.append((None, err))
+        if done[0][1] is not None:
+            raise done[0][1]
+        return done[0][0]
+    return env_of
+
+
 def body_probe(args, gh, write, lookup):   # #1751: gh_body.py beside this file, loaded by path; a WRITE it cannot load or run is refused
     try:
         spec = importlib.util.spec_from_file_location("gh_body", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gh_body.py"))
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-        return module.guard(args, write, api_parsed, gh, lambda: account_env(gh, lookup, args=args))
+        return module.guard(args, write, api_parsed, gh, body_read_env(gh, lookup, args, write))
     except Exception:
         return "gh: refused: the body guard could not be loaded, retry" if write else None
 

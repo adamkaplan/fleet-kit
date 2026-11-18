@@ -96,7 +96,7 @@ def ttl_text(seconds):
     return "%ds" % seconds
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None, ttl=None):
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None, ttl=None, every=None, check_chain=False):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
@@ -113,8 +113,13 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
         item["key"] = key
     if ttl:
         item["ttl"] = int(ttl)   # #1563: seconds after `at` past which the copy is dropped, audited
+    if every:
+        item["every"] = int(every)   # #2544: seconds; the daemon arms the next tick on the 15-minute UTC grid when this one is delivered
     with reminders_lock(state_dir):
         items = read_reminders(state_dir)
+        refusal = self_poll_chain(state_dir, sender, to, at, created, bool(key or every)) if check_chain else None   # #2544: check and write are one critical section
+        if refusal:
+            raise ReminderError(refusal)
         if key and isinstance(sender, str) and sender.strip():   # one pending per owner and key; another owner or key, a fired one and a sender-less one are never touched
             items = [i for i in items if not (i.get("key") == key and i.get("from") == sender and i.get("at", 0) > created)]
         write_reminders(state_dir, items + [item])
@@ -564,7 +569,7 @@ class ReminderFacts:
         return "%s (%s)" % (item["text"], tail)
 
     def verdict(self, item):
-        """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
+        """For a due conditional reminder: None (the condition is unreadable: it delivers, audited as reminder.condition_unreadable), "deliver", or the reason to drop it.
         One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
         condition, discovery = item["condition"], self.engine.discovery if self.engine else None
         moot = self.until_holds(condition)
@@ -600,30 +605,6 @@ class ReminderFacts:
         if any(r.get("from") == worker and r["to"] == item["to"] and r["created"] >= since for r in riders):
             return "%s reported to %s since the launch" % (worker, item["to"])
         return "deliver"
-
-    def says_again(self, item_id, reason, now):
-        """#1728: True when `reminder.waiting` is to be written for this reminder now: the first time, a changed reason, or every WAITING_REPEAT seconds."""
-        said = self.__dict__.setdefault("_said", {})
-        before = said.get(item_id)
-        if before is not None and before[0] == reason and 0 <= now - before[1] < WAITING_REPEAT:
-            return False
-        if len(said) > 1000:
-            said.clear()
-        said[item_id] = (reason, now)
-        return True
-
-    def waiting(self, item_id, recipient, due, reason):
-        """#1728: one `reminder.waiting` audit line (id, recipient, minutes past due, a one-line reason) for a due reminder not delivered in this pass."""
-        if self.engine is None or self.engine.audit is None:
-            return
-        now, reason = self.engine.now(), _one_line(reason, 160)
-        if self.says_again(item_id, reason, now):
-            self.engine.audit.append(self.engine.actor, "reminder.waiting", recipient,
-                                     {"id": item_id, "late_min": max(0, int((now - due) // 60)), "reason": reason})
-
-    def ceiling(self, plan, now):
-        """#1728: the ceiling step of one plan (see `ceiling_wake`)."""
-        return ceiling_wake(self.engine, self, plan, now)
 
     def notify_drop(self, item, why):
         """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
@@ -697,6 +678,38 @@ class ReminderFacts:
             write_reminders(self.state_dir, [i for i in items if i["id"] != item_id])
         return kept["id"]
 
+    def release(self, discovery, now):
+        """#2243, amendment 2: at its due time a reminder is handed to the ordinary send path (`send_fact`), once per pass and recipient: every due
+        reminder of a lane goes in ONE message, queued behind a real turn, a new turn when the lane is idle, steered as a send is steered. There is no
+        batch window and no wait of its own. What was delivered leaves the store at once. A lane that is gone or cannot be written to now (held) keeps
+        its reminders in the store, as a send to it is held. Returns the outcomes (with the recipient)."""
+        engine, outcomes = self.engine, []
+        by_recipient = {}
+        for fact in self():
+            if getattr(fact, "wake_class", None):
+                continue   # a load alert is a member of its lane's ONE wake message (merge_wake_facts): the wake path delivers it, `prune_delivered_reminders` forgets it
+            by_recipient.setdefault(fact.recipient, []).append(fact)
+        for recipient in sorted(by_recipient):
+            if recipient not in discovery.agents:
+                continue
+            first, rest = by_recipient[recipient][0], by_recipient[recipient][1:]
+            try:
+                outcome = engine.send_fact(first, discovery, now, carried=rest)
+            except Exception as err:   # the reminders stay in the store: the next pass hands them over again
+                engine._note("reminder.release_error", recipient, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+                continue
+            if outcome.get("sent"):
+                gone = [k[len("reminder:"):] for k in outcome.get("keys", []) if str(k).startswith("reminder:")]
+                gone += [m[len("reminder:"):] for f in by_recipient[recipient] for m in (getattr(f, "members", None) or []) if str(m).startswith("reminder:")]
+                if gone:
+                    self.audit_rearmed(remove_delivered(self.state_dir, set(gone), now)[2])   # #2544: an `--every` one arms its next tick first
+            outcomes.append(dict(outcome, recipient=recipient))
+        return outcomes
+
+    def audit_rearmed(self, armed):
+        for item in armed if self.engine is not None and self.engine.audit is not None else ():
+            self.engine.audit.append(self.engine.actor, "reminder.rearm", item["to"], {"id": item["id"], "at": iso(item["at"]), "key": _one_line(item.get("key") or "", 60)})
+
     def __call__(self):
         self.swept.clear()   # #1711: a pass starts here (each source is read once per pass), so `swept` holds only this pass's ids
         facts = []
@@ -709,8 +722,8 @@ class ReminderFacts:
                                              {"id": item["id"], "due": iso(item["at"]), "ttl": int(ttl)})
                 continue
             kept = self.superseded(item, everything)
-            if kept is not None and kept.get("condition") and self.verdict(kept) != "deliver":
-                kept = None   # the newer one is gated or unresolved: it may not be delivered, so deliver the older
+            if kept is not None and kept.get("condition") and self.verdict(kept) not in ("deliver", None):
+                kept = None   # the newer one is gated by a met condition: it will not be delivered, so deliver the older (#2243: an unreadable condition delivers, so the newer replaces the older)
             if kept is not None:
                 if drop_superseded_item(self.state_dir, item["id"], kept["id"]) and self.engine is not None and self.engine.audit is not None:
                     self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],
@@ -719,18 +732,10 @@ class ReminderFacts:
             unreadable = False
             if item.get("condition"):
                 found = self.verdict(item)
-                unreadable = found is None and self.engine is not None and self.engine.now() - item["at"] > reminder_bound(self.engine.config, item)   # #1728 ceiling: a condition that cannot be read does not hold a due reminder past its bound
-                if unreadable:
-                    found = "deliver"
-                    done = self.__dict__.setdefault("_ceiled_unreadable", set())   # once per id, on the ReminderFacts instance like ceiling_wake's _ceiled (never on the shared engine)
-                    if len(done) > 1000:
-                        done.clear()
-                    if self.engine.audit is not None and item["id"] not in done:
-                        done.add(item["id"])
-                        self.engine.audit.append(self.engine.actor, "reminder.ceiling", item["to"], {"id": item["id"], "why": "condition unreadable"})
-                if found is None:
-                    self.waiting(item["id"], item["to"], item["at"], "condition unreadable")
-                    continue
+                if found is None:   # #2243: the condition is checked ONCE, at the due time: one that cannot be read now does not hold the reminder
+                    found, unreadable = "deliver", True
+                    if self.engine is not None and self.engine.audit is not None:
+                        self.engine.audit.append(self.engine.actor, "reminder.condition_unreadable", item["to"], {"id": item["id"]})
                 if found != "deliver":
                     gone = remove_reminders(self.state_dir, {item["id"]})
                     if gone and self.engine is not None and self.engine.audit is not None:
@@ -753,50 +758,9 @@ class ReminderFacts:
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
             facts[-1].reminder_text = raw_text
             facts[-1].delayed = late > DELAYED_MARK_SECONDS
-            facts[-1].bound = reminder_bound(self.engine.config if self.engine else {}, item)   # #1728: read by steers_into_turn
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts
-
-
-WAITING_REPEAT = 1800   # #1728: seconds between two `reminder.waiting` lines for the same reminder and reason
-
-
-def stale_working(engine, observation, facts):
-    """#2243: herdr reads 'working' but v2 runs no turn for the session (session.active does not list it) and the turn has not started
-    within the reminder bound (turn-start.json: the daemon first saw 'working' longer ago than the bound; an unknown age is young): the
-    status is stale. A wake with a reminder (alone or mixed with other facts) is then a NEW turn, never queued behind a turn that is not
-    running. An unreadable answer is not stale."""
-    try:
-        if getattr(observation, "status", None) != "working" or not any(f.kind == "reminder" for f in facts or []):
-            return False
-        v2 = getattr(engine, "v2", None)
-        active = v2.session_active() if v2 is not None else None
-        if not isinstance(active, dict) or active.get(observation.session_id) or engine.state_dir is None:
-            return False
-        bound = min([getattr(f, "bound", None) or 600 for f in facts if f.kind == "reminder"])
-        age = load_module("turn_start").age(engine.state_dir, observation.session_id, engine.now(), load_module("record_json").parse_bounded)
-        return age is not None and age > bound
-    except Exception:
-        return False
-
-
-def waiting_reason(engine, plan, now):
-    """#1728: why the reminders of this plan do not reach the lane now, or None (a wake that goes in at once, or a steer)."""
-    if plan.action != "wake":
-        return "%s: %s" % (plan.action, plan.reason)
-    observation = plan.observation
-    if observation is None or observation.status != "working" or stale_working(engine, observation, plan.pending):
-        return None
-    age = None
-    try:
-        if engine.config.get("steer_after_minutes") and engine.state_dir is not None:
-            age = load_module("turn_start").age(engine.state_dir, observation.session_id, now, load_module("record_json").parse_bounded)
-    except Exception:
-        age = None
-    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age, now):
-        return None
-    return "lane in a turn of %d minutes, queued" % (age // 60) if age is not None else "lane in a turn of unknown length, queued"
 
 
 def reminder_bound(config, item):
@@ -858,56 +822,125 @@ def late_reminder_lines(state_dir, config, now):
     return ["      reminders  %s: %d later than the bound in 24h" % (lane, n) for lane, n in sorted(late_reminder_counts(state_dir, config, now).items())]
 
 
-def ceiling_wake(engine, source, plan, now):
-    """#1728 ceiling: a due reminder of this lane past its bound that this pass would not admit (a batch window) turns the plan into a queued wake,
-    carrying every pending fact of the lane, with one `reminder.ceiling` audit line per reminder. A wake already planned (queued behind a turn) is
-    delivered by this very pass: only the line is written. A held lane is left alone. Returns the ids written."""
-    if plan.action not in ("wait", "wake"):
-        return []
-    items = {i["id"]: i for i in read_reminders(source.state_dir)}
-    late = [(f, items[f.key[len("reminder:"):]]) for f in plan.pending
-            if str(f.key).startswith("reminder:") and f.key[len("reminder:"):] in items]
-    over = [(f, i) for f, i in late if now - i["at"] > reminder_bound(engine.config, i)]
-    done = source.__dict__.setdefault("_ceiled", set())
-    over = [(f, i) for f, i in over if i["id"] not in done]
-    if not over:
-        return []
-    if plan.action == "wait":
-        for fact in plan.pending:
-            fact.batch = False
-        plan.action, plan.reason = "wake", "ceiling: a due reminder is past its bound"
-    for _, item in over:
-        if len(done) > 1000:
-            done.clear()
-        done.add(item["id"])
-        if engine.audit is not None:
-            engine.audit.append(engine.actor, "reminder.ceiling", plan.recipient,
-                                {"id": item["id"], "late_min": max(0, int((now - item["at"]) // 60)),
-                                 "bound_min": int(reminder_bound(engine.config, item) // 60), "delivery": "queued wake"})
-    return [i["id"] for _, i in over]
+# ---- #2544: recurring reminders sit on the 15-minute UTC grid; a one-off stays exact
+GRID_SECONDS = 900
+SELF_WAKE_FILE = "self-wakes.json"   # {name: {"at": when a self-set reminder was delivered}}
+PROTECTED_ROLES = ("chief-of-staff", "orchestrator")
 
 
-def invariant_break(source, plan, now):
-    """#1728 invariant: the unconditional, unexpired due reminders of this lane that are not in its pending facts (an empty list: it holds)."""
-    have = {f.key for f in plan.pending}
-    return [i for i in source.due() if i["to"] == plan.recipient and not i.get("condition") and not i.get("key") and not i.get("ttl")
-            and "reminder:" + i["id"] not in have]
+def grid_when(text, now):
+    """`--key` / `--every` time: a delay under 15m is refused, a longer one snaps UP onto :00/:15/:30/:45 UTC, an ISO time must be future and on the grid."""
+    at = parse_when(text, now)
+    if re.fullmatch(r"\+?[0-9]+[smhd]", text.strip()):
+        if at - now < GRID_SECONDS:
+            raise ReminderError("a --key or --every reminder needs at least 15m (got %r): use 15m or more, or arm upfront one-shots without --key" % text[:40])
+        return float((int(at // GRID_SECONDS) + (1 if at % GRID_SECONDS else 0)) * GRID_SECONDS)
+    if at <= now:
+        raise ReminderError("a --key or --every reminder at an explicit time must be in the future, got %r" % text[:40])
+    if at % GRID_SECONDS:
+        raise ReminderError("a --key or --every reminder at an explicit time must fall on :00, :15, :30 or :45 UTC with :00 seconds, got %r" % text[:40])
+    return at
 
 
-def reminder_waiting(engine, plan, now):
-    """#1728: the audit line for each due reminder in `plan` that is not delivered in this pass. Never raises: it must not stop a delivery."""
+def parse_every(text):
+    """`--every 30m`: seconds, at least 15m and a multiple of 15m."""
+    match = re.fullmatch(r"([0-9]{1,6})([mhd])", str(text).strip())
+    seconds = int(match.group(1)) * REMINDER_UNITS[match.group(2)] if match else 0
+    if seconds < GRID_SECONDS or seconds % GRID_SECONDS:
+        raise ReminderError("--every must be a multiple of 15m, at least 15m (15m, 30m, 1h, 2h, 1d), got %r" % str(text)[:40])
+    return seconds
+
+
+def next_tick(at, every, now):
+    """The first tick after `now` of the series at, at+every, ...: anchored to the schedule, so a late delivery never drifts."""
+    return at + max(1, int((now - at) // every) + 1) * every
+
+
+def rearm_item(item, now):
+    """The next tick of a delivered `--every` reminder, or None."""
+    if not _is_number(item.get("every")) or item["every"] < GRID_SECONDS:
+        return None
+    return dict(item, id=uuid.uuid4().hex[:12], at=float(next_tick(item["at"], item["every"], now)), created=float(now))
+
+
+def note_self_wake(state_dir, name, now):
+    """Remember that a self-set reminder reached `name` at `now` (read by `self_poll_chain`)."""
+    with reminders_lock(state_dir):
+        known = read_record_file(Path(state_dir) / SELF_WAKE_FILE)
+        known = {k: v for k, v in (known if isinstance(known, dict) else {}).items()
+                 if isinstance(v, dict) and _is_number(v.get("at")) and now - v["at"] < 2 * GRID_SECONDS}
+        known[name] = {"at": float(now)}
+        write_text_atomic(Path(state_dir) / SELF_WAKE_FILE, json.dumps(known, sort_keys=True))
+
+
+def write_text_atomic(path, text):
+    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
-        source = next((s for s in engine.sources if isinstance(s, ReminderFacts)), None)
-        mine = [f for f in plan.pending if str(f.key).startswith("reminder:")]
-        reason = waiting_reason(engine, plan, now) if source is not None and mine else None
-        for fact in mine if reason else ():
-            source.waiting(fact.key[len("reminder:"):], plan.recipient, fact.created, reason)
-        if source is not None and plan.action != "hold":
-            for item in invariant_break(source, plan, now):
-                source.waiting(item["id"], plan.recipient, item["at"], "invariant broken: a due reminder of a lane neither held nor cancelled is not a pending fact")
-            source.ceiling(plan, now)
-    except Exception:
-        pass
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temp), str(path))
+    finally:
+        if os.path.exists(str(temp)):
+            os.unlink(str(temp))
+
+
+def self_poll_chain(state_dir, sender, to, at, now, keyed):
+    """The refusal text for an unkeyed self-reminder under 15m armed within 15m of waking from a self-reminder (a polling chain), else None.
+    Upfront one-shots and launch checkpoint reminders (set by the boss) pass."""
+    if keyed or not (isinstance(sender, str) and sender.strip() and sender == to) or at - now >= GRID_SECONDS:
+        return None
+    last = (read_record_file(Path(state_dir) / SELF_WAKE_FILE) or {}).get(sender)
+    woke = [last["at"]] if isinstance(last, dict) and _is_number(last.get("at")) else []
+    woke += [i["at"] for i in read_reminders(state_dir) if i.get("from") == i.get("to") == sender and i["at"] <= now]
+    if any(0 <= now - w < GRID_SECONDS for w in woke):
+        return ("you woke from a reminder you set for yourself less than 15m ago and this arms another under 15m: that is a self-polling chain. "
+                "Use --key with --every (15m or more, on :00/:15/:30/:45 UTC), or arm one-shots upfront (+5m, +15m, +30m) before the first fires")
+    return None
+
+
+def remove_delivered(state_dir, ids, now, extra=()):
+    """One locked step for delivered reminders (`ids`) and ones to drop (`extra`): an `--every` one still in the file arms its next tick first (a
+    cancelled one is never brought back; a newer pending one of the same key and sender wins), a self-reminder is noted as a wake.
+    Returns (delivered ids removed, extra ids removed, next-tick items armed)."""
+    ids, extra, armed, woke = set(ids), set(extra) - set(ids), [], set()
+    with reminders_lock(state_dir):
+        items = read_reminders(state_dir)
+        for item in (i for i in items if i["id"] in ids):
+            if item.get("from") == item["to"]:
+                woke.add(item["to"])
+            nxt = rearm_item(item, now) if item.get("every") else None
+            if nxt and not any(i.get("key") == nxt.get("key") and i.get("from") == nxt.get("from") and i["id"] not in ids and i["at"] > now for i in items):
+                armed.append(nxt)
+        gone, dropped = [i["id"] for i in items if i["id"] in ids], [i["id"] for i in items if i["id"] in extra]
+        if armed or dropped:
+            write_reminders(state_dir, [i for i in items if i["id"] not in ids | extra] + armed)
+    if not (armed or dropped):
+        gone = remove_reminders(state_dir, ids) if ids else []
+    for name in sorted(woke):
+        note_self_wake(state_dir, name, now)
+    return gone, dropped, armed
+
+
+def retired_orphans(state_dir, discovery, items):
+    """Ids of reminders for a retired worker (or its `--every` chain): never a registered, live or chartered name."""
+    reg = load_module("registry").read(state_dir) if discovery is not None and not getattr(discovery, "problems", None) else {}
+    if not reg.get("whole"):
+        return []   # a partial look at the fleet (or an unreadable registry) never prunes
+    gone = []
+    for item in items:
+        for who, chain_only in ((item.get("to"), False), (item.get("from"), True)):
+            entry = reg["retired"].get(who)
+            if not isinstance(entry, dict) or not entry.get("session") or who in reg["agents"] or who in discovery.agents or who in PROTECTED_ROLES or (chain_only and not item.get("every")):
+                continue
+            record = entry["record"] if isinstance(entry.get("record"), dict) else {}
+            if record.get("charter") or record.get("role") in PROTECTED_ROLES or record.get("kind") == "orchestrator":
+                continue
+            gone.append(item["id"])
+            break
+    return gone
 
 
 def prune_delivered_reminders(engine, discovery):
@@ -928,9 +961,12 @@ def prune_delivered_reminders(engine, discovery):
         except V2Error:
             continue
         delivered += [item["id"] for item in items if "reminder:" + item["id"] in keys]
-    gone = remove_reminders(source.state_dir, set(delivered)) if delivered else []
-    if gone and engine.audit is not None:
-        engine.audit.append(engine.actor, "reminder.prune", None, {"ids": gone})
+    orphans = retired_orphans(source.state_dir, discovery, read_reminders(source.state_dir))
+    gone, dropped, armed = remove_delivered(source.state_dir, set(delivered), engine.now(), orphans) if delivered or orphans else ([], [], [])
+    source.audit_rearmed(armed)
+    for event, found in (("reminder.prune", gone), ("reminder.prune_orphans", dropped)):   # audited after the removal, each only for its own ids
+        if found and engine.audit is not None:
+            engine.audit.append(engine.actor, event, None, {"ids": found})
     return gone
 
 

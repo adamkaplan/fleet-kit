@@ -31,7 +31,7 @@ class Route(unittest.TestCase):
     setUp = ta.Mint.setUp
 
     def env(self):
-        return dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
+        return dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.fast_openssl)
 
     def run_it(self, args, path=MINT, fds=()):
         """(completed process with its real stdout and stderr, nothing else): the mint run with args and the descriptors in fds inherited."""
@@ -331,7 +331,6 @@ class Route(unittest.TestCase):
         "cloud/launcher/tests/test_issues_read.py": "in process and fd",
         "cloud/launcher/tests/test_mint_retry.py": "in process",
         "cloud/launcher/tests/test_mint_roles.py": "argv (a fake mint records it)",
-        "cloud/launcher/tests/test_no_open_files.py": "text (a file list)",
         "cloud/launcher/tests/test_preflight.py": "in process",
         "cloud/launcher/tests/test_token_at_limit.py": "text (reads the mint source)",
         "docs/agent-credentials.md": "text",
@@ -359,7 +358,7 @@ class Route(unittest.TestCase):
         for name in sorted(found - set(self.CALLERS)):
             with open(os.path.join(ROOT, name), errors="replace") as f:
                 for line in f:
-                    if "app_token.py" in line and re.search(r"subprocess|check_output|capture_output|\$\(|`|Popen", line):
+                    if re.search(r"(?<![_\w])app_token\.py", line) and re.search(r"subprocess|check_output|capture_output|\$\(|`|Popen", line):
                         self.assertTrue("--fd" in line or "--out" in line, "%s runs the mint without a route: %s" % (name, line.strip()))
         self.assertFalse([f for f, route in self.CALLERS.items() if "stdout" in route.replace("an override prints on stdout", "")])
 

@@ -1,0 +1,209 @@
+# The Copilot bridge (ask #2341): one Deployment (1 replica: copilot-api 0.7.0 on the loopback plus the policy front), a ClusterIP Service
+# (the front's port only) and a NetworkPolicy that admits only the cluster's worker pods. Image: cloud/copilot-bridge/Dockerfile.
+# NO Secret value is here. The owner's steps are in cloud/README.md ("The Copilot bridge"): create the Secret copilot-github-token (key
+# github_token) from the vault, build and push the image, replace IMAGE_PLACEHOLDER with name@sha256:..., apply this file, set CW_COUNCIL_URL.
+# The bridge binds the loopback only: copilot-api has no bind option and listens on every interface by default, so the entrypoint sets
+# HOST=127.0.0.1 for it; the NetworkPolicy and the Service name the front's port 8080 alone as a second guard.
+# The ingress label app=cw-worker is the label the launcher puts on every worker pod (LABEL in cloud/launcher/cloud_worker.py, render_pod).
+# Egress is not restricted here: the namespace's allow-egress policy (cloud/k8s/cloud-hub-network.yaml) gives DNS and ports 80/443.
+# Rollback: kubectl -n cw delete deployment,service,networkpolicy -l app.kubernetes.io/part-of=copilot-bridge
+# (JSON is valid YAML: the file is written as JSON documents so the offline test needs no YAML library.)
+---
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "copilot-bridge",
+    "namespace": "cw",
+    "labels": {
+      "app": "copilot-bridge",
+      "app.kubernetes.io/part-of": "copilot-bridge"
+    }
+  },
+  "spec": {
+    "replicas": 1,
+    "strategy": {
+      "type": "Recreate"
+    },
+    "selector": {
+      "matchLabels": {
+        "app": "copilot-bridge"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "copilot-bridge",
+          "app.kubernetes.io/part-of": "copilot-bridge"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 10001,
+          "fsGroup": 10001,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "containers": [
+          {
+            "name": "bridge",
+            "image": "registry.invalid/cw/copilot-bridge:IMAGE_PLACEHOLDER",
+            "command": [
+              "/app/entrypoint.sh"
+            ],
+            "env": [
+              {
+                "name": "HOME",
+                "value": "/run/home"
+              },
+              {
+                "name": "BRIDGE_DAILY_BUDGET",
+                "value": "500"
+              },
+              {
+                "name": "BRIDGE_RATE_LIMIT_SECONDS",
+                "value": "2"
+              }
+            ],
+            "ports": [
+              {
+                "name": "front",
+                "containerPort": 8080
+              }
+            ],
+            "readinessProbe": {
+              "tcpSocket": {
+                "port": 8080
+              },
+              "periodSeconds": 10
+            },
+            "resources": {
+              "requests": {
+                "cpu": "100m",
+                "memory": "256Mi"
+              },
+              "limits": {
+                "cpu": "500m",
+                "memory": "512Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "github-token",
+                "mountPath": "/run/copilot",
+                "readOnly": true
+              },
+              {
+                "name": "home",
+                "mountPath": "/run/home"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "github-token",
+            "secret": {
+              "secretName": "copilot-github-token",
+              "defaultMode": 288,
+              "items": [
+                {
+                  "key": "github_token",
+                  "path": "github_token"
+                }
+              ]
+            }
+          },
+          {
+            "name": "home",
+            "emptyDir": {
+              "medium": "Memory",
+              "sizeLimit": "16Mi"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "copilot-bridge",
+    "namespace": "cw",
+    "labels": {
+      "app": "copilot-bridge",
+      "app.kubernetes.io/part-of": "copilot-bridge"
+    }
+  },
+  "spec": {
+    "type": "ClusterIP",
+    "selector": {
+      "app": "copilot-bridge"
+    },
+    "ports": [
+      {
+        "name": "front",
+        "port": 8080,
+        "targetPort": 8080,
+        "protocol": "TCP"
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "NetworkPolicy",
+  "metadata": {
+    "name": "copilot-bridge-ingress",
+    "namespace": "cw",
+    "labels": {
+      "app": "copilot-bridge",
+      "app.kubernetes.io/part-of": "copilot-bridge"
+    }
+  },
+  "spec": {
+    "podSelector": {
+      "matchLabels": {
+        "app": "copilot-bridge"
+      }
+    },
+    "policyTypes": [
+      "Ingress"
+    ],
+    "ingress": [
+      {
+        "from": [
+          {
+            "podSelector": {
+              "matchLabels": {
+                "app": "cw-worker"
+              }
+            }
+          }
+        ],
+        "ports": [
+          {
+            "protocol": "TCP",
+            "port": 8080
+          }
+        ]
+      }
+    ]
+  }
+}

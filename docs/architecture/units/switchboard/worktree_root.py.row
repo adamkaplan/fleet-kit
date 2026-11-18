@@ -1,0 +1,1 @@
+| `switchboard/worktree_root.py` | 5 | `worktree_root`: where a new worktree is made, and the refusal of a new top-level entry of ~/Code (ask #2363) | |

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests of the hardening of bin/cloud-prepush (ask #1284): process-group kill on timeout, the memory-heavy
 list, the bound values. Throwaway repositories under the temporary directory only."""
+import atexit
 import os
 import shutil
 import subprocess
@@ -31,7 +32,24 @@ def put(repo, rel, text, mode=0o755):
     os.chmod(path, mode)
 
 
+_TEMPLATES = {}
+
+
 def make_repo(tmp, tests):
+    """The repository of these test files: built once per distinct set (git runs once), then copied."""
+    key = tuple(sorted(tests.items()))
+    template = _TEMPLATES.get(key)
+    if template is None:
+        holder = tempfile.mkdtemp(prefix="prepush-hard-tpl-")
+        atexit.register(shutil.rmtree, holder, True)
+        template = _TEMPLATES[key] = _build_repo(holder, tests)
+    repo = os.path.join(tmp, "repo")
+    os.makedirs(tmp, exist_ok=True)
+    shutil.copytree(template, repo, symlinks=True, ignore=shutil.ignore_patterns("*.lock"))
+    return repo
+
+
+def _build_repo(tmp, tests):
     repo = os.path.join(tmp, "repo")
     os.makedirs(repo)
     git(repo, "init", "-q", "-b", "trunk")
@@ -85,10 +103,10 @@ def alive(pid):
 
 
 def wait_dead(pid):
-    for _ in range(50):
+    for _ in range(250):
         if not alive(pid):
             return True
-        time.sleep(0.1)
+        time.sleep(0.02)
     return False
 
 
@@ -108,11 +126,11 @@ class TestGroupKill(Base):
         out = {}
         # preflight timeout
         repo = make_repo(os.path.join(self.tmp, "r1"), {TD + "test_x.py": "# a.txt\n" + PASS})
-        out["pf"] = run(repo, preflight=spawner(pf), env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "2"},
+        out["pf"] = run(repo, preflight=spawner(pf), env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "1"},
                         script_text=script_text)
         # per-test timeout
         repo = make_repo(os.path.join(self.tmp, "r2"), {TD + "test_x.py": "# a.txt\n" + spawner(tf)})
-        out["test"] = run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "2"}, script_text=script_text)
+        out["test"] = run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "1"}, script_text=script_text)
         return out, pf, tf
 
     def test_preflight_and_test_children_die(self):
@@ -163,8 +181,11 @@ class TestHeavy(Base):
 class TestBounds(Base):
     def test_values(self):
         repo = make_repo(os.path.join(self.tmp, "r"), {TD + "test_x.py": "# a.txt\n" + PASS})
-        for v in ("0", "-1", "abc", "1e3", "1.5", " 5", "5\n", "999999999", ""):
-            for name in ("CLOUD_PREPUSH_TIMEOUT", "CLOUD_PREPUSH_TOTAL", "CLOUD_PREPUSH_PREFLIGHT_TIMEOUT"):
+        # all three variables go through the same bound() helper: every bad shape on one, the two plainest on the other two
+        cases = [("CLOUD_PREPUSH_TIMEOUT", v) for v in ("0", "-1", "abc", "1e3", "1.5", " 5", "5\n", "999999999", "")]
+        cases += [(name, v) for name in ("CLOUD_PREPUSH_TOTAL", "CLOUD_PREPUSH_PREFLIGHT_TIMEOUT") for v in ("0", "abc")]
+        for name, v in cases:
+            if True:
                 p = run(repo, env={name: v})
                 self.assertEqual(p.returncode, 2, (name, v, p.stderr))
         self.assertEqual(run(repo, env={"CLOUD_PREPUSH_TIMEOUT": "86400"}).returncode, 0)

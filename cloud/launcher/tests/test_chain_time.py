@@ -8,15 +8,18 @@ import test_chain_list as base
 
 PARALLEL = base.SCRIPT + ".parallel"
 
-# The temporary-directory markers a parallel entry may show (checked by the scan; each is used by at least one entry). The three
-# "import" markers inherit a fixture module's own TemporaryDirectory (test_cloud_worker.Base, test_pr_edit, test_app_token/test_driver).
+# The temporary-directory markers a parallel entry may show (checked by the scan; each is used by at least one entry). The two
+# "import" markers inherit a fixture module's own TemporaryDirectory (test_cloud_worker.Base, test_app_token/test_driver). (`mkstemp` and the `test_pr_edit` import were
+# used only by the entries test_guard_table and test_pr_edit_hardening, deleted with the guard layer, ask #2402.)
 TEMP_MARKERS = {
     "mkdtemp": r"\bmkdtemp\(",
     "TemporaryDirectory": r"\bTemporaryDirectory\(",
-    "mkstemp": r"\bmkstemp\(",
     "test_cloud_worker": r"^\s*(import|from) test_cloud_worker\b",
-    "test_pr_edit": r"^\s*(import|from) test_pr_edit\b",
     "test_driver": r"^\s*(import|from) test_driver\b",
+    # Wave 4 (#2525): fixture modules that own a temporary directory, and a stub server on port 0 that writes no file.
+    "fixture_import": r"^\s*(import|from) (test_failed_pod_record|test_run_record|test_preflight|test_image_gate|test_cloud_worker)\b",
+    "worker_fixture_loaded": r"SourceFileLoader\([^\n]*bin\" / \"test-cloud-worker\"",
+    "port_zero_stub_server": r"ThreadingHTTPServer\(\(\"127\.0\.0\.1\", 0\)",
 }
 # What a parallel entry must not do: bind a fixed port (a nonzero literal or a constant) or write a fixed absolute path.
 SHARED = {

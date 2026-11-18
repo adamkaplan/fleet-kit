@@ -135,7 +135,7 @@ IDLE = float(os.environ.get("STUB_IDLE_SECONDS", "600"))
 
 def watch():
     while True:
-        time.sleep(1)
+        time.sleep(min(0.2, IDLE / 2))
         if os.getppid() != PARENT or time.time() - LAST["t"] > IDLE:
             os._exit(0)
 

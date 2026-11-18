@@ -16,6 +16,35 @@ def escalated_lock(state_dir):
         os.close(fd)
 
 
+ESCALATED_READ_MAX = 1 << 20   # the list reads the record once, at most this many bytes
+
+
+def read_escalated_checked(state_dir, limit=None):
+    """(found, note): the record's content and, when the record is unreadable, too large (past `limit` bytes) or malformed, one line
+    (a missing record is an empty one, with a note the list shows only when a cos row could move). This is the LIST's read only (the daemon keeps `read_escalated`, unchanged). A record that is not a regular file is unreadable (never opened blocking). Writes nothing."""
+    path = Path(state_dir) / ESCALATED_FILE
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            if os.fstat(fd).st_mode & 0o170000 != 0o100000:   # not a regular file
+                return {}, "%s cannot be read" % ESCALATED_FILE
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                data = handle.read() if limit is None else handle.read(limit + 1)
+        finally:
+            os.close(fd)
+        if limit is not None and len(data) > limit:
+            return {}, "%s is too large to read" % ESCALATED_FILE
+        raw = load_module("record_json").parse_bounded(data.decode("utf-8"))
+    except FileNotFoundError:
+        return {}, "%s is missing" % ESCALATED_FILE   # the same as an empty record for the daemon; the list notes it only when a `cos` row could move (see `escalation_applied`)
+    except (OSError, ValueError, RecursionError):
+        return {}, "%s cannot be read" % ESCALATED_FILE
+    found = raw.get("requests") if isinstance(raw, dict) else None
+    if not isinstance(found, dict):
+        return {}, "%s is malformed" % ESCALATED_FILE
+    return {k: v for k, v in found.items() if isinstance(k, str) and isinstance(v, str)}, None
+
+
 def read_escalated(state_dir):
     """{"<session>:<request id>": iso time} of the permission requests and questions the Chief of Staff escalated.
     A DISPOSABLE file, not a second source of truth: it only moves a request that is still pending from `cos` to
@@ -27,6 +56,18 @@ def read_escalated(state_dir):
         return {}
     found = raw.get("requests") if isinstance(raw, dict) else None
     return {k: v for k, v in found.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(found, dict) else {}
+
+
+def escalation_applied(decisions, state_dir):
+    """(rows, note): the daemon's rows with the escalation record applied at read time (decision_core.apply_escalations, the daemon's own key and test). The record is
+    read once and never written. A record that cannot be read leaves the daemon's tier, with one line as the note (only when a `cos` row could have been moved)."""
+    waiting = [d for d in decisions if isinstance(d, dict) and d.get("tier") == "cos" and decision_core.entry_escalation_key(d)]
+    if not waiting:
+        return decisions, None
+    found, note = read_escalated_checked(state_dir, ESCALATED_READ_MAX)
+    if note:
+        return decisions, "%s: the tiers shown are the daemon's as of its last pass" % note
+    return decision_core.apply_escalations(decisions, found)[0], None
 
 
 def write_escalated(state_dir, requests):
@@ -145,7 +186,7 @@ def captain_escalation_leaves(engine, escalated, now):
 
 
 def captain_escalations_to_keep(engine):
-    """The escalations of `MERGE: captain` PR decisions that must survive a pass in which the PR could not be judged: those
+    """The escalations of merge-captain PR decisions that must survive a pass in which the PR could not be judged: those
     whose notice is still on file. An unreadable PR (a restart's first passes, a 404 under the wrong account, an outage) derives
     no captain entry, so its key is not among the pending requests, and pruning on that would demote a decision the Chief of
     Staff escalated. The key leaves when its notice does (the PR merged or closed), or by the head naming it never matching again.
@@ -514,18 +555,10 @@ def apply_notice_effects(engine):
     return False
 
 
-CAPTAIN_MARK = "MERGE: captain"
-
-
-def pr_is_captain(body):
-    """True when the body's FIRST non-empty line starts with `MERGE: captain`. Nothing else of the body is read."""
-    return pr_marker(body) == "captain"
-
-
-def is_captain(pr, now=None):
+def is_captain(pr):
     """THE one helper: whether a PR is held for the person. `pr` is a dict with `labels` (names or {"name"} dicts) and `body`;
-    see `pr_marker_state` for the rule (label first, the first-line marker only inside the transition window)."""
-    return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"), now)["captain"]
+    see `pr_marker_state` for the rule (the label is the only signal)."""
+    return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"))["captain"]
 
 
 def sweep_clear_agrees(engine, repo, number, labels, marker):
@@ -551,7 +584,7 @@ CAPTAIN_EVIDENCE_MAX = 5    # signed reviewers listed in a decision
 
 
 def captain_evidence(facts, senders):
-    """[{"by", "kind": review|comment, "state"}] of the review of a `MERGE: captain` PR at its exact head: formal
+    """[{"by", "kind": review|comment, "state"}] of the review of a merge-captain PR at its exact head: formal
     reviews by a non-author, plus signed comments naming the head whose signer is not a sender of the PR's notice.
     None when there is none and a source could not be read (review not detectable)."""
     evidence = [dict(r, kind="review") for r in facts.get("reviews") or []]
@@ -660,8 +693,8 @@ def label_hold_entries(engine, now, noticed, escalated, in_play):
             if decision_core.pr_key(repo, number) in noticed_keys:
                 continue   # a noticed pull request keeps its notice row: one row (the identity is folded once, `pr_key`, for both sources)
             tag = repo if len(in_play) > 1 else repo.split("/")[-1]
-            captain_key = "captain:%s#%d@%s" % (repo, number, row["head"]) if row["head"] else None
-            entry = decision_core.labels_entry(repo, number, tag, row, bool(captain_key and captain_key in escalated), default_repo)
+            captain_key = decision_core.captain_escalation_key(repo, number, row["head"])
+            entry = decision_core.labels_entry(repo, number, tag, row, decision_core.is_escalated(captain_key, escalated), default_repo)
             if captain_key and isinstance(engine.request_keys, set):
                 engine.request_keys.add(captain_key)   # keeps its escalation through the daemon's prune
             out.append(((now, repo, number), entry, "%s#%d" % (repo, number)))
@@ -731,15 +764,16 @@ def decisions_from_notices(engine, now):
         tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
                                            item["created"], item.get("note"), hold, engine.config.get("intent_repo"))
-        evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
+        labels_unread = bool(facts) and plan_ledger.labels_unread(facts.get("captain"))   # (#2379) unreadable labels: never a plain notice that loses a hold
+        evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else ([] if not labels_unread else None)
         if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
             pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it
         elif evidence == []:
             evidence = False
-        if facts and facts.get("captain") and facts.get("head") and evidence is not False:
-            # a `MERGE: captain` PR is the Chief of Staff's decision, in place of the heads-up (never both)
-            captain_key = "captain:%s#%d@%s" % (repo, number, facts["head"])
-            entry = decision_core.captain_entry(entry, facts, captain_key in escalated, evidence)
+        if facts and (facts.get("captain") or labels_unread) and facts.get("head") and evidence is not False:
+            # a merge-captain PR is the Chief of Staff's decision, in place of the heads-up (never both)
+            captain_key = decision_core.captain_escalation_key(repo, number, facts["head"])
+            entry = decision_core.captain_entry(entry, facts, decision_core.is_escalated(captain_key, escalated), evidence, labels_unread)
             if isinstance(engine.request_keys, set):
                 engine.request_keys.add(captain_key)  # keeps its escalation through the daemon's prune
         entries.append((order(item), entry, key))

@@ -21,6 +21,7 @@ from pathlib import Path
 CONFIG_KEY = "delegated_clear"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
 CONFIG_DEFAULT = None            # None: no default is added; absent = off
 MAX_ORDERS = 20
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")   # the same shape as the configuration's other repository names (intent_repo)
 
 
 MATRIX_FILE = Path(__file__).resolve().parent.parent / "docs" / "review-laws" / "impact-matrix.json"
@@ -78,11 +79,11 @@ def _level_problem(entry):
 
 def validate(raw, source):
     """`delegated_clear`: absent, null or false = off; else {"orders": [{"number": N, "sha256": "<hash of the order's text>", "max_level": "<highest level she may clear>"?, "source": "owner-file"?}, ...], "charter": the
-    charter issue number that holds the charter-sourced orders (not needed when every order is `owner-file`)}. An empty list is off. `max_level` absent = the old rules (nothing is cleared by score). Raises ValueError naming the key."""
+    charter issue number that holds the charter-sourced orders (not needed when every order is `owner-file`), "repo"?: OWNER/REPO of that charter issue (absent = the configuration's `intent_repo`)}. An empty list is off. `max_level` absent = the old rules (nothing is cleared by score). Raises ValueError naming the key."""
     if raw is None or raw is False:
         return
-    if not isinstance(raw, dict) or set(raw) - {"orders", "charter"}:
-        raise ValueError("%s: 'delegated_clear' must be false or an object with only orders and charter, got %r" % (source, raw))
+    if not isinstance(raw, dict) or set(raw) - {"orders", "charter", "repo"}:
+        raise ValueError("%s: 'delegated_clear' must be false or an object with only orders, charter and repo, got %r" % (source, raw))
     orders, charter = raw.get("orders"), raw.get("charter")
     if not (isinstance(orders, list) and len(orders) <= MAX_ORDERS and all(_entry_ok(e) for e in orders)) or len({e["number"] for e in orders}) != len(orders):
         raise ValueError("%s: delegated_clear.orders must be a list of {\"number\": N, \"sha256\": <64 hex of the order's text>, \"max_level\"?, \"source\"?: \"owner-file\"} (an empty list is off; a number may appear once)" % source)
@@ -94,6 +95,8 @@ def validate(raw, source):
         raise ValueError("%s: delegated_clear.charter must be the charter's issue number" % source)
     if charter is not None and not (isinstance(charter, int) and not isinstance(charter, bool) and charter >= 1):
         raise ValueError("%s: delegated_clear.charter must be the charter's issue number" % source)
+    if "repo" in raw and not (isinstance(raw["repo"], str) and REPO_RE.fullmatch(raw["repo"])):
+        raise ValueError("%s: delegated_clear.repo must be OWNER/REPO (the repository of the charter issue), got %r" % (source, raw["repo"]))
 
 
 def settings(config):
@@ -104,6 +107,13 @@ def settings(config):
     except ValueError:
         return None
     return ({e["number"]: e["sha256"] for e in raw["orders"]}, raw.get("charter")) if isinstance(raw, dict) and raw["orders"] else None
+
+
+def charter_repo(config, default):
+    """The repository of the charter issue: `delegated_clear.repo` when the delegated clear is enabled and the key is set, else `default` (the configuration's `intent_repo`, as before)."""
+    if settings(config) is None:
+        return default
+    return config[CONFIG_KEY].get("repo", default)
 
 
 def entry_of(config, number):

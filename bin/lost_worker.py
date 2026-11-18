@@ -39,7 +39,7 @@ REAPER_ID = "reaper"
 SLOW_WINDOW = 7200            # the reaper's slow passes of the last two hours say how late a stop may be
 SLOW_MAX = 50                 # most slow passes kept
 REAPER_PASS = 60              # the reaper's pass interval (the launcher's once-a-minute floor, REAP_FLOOR_SECONDS); a copy: this module does not import the launcher
-GRACE = 3 * REAPER_PASS       # 180 s: three reaper passes after the hard deadline before a pod with no stop line is lost (a stop can be a pass or two late); a real loss is told at most this much later
+GRACE = 10 * REAPER_PASS      # 600 s (#2255 plan): ten reaper passes after the hard deadline before a pod with no stop line is lost (room for a slow pass and a stop that lands late); a real loss is told at most this much later
 SLOW_RE = re.compile(r"the pass took (\d{1,7}) seconds \(limit (\d{1,7})\)")
 
 _PROC_ALERTED = {}            # per memory path: keys this process already alerted or skipped: survives a memory file that cannot be saved or set aside
@@ -156,7 +156,7 @@ def _fold(state, sb, lines, source):
             elif event == "cloud.stopped":
                 stop[name] = max(ts, stop.get(name, 0))
             elif event == "cloud.create_failed":
-                state.setdefault("refused", {})["%s@%s" % (name, item["ts"])] = {"name": name, "at": ts, "line": raw}
+                state.setdefault("refused", {})["%s@%s" % (name, item["ts"])] = {"name": name, "at": ts, "line": raw, "boss": detail.get("boss") if isinstance(detail.get("boss"), str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", detail["boss"], re.ASCII) else None}   # a lane name as agent_presence spells it; any other text is no lane
         else:
             name, action, ok = item.get("worker"), item.get("action"), item.get("ok")
             _note_slow(state, item, ts)
@@ -366,7 +366,8 @@ def _losses(state, sb, engine, alive, now, records):
             continue
         if now - deadline <= GRACE:
             continue   # within the grace after the hard deadline: not lost yet (a stop runs a pass or two late)
-        newest = max(c["at"], state.get("active", {}).get(name, 0))
+        last_active = state.get("active", {}).get(name, 0)
+        newest = max(c["at"], last_active if last_active <= now else 0)   # a sign of life dated after now (clock skew, damaged memory) is no sign: it cannot hold the notice back
         if now - newest <= GRACE and newest > c["at"]:
             continue   # a launcher action or a push within the grace: the pod still answers
         record = records.get(name, {})
@@ -380,7 +381,7 @@ def _losses(state, sb, engine, alive, now, records):
     for key, r in sorted(state.get("refused", {}).items()):
         record = records.get(r["name"], {})
         out.append({"key": "refused_launch:" + key, "kind": "refused_launch", "name": r["name"], "ask": _ask_of(r["name"], record),
-                    "at": r["at"], "lane": record.get("reports_to"), "line": r["line"]})
+                    "at": r["at"], "lane": r.get("boss") or None, "line": r["line"]})
     outage = state.get("reaper_outage")
     if isinstance(outage, dict) and not outage.get("sent"):
         out.append({"key": "reaper_missed:outage@%s" % outage["first"], "kind": "reaper_missed", "name": REAPER_ID, "ask": "-", "at": outage["latest"],
@@ -426,8 +427,9 @@ def _iso(epoch):
 def text_of(loss, earlier):
     repeat = ("repeat: %d earlier lost worker(s) of this ask" % earlier) if earlier else "first loss of this ask"
     kind = loss["kind"] + (" (possibly lost: absent from discovery, not known to be dead)" if loss["kind"] == "local_worker" else "")
-    return "[lost worker] %s (ask %s) kind=%s, last event %s. Evidence: %s. %s." % (
-        _name(loss["name"]), loss["ask"], kind, _iso(loss["at"]), _clean(loss["line"]), repeat)
+    lane = (" lane=%s," % loss["lane"]) if loss["kind"] == "refused_launch" and loss.get("lane") else ""
+    return "[lost worker] %s (ask %s) kind=%s,%s last event %s. Evidence: %s. %s." % (
+        _name(loss["name"]), loss["ask"], kind, lane, _iso(loss["at"]), _clean(loss["line"]), repeat)
 
 
 def run_pass(sb, engine, now, alive=None, launcher_audit=None):
@@ -503,6 +505,10 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
             state.pop("reaper_gap", None)   # summed once per gap: cleared as it is sent
         if loss.get("outage") and isinstance(state.get("reaper_outage"), dict):
             state["reaper_outage"]["sent"] = True
+        if loss["kind"] == "refused_launch":
+            _deliver(engine, sb, loss, [loss.get("lane") or "chief-of-staff"], text)   # #2303: the launching lane only; no readable lane: the Chief of Staff alone
+            raised.append(dict(loss, text=text, earlier=earlier))
+            continue
         if stopped_cleanly(state, loss):
             _deliver(engine, sb, loss, [loss.get("lane")], text)   # #2202: the launcher's own records show a clean stop: the lane only
             raised.append(dict(loss, text=text, earlier=earlier))

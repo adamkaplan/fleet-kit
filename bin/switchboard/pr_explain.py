@@ -129,9 +129,9 @@ def _held_none(line):
     return tail in ("", ".") or (tail.startswith("(") and (tail.endswith(")") or tail.endswith(").")))
 
 
-def pr_is_held(labels, body, now=None):
-    """A PR is held for the owner: it carries a hold label, or (the same rule as everywhere) a merge-captain label or the legacy first line."""
-    return bool(pr_hold_reasons(labels)) or is_captain({"labels": labels, "body": body}, now)
+def pr_is_held(labels, body):
+    """A PR is held for the owner: it carries a hold label, or (the same rule as everywhere) a merge-captain label."""
+    return bool(pr_hold_reasons(labels)) or is_captain({"labels": labels, "body": body})
 
 
 _HELD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
@@ -419,7 +419,7 @@ def cmd_pr_explain(args, runner, now):
     body = pr.get("body") if isinstance(pr.get("body"), str) else ""
     if args.check:
         problems = explainer_defects(body)
-        if pr_is_held(pr.get("labels") or [], body):
+        if not isinstance(pr.get("labels"), list) or pr_is_held(pr.get("labels"), body):   # labels that cannot be read: not "not held" (#2379)
             problems += [p for p in held_defects(body) if p not in problems]   # the summary flowchart is named once
         for problem in problems:
             print("DEFECT: %s" % problem)

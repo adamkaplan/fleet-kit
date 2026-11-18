@@ -6,11 +6,14 @@ Run directly: python3 cloud/launcher/tests/test_m_cap.py
 """
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -25,6 +28,9 @@ sys.modules["cw_test_cloud_worker_mod"] = tcw
 _loader.exec_module(tcw)
 
 FUTURE, PAST = "2099-01-01T00:00:00Z", "2001-01-01T00:00:00Z"
+CAP = int(re.search(r"^MAX_M_PER_LANE = (\d+)", (ROOT / "bin" / "cloud_worker.py").read_text(), re.M).group(1))   # the cap itself, read from the code
+CAP_L = int(re.search(r'"L": (\d+)\}\[args.shape\]', (ROOT / "bin" / "cloud_worker.py").read_text()).group(1))   # the cap of shape L, from the table
+HELD_CHECK = '            if len(held) >= {"M": MAX_M_PER_LANE, "L": 2}[args.shape]:'
 OLD_ONLY = "M_CAP_SCRATCH_OLD"   # set only in the scratch copy of the code before the change
 
 
@@ -69,32 +75,44 @@ class TestScenarios(Cap):
         self.assertEqual(records, [])
 
     def test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call(self):
-        for n in range(1, 5):
-            self.put("coder%d" % n)
-        code, out, err = self.ask("coder5")
+        names = ["coder%d" % n for n in range(1, CAP + 1)]
+        for n in names:
+            self.put(n)
+        code, out, err = self.ask("extra1")
         lines = [l for l in err.splitlines() if "already holds" in l and "lane-a" in l]
-        named = [n for n in ("coder1", "coder2", "coder3", "coder4") if n in (lines or [""])[0]]
+        named = [n for n in names if n in (lines or [""])[0]]
         print("S3: refusal exit %d, lines naming the lane %d, workers named %d, token minter calls %d, launcher calls %d, cluster calls %d"
               % (code, len(lines), len(named), len(self.jsonl("login.log")), len(self.stub_calls()), len(self.jsonl("kubectl.log"))))
         self.assertEqual(code, 2, err)
         self.assertEqual(len(lines), 1, err)
-        self.assertIn("holds 4 shape-M", lines[0])
-        self.assertIn("coder1, coder2, coder3, coder4", lines[0])
+        self.assertIn("holds %d shape-M" % CAP, lines[0])
+        self.assertEqual(len(named), min(CAP, 10), lines[0])   # the refusal lists at most 10 names (held[:10] in bin/cloud_worker.py)
         self.assertIn("retire one", lines[0])
         self.assertIn("--shape S", lines[0])
         self.assertEqual(self.calls(), 0)
 
+    def test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l(self):
+        self.assertLess(CAP_L, CAP)
+        for n in range(1, CAP_L + 1):
+            self.put("big%d" % n, shape="L")
+        self.put("mid1")   # a shape-M record does not count against L
+        code, out, err = self.ask("extra1", shape="L")
+        self.assertEqual(code, 2, err)
+        self.assertIn("holds %d shape-L" % CAP_L, err)
+        self.assertEqual(self.calls(), 0)
+        self.assertEqual(self.ask("extra2", lane="lane-b", shape="L")[0], 0)   # another lane is not held
+
     def test_s4_other_shapes_names_and_lanes_proceed_as_before(self):
-        for n in range(1, 5):
+        for n in range(1, CAP + 1):
             self.put("coder%d" % n)
-        for n in range(5, 8):
-            self.put("coder%d" % n, lane="lane-c")
+        for n in range(1, CAP):
+            self.put("lanec%d" % n, lane="lane-c")
         self.put("sidekick", lane="lane-c", shape="S")   # a record of another shape must not count toward lane-c
         results = []
-        results.append(self.ask("coder8", shape="S"))                 # another shape, full lane
+        results.append(self.ask("extra1", shape="S"))                 # another shape, full lane
         results.append(self.ask("coder1"))                             # a name that has a record
-        results.append(self.ask("coder9", lane="lane-b"))              # another lane, 0 records
-        results.append(self.ask("coder10", lane="lane-c"))             # 3 shape-M records and one shape-S record: the 4th shape M is accepted
+        results.append(self.ask("extra2", lane="lane-b"))              # another lane, 0 records
+        results.append(self.ask("extra3", lane="lane-c"))              # CAP-1 shape-M records and one shape-S record: the last shape M is accepted
         refused = sum(1 for _, _, e in results if self.cap_refused(e))
         print("S4: launches proceeding as before %d of 4, refusals by the cap %d" % (4 - refused, refused))
         self.assertEqual(refused, 0, [e for _, _, e in results])
@@ -161,6 +179,26 @@ class TestDocs(unittest.TestCase):
 class TestScratch(unittest.TestCase):
     """Scratch copies OUTSIDE the repository (a temporary directory), each run in a child process by stub_support.start."""
 
+    def in_process(self, source, test):
+        """Run one scenario in this process with `source` standing in for the cloud_worker module (the real file is never edited)."""
+        sb = tcw.sb
+        path = ROOT / "bin" / "cloud_worker.py"
+        saved = (sys.modules.get("cloud_worker"), sb._MODULES_DONE.get("cloud_worker"))
+        buf = io.StringIO()
+        try:
+            mutant = types.ModuleType("cloud_worker")
+            mutant.__file__ = str(path)
+            sys.modules["cloud_worker"] = sb._MODULES_DONE["cloud_worker"] = mutant
+            exec(compile(source, str(path), "exec"), mutant.__dict__)
+            res = unittest.TextTestRunner(stream=buf, verbosity=2).run(unittest.TestSuite([TestScenarios(test)]))
+        finally:
+            for table, old in ((sys.modules, saved[0]), (sb._MODULES_DONE, saved[1])):
+                if old is None:
+                    table.pop("cloud_worker", None)
+                else:
+                    table["cloud_worker"] = old
+        return (0 if res.wasSuccessful() else 1), buf.getvalue()
+
     def child(self, edits, test, old=False):
         src = (ROOT / "bin" / "cloud_worker.py").read_text()
         part = (ROOT / "bin" / "cloud_lane_cap.py").read_text()   # the count moved here (ask #2259)
@@ -173,9 +211,12 @@ class TestScratch(unittest.TestCase):
             self.assertEqual(src.count(old_text), 1, "the line to change is not as expected: " + old_text)
             src = src.replace(old_text, new_text, 1)
             applied += 1
+        if not old and part == (ROOT / "bin" / "cloud_lane_cap.py").read_text():   # only the worker text changed: run it in this process
+            return (applied,) + self.in_process(src, test)
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
-        shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__", "test-switchboard"))   # the 5 MB switchboard suite is linked instead
+        os.symlink(ROOT / "bin" / "test-switchboard", os.path.join(d, "bin", "test-switchboard"))
         shutil.copytree(ROOT / "cloud" / "worker" / "tests", os.path.join(d, "cloud", "worker", "tests"), ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(ROOT / "cloud" / "launcher", os.path.join(d, "cloud", "launcher"), ignore=shutil.ignore_patterns("__pycache__", "tests"), dirs_exist_ok=True)
         os.makedirs(os.path.join(d, "cloud", "launcher", "tests"), exist_ok=True)
@@ -195,7 +236,7 @@ class TestScratch(unittest.TestCase):
         return applied, code, Path(d, "out.txt").read_text() + Path(d, "err.txt").read_text()
 
     def test_s2_the_old_code_accepts_the_sixth_launch(self):
-        edits = [('    if args.shape == "M":   # the per-lane cap', '    if False:   # the per-lane cap'),
+        edits = [('    if args.shape in ("M", "L"):   # the per-lane cap', '    if False:   # the per-lane cap'),
                  ("            if isinstance(args.shape, str) and args.shape:\n                record[\"shape\"]", "            if False:\n                record[\"shape\"]")]
         applied, code, out = self.child(edits, "test_s2_the_code_before_the_change_accepts_a_sixth_launch", old=True)
         print(out.strip().splitlines()[0] if "S2:" in out else out[-300:])
@@ -203,14 +244,26 @@ class TestScratch(unittest.TestCase):
         self.assertIn("S2: launches accepted for a lane holding 5 records 1, written records with a shape key 0", out)
 
     def test_s8_a_mutant_that_never_stops_a_launch_fails_the_cap_scenario(self):
-        applied, code, out = self.child([("            if len(held) >= MAX_M_PER_LANE:", "            if False:")], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")
+        self.assertEqual(self.child([], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")[1], 0)   # the control, first
+        applied, code, out = self.child([(HELD_CHECK, "            if False:")], "test_s3_a_fifth_shape_m_launch_stops_at_the_cap_with_no_call")
+        self.assertIn("AssertionError: 0 != 2", out)
         print("S8: mutant never-stops exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
 
+    def test_l_a_mutant_that_never_stops_shape_l_fails_the_l_cap_test(self):
+        edits = [(HELD_CHECK, "            if False:")]
+        _, ccode, cout = self.child([], "test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l")   # the control, first
+        self.assertEqual(ccode, 0, cout[-800:])
+        applied, code, out = self.child(edits, "test_l_a_lane_stops_at_its_own_lower_cap_of_shape_l")
+        self.assertEqual((applied, code), (1, 1), out[-800:])
+        self.assertIn("AssertionError: 0 != 2 : ", out)   # the launch that should be refused exits 0
+
     def test_s8_a_mutant_that_counts_every_shape_fails_the_other_shapes_scenario(self):
-        applied, code, out = self.child([('record.get("shape") != "M" or ', "")], "test_s4_other_shapes_names_and_lanes_proceed_as_before")
+        self.assertEqual(self.child([], "test_s4_other_shapes_names_and_lanes_proceed_as_before")[1], 0)   # the control, first
+        applied, code, out = self.child([('record.get("shape") != shape or ', "")], "test_s4_other_shapes_names_and_lanes_proceed_as_before")
         print("S8: mutant counts-every-shape exit %d, mutations applied %d of 1" % (code, applied))
         self.assertEqual((applied, code), (1, 1), out[-800:])
+        self.assertIn("AssertionError: ", out)   # a failed assertion of the scenario, not a crash
 
 
 if __name__ == "__main__":

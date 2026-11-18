@@ -1,4 +1,6 @@
 """Slice S3 (#638): the run record (S5, U2) and the report path (S6). Offline: the fake kubectl and the stub server."""
+import contextlib
+import io
 import pathlib
 import base64
 import json
@@ -112,6 +114,26 @@ class Record(td.Driver):
         self.assertEqual(out.count(self.shown(d)), 1, "named once on screen")
         self.assertEqual(self.read(self.env["CW_CLOUD_AUDIT"]).count(self.shown(d)), 1)
 
+    def test_the_boss_is_kept_for_the_land_report_lane(self):   # #2448: read-only from the switchboard's worker record
+        sb = os.path.join(self.tmp.name, "sb")
+        os.makedirs(sb)
+        with open(os.path.join(sb, "coder7.json"), "w") as f:
+            json.dump({"worker": "coder7", "reports_to": "orch-one"}, f)
+        self.denv["CW_CLOUD_RECORD_DIR"] = sb
+        p, out = self.run_driver()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(json.loads(self.read(os.path.join(self.the_record(), "run.json"))).get("boss"), "orch-one")
+
+    def test_a_hostile_boss_is_never_written(self):   # #2448: the worker record's reports_to is untrusted text
+        sb = os.path.join(self.tmp.name, "sb")
+        os.makedirs(sb)
+        with open(os.path.join(sb, "coder7.json"), "w") as f:
+            json.dump({"worker": "coder7", "reports_to": "Not A Name; x"}, f)
+        self.denv["CW_CLOUD_RECORD_DIR"] = sb
+        p, out = self.run_driver()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("boss", json.loads(self.read(os.path.join(self.the_record(), "run.json"))))
+
     def test_the_head_sha_is_kept_when_the_pod_can_say_it(self):
         self.patch_state(head_sha="a" * 40)
         p, out = self.run_driver()
@@ -119,7 +141,7 @@ class Record(td.Driver):
         self.assertEqual(json.loads(self.read(os.path.join(self.the_record(), "run.json")))["head_sha"], "a" * 40)
 
     def test_s5_a_transcript_that_cannot_be_read_still_stops_the_pod_and_says_unavailable(self):
-        p, out = self.run_driver(STUB_MODE="messages-down", CW_RECORD_TIMEOUT="3")
+        p, out = self.run_driver(STUB_MODE="messages-down", CW_RECORD_TIMEOUT="1")
         self.assertEqual(p.returncode, 0, out)
         self.assertEqual(self.st()["pods"], {})
         d = self.the_record()
@@ -201,7 +223,7 @@ class Record(td.Driver):
 
     # -- M3: the record is the launcher's stop's: retire and a person get it too --
     def stub_env(self, **extra):
-        self.env.update(CW_RUN_RECORD_DIR=self.records, STUB_MESSAGES=self.msgfile, STUB_LOG=self.stub_log, CW_RECORD_TIMEOUT="5")
+        self.env.update(CW_RUN_RECORD_DIR=self.records, STUB_MESSAGES=self.msgfile, STUB_LOG=self.stub_log, CW_RECORD_TIMEOUT="1")
         self.env.update(extra)
 
     def create_with_secrets(self):
@@ -216,10 +238,17 @@ class Record(td.Driver):
             fds.append(r)
             args += ["--run-secret-fd", "%s=%d" % (name, r)]
         env = dict(os.environ, **self.env)
-        p = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "cloud_worker.py")] + args, env=env,
-                           capture_output=True, text=True, pass_fds=fds + [pw_w], timeout=120)
-        os.close(pw_w)
-        self.assertEqual(p.returncode, 0, p.stderr)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cw.main(args, env)   # in this process: the fake kubectl runs in process too (the Kube patch of Base)
+        finally:
+            for fd in fds + [pw_w, pw_r]:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.assertEqual(code, 0, err.getvalue())
 
     def test_s5_the_launchers_stop_alone_writes_the_record_so_retire_gets_one(self):
         self.check_stop_alone()
@@ -267,11 +296,11 @@ class Record(td.Driver):
 
     def test_a_server_that_drips_one_byte_at_a_time_cannot_keep_the_pod_past_the_deadline(self):
         t = time.monotonic()
-        self.check_timed_out(t, 25, STUB_DRIP="1", CW_RECORD_SECONDS="3", CW_RECORD_TIMEOUT="30")
+        self.check_timed_out(t, 25, STUB_DRIP="1", CW_RECORD_SECONDS="1.5", CW_RECORD_TIMEOUT="30")
 
     def test_kubectl_reads_that_each_hang_near_their_limit_are_bounded_by_the_one_deadline(self):
-        t = time.monotonic()   # ls + cat + git each sleep 2 s: the sum (6 s+) is over the 3 s deadline
-        self.check_timed_out(t, 25, FAKE_KUBE_EXEC_SLEEP="2", CW_RECORD_SECONDS="3")
+        t = time.monotonic()   # ls + cat + git each sleep 1 s: the sum (3 s+) is over the 1.5 s deadline
+        self.check_timed_out(t, 25, FAKE_KUBE_EXEC_SLEEP="1", CW_RECORD_SECONDS="1.5")
 
     def test_the_record_deadline_default_maximum_and_bad_values(self):
         rr = cw.run_record
@@ -491,6 +520,12 @@ class Record(td.Driver):
         prompt = log[log.index("prompt "):]   # the brief is multi-line: everything the stub logged from the prompt on
         self.assertTrue(prompt.startswith("prompt " + td.BRIEF), prompt)
         self.assertIn("/home/worker/report", prompt)
+
+
+# Record extends td.Driver for its harness only; the tests td.Driver itself defines are run, unchanged, by test_driver.py, so they are not
+# collected a second time here (about 37 s of this file). Every test Record defines is kept.
+for _inherited in [n for n in dir(td.Driver) if n.startswith("test_") and n not in Record.__dict__]:
+    setattr(Record, _inherited, None)
 
 
 class RecordUnderATokenShapedPath(Record):

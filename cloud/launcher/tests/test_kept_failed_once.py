@@ -23,7 +23,7 @@ class Scen(fpr.Fixture):
         return [x for x in self.audit_lines() if x["worker"] == self.w and x["action"] == "stop"]
 
     def past_hard(self):
-        self.clock.advance(hours=30)
+        self.clock.advance(hours=4)   # past the hard deadline (2 h), inside KEPT_GRACE_SECONDS (24 h, #2345): the pod is not yet expired
 
     def scenario(self, phase, w="keptf"):
         """Three passes over a kept pod of `phase`, past its hard limit; asserts the one-try rule."""

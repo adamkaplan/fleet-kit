@@ -12,7 +12,19 @@ from support.paths import REPO
 GLOBS = ("cloud/**/test_*.py", "cloud/**/test-*", "plugins/**/*.test.mjs", "plugins/**/*.test.ts", "tests/**/test_*.py")
 
 
+_TREE_CACHE = []
+_STRINGS_CACHE = {}
+
+
 def tree_files(repo, globs=GLOBS):
+    if repo == REPO and globs == GLOBS:   # the walk of the real tree, once per process
+        if not _TREE_CACHE:
+            _TREE_CACHE.append(_tree_files(repo, globs))
+        return list(_TREE_CACHE[0])
+    return _tree_files(repo, globs)
+
+
+def _tree_files(repo, globs):
     """The test files of the trees, read from the directory (node_modules skipped)."""
     return sorted({p.relative_to(repo).as_posix() for g in globs for p in repo.glob(g) if p.is_file() and "node_modules" not in p.parts})
 
@@ -44,7 +56,11 @@ def problems(list_text, files, workflow_text, chain_texts, runner_sources):
     named = set()
     discovered = [r for r in loaders if 'bind_discovered(__name__, ' in runner_sources.get(r, "") and '"tests" / "switchboard"' in runner_sources.get(r, "")]   # #2206: a runner that self-registers the Test* classes of tests/switchboard/ names no module
     for runner in loaders:
-        named |= {n.value for n in ast.walk(ast.parse(runner_sources.get(runner, ""))) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        src = runner_sources.get(runner, "")
+        strings = _STRINGS_CACHE.get(src)
+        if strings is None:
+            strings = _STRINGS_CACHE[src] = frozenset(n.value for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        named |= strings
     for path, step in sorted(run.items()):
         if not re.search(r"^\s+(run: node --test .*" + re.escape(path) + r"(\s|$)|" + re.escape(path) + r"\s+2>&1)", workflow_text, re.M):
             out.append("no workflow step runs: " + path)
@@ -83,7 +99,7 @@ class TestCiOutsideBin(unittest.TestCase):
         self.assertIn("not in the CI outside-bin list: plugins/x/new.test.mjs", problems(*self.args(files=tree_files(REPO) + ["plugins/x/new.test.mjs"])))
 
     def test_removing_a_listed_file_fails_naming_it(self):
-        for name in ("plugins/fleet-hooks/index.test.mjs", "cloud/worker/tests/test_guard.py"):
+        for name in ("plugins/fleet-hooks/index.test.mjs", "cloud/launcher/tests/test_cloud_pod_deadline.py"):
             text = "\n".join(l for l in self.LIST.read_text().splitlines() if name not in l)
             self.assertIn("not in the CI outside-bin list: " + name, problems(*self.args(text=text)))
 

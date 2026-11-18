@@ -1,0 +1,10 @@
+{
+  "printWidth": 100,
+  "trailingComma": "all",
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/coverage/**"
+  ]
+}
