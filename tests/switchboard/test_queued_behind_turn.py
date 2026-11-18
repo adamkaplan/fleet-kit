@@ -247,6 +247,24 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
         for shape in ("delayed", "held", "supersedes"):
             self.assertTrue(any(shape in h for h in recorded), shape)
 
+    # ---- #2044: a steered message says it was steered; a queued one says it was queued
+    STEER_TEXT = "a message steered into a turn says steered into a turn, one queued behind it says queued behind a turn"
+
+    def test_s6_a_steered_message_says_steered_and_a_queued_one_says_queued(self):
+        steered, sid = self.world_of({"send_to_working": "queue", "steer_after_minutes": 30})   # a turn older than the setting steers (#1540)
+        steered.v2.start_turn(sid, "task", fleet=True, lasts=3 * 3600, steps=3)
+        steered.engine.run_pass()
+        steered.tick(3600)
+        self.assertTrue(self.send(steered)["sent"])
+        queued, _ = self.queued_working({"send_to_working": "queue"})
+        (a,) = steered.admissions("platform")
+        (b,) = queued.admissions("platform")
+        steer_line, queue_line = [e["detail"] for e in self.intents(steered)]   # the worlds share one audit file: the steered delivery first
+        self.assertEqual((steer_line["delivery"], queue_line["delivery"]), ("steer", "queue"))
+        self.assertTrue(steer_line["in_turn"] and queue_line["in_turn"])
+        self.assertEqual((a["text"].count("steered into a turn"), a["text"].count(WORDS)), (1, 0), self.STEER_TEXT)
+        self.assertEqual((b["text"].count("steered into a turn"), b["text"].count(WORDS)), (0, 1), self.STEER_TEXT)
+
     # ---- S3 (REAL audit line)
     def test_s3_the_audit_line_says_whether_the_session_was_in_a_turn(self):
         busy, _ = self.queued_working()
@@ -352,10 +370,15 @@ class TestQueuedBehindTurn(QueuedWaitModuleTests, Base):
     def test_s5_the_mutants_fail_with_the_anchored_texts_after_the_controls_pass(self):
         # the controls are the two real tests of this class (test_s2_..., test_s4_...) run on the live tree; they are not run a second time in a copy
         tree = self.copy_tree()
-        self.mutate(tree, "bin/switchboard/decision.py", '", queued behind a turn" if in_turn else ""', '""')
+        self.mutate(tree, "bin/switchboard/decision.py", '(", steered into a turn" if delivery == "steer" else ", queued behind a turn") if in_turn else ""', '""')
         code, out = self.run_in(tree, "test_s2_a_message_admitted_in_a_turn_says_so_and_an_idle_one_prints_as_recorded")
         self.assertNotEqual(code, 0)
         self.assertIn(IN_TURN_TEXT, out)
+        tree = self.copy_tree()
+        self.mutate(tree, "bin/switchboard/decision.py", '", steered into a turn" if delivery == "steer" else ", queued', '", queued')
+        code, out = self.run_in(tree, "test_s6_a_steered_message_says_steered_and_a_queued_one_says_queued")
+        self.assertNotEqual(code, 0)
+        self.assertIn(self.STEER_TEXT, out)
         tree = self.copy_tree()
         self.mutate(tree, "bin/queued_wait.py", 'note["consumed"] = first', 'note["consumed"] = note["delivered"]')
         code, out = self.run_in(tree, "test_s4_a_consumed_message_says_how_long_it_waited")

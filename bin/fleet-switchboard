@@ -2485,6 +2485,12 @@ class Switchboard:
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
         detail["in_turn"] = in_turn
+        if in_turn and delivery == "steer":   # #2044: the header names the mode decided here (compose ran before it, with the queue wording)
+            text, _again = compose(plan.recipient, pending, section=section_resolver(self, observation),
+                                   repos=repos, delivered=self.now(), resume=parts_done, in_turn=in_turn, delivery=delivery)
+            if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
+                self.intents.discard_told()
+                compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now(), in_turn=in_turn, delivery=delivery)
         if busy:
             detail["busy"] = True
             if age is not None:
