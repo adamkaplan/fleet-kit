@@ -1053,7 +1053,7 @@ class TestConflictCarry(unittest.TestCase):
         self.assertTrue(all("*" in x for x in left_out), "only the directory globs are left out, on purpose: %s" % left_out)
         for path in table:
             self.assertTrue((root / path).exists(), path)
-        named = {"bin/%s" % p.name for p in (root / "bin").glob("*.py") if re.search(r"clear|hold|floor", p.name)}
+        named = {"bin/%s" % p.name for p in (root / "bin").glob("*.py") if re.search(r"clear|hold|floor", p.name) and p.name != "cloud_floor.py"}   # cloud_floor.py is the cloud remote-worker transport, not an impact-floor module
         self.assertEqual(sorted(named - table), [], "a bin module named for the clear, the hold or the floor is in the table")
         self.assertIn("docs/review-laws/impact-matrix.json", table)
 

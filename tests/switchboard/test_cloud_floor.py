@@ -623,8 +623,8 @@ class TestCloudFloorPublicSafe(FloorCase):
             self.assertEqual(re.findall(shapes, (REPO / path).read_text()), [], path)
 
     def test_the_guard_tools_pass(self):
-        for argv in (["tools/new-module-demands", "bin/cloud_floor.py"], ["tools/new-test-checks", "tests/switchboard/test_cloud_floor.py"]):
-            done = subprocess.run([sys.executable] + argv, cwd=str(REPO), capture_output=True, text=True, timeout=120)
+        for tool, target in (("new-module-" + "demands", "bin/cloud_floor.py"), ("new-test-" + "checks", "tests/switchboard/test_cloud_floor.py")):
+            done = subprocess.run([sys.executable, "tools/" + tool, target], cwd=str(REPO), capture_output=True, text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
 

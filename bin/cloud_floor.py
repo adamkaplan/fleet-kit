@@ -358,7 +358,7 @@ def _call(function, *args, **kwargs):
 
 def verify_enabled(env=None):
     """True when Floor's verify workflows are on (CW_FLOOR_VERIFY_ENABLED is `1` or `true`)."""
-    return ((env_of() if env is None else env).get("CW_FLOOR_VERIFY_ENABLED") or "").strip().lower() in ("1", "true")
+    return ((env_of() if env is None else env).get("CW_FLOOR_VERIFY_ENABLED") or "").strip().lower() in ("1", "true", "yes")
 
 
 def verify_mode(args, brief):
