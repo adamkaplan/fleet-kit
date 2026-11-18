@@ -209,6 +209,8 @@ fleet-switchboard read coder7
 fleet-switchboard retire coder7
 ```
 
+**Working or stalled (#1102).** `read` opens with one summary line, the one signal: `turns=N tools=N last_tool=NAME last_error=NAME/STATUS last_activity=TIME`. A turn that only calls tools is printed as one `tool NAME summary` line per call (arguments scrubbed, at most 80 characters); a failed turn prints `error NAME STATUS`. A worker whose `tools` count and `last_activity` keep moving is working; a worker whose `last_error` is set (for example a rate limit) and whose activity time stands still is stalled. Never retire a worker for turns that look empty: read the summary line first.
+
 `retire` stops the worker: the end hook pushes its work and the pod and its Secrets are deleted.
 
 ### The light shape (`XS`) and the other shapes
