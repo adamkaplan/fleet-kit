@@ -46,6 +46,8 @@ Go 1.27.4 is also built in (`/usr/local/go`, root-owned, `go` and `gofmt` linked
 
 `mise` v2026.11.6 is built in too (`/usr/local/bin/mise`, root-owned, not writable by others): `MISE_VERSION` and `MISE_SHA256` (the sha256 of `mise-<version>-linux-x64.tar.gz`) in `cloud/worker/Dockerfile`, checked with `sha256sum -c` before the unpack; a bump updates both and the pin test `cloud/worker/tests/test_dockerfile_mise.py`. `python@3.11` is preinstalled in `/home/worker/.local/share/mise` at image build time (`mise install python@3.11`, stdlib test directories removed), so pods do not install it by hand; `python3` stays the system Python. Other toolchain versions install at run time into the run user's home, once per pod.
 
+A pinned headless Chromium (Chrome for Testing `chrome-headless-shell`, `linux64`) is built in too (ask #2565): `CHROMIUM_VERSION` (158.0.8127.36) and `CHROMIUM_SHA256` (the sha256 of the release zip) in `cloud/worker/Dockerfile`, checked with `sha256sum -c` before the unpack into `/opt/chromium` (root-owned, not writable by others). `/opt/chromium/chrome-headless-shell` is linked as `/usr/bin/chromium`, `/usr/bin/chromium-browser` and `/usr/bin/google-chrome-stable`, and the image sets `CHROME_PATH=/usr/bin/chromium`. A bump updates both constants and the pin test `cloud/worker/tests/test_dockerfile_browser.py`.
+
 The pinned version is a security floor: Node >= 22.23.4 (the older 22.23.2 carries trust roots that are being withdrawn).
 
 To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the version is written) AND both sha256 constants (`NODE_SHA256_X64`,
