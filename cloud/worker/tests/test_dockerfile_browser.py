@@ -30,6 +30,54 @@ def check(text):
         raise AssertionError("a browser library package is missing from the image: " + " ".join(missing))
 
 
+CHROMIUM_VERSION = "158.0.8127.36"
+CHROMIUM_SHA = "2d3a23017323c54fd457a678e4351f895c4076d8050e39d5aa6247f93448b73a"
+CHROMIUM_CHECK = ' && echo "${CHROMIUM_SHA256}  /tmp/chromium.zip" | sha256sum -c - \\\n'
+UNCHECKED = "the Chromium archive was not checked"
+README = os.path.join(os.path.dirname(os.path.dirname(HERE)), "README.md")
+
+
+def chromium_run(t):
+    b = t.find("ARG CHROMIUM_SHA256=")
+    e = t.find("# ---- end Chromium ----", b)
+    if b < 0 or e < 0:
+        return ""
+    blk = t[b:e]
+    return " ".join(x.strip() for x in blk.replace("\\\n", " ").split("\n") if x.strip() and not x.startswith(("#", "ARG ", "ENV ")))
+
+
+def chromium_problems(t):
+    out = []
+    if len(re.findall(r"^ARG CHROMIUM_VERSION=%s$" % re.escape(CHROMIUM_VERSION), t, re.M)) != 1:
+        out.append("CHROMIUM_VERSION must be pinned once to " + CHROMIUM_VERSION)
+    if len(re.findall(r"^ARG CHROMIUM_SHA256=%s$" % CHROMIUM_SHA, t, re.M)) != 1:
+        out.append("CHROMIUM_SHA256 must be pinned once to the stated hash")
+    run = chromium_run(t)
+    if not run.startswith("RUN "):
+        out.append("no Chromium RUN")
+    chk = run.find('echo "${CHROMIUM_SHA256}  /tmp/chromium.zip" | sha256sum -c -')
+    unz = run.find("python3 -m zipfile -e /tmp/chromium.zip /tmp/chromium")
+    if chk < 0 or unz < 0 or chk > unz:
+        out.append(UNCHECKED)
+    if ("curl -fsSL https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}"
+            "/linux64/chrome-headless-shell-linux64.zip -o /tmp/chromium.zip") not in run:
+        out.append("Chromium archive not downloaded with curl -fsSL from the pinned version")
+    for need in ("chmod 0755 /opt/chromium/chrome-headless-shell", "chown -R root:root /opt/chromium",
+                 "chmod -R a+rX,go-w /opt/chromium"):
+        if need not in run:
+            out.append("missing: " + need)
+    for n in ("chromium", "chromium-browser", "google-chrome-stable"):
+        if not re.search(r"ln -s /opt/chromium/chrome-headless-shell /usr/bin/%s(?= |$)" % re.escape(n), run):
+            out.append(n + " not linked")
+    if not re.search(r"&& rm -rf /tmp/chromium\.zip /tmp/chromium$", run):
+        out.append("archive not removed at the end of the RUN")
+    if "||" in run or re.search(r"sha256sum[^&]*;", run):
+        out.append("check or chain masked")
+    if len(re.findall(r"^ENV CHROME_PATH=/usr/bin/chromium$", t, re.M)) != 1 or len(re.findall(r"^ENV[^\n]*CHROME_PATH", t, re.M)) != 1:
+        out.append("CHROME_PATH=/usr/bin/chromium must be set once")
+    return out
+
+
 class TestDockerfileBrowser(unittest.TestCase):
     def test_real_dockerfile_has_every_package(self):
         check(read(DF))
@@ -45,6 +93,50 @@ class TestDockerfileBrowser(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             check(mutant)
         self.assertIn("a browser library package is missing from the image: " + name, str(cm.exception))
+
+    def _cm(self, old, new):
+        t = read(DF)
+        self.assertEqual(t.count(old), 1, old)
+        m = t.replace(old, new)
+        self.assertNotEqual(m, t)
+        return m
+
+    def test_chromium_real_file_clean(self):
+        self.assertEqual(chromium_problems(read(DF)), [])
+
+    def test_chromium_mutant_check_dropped(self):
+        self.assertEqual(chromium_problems(read(DF)), [])
+        self.assertIn(UNCHECKED, chromium_problems(self._cm(CHROMIUM_CHECK, "")))
+
+    def test_chromium_mutant_check_after_unpack(self):
+        self.assertEqual(chromium_problems(read(DF)), [])
+        unz = " && python3 -m zipfile -e /tmp/chromium.zip /tmp/chromium \\\n"
+        m = self._cm(CHROMIUM_CHECK + unz, unz + CHROMIUM_CHECK)
+        self.assertIn(UNCHECKED, chromium_problems(m))
+
+    def test_chromium_mutant_masked(self):
+        m = self._cm("sha256sum -c - \\\n && python3 -m zipfile", "sha256sum -c - || true \\\n && python3 -m zipfile")
+        self.assertIn("check or chain masked", chromium_problems(m))
+
+    def test_chromium_mutants_other(self):
+        self.assertEqual(chromium_problems(read(DF)), [])
+        for old, new in (
+            ("ARG CHROMIUM_VERSION=" + CHROMIUM_VERSION, "ARG CHROMIUM_VERSION=158.0.0.0"),
+            ("ARG CHROMIUM_SHA256=" + CHROMIUM_SHA, "ARG CHROMIUM_SHA256=" + "0" * 64),
+            ("chown -R root:root /opt/chromium && ", ""),
+            ("chmod 0755 /opt/chromium/chrome-headless-shell /opt/chromium/*.so* \\\n && ", ""),
+            (" && ln -s /opt/chromium/chrome-headless-shell /usr/bin/chromium \\\n", ""),
+            (" && ln -s /opt/chromium/chrome-headless-shell /usr/bin/google-chrome-stable \\\n", ""),
+            ("rm -rf /tmp/chromium.zip /tmp/chromium", "rm -rf /tmp/chromium"),
+            ("ENV CHROME_PATH=/usr/bin/chromium\n", ""),
+        ):
+            with self.subTest(old=old):
+                self.assertNotEqual(chromium_problems(self._cm(old, new)), [])
+
+    def test_chromium_docs(self):
+        r = read(README)
+        for s in ("CHROMIUM_VERSION", "CHROMIUM_SHA256", "CHROME_PATH=/usr/bin/chromium"):
+            self.assertIn(s, r)
 
     def test_noop_mutation_fails_the_computation(self):
         real = read(DF)
