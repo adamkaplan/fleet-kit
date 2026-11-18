@@ -541,19 +541,13 @@ class TestFakeV2(Base):
 # ------------------------------------------------------------------ the facts
 
 class TestPrivateDanglingSymlink(Base):
-    def test_dangling_symlink_is_refused_with_a_config_error(self):
+    def test_dangling_symlink_refused_and_existing_parent_tolerated(self):
         with tempfile.TemporaryDirectory() as tmp:
             link = Path(tmp) / "link"
             link.symlink_to(Path(tmp) / "missing")
-            with self.assertRaises(sb.ConfigError):
-                sb.ensure_state_dir(link)
-            with self.assertRaises(sb.ConfigError):
-                sb._write_private(link / "f", "x")
-            with self.assertRaises(sb.ConfigError):
-                sb._write_private(link, "x")
-
-    def test_write_private_tolerates_existing_parent(self):
-        with tempfile.TemporaryDirectory() as tmp:
+            for call in (lambda: sb.ensure_state_dir(link), lambda: sb._write_private(link / "f", "x"), lambda: sb._write_private(link, "x")):
+                with self.assertRaises(sb.ConfigError):
+                    call()
             sb._write_private(Path(tmp) / "a" / "f", "x")
             sb._write_private(Path(tmp) / "a" / "f", "y")
             self.assertEqual((Path(tmp) / "a" / "f").read_text(), "y")

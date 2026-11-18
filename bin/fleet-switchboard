@@ -1104,8 +1104,7 @@ def ensure_state_dir(path=None):
     than repaired: something changed it, and that deserves a person's look.
     """
     path = refuse_real_location(Path(path) if path else state_dir_path(), "state")
-    if path.is_symlink() and not path.exists():
-        raise ConfigError("state path is a dangling symlink: %s" % path)
+    if path.is_symlink() and not path.exists(): raise ConfigError("state path is a dangling symlink: %s" % path)
     if not path.exists():
         try:
             path.mkdir(parents=True, mode=0o700)
@@ -23048,13 +23047,8 @@ def format_install_lines(report):
 def _write_private(path, text):
     """Write `text` to `path` atomically with mode 0600: a temporary file in the same directory, then rename."""
     path = Path(path)
-    for target in (path, path.parent):
-        if target.is_symlink() and not target.exists():
-            raise ConfigError("path is a dangling symlink: %s" % target)
-    try:
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    except FileExistsError:
-        raise ConfigError("parent path is not a directory: %s" % path.parent)
+    if any(t.is_symlink() and not t.exists() for t in (path, path.parent)): raise ConfigError("path is a dangling symlink: %s" % path)
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
     try:
         with os.fdopen(handle, "w") as out:
