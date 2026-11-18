@@ -262,7 +262,8 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             econn = {"type": "provider.transport", "message": "ECONNRESET: socket closed"}
             self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_t1", "type": "assistant", "error": dict(econn)})
             self.world.v2.sessions[sid2]["messages"].append({"id": "msg_t2", "type": "assistant", "error": dict(econn)})
-            with mock.patch.object(sb, "probe_transport", lambda: False):
+            with mock.patch.dict(os.environ, {sb.UNDER_TEST_ENV: ""}), mock.patch.object(sb.socket, "create_connection", side_effect=OSError("reset")):
+                self.assertFalse(sb.probe_transport())
                 for _ in range(10):
                     self.tick(30)
             self.assertEqual(self.resumes(), [])

@@ -8988,8 +8988,11 @@ def read_errored_turn(engine, observation, now):
 STREAM_RESUME_STATE = "stream-resumes.json"   # {agent: {"times": [epoch], "last_id": newest message id handled}}
 STREAM_RESUME_WINDOW, STREAM_RESUME_MAX, STREAM_RESUME_AGENTS_MAX = 3600, 8, 64
 TRANSPORT_ERROR = re.compile(r"ECONNRESET|time(?:d)?[ -]?out|\b499\b", re.I)
-def probe_transport():
-    return True
+def probe_transport(host="api.githubcopilot.com", port=443, timeout=3.0):
+    if os.environ.get(UNDER_TEST_ENV): return True
+    try:
+        with socket.create_connection((host, port), timeout=timeout): return True
+    except OSError: return False
 def stream_error_tick(engine, discovery):
     """#2551, #34: resume blocked agents on provider stream failure; gate transport outages on probe_transport() with 1 cos summary line."""
     if discovery is None or engine.state_dir is None:
@@ -9033,8 +9036,7 @@ def stream_error_tick(engine, discovery):
                 if TRANSPORT_ERROR.search(current_err):
                     transport_resumed.append(name)
             def save(state, _name=name, _times=times, _msg=message, _now=now):
-                kept = {k: v for k, v in state.items() if k != _name and isinstance(v, dict) and isinstance(v.get("times"), list) and any(_is_number(t) and 0 <= _now - t < STREAM_RESUME_WINDOW for t in v["times"])}
-                kept[_name] = {"times": _times, "last_id": _msg}
+                kept = {k: v for k, v in state.items() if k != _name and isinstance(v, dict) and isinstance(v.get("times"), list) and any(_is_number(t) and 0 <= _now - t < STREAM_RESUME_WINDOW for t in v["times"])}; kept[_name] = {"times": _times, "last_id": _msg}
                 return {n: kept[n] for n in sorted(kept, key=lambda n: max([t for t in kept[n].get("times", []) if _is_number(t)] or [0]), reverse=True)[:STREAM_RESUME_AGENTS_MAX]}
             blocked_update(engine.state_dir, STREAM_RESUME_STATE, save)
         except Exception as err:
@@ -9043,9 +9045,7 @@ def stream_error_tick(engine, discovery):
         engine.send("switchboard", cos, "[transport-outage] Provider transport probe succeeded; resumed %d agent(s) once (%s)." % (len(transport_resumed), ", ".join(transport_resumed)))
 
 def ended_turn_text(name, resumed):
-    """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
-    if resumed:
-        return "an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60)
+    if resumed: return "an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60)
     return "an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name)
 # ---- an undelivered wake is recovered (#1337, docs/switchboard.md, "An undelivered wake is recovered").
 UNDELIVERED_STATE = "undelivered-wake.json"   # {agent: {"session", "since", "keys", "resumed", "told"}}: one incident per agent (an ordinary state row)
