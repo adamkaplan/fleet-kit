@@ -2363,7 +2363,7 @@ class Switchboard:
                 detail = {"was": plan.action, "now": again.action, "reason": again.reason,
                           "keys": [fact.key for fact in plan.pending]}
                 if self.audit is not None:
-                    self.audit.append(self.actor, "recheck", plan.recipient, detail)
+                    self.audit.append(self.actor, "recheck", plan.recipient, with_block_kind(self, fresh, detail))
                 note_unreachable(self, plan.recipient, fresh, why)
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
@@ -2394,8 +2394,8 @@ class Switchboard:
                     redone.action = "note"
                 if redone.action != plan.action and not (interrupt and redone.action in ("note", "wake")):
                     if self.audit is not None:
-                        self.audit.append(self.actor, "recheck", plan.recipient, {"was": plan.action, "now": redone.action, "reason": redone.reason,
-                                                                                  "keys": [fact.key for fact in kept_facts]})
+                        self.audit.append(self.actor, "recheck", plan.recipient, with_block_kind(self, observation, {"was": plan.action, "now": redone.action, "reason": redone.reason,
+                                                                                  "keys": [fact.key for fact in kept_facts]}))
                     if redone.action not in ("note", "wake"):
                         return {"sent": False, "action": redone.action, "reason": redone.reason}
                     plan.action = redone.action
@@ -2654,10 +2654,10 @@ class Switchboard:
                 if fresh is None or hold_reason(fresh) or fresh.status != "idle" \
                         or fresh.engaged(self.now(), self.engaged_seconds):
                     if self.audit is not None:
-                        self.audit.append(self.actor, "recheck", observation.name, {
+                        self.audit.append(self.actor, "recheck", observation.name, with_block_kind(self, fresh, {
                             "was": "convert", "now": "keep", "inbox_id": item.get("id"),
                             "reason": why or hold_reason(fresh) or "%s is %s or engaged" % (
-                                observation.name, fresh.status)})
+                                observation.name, fresh.status)}))
                     break
             for delivery in ("queue", "steer"):
                 with self._external("v2.inbox.update", observation.name, {
@@ -2880,8 +2880,8 @@ class Switchboard:
                 elif plan.action == "hold":
                     held[recipient] = plan
                     report["held"].append({"recipient": recipient, "reason": plan.reason})
-                    self._note("hold", recipient, {"reason": plan.reason,
-                                                   "keys": [fact.key for fact in plan.pending]})
+                    self._note("hold", recipient, with_block_kind(self, plan.observation, {"reason": plan.reason,
+                                                   "keys": [fact.key for fact in plan.pending]}))
                 else:
                     outcome = self.deliver(plan)
                     if outcome["sent"]:
@@ -3050,7 +3050,7 @@ class Switchboard:
             plan.action, plan.reason, plan.folded = "note", "folded into the sender's earlier message: no second wake", True
         if plan.action == "hold":
             if self.audit is not None:
-                self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
+                self.audit.append(self.actor, "hold", recipient, with_block_kind(self, plan.observation, {"reason": plan.reason, "keys": [fact.key]}))
             if fact.kind in ("send", REPORT) and fact.key.startswith(("send:", "report:")) and self.state_dir is not None and held_send_applies(plan.observation):
                 return hold_send_fact(self, fact, now)   # #2051, #34: a send or attention report to an agent with any hold reason is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
@@ -9212,6 +9212,52 @@ def blocked_alert_section(config):
     return dict(BLOCKED_ALERT_DEFAULTS, **(raw or {}))
 
 
+def blocked_kind_code(engine, observation):
+    """The kind of a block, read once for every reader (the blocked report, `pending`, the hold and recheck audit lines):
+    "permission", "question", "permission and question" (open requests), "ended turn" (nothing open) or "not read"."""
+    source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
+    if source is None:
+        return "not read"
+    kinds = sorted({kind for who, kind, _ in source.requests if who.session_id == observation.session_id})
+    return " and ".join(kinds) if kinds else "ended turn"
+
+
+def with_block_kind(engine, observation, detail):
+    """An audit detail for a hold or a recheck: for a blocked agent it carries `kind`, and an ended turn with nothing open is not
+    called a permission request or a question."""
+    if observation is None or getattr(observation, "status", None) != "blocked":
+        return detail
+    detail = dict(detail, kind=blocked_kind_code(engine, observation))
+    if detail["kind"] == "ended turn":
+        for key in ("reason", "why"):
+            if isinstance(detail.get(key), str):
+                detail[key] = detail[key].replace("blocked on a permission request or a question", "blocked on an ended turn with nothing open")
+    return detail
+
+
+def held_line(engine, observation):
+    """The one `pending` line for a blocked agent: the hold, its kind, what releases it, and since when (None when not blocked)."""
+    if observation is None or observation.get("status") != "blocked":
+        return None
+    seen = types.SimpleNamespace(name=observation["name"], session_id=observation["session"])
+    kind = blocked_kind_code(engine, seen)
+    if kind == "ended turn":
+        released = "`%s %s` by the Chief of Staff" % (RESUME_COMMAND, seen.name)
+        label = "an ended turn with nothing open"
+    else:
+        released = "the person's answer"
+        label = "an open %s request" % kind if kind != "not read" else "a permission request or a question (not read)"
+    entry = {}
+    if engine.state_dir is not None:
+        try:
+            entry = _read_small(engine.state_dir, BLOCKED_ALERT_STATE).get(seen.name) or {}
+        except Exception:
+            entry = {}
+    since = entry.get("since") if entry.get("session") == seen.session_id and _is_number(entry.get("since")) else None
+    when = "blocked since: not recorded" if since is None else "blocked since %s (%d minutes)" % (iso(since), int(max(0, engine.now() - since) // 60))
+    return "held: %s; released by %s; %s" % (label, released, when)
+
+
 def blocked_kind(engine, observation, resumed=False):
     """What a blocked agent waits on, in words, as the pass read it: an open permission request or question, or (nothing open) an ended turn."""
     source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
@@ -13905,6 +13951,9 @@ def cmd_pending(args, runner, now):
         print(json.dumps(entry, indent=2, sort_keys=True))
         return EXIT_OK
     print(_agent_line(entry))
+    held_text = held_line(engine, entry["observation"])
+    if held_text:
+        print(held_text)
     if entry["missing"]:
         print("  %s" % entry["missing"])
     repos = engine.repos_in_play()
