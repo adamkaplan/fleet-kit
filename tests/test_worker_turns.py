@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bin"))
-import worker_turns as wt  # noqa: E402
+import cloud_retired as wt  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("launcher_worker", ROOT / "cloud" / "launcher" / "cloud_worker.py")
 launcher = importlib.util.module_from_spec(spec)
@@ -45,7 +45,7 @@ class TestTurns(unittest.TestCase):
 
     def test_argument_summary_is_bounded(self):
         out = wt.turn_text({"parts": [tool("bash", command="word " * 500)]}, SCRUB)
-        self.assertLessEqual(len(out), len("tool bash ") + wt.SUMMARY_MAX + 1)
+        self.assertLessEqual(len(out), len("tool bash ") + wt.TURN_SUMMARY_MAX + 1)
 
     def test_canary_token_in_arguments_is_not_printed(self):
         out = wt.turn_text({"parts": [tool("bash", command="curl -H 'Authorization: Bearer %s' x" % CANARY)]}, SCRUB)

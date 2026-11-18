@@ -1131,7 +1131,7 @@ def cmd_send(args, runner, now, record):
 
 def message_line(message):
     role = str(message.get("type") or message.get("role") or "?")[:20]
-    line = "%s: %s" % (role, H["load_module"]("worker_turns").turn_text(message, _scrub_lib()) or H["_message_text"](message))
+    line = "%s: %s" % (role, _retired().turn_text(message, _scrub_lib()) or H["_message_text"](message))
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", " ", line).strip()   # a pod's text never reaches the terminal as an escape sequence
 
 
@@ -1182,7 +1182,7 @@ def cmd_read(args, runner, now):
                 return _retired().read_run_record(args.name, retired, state, runner, now)
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
         messages = engine.v2.message_list(session, limit=limit, order="desc") or []
-    print("[%s]" % H["load_module"]("worker_turns").summary_line(messages, _scrub_lib()))   # #1102: the one signal of a working worker
+    print("[%s]" % _retired().summary_line(messages, _scrub_lib()))   # #1102: the one signal of a working worker
     for message in reversed([m for m in messages if isinstance(m, dict)]):
         print(message_line(message))
     return H["EXIT_OK"]
