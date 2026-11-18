@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tuesday and Thursday Caretaker review of aging open issues across watched repos (#2573).
 
 Reviews open issues with no movement for `days` (default 14) across every watched repository
@@ -95,7 +94,7 @@ def run_caretaker(config=None, apply_changes=False, days=14, now_dt=None, runner
     return {"closed": closed, "raised": raised, "errors": errors, "summary": summary, "cutoff": cutoff_iso}
 
 
-def main(argv=None):
+def caretaker_main(argv=None):
     p = argparse.ArgumentParser(description="Tuesday/Thursday Caretaker review of aging open issues (#2573)")
     p.add_argument("--apply", action="store_true", help="Close obsolete issues on GitHub")
     p.add_argument("--days", type=int, default=14, help="Staleness threshold in days (default: 14)")
@@ -104,6 +103,3 @@ def main(argv=None):
     print(out["summary"])
     return 1 if out["errors"] else 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())
