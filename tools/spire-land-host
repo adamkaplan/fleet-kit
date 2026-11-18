@@ -137,8 +137,9 @@ def _find_floor_heavy_pod(proof, env, cfg, ns, repo):
         return proof.kube_run(
             ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
              "import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
-             "fc._pg_run(\"INSERT INTO floor_live_sessions(session_id, state, repo, branch, round, updated_at) "
-             "VALUES (%s, 'landing', %s, 'main', 1, NOW()) ON CONFLICT (session_id) DO UPDATE SET state='landing', updated_at=NOW();\" "
+             "fc._pg_run(\"INSERT INTO floor_live_sessions(session_id, caller, repo, ref, mode, state, round_num, updated_at) "
+             "VALUES (%s, 'fleet', %s, 'main', 'author', 'running', 1, NOW()) "
+             "ON CONFLICT (session_id) DO UPDATE SET state='running', updated_at=NOW();\" "
              "% (fc._sql_str(sys.argv[1]), fc._sql_str(sys.argv[2]))); fc.set_fhex_scale(max(1, fc.get_fhex_scale()[0]))",
              lease_sid, repo],
             env, config=cfg,
@@ -271,13 +272,16 @@ def run_floor_nightly(root):
         failed = 0
         for suite in NIGHTLY_SUITES:
             t0 = time.monotonic()
-            cmd = "export FLEET_HEAVY=off PATH=\"/run/cw-tmp/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; cd /home/worker/nightly-ws && %s" % suite
+            cmd = "unset FLEET_REAL_GH; export FLEET_HEAVY=off PATH=\"/run/cw-tmp/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; cd /home/worker/nightly-ws && %s" % suite
             r = proof.kube_run(["kubectl", "-n", ns, "exec", pod, "--", "bash", "-c", cmd], env, config=cfg)
             elapsed = round(time.monotonic() - t0, 1)
             ok = r.returncode == 0
             if not ok:
                 failed += 1
-            results.append({"suite": suite, "rc": r.returncode, "seconds": elapsed, "ok": ok})
+            entry = {"suite": suite, "rc": r.returncode, "seconds": elapsed, "ok": ok}
+            if not ok:
+                entry["tail"] = ((r.stdout or "") + "\n" + (r.stderr or ""))[-1500:].strip()
+            results.append(entry)
         print(json.dumps({"pod": pod, "repo": repo, "failed": failed, "results": results}))
         return 1 if failed else 0
     finally:
