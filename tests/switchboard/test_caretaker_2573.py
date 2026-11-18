@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,11 +11,20 @@ _spec = importlib.util.spec_from_file_location("caretaker", os.path.join(ROOT, "
 caretaker = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(caretaker)
 
+sys.path.insert(0, os.path.join(ROOT, "bin"))
+import caretaker_config  # noqa: E402
+
 CUTOFF = "2026-11-04T12:00:00Z"
 OLD = "2026-10-01T00:00:00Z"
 
 
 class TestCaretaker2573(unittest.TestCase):
+    def test_config_key_declared_and_validated(self):
+        self.assertEqual(caretaker_config.CONFIG_KEY, "caretaker_other_owners")
+        self.assertIsNone(caretaker_config.validate(["other_login"], "config"))
+        with self.assertRaises(ValueError):
+            caretaker_config.validate("bad", "config")
+
     def test_classify_skips_fresh_and_protected_issues(self):
         fresh = {"title": "cw-worker thing", "updatedAt": CUTOFF, "labels": []}
         self.assertEqual(caretaker.classify_issue(fresh, CUTOFF)[0], "skip")
