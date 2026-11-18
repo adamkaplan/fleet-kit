@@ -1667,9 +1667,9 @@ class TestWorkSyncPump(unittest.TestCase):
 
     def test_a_permanent_refusal_is_sent_once_until_the_content_changes(self):
         for status in (409, 400):
+            self.setUp()
             self.sink.refuse = type("Refusal", (Exception,), {"status": status})("refused\nsecond line")
-            self.sink.attempts, self.host.events[:] = 0, []
-            self.host.agent_list = [worker(issue=status)]
+            self.host.agent_list = [worker()]
             for _ in range(50):
                 status_now = self.cycle(1000)
             self.assertEqual(self.sink.attempts, 1)
@@ -1678,12 +1678,12 @@ class TestWorkSyncPump(unittest.TestCase):
             self.assertEqual(lines[0][2]["status"], status)
             self.assertNotIn("\n", lines[0][2]["error"])
             self.assertEqual(status_now["permanent"], 1)
-            self.host.agent_list = [worker(issue=status, status="working")]
+            self.host.agent_list = [worker(status="working")]
             for _ in range(5):
                 self.cycle(1000)
             self.assertEqual(self.sink.attempts, 2)
             self.sink.refuse = None
-            self.host.agent_list = [worker(issue=status, status="idle")]
+            self.host.agent_list = [worker(status="idle")]
             self.assertEqual(self.cycle(1000)["permanent"], 0)
 
     def test_a_transient_error_keeps_retrying_and_is_not_permanent(self):
