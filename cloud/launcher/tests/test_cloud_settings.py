@@ -37,6 +37,18 @@ OPTIONAL_SAMPLES["CW_LAND_REPORT_GIT_DIR"] = "/srv/checkout"
 OPTIONAL_SAMPLES["CW_LAND_REPORT_BRANCH"] = "origin/main"
 OPTIONAL_SAMPLES["CW_LAND_REPORT_OWN_AUTHORS"] = "acme-bot[bot],worker-two"
 OPTIONAL_SAMPLES["CW_LAND_REPORT_FIRST_REPO"] = "acme-org/widget-service"
+OPTIONAL_SAMPLES["CW_REMOTE_BACKEND"] = "floor"
+OPTIONAL_SAMPLES["CW_FLOOR_REPOS"] = "acme-org/widget-service,acme-org/*"
+OPTIONAL_SAMPLES["CW_FLOOR_TRANSPORT"] = "queue"
+OPTIONAL_SAMPLES["CW_FLOOR_QUEUE_URL"] = "https://queue.example.internal/cmd-f1-fleet"
+OPTIONAL_SAMPLES["CW_FLOOR_QUEUE_SAS_FILE"] = "/home/user/queue.sas"
+OPTIONAL_SAMPLES["CW_FLOOR_BLOB_URL"] = "https://blob.example.internal/floor-f1-fleet"
+OPTIONAL_SAMPLES["CW_FLOOR_BLOB_SAS_FILE"] = "/home/user/blob.sas"
+OPTIONAL_SAMPLES["CW_FLOOR_URL"] = "https://floor.example.internal/v1"
+OPTIONAL_SAMPLES["CW_FLOOR_CALLER"] = "fleet"
+OPTIONAL_SAMPLES["CW_FLOOR_TOKEN_FILE"] = "/home/user/floor.tok"
+OPTIONAL_SAMPLES["CW_FLOOR_VERIFY_ENABLED"] = "1"
+OPTIONAL_SAMPLES["CW_POD_ROLLBACK_WINDOW"] = "open"
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -107,6 +119,18 @@ HOSTILE["CW_LAND_REPORT_GIT_DIR"] = ["relative", "/a/../b", "-x"]
 HOSTILE["CW_LAND_REPORT_FIRST_REPO"] = ["-x/y", "a b/c", "a;b/c", "noslash", "a/" + "b" * 101]
 HOSTILE["CW_LAND_REPORT_OWN_AUTHORS"] = ["-x", "a;b", "$(x)", "a" * 101, "a,,b", "a,-b"]
 HOSTILE["CW_LAND_REPORT_BRANCH"] = ["-x", "a b", "a;b", "$(x)", "a" * 101]
+HOSTILE["CW_REMOTE_BACKEND"] = ["other", "FLOOR", "a b"]
+HOSTILE["CW_FLOOR_REPOS"] = ["noslash", "a b/c", "-x/y", "a/b,"]
+HOSTILE["CW_FLOOR_TRANSPORT"] = ["pigeon", "HTTP", "a b"]
+HOSTILE["CW_FLOOR_QUEUE_URL"] = ["http://queue.example.internal/q", "https://queue.example.internal", "https://queue.example.internal/a/b", "https://queue.example.internal/q?sig=1"]
+HOSTILE["CW_FLOOR_QUEUE_SAS_FILE"] = ["relative", "/a/../b", "-x"]
+HOSTILE["CW_FLOOR_BLOB_URL"] = ["http://blob.example.internal/b", "https://blob.example.internal", "https://blob.example.internal/a/b", "https://blob.example.internal/b?sig=1"]
+HOSTILE["CW_FLOOR_BLOB_SAS_FILE"] = ["relative", "/a/../b", "-x"]
+HOSTILE["CW_FLOOR_URL"] = ["http://floor.example.internal", "https://floor.example.internal/a/b", "https://floor.example.internal?x=1", "floor.example.internal"]
+HOSTILE["CW_FLOOR_CALLER"] = ["UPPER", "-bad", "a b", "a" * 33]
+HOSTILE["CW_FLOOR_TOKEN_FILE"] = ["relative", "/a/../b", "-x"]
+HOSTILE["CW_FLOOR_VERIFY_ENABLED"] = ["maybe", "2", "a b"]
+HOSTILE["CW_POD_ROLLBACK_WINDOW"] = ["half", "OPEN", "a b"]
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 
@@ -720,6 +744,9 @@ NOT_SETTINGS = {
     "CW_CLOUD_RECORD_DIR": "read-only override of where the reaper looks for the switchboard's records; the reaper's own wiring passes it",
     "CW_CLOUD_DOMAIN": "the domain in the recorded worker URL (default example.internal); the switchboard reaches the worker by a tunnel, so it is cosmetic",
     "CW_TOKEN_ENDPOINT": "the pod-side token mint's URL; needed only when no per-run secret carries git access, which `launch --cloud` always does",
+    "CW_HEAVY_EXECUTOR_SA": "the service account allowed to mint the lander role in token_service.py (default system:serviceaccount:<ns>:floor-heavy-executor); an in-cluster token-mint setting, not a host cloud.env key",
+    "CW_FLOOR_QUEUE_SAS": "in-memory SAS query string used by loopback tests; the settings file carries CW_FLOOR_QUEUE_SAS_FILE (a path, never a secret value)",
+    "CW_FLOOR_BLOB_SAS": "in-memory SAS query string used by loopback tests; the settings file carries CW_FLOOR_BLOB_SAS_FILE (a path, never a secret value)",
     "CW_RECORD_KEEP_DAYS": "tuning knob with a safe default (30 days)",
     "CW_RECORD_MAX_BYTES": "tuning knob with a safe default (transcript cap)",
     "CW_RECORD_SECONDS": "tuning knob with a safe default (how long the record may take)",
@@ -739,7 +766,7 @@ NOT_SETTINGS = {
     # the switchboard's own variable (S18)
     SWITCHBOARD_PREFIX + "WORKER_BIN": "the launcher program, found by a lookup order (the variable when set, else the launcher of the switchboard's own checkout, else `cloud-worker` on the PATH), not a settings key: a path in the file would be one more thing to keep in step with the checkout, and an environment override that wins is what tests and a second install need",
 }
-SOURCES = ["bin/cloud_worker.py", "bin/cloud_cluster.py"]
+SOURCES = ["bin/cloud_worker.py", "bin/cloud_cluster.py", "bin/cloud_floor.py"]
 NAME = re.compile(r"(?:%s)[A-Z0-9_]+" % "|".join(PREFIXES))
 
 

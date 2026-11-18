@@ -91,6 +91,15 @@ def scrub(text, limit=200):
         value = (env.get(key) or "").strip().lstrip("?")
         forms += [value] if len(value) > 3 else []
         forms += [part.partition("=")[2] for part in value.split("&") if len(part.partition("=")[2]) >= 6]   # each parameter value of the SAS alone
+    for key in ("CW_FLOOR_QUEUE_SAS_FILE", "CW_FLOOR_BLOB_SAS_FILE"):
+        sfile = (env.get(key) or "").strip()
+        if sfile:
+            try:
+                value = open(sfile).read(TOKEN_MAX).strip().lstrip("?")
+                forms += [value] if len(value) > 3 else []
+                forms += [part.partition("=")[2] for part in value.split("&") if len(part.partition("=")[2]) >= 6]
+            except OSError:
+                pass
     token_file = env.get("CW_FLOOR_TOKEN_FILE")
     if token_file:
         try:
@@ -289,18 +298,27 @@ class QueueBlobTransport:
         return {"state": seen["state"], "landed_sha": seen["landed_sha"], "error": seen["error"], "manifest": seen["manifest"], "log_tail": seen["log_tail"]}
 
 
-def _token():
-    path = (env_of().get("CW_FLOOR_TOKEN_FILE") or "").strip()
+def _private_file(setting):
+    path = (env_of().get(setting) or "").strip()
     if not path:
         return None
     try:
         found = os.lstat(path)
         if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
-            raise D["Refusal"]("CW_FLOOR_TOKEN_FILE is not a regular 0600 file of the user's own; nothing was called")
+            raise D["Refusal"]("%s is not a regular 0600 file of the user's own; nothing was called" % setting)
         with open(path) as handle:
             return handle.read(TOKEN_MAX + 1).strip() or None
     except OSError:
-        raise D["Refusal"]("CW_FLOOR_TOKEN_FILE cannot be read; nothing was called") from None
+        raise D["Refusal"]("%s cannot be read; nothing was called" % setting) from None
+
+
+def _token():
+    return _private_file("CW_FLOOR_TOKEN_FILE")
+
+
+def _sas(val_key, file_key):
+    val = (env_of().get(val_key) or "").strip()
+    return val if val else _private_file(file_key)
 
 
 def _base_problem(value):
@@ -332,7 +350,7 @@ def transport():
             problem = _base_problem(value)
             if problem:
                 raise D["Refusal"]("a Floor queue or blob URL is refused: %s; nothing was created" % problem)
-        return QueueBlobTransport(queue, env.get("CW_FLOOR_QUEUE_SAS"), blob, env.get("CW_FLOOR_BLOB_SAS"))
+        return QueueBlobTransport(queue, _sas("CW_FLOOR_QUEUE_SAS", "CW_FLOOR_QUEUE_SAS_FILE"), blob, _sas("CW_FLOOR_BLOB_SAS", "CW_FLOOR_BLOB_SAS_FILE"))
     url = (env.get("CW_FLOOR_URL") or "").strip()
     if not url:
         raise D["Refusal"]("a repository routes to Floor but CW_FLOOR_URL is not set in the private settings; nothing was created")
