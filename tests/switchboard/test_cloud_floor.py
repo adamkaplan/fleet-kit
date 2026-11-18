@@ -24,6 +24,7 @@ Every input and external call:
   Floor 503 on submit                            test_an_outage_on_submit_writes_no_record                            S5
   unreadable artifact on observe and result      test_an_unreadable_artifact_is_named_and_the_record_is_untouched     S5
   the HTTP client (503, art-9, redirect)         test_the_http_client_over_loopback                                   S5
+  Queue + Blob wire format over loopback         TestCloudFloorQueueBlob (five tests: life, payload blob, state_seq, outage, choice)   S1 S5
   private names in settings and errors           test_planted_private_values_never_reach_output_or_files              U1
   the two guards of a new module and test file   test_the_guard_tools_pass                                            U1
 
@@ -535,6 +536,11 @@ class TestCloudFloor(FloorCase):
         said = self.floor.scrub("POST https://%s/api/x failed: %s Bearer %s sig=Zm9vYmFy host %s" % (host, token, token, host))
         for secret in (host, token, "Zm9vYmFy", "https://"):
             self.assertNotIn(secret, said)
+        os.environ.update({"CW_FLOOR_QUEUE_URL": "https://queue.example.internal/cmds", "CW_FLOOR_QUEUE_SAS": "?sv=2024&sig=QPLANTEDsig9",
+                           "CW_FLOOR_BLOB_URL": "https://blob.example.internal/state", "CW_FLOOR_BLOB_SAS": "sv=2024&sig=BPLANTEDsig9"})
+        said = self.floor.scrub("PUT https://queue.example.internal/cmds/messages?sv=2024&sig=QPLANTEDsig9 and blob.example.internal/state QPLANTEDsig9 BPLANTEDsig9")
+        for secret in ("queue.example.internal", "blob.example.internal", "PLANTEDsig9", "https://"):
+            self.assertNotIn(secret, said)
         self.fake.down = True
         _, _, err = self.run_cmd_catching(self.m.cmd_launch, self.args("u1"), None, lambda: 1000.0)
         self.assertNotIn(host, err)
@@ -547,6 +553,183 @@ class TestCloudFloor(FloorCase):
         for argv in (["tools/new-module-demands", "bin/cloud_floor.py"], ["tools/new-test-checks", "tests/switchboard/test_cloud_floor.py"]):
             done = subprocess.run([sys.executable] + argv, cwd=str(REPO), capture_output=True, text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+class MiniFloor:
+    """Floor's side of the Queue + Blob v1 wire format on a loopback port: the queue takes base64 commands in a QueueMessage, applies each cmd_id once
+    (a repeat is acked `duplicate`) and publishes state.json and msg/<session>.json; a payload blob is read back when a command names one."""
+    QUEUE_SAS, BLOB_SAS = "sv=2024&sig=QUEUEsigPLANTED", "sv=2024&sig=BLOBsigPLANTED"
+
+    def __init__(self):
+        self.commands, self.sessions, self.acks, self.blobs, self.texts, self.paths = [], {}, {}, {}, {}, []
+        self.down, self.hold, self.state_key = False, False, "seq"
+        mini = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                return None
+
+            def _send(self, code, body=b"", headers=()):
+                self.send_response(code)
+                for key, value in headers:
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _split(self):
+                path, _, query = self.path.partition("?")
+                mini.paths.append(self.path)
+                return path, query
+
+            def do_POST(self):
+                path, query = self._split()
+                data = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if query != mini.QUEUE_SAS or path != "/q/messages":
+                    return self._send(403)
+                if mini.down:
+                    return self._send(503, b"queue down")
+                text = re.search(rb"<MessageText>([A-Za-z0-9+/=]+)</MessageText>", data).group(1)
+                mini.apply(json.loads(__import__("base64").b64decode(text)))
+                self._send(201)
+
+            def do_PUT(self):
+                path, query = self._split()
+                data = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if query != mini.BLOB_SAS or self.headers.get("x-ms-blob-type") != "BlockBlob":
+                    return self._send(403)
+                mini.blobs[path[len("/b/"):]] = json.loads(data)
+                self._send(201)
+
+            def do_GET(self):
+                path, query = self._split()
+                if query != mini.BLOB_SAS:
+                    return self._send(403)
+                if path == "/b/state.json":
+                    body = {"v": 1, "floor": "f1", mini.state_key: 7, "written_at": "2030-01-01T00:00:00Z", "sessions": mini.sessions, "acks": mini.acks}
+                    return self._send(200, json.dumps(body).encode())
+                name = path[len("/b/msg/"):-len(".json")]
+                if path.startswith("/b/msg/") and name in mini.texts:
+                    return self._send(200, json.dumps({"v": 1, "session_id": name, "state": "idle", "text": mini.texts[name], "at": "2030-01-01T00:00:00Z", "round": 1}).encode())
+                self._send(404)
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.thread.join(5)
+
+    @property
+    def base(self):
+        return "http://127.0.0.1:%d" % self.server.server_port
+
+    def apply(self, command):
+        self.commands.append(command)
+        key, sid = command["cmd_id"], command["session_id"]
+        if key in self.acks:
+            self.acks[key] = "duplicate"
+            return
+        self.acks[key] = "applied"
+        if command["op"] == "launch":
+            brief = command.get("brief") if "brief" in command else self.blobs[command["payload"]]["brief"]
+            self.sessions.setdefault(sid, {"state": "running", "busy": True, "last_update": "2030-01-01T00:00:00Z", "rounds": 2, "landed_sha": None, "error": None, "brief": brief})
+        elif command["op"] == "retire" and not self.hold:
+            self.sessions[sid]["state"] = "retired"
+
+
+class TestCloudFloorQueueBlob(FloorCase):
+    def setUp(self):
+        super().setUp()
+        self.mini = MiniFloor()
+        self.addCleanup(self.mini.close)
+        self.floor.TRANSPORT = None
+        os.environ.update({"CW_FLOOR_QUEUE_URL": self.mini.base + "/q", "CW_FLOOR_QUEUE_SAS": "?" + MiniFloor.QUEUE_SAS,
+                           "CW_FLOOR_BLOB_URL": self.mini.base + "/b", "CW_FLOOR_BLOB_SAS": MiniFloor.BLOB_SAS})
+        for name in ("CW_FLOOR_TRANSPORT", "CW_FLOOR_URL"):
+            os.environ.pop(name, None)
+
+    def test_the_whole_life_of_a_worker_over_the_wire(self):
+        self.assertEqual(self.launch()[0], 0)
+        sid = self.record("f1")["session"]
+        launch = self.mini.commands[0]
+        self.assertEqual({k: launch[k] for k in ("v", "op", "session_id", "seq", "ref", "repo")},
+                         {"v": 1, "op": "launch", "session_id": sid, "seq": 1, "ref": "main", "repo": "https://github.com/%s.git" % REPO_NAME})
+        self.assertRegex(launch["cmd_id"], r"^c-[0-9a-f]{16}$")
+        self.assertRegex(launch["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertTrue(launch["brief"].startswith("Floor Author Contract"))
+        self.assertNotRegex(launch["brief"].split("Task:\n", 1)[1], r"git push|gh pr create")
+        self.assertEqual(self.record("f1")["work_id"], sid)
+        self.assertEqual(self.launch()[0], 0)   # the same command again: Floor acks it `duplicate`, there is one session
+        self.assertEqual((len(self.mini.sessions), list(self.mini.acks.values())), (1, ["duplicate"]))
+        self.assertEqual(self.send("f1", "please continue")[0], 0)
+        send = self.mini.commands[-1]
+        self.assertEqual((send["op"], send["seq"], send["text"], send["session_id"]), ("send", 2, "please continue", sid))
+        self.mini.texts[sid], self.mini.sessions[sid]["landed_sha"] = "all done here", "d" * 40
+        code, out, err = self.read("f1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("assistant: all done here", out)
+        self.assertIn("landed_sha " + "d" * 40, out)
+        lines, rows = self.status()
+        self.assertTrue(any("state running" in l and "d" * 40 in l and "rounds 2" in l for l in lines), lines)
+        self.mini.hold = True   # the retire is sent but the session is not retired yet: custody is not confirmed
+        code, out, err = self.retire("f1")
+        self.assertEqual(code, self.m.H["EXIT_ERROR"])
+        self.assertIn("waiting for heavy-job custody", out)
+        retire = self.mini.commands[-1]
+        self.assertEqual((retire["op"], retire["seq"]), ("retire", 3))
+        self.assertNotIn("text", retire)
+        self.mini.sessions[sid]["state"] = "retired"
+        self.assertEqual(self.retire("f1")[0], 0)
+        self.assertEqual(self.mini.commands[-1]["cmd_id"], retire["cmd_id"])   # the wait asked the same command again
+        self.assertFalse(self.m.record_path(str(self.state), "f1").exists())
+        for path in self.mini.paths:
+            self.assertTrue(path.endswith(MiniFloor.QUEUE_SAS) or path.endswith(MiniFloor.BLOB_SAS), path)
+
+    def test_a_large_brief_goes_in_a_payload_blob(self):
+        self.brief = "Add the table.\n" + "x" * 70000
+        self.assertEqual(self.launch()[0], 0)
+        command = self.mini.commands[0]
+        self.assertEqual(command["payload"], "payload/%s.json" % command["cmd_id"])
+        self.assertNotIn("brief", command)
+        blob = self.mini.blobs[command["payload"]]
+        self.assertEqual(blob["env"], {})
+        self.assertTrue(blob["brief"].startswith("Floor Author Contract") and blob["brief"].endswith("x\n"))
+        self.assertEqual(next(iter(self.mini.sessions.values()))["brief"], blob["brief"])
+
+    def test_state_may_name_its_counter_state_seq_and_a_missing_message_blob_is_empty(self):
+        self.launch()
+        self.mini.state_key = "state_seq"
+        code, out, err = self.read("f1")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("assistant:", out)
+        self.assertIn("state running", self.status()[0][-1])
+
+    def test_a_queue_outage_writes_no_record_and_says_nothing_private(self):
+        self.mini.down = True
+        code, out, err = self.run_cmd_catching(self.m.cmd_launch, self.args("q1"), None, lambda: 1000.0)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(list(Path(self.state).glob("cloud/*")), [])
+        for secret in ("127.0.0.1", "sigPLANTED", MiniFloor.QUEUE_SAS):
+            self.assertNotIn(secret, err)
+
+    def test_the_transport_is_chosen_by_the_settings(self):
+        pick = self.floor.transport
+        self.assertIsInstance(pick(), self.floor.QueueBlobTransport)
+        os.environ["CW_FLOOR_URL"] = "https://floor.example.internal"
+        self.assertIsInstance(pick(), self.floor.QueueBlobTransport)   # both URLs set: the queue is the default
+        os.environ["CW_FLOOR_TRANSPORT"] = "http"
+        self.assertIsInstance(pick(), self.floor.HttpTransport)
+        del os.environ["CW_FLOOR_TRANSPORT"], os.environ["CW_FLOOR_QUEUE_URL"]
+        self.assertIsInstance(pick(), self.floor.HttpTransport)   # no queue URL: http
+        os.environ["CW_FLOOR_TRANSPORT"] = "queue"
+        with self.assertRaises(self.m.Refusal):
+            pick()
+        os.environ["CW_FLOOR_TRANSPORT"] = "pigeon"
+        with self.assertRaises(self.m.Refusal):
+            pick()
+        self.floor.TRANSPORT = self.fake   # the injectable object wins over every setting
+        self.assertIs(pick(), self.fake)
 
 
 class TestCloudFloorMutants(Base):

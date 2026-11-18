@@ -7,6 +7,9 @@ setting of the day, so a worker stays on the side that admitted it through a cut
 Private settings (cloud.env or the environment, never in this file):
   CW_REMOTE_BACKEND       `pod` (the default and the rollback switch: it wins over everything) or `floor`
   CW_FLOOR_REPOS          comma-separated `owner/repo`, `owner/*` or `*`: the repositories routed to Floor while the backend is not `floor` yet
+  CW_FLOOR_TRANSPORT      `queue` or `http` (default `queue` when CW_FLOOR_QUEUE_URL and CW_FLOOR_BLOB_URL are both set, else `http`)
+  CW_FLOOR_QUEUE_URL, CW_FLOOR_QUEUE_SAS   the command queue (queue transport): commands are POSTed to <url>/messages?<sas>
+  CW_FLOOR_BLOB_URL, CW_FLOOR_BLOB_SAS     the published state (state.json, msg/<session>.json) and the payload blobs (queue transport)
   CW_FLOOR_URL            the base URL of the Floor caller API (https, or plain http to a loopback address)
   CW_FLOOR_CALLER         the caller id of this fleet (default `fleet`)
   CW_FLOOR_TOKEN_FILE     optional path of a 0600 bearer-token file
@@ -17,8 +20,11 @@ HTTP client of CW_FLOOR_URL is made (no redirect followed, 30 s, 1 MiB, parsed b
 Commands are idempotent by key: the session id and every command id are a hash of the caller and the worker, so a launch or a send that is repeated
 after a crash names the same work and is never run twice.
 """
+import base64
 import hashlib
+import json
 import os
+import time
 import re
 import stat
 import sys
@@ -32,6 +38,7 @@ TRANSPORT = None   # a test seam: an object with submit, message, cancel, observ
 ENDPOINT_URL = "https://floor.example.internal"   # the placeholder the record carries: the real URL stays in the private settings
 TIMEOUT_SECONDS = 30
 RESPONSE_MAX = 1 << 20
+PAYLOAD_LIMIT = 60 * 1024   # a queue message whose base64 text is longer than this carries its brief or text in a payload blob
 TOKEN_MAX = 512
 CALLER_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 NOT_AUTHORS = ("orchestrator",)   # an agent that is not a sandbox author
@@ -76,6 +83,12 @@ def scrub(text, limit=200):
     env = env_of()
     url = (env.get("CW_FLOOR_URL") or "").strip()
     forms = [url, urllib.parse.urlsplit(url).netloc if url else ""]
+    for key in ("CW_FLOOR_QUEUE_URL", "CW_FLOOR_BLOB_URL"):
+        value = (env.get(key) or "").strip()
+        forms += [value, urllib.parse.urlsplit(value).netloc if value else ""]
+    for key in ("CW_FLOOR_QUEUE_SAS", "CW_FLOOR_BLOB_SAS"):
+        value = (env.get(key) or "").strip().lstrip("?")
+        forms += [value] if len(value) > 3 else []
     token_file = env.get("CW_FLOOR_TOKEN_FILE")
     if token_file:
         try:
@@ -131,42 +144,51 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _request(method, url, data=None, headers=(), missing_ok=False):
+    """(status, body bytes) of one request: no redirect followed, 30 s, the answer cut at 1 MiB. An HTTP error is a FloorError (a 503 that names `art-...` is an
+    UnavailableArtifactError); a 404 is returned as (404, b"") when `missing_ok`. The text of an error holds no URL: callers scrub it again."""
+    request = urllib.request.Request(url, data=data, method=method)
+    for key, value in headers:
+        request.add_header(key, value)
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(request, timeout=TIMEOUT_SECONDS) as answer:
+            status, raw = answer.status, answer.read(RESPONSE_MAX + 1)
+    except urllib.error.HTTPError as err:
+        if err.code == 404 and missing_ok:
+            return 404, b""
+        raw = err.read(RESPONSE_MAX + 1) if err.fp else b""
+        found = re.search(r"\bart-[A-Za-z0-9]{1,40}\b", raw[:RESPONSE_MAX].decode("utf-8", "replace"))
+        if err.code == 503 and found:
+            raise UnavailableArtifactError(found.group(0)) from None
+        raise FloorError("Floor answered HTTP %d" % err.code, err.code) from None
+    except (urllib.error.URLError, OSError, ValueError) as err:
+        raise FloorError("Floor could not be reached (%s)" % scrub(type(err).__name__, 60)) from None
+    if len(raw) > RESPONSE_MAX:
+        raise FloorError("Floor's answer is larger than %d bytes" % RESPONSE_MAX)
+    return status, raw
+
+
+def _parse(raw):
+    try:
+        parsed = D["parse_bounded"](raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise FloorError("Floor's answer is not JSON") from None
+    if not isinstance(parsed, dict):
+        raise FloorError("Floor's answer is not an object")
+    return parsed
+
+
 class HttpTransport:
     """The five calls of the Floor caller API over HTTP: a JSON body in, a bounded JSON answer out. Paths are under /v1/callers/<caller>/."""
     def __init__(self, base, token=None):
         self.base, self.token = base.rstrip("/"), token
 
     def _call(self, method, path, body=None):
-        import json
         data = None if body is None else json.dumps(body, sort_keys=True).encode()
-        request = urllib.request.Request(self.base + path, data=data, method=method)
-        request.add_header("Accept", "application/json")
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
+        headers = [("Accept", "application/json")] + ([("Content-Type", "application/json")] if data is not None else [])
         if self.token:
-            request.add_header("Authorization", "Bearer " + self.token)
-        opener = urllib.request.build_opener(_NoRedirect)
-        try:
-            with opener.open(request, timeout=TIMEOUT_SECONDS) as answer:
-                raw = answer.read(RESPONSE_MAX + 1)
-        except urllib.error.HTTPError as err:
-            raw = err.read(RESPONSE_MAX + 1) if err.fp else b""
-            text = raw[:RESPONSE_MAX].decode("utf-8", "replace")
-            found = re.search(r"\bart-[A-Za-z0-9]{1,40}\b", text)
-            if err.code == 503 and found:
-                raise UnavailableArtifactError(found.group(0)) from None
-            raise FloorError("Floor answered HTTP %d" % err.code, err.code) from None
-        except (urllib.error.URLError, OSError, ValueError) as err:
-            raise FloorError("Floor could not be reached (%s)" % scrub(type(err).__name__, 60)) from None
-        if len(raw) > RESPONSE_MAX:
-            raise FloorError("Floor's answer is larger than %d bytes" % RESPONSE_MAX)
-        try:
-            parsed = D["parse_bounded"](raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise FloorError("Floor's answer is not JSON") from None
-        if not isinstance(parsed, dict):
-            raise FloorError("Floor's answer is not an object")
-        return parsed
+            headers.append(("Authorization", "Bearer " + self.token))
+        return _parse(_request(method, self.base + path, data, headers)[1])
 
     def _root(self, caller):
         return "/v1/callers/" + urllib.parse.quote(caller, safe="")
@@ -187,6 +209,86 @@ class HttpTransport:
         return self._call("GET", "%s/works/%s/result" % (self._root(caller), urllib.parse.quote(work_id, safe="")))
 
 
+def rfc3339(moment=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if moment is None else moment))
+
+
+class QueueBlobTransport:
+    """Floor's Queue + Blob v1 wire format. A command is JSON, base64 inside a <QueueMessage> POSTed to <queue>/messages; the state is published by Floor as
+    state.json and msg/<session>.json under the blob URL. The work id is the session id. A command is never acknowledged on the call: `cancel` reads the
+    published state and says `reserved` until the session is `retired`; a submit or a send is applied once by Floor (it acks a repeated cmd_id `duplicate`)."""
+    def __init__(self, queue_url, queue_sas, blob_url, blob_sas):
+        self.queue, self.queue_sas, self.blob, self.blob_sas = queue_url.rstrip("/"), (queue_sas or "").lstrip("?"), blob_url.rstrip("/"), (blob_sas or "").lstrip("?")
+
+    @staticmethod
+    def _url(base, path, sas):
+        return base + path + ("?" + sas if sas else "")
+
+    def _enqueue(self, command, payload=None):
+        """Send `command` (a dict); `payload` holds the large fields (brief or text), which go in the message or, when it would be over 60 KiB, in a blob."""
+        full = dict(command, **(payload or {}))
+        text = base64.b64encode(json.dumps(full, sort_keys=True).encode("utf-8")).decode("ascii")
+        if payload and len(text) > PAYLOAD_LIMIT:
+            path = "payload/%s.json" % command["cmd_id"]
+            blob = json.dumps(dict(payload, env={}), sort_keys=True).encode("utf-8")
+            _request("PUT", self._url(self.blob, "/" + path, self.blob_sas), blob, [("x-ms-blob-type", "BlockBlob"), ("Content-Type", "application/json")])
+            text = base64.b64encode(json.dumps(dict(command, payload=path), sort_keys=True).encode("utf-8")).decode("ascii")
+        body = ("<QueueMessage><MessageText>%s</MessageText></QueueMessage>" % text).encode("ascii")
+        _request("POST", self._url(self.queue, "/messages", self.queue_sas), body, [("Content-Type", "application/xml")])
+
+    def _command(self, op, cmd_id, session_id, seq, **more):
+        return dict({"v": 1, "cmd_id": cmd_id, "op": op, "session_id": session_id, "seq": int(seq), "at": rfc3339()}, **more)
+
+    def _state(self):
+        state = _parse(_request("GET", self._url(self.blob, "/state.json", self.blob_sas), None, [("Accept", "application/json")])[1])
+        sessions, acks = state.get("sessions"), state.get("acks")
+        if state.get("v") != 1 or not isinstance(sessions, dict):
+            raise FloorError("the published state is not v1")
+        state["floor_seq"] = state.get("seq", state.get("state_seq"))
+        state["acks"] = acks if isinstance(acks, dict) else {}
+        return state
+
+    def _text(self, session_id):
+        status, raw = _request("GET", self._url(self.blob, "/msg/%s.json" % urllib.parse.quote(session_id, safe=""), self.blob_sas), None, [("Accept", "application/json")], missing_ok=True)
+        if status == 404:
+            return ""
+        text = _parse(raw).get("text")
+        return text if isinstance(text, str) else ""
+
+    def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", **ignored):
+        command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main")
+        self._enqueue(command, {"brief": brief})
+        return {"work_id": session_id, "session_id": session_id, "seq": 1}
+
+    def message(self, caller, work_id, cmd_id, seq, text):
+        self._enqueue(self._command("send", cmd_id, work_id, seq), {"text": text})
+        return {"id": cmd_id, "seq": int(seq)}
+
+    def cancel(self, caller, work_id, cmd_id, seq):
+        self._enqueue(self._command("retire", cmd_id, work_id, seq))
+        try:
+            state = self._state()
+        except FloorError:
+            return {"cancelled": True, "reserved": True}   # sent, not yet seen applied: custody is not confirmed
+        ack = state["acks"].get(cmd_id)
+        if isinstance(ack, str) and ack.startswith("rejected"):
+            raise FloorError("Floor rejected the retire (%s)" % scrub(ack, 80))
+        retired = (state["sessions"].get(work_id) or {}).get("state") == "retired"
+        return {"cancelled": True, "reserved": not retired}
+
+    def observe(self, caller, work_id):
+        state = self._state()
+        found = state["sessions"].get(work_id)
+        found = found if isinstance(found, dict) else {}
+        text = self._text(work_id)
+        return {"state": found.get("state", "queued"), "busy": bool(found.get("busy")), "landed_sha": found.get("landed_sha"), "rounds": found.get("rounds", 0),
+                "error": found.get("error"), "last_update": found.get("last_update"), "messages": [{"role": "assistant", "text": text}] if text else []}
+
+    def result(self, caller, work_id):
+        seen = self.observe(caller, work_id)
+        return {"state": seen["state"], "landed_sha": seen["landed_sha"], "error": seen["error"]}
+
+
 def _token():
     path = (env_of().get("CW_FLOOR_TOKEN_FILE") or "").strip()
     if not path:
@@ -201,12 +303,37 @@ def _token():
         raise D["Refusal"]("CW_FLOOR_TOKEN_FILE cannot be read; nothing was called") from None
 
 
+def _base_problem(value):
+    """Why a queue or blob URL (it may carry a path, the queue name) is refused, or None: the host part is judged as an endpoint is, and no query, fragment or credentials."""
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port
+    except ValueError:
+        return "not a URL"
+    if parts.query or parts.fragment:
+        return "it must not carry a query or fragment (the SAS is a separate setting)"
+    return D["endpoint_problem"]("%s://%s" % (parts.scheme, parts.netloc))
+
+
 def transport():
     """The transport: the test seam, else an HTTP client of CW_FLOOR_URL (read from the private settings)."""
     if TRANSPORT is not None:
         return TRANSPORT
     D["use_settings"]()
-    url = (env_of().get("CW_FLOOR_URL") or "").strip()
+    env = env_of()
+    queue, blob = (env.get("CW_FLOOR_QUEUE_URL") or "").strip(), (env.get("CW_FLOOR_BLOB_URL") or "").strip()
+    mode = (env.get("CW_FLOOR_TRANSPORT") or "").strip().lower() or ("queue" if queue and blob else "http")
+    if mode not in ("queue", "http"):
+        raise D["Refusal"]("CW_FLOOR_TRANSPORT is not queue or http; nothing was created")
+    if mode == "queue":
+        if not queue or not blob:
+            raise D["Refusal"]("the queue transport needs CW_FLOOR_QUEUE_URL and CW_FLOOR_BLOB_URL in the private settings; nothing was created")
+        for value in (queue, blob):
+            problem = _base_problem(value)
+            if problem:
+                raise D["Refusal"]("a Floor queue or blob URL is refused: %s; nothing was created" % problem)
+        return QueueBlobTransport(queue, env.get("CW_FLOOR_QUEUE_SAS"), blob, env.get("CW_FLOOR_BLOB_SAS"))
+    url = (env.get("CW_FLOOR_URL") or "").strip()
     if not url:
         raise D["Refusal"]("a repository routes to Floor but CW_FLOOR_URL is not set in the private settings; nothing was created")
     problem = D["endpoint_problem"](url)
@@ -369,7 +496,6 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
 
 
 def _json(value):
-    import json
     return json.dumps(value, sort_keys=True)
 
 
