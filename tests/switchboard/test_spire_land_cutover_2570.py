@@ -73,6 +73,17 @@ class TestSpireLandCutover2570(Base):
         self.assertEqual(rc3, 0)
         self.assertEqual(seen_env.get("FLEET_APP_ID"), "5404907")
         self.assertEqual(seen_env.get("FLEET_LAND_STATUSES"), "required")
+        # Local check on darwin is refused (exit 64) without calling runner, and land on darwin routes to submit_cloud_land
+        calls.clear()
+        rc4 = host.main(["check"], workdir=str(REPO), runner=lambda *a, **kw: calls.append(a), platform="darwin")
+        self.assertEqual(rc4, 64)
+        self.assertEqual(calls, [])
+        cloud_calls = []
+        host.submit_cloud_land = lambda root, subcmd, aid, akey: (cloud_calls.append((subcmd, aid)), 0)[1]
+        rc5 = host.main(["land"], workdir=str(REPO), runner=lambda *a, **kw: calls.append(a), platform="darwin")
+        self.assertEqual(rc5, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(cloud_calls, [(["land"], "5404907")])
 
     def test_u1_parity_tool_verifies_spire_land_statuses_and_tree(self):
         parity = _load_script("tools/land-status-parity", "land_status_parity_test")

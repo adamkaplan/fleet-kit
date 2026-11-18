@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Host-only wrapper for `.spire/tool/bin/spire land` (#2570).
+"""Host-only submitter and observer for `.spire/tool/bin/spire land` (#2570, #34).
 
-Reads `CW_SECRET_DIR` (`cw-app-id`, `cw-app-key`, and optional `cw-stack-model-key`) from
-`~/.config/fleet-switchboard/cloud.env` via `pwd.getpwuid(os.getuid()).pw_dir` (never trusting
-`$HOME`), sets `FLEET_APP_ID`, `FLEET_APP_PRIVATE_KEY`, `FLEET_LAND_STATUSES=required`, and
-`COUNCIL_MODEL_URL` (default `https://openrouter.ai/api/v1` when `COUNCIL_MODEL_KEY` or
-`cw-stack-model-key` is present) / `COUNCIL_MODEL_KEY` in the child environment, and runs
-`.spire/tool/bin/spire` (where `.spire/tool/lib/app-key.sh` immediately moves
-`FLEET_APP_PRIVATE_KEY` out of the exported environment so no check or council child sees it).
-Fails closed (exit 70) before running anything if the App ID, private key, or present model key
-file is missing or unreadable.
+Reads `CW_SECRET_DIR` (`cw-app-id`, `cw-app-key`, `cw-minter-kubeconfig`, and optional
+`cw-stack-model-key`) and `CW_COUNCIL_URL` from `~/.config/fleet-switchboard/cloud.env` via
+`pwd.getpwuid(os.getuid()).pw_dir` (never trusting `$HOME`). Refuses (exit 64) to run `check`
+locally on the Mac host (`sys.platform == "darwin"`), and for `land` on the Mac host submits
+and observes the landing on a cloud heavy-executor pod (`shape L`) so no test or check suite
+runs on the host. Fails closed (exit 70) before running anything if the App ID, private key,
+or present model key file is missing or unreadable.
 """
+import base64
+import datetime as dt
 import os
 import pwd
+import re
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 
 NOT_CONFIGURED = 70
+REFUSED_LOCAL = 64
 MAX_ENV_BYTES = 65536
 MAX_KEY_BYTES = 65536
 DEFAULT_COUNCIL_URL = "https://openrouter.ai/api/v1"
@@ -26,22 +30,27 @@ SECRET_DIR = None
 HOME_DIR = None
 
 
-def secret_dir():
-    if SECRET_DIR:
-        return SECRET_DIR
+def _cloud_env_map():
+    out = {}
     try:
         home = HOME_DIR or pwd.getpwuid(os.getuid()).pw_dir
         path = os.path.join(home, ".config", "fleet-switchboard", "cloud.env")
         with open(path, encoding="utf-8") as handle:
             text = handle.read(MAX_ENV_BYTES + 1)
-        if len(text) > MAX_ENV_BYTES:
-            return None
-        for line in text.splitlines():
-            if line.startswith("CW_SECRET_DIR="):
-                return line.split("=", 1)[1].strip().strip("\"'")
+        if len(text) <= MAX_ENV_BYTES:
+            for line in text.splitlines():
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip().strip("\"'")
     except (OSError, KeyError, UnicodeError):
         pass
-    return None
+    return out
+
+
+def secret_dir():
+    if SECRET_DIR:
+        return SECRET_DIR
+    return _cloud_env_map().get("CW_SECRET_DIR")
 
 
 def _read_secret_file(path):
@@ -87,8 +96,88 @@ def _ensure_host_bash_shim():
     return shim_dir
 
 
-def main(argv=None, workdir=None, runner=subprocess.run):
+def _origin_repo(root):
+    done = subprocess.run(["git", "-C", root, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=15)
+    m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", (done.stdout or "").strip())
+    if not m:
+        raise ValueError("origin remote is not a github.com repository")
+    return m.group(1)
+
+
+def submit_cloud_land(root, subcmd, app_id, app_key):
+    sys.path.insert(0, os.path.join(root, "bin"))
+    import cloud_image_proof as proof
+    cenv = _cloud_env_map()
+    env = dict(os.environ, CW_SECRET_DIR=secret_dir() or "", CW_PROOF_KUBECTL_TIMEOUT="900")
+    cfg = proof.mint_token(env)
+    ns = env.get("CW_CLOUD_NAMESPACE") or cenv.get("CW_CLOUD_NAMESPACE") or "cw"
+    council_url = env.get("CW_COUNCIL_URL") or cenv.get("CW_COUNCIL_URL") or "http://copilot-bridge.%s.svc:8080" % ns
+    repo = _origin_repo(root)
+    head_sha = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True, timeout=15).strip()
+    pod = (env.get("CW_LAND_EXECUTOR_POD") or "").strip()
+    created_worker = None
+    tmp_dir = tempfile.mkdtemp(prefix="spire-land-bundle-")
+    try:
+        if not pod:
+            res = proof.kube_run(["kubectl", "-n", ns, "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"], env, config=cfg)
+            names = (res.stdout or "").split() if res.returncode == 0 else []
+            pod = next((n for n in names if n.startswith(("fhex-", "land-", "nightly2570-"))), "")
+        if not pod:
+            created_worker = "fhex-%s" % dt.datetime.now(dt.timezone.utc).strftime("%H%M%S")
+            brief_path = os.path.join(tmp_dir, "brief.md")
+            with open(brief_path, "w", encoding="utf-8") as bf:
+                bf.write("Heavy executor lander job for %s (%s).\n" % (repo, head_sha[:12]))
+            sw = os.path.join(root, "bin", "fleet-switchboard")
+            out = subprocess.check_output([
+                sw, "launch", created_worker, "--cloud", "--shape", "L", "--role", "tester", "--no-commit",
+                "--repo", repo, "--branch", "main", "--agent", "coder", "--reports-to", "fleetkit",
+                "--checkpoint", "15m", "--overdue", "30m", "--brief-file", brief_path
+            ], env=env, text=True, timeout=240)
+            m = re.search(r'"runtime_id":\s*"pod/([a-z0-9-]+)"', out)
+            if not m:
+                raise RuntimeError("cloud launch did not return a pod runtime_id")
+            pod = m.group(1)
+        bundle_path = os.path.join(tmp_dir, "cand.bundle")
+        subprocess.run(["git", "-C", root, "bundle", "create", bundle_path, "HEAD"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        with open(bundle_path, "rb") as bf:
+            b64_bundle = base64.b64encode(bf.read()).decode("ascii")
+        prep = (
+            "base64 -d > /tmp/cand.bundle && rm -rf /home/worker/land-ws && "
+            "git clone -q /work/repo /home/worker/land-ws && chmod 755 /home/worker/land-ws && "
+            "git -C /home/worker/land-ws remote set-url origin https://github.com/%s.git && "
+            "git -C /home/worker/land-ws fetch -q origin main && "
+            "git -C /home/worker/land-ws fetch -q /tmp/cand.bundle HEAD && "
+            "git -C /home/worker/land-ws checkout -q -B land-cand FETCH_HEAD && rm -f /tmp/cand.bundle" % repo
+        )
+        up = proof.kube_run(["kubectl", "-n", ns, "exec", "-i", pod, "--", "sh", "-c", prep], env, stdin=b64_bundle, config=cfg)
+        if up.returncode != 0:
+            sys.stderr.write((up.stdout or "") + (up.stderr or ""))
+            return up.returncode or 1
+        cmd_str = " ".join(shlex.quote(a) for a in ([".spire/tool/bin/spire"] + subcmd))
+        run_sh = (
+            "export PATH=\"/run/cw-tmp/bin:$PATH\" FLEET_APP_ID=%s FLEET_LAND_STATUSES=required "
+            "COUNCIL_MODEL_URL=%s COUNCIL_MODEL_KEY=copilot-bridge; "
+            "FLEET_APP_PRIVATE_KEY=\"$(cat)\" && export FLEET_APP_PRIVATE_KEY && "
+            "cd /home/worker/land-ws && %s" % (shlex.quote(app_id), shlex.quote(council_url), cmd_str)
+        )
+        done = proof.kube_run(["kubectl", "-n", ns, "exec", "-i", pod, "--", "bash", "-c", run_sh], env, stdin=app_key, config=cfg)
+        if done.stdout:
+            sys.stdout.write(done.stdout)
+        if done.stderr:
+            sys.stderr.write(done.stderr)
+        return int(done.returncode)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if created_worker:
+            sw = os.path.join(root, "bin", "fleet-switchboard")
+            ret = subprocess.run([sw, "retire", created_worker, "--close"], env=env, check=False, capture_output=True, text=True, timeout=90)
+            if ret.returncode != 0:
+                sys.stderr.write("spire-land-host: warning: retire %s exited %d: %s\n" % (created_worker, ret.returncode, (ret.stderr or "").strip()))
+
+
+def main(argv=None, workdir=None, runner=subprocess.run, platform=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    plat = sys.platform if platform is None else platform
     try:
         app_id, app_key = load_app_credentials()
         council_key = load_council_model_key()
@@ -100,6 +189,16 @@ def main(argv=None, workdir=None, runner=subprocess.run):
     if not os.access(spire_bin, os.X_OK):
         sys.stderr.write("spire-land-host: %s is not executable: nothing was checked or pushed\n" % spire_bin)
         return 2
+    subcmd = argv if argv and argv[0] in ("land", "push", "check", "council", "attest", "doctor") else ["land"] + argv
+    if plat == "darwin" and subcmd[0] == "check":
+        sys.stderr.write("spire-land-host: refused: checks do not run on the Mac host (use cloud heavy executor)\n")
+        return REFUSED_LOCAL
+    if plat == "darwin" and subcmd[0] == "land" and "--dry-run" not in subcmd:
+        try:
+            return submit_cloud_land(root, subcmd, app_id, app_key)
+        except Exception as err:
+            sys.stderr.write("spire-land-host: cloud land failed (%s): nothing was pushed\n" % err)
+            return 1
     child_env = dict(os.environ)
     if os.path.isdir("/opt/homebrew/bin"):
         shim_dir = _ensure_host_bash_shim()
@@ -113,7 +212,6 @@ def main(argv=None, workdir=None, runner=subprocess.run):
         if model_key:
             child_env["COUNCIL_MODEL_URL"] = DEFAULT_COUNCIL_URL
             child_env["COUNCIL_MODEL_KEY"] = model_key
-    subcmd = argv if argv and argv[0] in ("land", "push", "check", "council", "attest", "doctor") else ["land"] + argv
     done = runner([spire_bin] + subcmd, cwd=root, env=child_env)
     return int(done.returncode)
 
