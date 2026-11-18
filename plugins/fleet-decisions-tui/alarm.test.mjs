@@ -4,7 +4,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { alarmRows, healthRows, loadInputs, concernsHealth } from "./health.mjs"
+import { ALARM_STALE_MS, alarmRows, healthRows, loadInputs, concernsHealth } from "./health.mjs"
 
 const NOW = 1_800_000_000_000
 const rec = (extra) => ({ alarm: { agent: "cos", since: NOW / 1000 - 25 * 60, text: "cos blocked", resume: "x resume cos", at: NOW / 1000, ended: null, ...extra } })
@@ -19,7 +19,8 @@ test("the row says what it waits on and the command that resumes it, and a daemo
   const got = alarmRows(rec({ text: "cos is blocked: an ended turn", resume: "fleet-switchboard resume cos" }), NOW, 80).map(text)
   assert.ok(got.some((l) => /an ended turn/.test(l)))
   assert.ok(got.some((l) => /fleet-switchboard resume cos/.test(l)))
-  assert.equal(rows(rec({ at: NOW / 1000 - 7 * 3600 })).length, 0)
+  assert.equal(rows(rec({ at: NOW / 1000 - 25 * 3600 })).length, 0)
+  assert.equal(rows(rec({ at: NOW / 1000 - 23 * 3600 })).length > 0, true)
 })
 test("at the sidebar width the wait and the command are wrapped, not cut; a record with no time of its last write expires", () => {
   const got = alarmRows(rec({ text: "cos has been blocked for 25 minutes; waits on: an ended turn", resume: "fleet-switchboard resume cos" }), NOW, 34).map(text).join(" ")
@@ -54,4 +55,14 @@ test("loadInputs reads the file and healthRows draws the row; a missing or malfo
   assert.ok(got.length >= 2)
   assert.match(text(got[0]), /25 minutes/)
   assert.equal(concernsHealth("owner-alarm.json"), true)
+})
+test("the stale limit is 24 hours and the boundary is exclusive: a `>=` mutant is caught", () => {
+  assert.equal(ALARM_STALE_MS, 86_400_000)
+  const at = (NOW - ALARM_STALE_MS) / 1000
+  // exactly at the limit still shows; the mutant (`>=`) would drop it
+  assert.equal(rows(rec({ at })).length > 0, true)
+  const real = (age) => age > ALARM_STALE_MS
+  const mutant = (age) => age >= ALARM_STALE_MS
+  assert.notEqual(real(NOW - at * 1000), mutant(NOW - at * 1000))
+  assert.equal(rows(rec({ at: at - 1 })).length, 0)
 })

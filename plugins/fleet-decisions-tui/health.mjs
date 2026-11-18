@@ -17,7 +17,7 @@ export const DECISIONS_FILE = "decisions.json"
 export const WATCHED = [RECORDS_FILE, LOAD_FILE, PANE_FILE, DECISIONS_FILE]
 export const ALARM_FILE = "owner-alarm.json"   // the Chief of Staff's blocked alarm (written by the daemon's blocked report)
 export const ALARM_KEEP_MS = 3600_000          // an ended alarm's row is kept an hour
-export const ALARM_STALE_MS = 6 * 3600_000   // the daemon rewrites a block's record at every repeat (60 minutes by default): older and not ended is a daemon that stopped
+export const ALARM_STALE_MS = 24 * 3600_000  // a blocked record not updated for 24 hours is a block whose end was never written (the daemon stopped, the agent was removed)
 WATCHED.push(ALARM_FILE)
 export const RECORDS_STALE_MS = 600_000   // the daemon rewrites health-records.json at least every 5 minutes (its heartbeat)
 export const LOAD_STALE_MS = 3 * 3600_000 // load.json is rewritten only when its content changes: an hour or two quiet is normal
