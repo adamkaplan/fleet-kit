@@ -606,6 +606,17 @@ class TestHardening(Base):
         self.assertNotEqual(done.returncode, 0)
         self.assertNotIn("password=", done.stdout)
 
+    def test_the_credential_route_with_a_named_repository_picks_the_mapped_account_and_refuses_an_unmapped_one(self):
+        done, calls = self.gh("auth", "git-credential", "get", stdin="host=github.com\n\n")
+        self.assertEqual([l for l in done.stdout.splitlines() if l.startswith("password=")], ["password=" + TOKEN])
+        self.assertEqual(json.loads(self.endpoint.mints()[0]["body"])["repositories"], ["widget-api"])
+        self.setUp()
+        self.repo, self.own, self.role = OTHER, False, "coder"
+        done, calls = self.gh("auth", "git-credential", "get", stdin="host=github.com\n\n")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("password=", done.stdout)
+        self.assertNotIn(TOKEN, done.stdout)
+
     def test_a_non_chief_caller_with_no_repository_naming_an_unmapped_repository_is_as_before(self):
         self.repo, self.own, self.role = MAPPED, False, "coder"
         done, calls = self.gh("issue", "view", "7", "-R", OTHER)
