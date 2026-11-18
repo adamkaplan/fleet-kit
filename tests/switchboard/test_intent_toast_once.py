@@ -36,7 +36,7 @@ def passes(engine, count):
         sb.Switchboard.render_toast(engine, discovery, {}, 0, {"toasts": []})
 
 
-class IntentToastOnce(unittest.TestCase):
+class TestIntentToastOnce(unittest.TestCase):
     def test_two_pending_edits_are_two_toasts(self):
         engine = world(FakeSource(["intent edit #1 t1", "intent edit #2 t2"]))
         passes(engine, 6)
