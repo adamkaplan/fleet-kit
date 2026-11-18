@@ -1,0 +1,1 @@
+| `cloud_floor.py` | 5 | the Floor remote-worker transport adapter, role and workflow gate, brief translator, and single-authority cutover router (#2564); a part of `cloud_worker.py`, loaded by `cloud_inspect.py` | |

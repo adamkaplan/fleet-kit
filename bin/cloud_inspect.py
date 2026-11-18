@@ -15,6 +15,7 @@ INSPECT_SECONDS = 60   # the bound of the launcher's one read (one exec, or the 
 def bind(namespace):
     """Load the ended-pod lines of the status (ask #2343, bin/cloud_ended_pods.py): that part wraps the summary line of bin/cloud_worker.py."""
     namespace["_load_part"]("cloud_ended_pods")
+    namespace["cloud_floor"] = namespace["_load_part"]("cloud_floor")   # the Floor remote-worker transport (#2564)
 
 
 def _inspect_short(body):
