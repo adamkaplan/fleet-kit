@@ -606,6 +606,53 @@ export function resolveSettings(env = process.env, deps = {}) {
   return { ...settings, shims };
 }
 
+// ---- #1011: the Chief of Staff's standing orders in its system prompt, on every model call.
+// A message in the conversation is summarised by a compaction; the system prompt is not part of the conversation, so the orders
+// are put there, read from the file each call (an edit shows at once), word for word after the template's comment strip.
+// A file over 8 KB is refused with a visible note, never cut. Only the Chief of Staff's role gets them.
+export const COS_ORDERS_MAX = 8192;
+export const COS_ROLE = "chief-of-staff";
+
+export function cosOrdersPathOf(env = process.env, home = os.homedir()) {
+  if (env.FLEET_COS_ORDERS_FILE && path.isAbsolute(env.FLEET_COS_ORDERS_FILE)) return env.FLEET_COS_ORDERS_FILE;
+  const base = env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(home, ".config");
+  return path.join(base, "fleet-switchboard", "standing-orders.md");
+}
+
+// -> {text} | {refused} | null (no file, or nothing but the comment)
+export function readCosOrders(file, fsm = fs) {
+  let size;
+  try {
+    size = fsm.statSync(file).size;
+  } catch {
+    return null;
+  }
+  if (size > COS_ORDERS_MAX) return { refused: `${file} is ${size} bytes: the limit is ${COS_ORDERS_MAX} (8 KB). Trim it; none of it is given to you from a file this large` };
+  let raw;
+  try {
+    raw = fsm.readFileSync(file, "utf8");
+  } catch (err) {
+    return { refused: `${file} cannot be read (${oneLine(err && (err.code || err.message) || "error")})` };
+  }
+  const text = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
+  return text ? { text } : null;
+}
+
+export function makeOrdersHook({ file, fsm = fs, role = COS_ROLE }) {
+  return function system(ctx) {
+    try {
+      if (!ctx || ctx.agent !== role || !Array.isArray(ctx.system)) return;
+      const found = readCosOrders(file, fsm);
+      if (!found) return;
+      ctx.system.push(found.text !== undefined
+        ? `Your standing orders from the owner, word for word (always in force):\n\n${found.text}`
+        : `NOTE: your standing orders file was refused: ${found.refused}. Tell the owner.`);
+    } catch {
+      // a model call is never blocked by the orders
+    }
+  };
+}
+
 export default {
   id: "fleet.hooks",
   async setup(api, env = process.env, deps = {}) {
@@ -613,6 +660,9 @@ export default {
     if (env.FLEET_SWITCHBOARD_PLUGIN_EVENTS !== "off") {
       const sender = deps.sender === undefined ? makeEventSender({ dir: stateDirOf(env, deps.home) }) : deps.sender;
       if (sender) wireEvents(api, sender); // each part is wired only if the service offers it; never any effect on a tool call
+    }
+    if (api.session && typeof api.session.hook === "function" && env.FLEET_SWITCHBOARD_COS_ORDERS_HOOK !== "off") {
+      api.session.hook("system", makeOrdersHook({ file: cosOrdersPathOf(env, deps.home) }));
     }
     if (shims && api.shell && typeof api.shell.hook === "function") {
       const tmpFor = deps.tmpFor === undefined ? makeTmpResolver({ stateDir: stateDirOf(env, deps.home), root: tmpRootOf(env, deps.home) }) : deps.tmpFor;

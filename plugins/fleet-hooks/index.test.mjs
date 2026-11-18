@@ -553,3 +553,51 @@ test("#846: the other branches of the hook never drop the shims", () => {
   const unreadable = { get env() { throw new Error("getter"); } };
   assert.doesNotThrow(() => hook(unreadable));
 });
+
+// ---- #1011: the Chief of Staff's orders in the system prompt
+import { makeOrdersHook, readCosOrders } from "./index.js";
+
+function ordersFile(content) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-orders-"));
+  const file = path.join(dir, "standing-orders.md");
+  fs.writeFileSync(file, content);
+  return file;
+}
+const sent = (hook, agent) => { const ctx = { agent, system: ["base"] }; hook(ctx); return ctx.system.join("\n"); };
+
+test("the orders are in every model call, before and after a compaction and after an edit", () => {
+  const file = ordersFile("<!-- header -->\n- Decisions one at a time.\n");
+  const hook = makeOrdersHook({ file });
+  assert.ok(sent(hook, "chief-of-staff").includes("- Decisions one at a time."));
+  assert.ok(!sent(hook, "chief-of-staff").includes("header"));
+  // a compaction replaces the conversation only; the next call's system prompt is built again
+  assert.ok(sent(hook, "chief-of-staff").includes("- Decisions one at a time."));
+  fs.writeFileSync(file, "- Tell the owner about every pull request.\n");
+  const after = sent(hook, "chief-of-staff");
+  assert.ok(after.includes("- Tell the owner about every pull request."));
+  assert.ok(!after.includes("Decisions one at a time"));
+});
+
+test("a worker role gets no orders", () => {
+  const hook = makeOrdersHook({ file: ordersFile("- secret rule\n") });
+  assert.equal(sent(hook, "coder"), "base");
+  assert.equal(sent(hook, undefined), "base");
+});
+
+test("a file over the limit is refused visibly, never cut", () => {
+  const file = ordersFile("x".repeat(9000));
+  assert.ok(readCosOrders(file).refused);
+  const out = sent(makeOrdersHook({ file }), "chief-of-staff");
+  assert.ok(out.includes("refused") && !out.includes("xxxx"));
+});
+
+test("setup registers the system hook, and not when turned off", async () => {
+  const { home } = fakeHome();
+  const hooks = [];
+  const api = { session: { hook: (name) => hooks.push(name) } };
+  await plugin.setup(api, {}, { home, sender: null });
+  assert.ok(hooks.includes("system"));
+  hooks.length = 0;
+  await plugin.setup(api, { FLEET_SWITCHBOARD_COS_ORDERS_HOOK: "off" }, { home, sender: null });
+  assert.ok(!hooks.includes("system"));
+});

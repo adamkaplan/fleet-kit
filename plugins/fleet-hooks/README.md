@@ -105,3 +105,18 @@ The cached mode is **per session**, so one agent's shadow reply never makes anot
 ## A private `TMPDIR` for a launched headless worker (#846)
 
 The shell hook also sets `TMPDIR` for a session of a launched headless worker (found from `<state>/headless/<name>.json` and the command's `OPENCODE_SESSION_ID`) to `<data>/fleet-switchboard/profile/tmp/<agent name>`, mode 0700, made on first use. Nothing else in the environment changes. A terminal worker, any session with no launch record, and a failed directory (one stderr line, the shared `TMPDIR` kept) leave the command as it was. Needs a plugin install and an OpenCode service restart. See "A private TMPDIR per agent" in `docs/switchboard.md`.
+
+## The Chief of Staff's standing orders (#1011)
+
+**Cause of the recorded loss.** The daemon delivered the orders as a message in the conversation
+(`OrdersFacts.cos_fact` in `bin/fleet-switchboard`, key `orders:cos:<hash>:<compaction|start>`), so a compaction
+summary could drop them: a message is summarised like any other. The file's cut (`read_cos_orders`) refuses over 8 KB
+and only strips comments, so no text was cut.
+
+**Now.** `session.hook("system")` appends the orders to the Chief of Staff's system prompt on every model call
+(agent `chief-of-staff` only; never a worker). The file is read each call, word for word after the comment strip, so an
+edit shows at the next call. The system prompt is not part of the conversation, so a compaction cannot summarise it
+away. A file over 8 KB gives a visible refusal note instead, never a cut. The daemon's dated message stays as a backup.
+The hook name and context shape (`{agent, system[]}`) are what this plugin expects of the service; it is
+skipped where the service has no `session.hook`. `FLEET_SWITCHBOARD_COS_ORDERS_HOOK=off` turns it off;
+`FLEET_COS_ORDERS_FILE` names a non-default file (as `cos_orders_file` does).
