@@ -35,6 +35,7 @@ while [ $# -gt 0 ]; do case $1 in
 here=$(cd "$(dirname "$0")" && pwd); top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "land: not in a git worktree" >&2; exit 2; }; cd "$top"
 # inside a workroom instance (`box land` sets LAND_INSTANCE_URL, its app, and LAND_INSTANCE_DB, its database server): the checks use them; nothing else is started
 t0=$(date +%s); say() { echo "land: $*"; }
+[ -n "$retest" ] || node "$here/council-route.mjs" || true # a council with no model route is said ONCE, here, at the start, with the variable's name (never a value); the landing goes on (advice only)
 run_id=$t0-$$; export LAND_RUN=$run_id # the measurement record's key of this run: `push` writes it too (metrics.mjs)
 result=; kt0=; sha=; base=; branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
 # every temp file of this run lives in one directory that is removed when the run ends, by any exit, interrupt or terminate; a killed run's is removed by the next run (owned-tmp.sh)

@@ -188,3 +188,71 @@ test("a bare `index.ts` in a string names no file when several files have that n
   assert.deepEqual(who("lone/main.mjs"), ["lone/run.mjs"]);
   assert.deepEqual(who("solo/dir/index.mjs"), ["solo/run.mjs"]); // one file has the name: the one it names
 });
+
+test("#8524: a root-absolute name (the path a dev server serves a module at) names the file whose path ends it; a container's absolute path names the file it ends with; `/index.ts` names none", () => {
+  const src = {
+    "app/src/routes/page.test.ts": 'const m = await server.ssrLoadModule("/src/routes/page.tsx");',
+    "app/src/routes/page.tsx": "",
+    "web/src/other/page.tsx": "",
+    "app/src/lib/other.test.ts": "await server.ssrLoadModule('/src/lib/missing.tsx'); const i = '/index.ts';",
+    "app/src/lib/index.ts": "",
+    "app/src/other/index.ts": "",
+    "scripts/seed.mjs": 'await import("/app/server/src/store.ts");',
+    "server/src/store.ts": "",
+    "tools/store.ts": "",
+  };
+  const tests = ["app/src/routes/page.test.ts", "app/src/lib/other.test.ts", "scripts/seed.mjs"];
+  assert.deepEqual(reach(src, tests, ["app/src/routes/page.tsx"]), ["app/src/routes/page.test.ts"]);
+  assert.deepEqual(reach(src, tests, ["web/src/other/page.tsx"]), [], "another tree's page.tsx is not the one `/src/routes/page.tsx` names");
+  assert.deepEqual(reach(src, tests, ["app/src/lib/index.ts"]), [], "`/index.ts` is the one name every directory has");
+  assert.deepEqual(reach(src, tests, ["server/src/store.ts"]), ["scripts/seed.mjs"]);
+  assert.deepEqual(reach(src, tests, ["tools/store.ts"]), [], "`/app/server/src/store.ts` does not end like tools/store.ts");
+});
+
+test("#8524: a specifier that resolves to no tracked file is over-linked by its last two segments, never dropped; a package nobody tracks and a file that exists are not", () => {
+  const src = {
+    "t/a.test.ts": 'import { x } from "../../vendor/shared/types.js";',
+    "t/b.test.ts": 'import { y } from "@/routes/gone";',
+    "t/c.test.ts": 'import pg from "../../server/node_modules/pg";',
+    "t/d.test.ts": 'import { z } from "../src/real";',
+    "shared/types.ts": "",
+    "shared/other.ts": "",
+    "app/src/routes/gone/index.ts": "",
+    "src/real.ts": "",
+    "x/shared/real.ts": "",
+    "pg/index.js": "",
+  };
+  const tests = ["t/a.test.ts", "t/b.test.ts", "t/c.test.ts", "t/d.test.ts"];
+  assert.deepEqual(reach(src, tests, ["shared/types.ts"]), ["t/a.test.ts"]);
+  assert.deepEqual(reach(src, tests, ["shared/other.ts"]), []);
+  assert.deepEqual(reach(src, tests, ["app/src/routes/gone/index.ts"]), ["t/b.test.ts"], "an index file of the named directory");
+  assert.deepEqual(reach(src, tests, ["pg/index.js"]), [], "a package under node_modules is no tracked file");
+  assert.deepEqual(reach(src, tests, ["src/real.ts"]), ["t/d.test.ts"]);
+  assert.deepEqual(reach(src, tests, ["x/shared/real.ts"]), [], "a specifier that resolves is exact: it never also guesses");
+});
+
+test("#8524: a query on a specifier is not the path; import.meta.glob links the files under its literal directory", () => {
+  const src = {
+    "app/src/a.test.ts": 'import raw from "./notes.txt?raw"; import css from "./site.css?url";',
+    "app/src/notes.txt": "",
+    "app/src/site.css": "",
+    "app/src/pages/index.test.tsx": 'const pages = import.meta.glob("./*.tsx"); const eager = import.meta.glob(["./deep/**/*.ts", "!./deep/skip.ts"], { eager: true });',
+    "app/src/pages/home.tsx": "",
+    "app/src/pages/deep/a/b.ts": "",
+    "app/src/pages/deep/skip.ts": "",
+    "app/src/pages/home.css": "",
+    "app/src/elsewhere/x.tsx": "",
+  };
+  const tests = ["app/src/a.test.ts", "app/src/pages/index.test.tsx"];
+  assert.deepEqual(reach(src, tests, ["app/src/notes.txt"]), ["app/src/a.test.ts"]);
+  assert.deepEqual(reach(src, tests, ["app/src/site.css"]), ["app/src/a.test.ts"]);
+  assert.deepEqual(reach(src, tests, ["app/src/pages/home.tsx"]), ["app/src/pages/index.test.tsx"]);
+  assert.deepEqual(reach(src, tests, ["app/src/pages/deep/a/b.ts"]), ["app/src/pages/index.test.tsx"]);
+  assert.deepEqual(reach(src, tests, ["app/src/pages/home.css", "app/src/elsewhere/x.tsx"]), []);
+});
+
+test("#8524: a file that only a type-only import names is no edge, and is recorded as named (graph.typed)", () => {
+  const g = graphOf({ "t/a.test.ts": 'import type { T } from "../src/types.ts";\nexport type { U } from "../src/u.ts";', "src/types.ts": "", "src/u.ts": "", "src/free.ts": "" });
+  assert.deepEqual([...g.typed].sort(), ["src/types.ts", "src/u.ts"]);
+  assert.equal(g.importers.has("src/types.ts"), false);
+});

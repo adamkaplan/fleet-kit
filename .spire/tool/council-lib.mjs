@@ -39,27 +39,39 @@ export function mergeClasses(classes, raw, source = "COUNCIL_MODELS") {
 /** The bearer a keyless call sends: a gateway replaces the Authorization of every call it forwards, so this is only a placeholder. */
 export const GATEWAY_BEARER = "host-gateway";
 
-/** Where a member's model call goes and what it sends: everything comes from the caller's environment, nothing is built in.
- *  `COUNCIL_MODEL_URL` is the base of a chat-completions API (required). With `COUNCIL_MODEL_KEY` the call carries that key; without it the URL is a
- *  gateway that holds the key itself, and the call carries `COUNCIL_MODEL_BEARER` (a per-turn token the gateway may use) or a placeholder.
- *  Returns {url, bearer, via: "key"|"gateway"} or null when no member can answer. */
+/** The provider's API base, the ONE built-in address of the council's model route: used when `COUNCIL_MODEL_URL` is unset (a provider needs a key, so `COUNCIL_MODEL_KEY` is then required). */
+export const DEFAULT_MODEL_URL = "https://openrouter.ai/api/v1";
+
+/** Where a member's model call goes and what it sends: it comes from the caller's environment; the one thing built in is the provider's address (`DEFAULT_MODEL_URL`), the one thing never built in is a key.
+ *  `COUNCIL_MODEL_URL` is the base of a chat-completions API; unset, it is `DEFAULT_MODEL_URL`. With `COUNCIL_MODEL_KEY` the call carries that key; without it a URL that was NAMED is a
+ *  gateway that holds the key itself, and the call carries `COUNCIL_MODEL_BEARER` (a per-turn token the gateway may use) or a placeholder; the default URL is no gateway, so with no key there is no route.
+ *  Returns {url, bearer, via: "key"|"gateway"} or null when no member can answer (`routeProblem` says which name is wrong). */
 export function modelRoute(env) {
+  if (routeProblem(env)) return null;
   const named = String(env.COUNCIL_MODEL_URL ?? "")
     .trim()
     .replace(/\/+$/, "");
-  if (!/^https?:\/\/[^\s/]+/.test(named)) return null;
-  const url = `${named}/chat/completions`;
+  const url = `${named || DEFAULT_MODEL_URL}/chat/completions`;
   const key = String(env.COUNCIL_MODEL_KEY ?? "").trim();
   if (key) return { url, bearer: key, via: "key" };
   return { url, bearer: String(env.COUNCIL_MODEL_BEARER ?? "").trim() || GATEWAY_BEARER, via: "gateway" };
 }
 
-/** Why `modelRoute` found no route, as the headline of the council's refusal: it says whether the name is absent or set wrongly, and which side must act. The environment is the only input;
+/** What stops `modelRoute` from finding a route, or null when it has one: `{name, text}`, the exact variable that is wrong and a sentence that says who must act. The environment is the only input;
  *  never a value (it may carry a credential). */
-export function noRouteCause(env) {
-  if (String(env.COUNCIL_MODEL_URL ?? "").trim()) return "COUNCIL_MODEL_URL is set but is not an http(s) base URL: the side that set it must give the model API's base";
-  return "no COUNCIL_MODEL_URL in the environment: whoever starts the command sets it, so run it in a shell that was given one";
+export function routeProblem(env) {
+  const named = String(env.COUNCIL_MODEL_URL ?? "").trim();
+  if (named) return /^https?:\/\/[^\s/]+/.test(named) ? null : BAD_URL;
+  return String(env.COUNCIL_MODEL_KEY ?? "").trim() ? null : KEY_MISSING;
 }
+const BAD_URL = { name: "COUNCIL_MODEL_URL", text: "COUNCIL_MODEL_URL is set but is not an http(s) base URL: the side that set it must give the model API's base" };
+const KEY_MISSING = {
+  name: "COUNCIL_MODEL_KEY",
+  text: `COUNCIL_MODEL_KEY missing: COUNCIL_MODEL_URL is unset, so the provider's address ${DEFAULT_MODEL_URL} is used and it needs a key: whoever starts the command sets it, so run it in a shell that was given one`,
+};
+
+/** Why `modelRoute` found no route, as the headline of the council's refusal: it names the variable and which side must act (the problem `routeProblem` finds; the key's when there is none). */
+export const noRouteCause = (env) => (routeProblem(env) ?? KEY_MISSING).text;
 
 // A model id as the registry writes it ("vendor/model-name") and as an author names itself ("model-name") are one model.
 export const bare = (id) =>

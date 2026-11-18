@@ -16,10 +16,10 @@
 // SOUNDNESS: the step passed on the tree T of this change (the same patch-id) and ran there; the rebased tree T' differs from T exactly in the incoming files, none of which the change touches (an overlap re-runs); when no incoming file is an input of the step, every input of the step has the same bytes in T and T', so the step's result on T' is its result on T. It is the overlap rule of the tests with "the step reads" in place of "the test reaches". What the text cannot see (a path built at run time, a directory the globs do not name) is the project's to name; a project that names it wrongly carries a pass it should not: the same residual risk as for tests, and the release-candidate run before every roll is the net. The FINAL tree is the one that is gated: a step whose inputs came in runs on it, a step carried has the pass of a tree that is the final one in every file it reads, and a red on it lands nothing.
 // Steps that wait for one another (`after`) are carried whole or not at all (run-steps.mjs): one reads the files the other makes.
 // What stays re-run: a step with no `reads`; a step an incoming file of whose inputs matches; an overlap; any unreadable diff or graph; the gate's own runner's inputs; a toolchain pin; the first run of a change.
-// THE FIRST RUN selects by REACH (a step the project marks `"select": "reach"`): the step runs the test files the change ITSELF adds or edits and every test file that reaches (reach.mjs, transitively) a file the change touches, deletions included (a deleted file's importers still name it); a file nothing reaches selects nothing, and a step no test of which is selected does not run at all (selected 0 of N). The step runs WHOLE instead when what the text cannot see is touched:
+// THE FIRST RUN selects by REACH (a step the project marks `"select": "reach"`): the step runs the test files the change ITSELF adds or edits and every test file that reaches (reach.mjs, transitively) a file the change touches, deletions included (a deleted file's importers still name it); a file outside the step's tree that nothing reaches selects nothing, and a step no test of which is selected does not run at all (selected 0 of N). The step runs WHOLE instead when what the text cannot see is touched:
 //   - the gate's own runner reads it (under `.spire/`, as on a re-check), or a file every test of the step runs under changed (`preload`, plan.mjs runnerInputs: the files its command names (its runner, its --import files), its list command and its environment's recipe name, the files the step's `runsUnder` globs of land.json name (the project's own test harness), and what those load or name directly; what they load only further down is judged by reach like any other file: the residual risk of this rule);
 //   - a pin of the toolchain (.node-version, .nvmrc, mise.toml, .tool-versions), SQL, a migration, an environment file;
-//   - a data file (not code, not prose) that no source names: only a path built at run time could read it;
+//   - a data file (not code, not prose) that no source names: only a path built at run time could read it; the same for a SOURCE file inside the step's own tree (`dir` of the step, not ".") that is no test of any step and that no source imports or names, not even as a type (#8524: the graph cannot tell what loads it; a file outside the step's tree that nothing names selects none, as before);
 //   - the graph, the change's own files or the step's test list cannot be read (unsure runs more, never less).
 // WHAT THE GRAPH DOES NOT SEE: what reach.mjs names (a path built at run time, a directory read as text), and the files a runner's reset helper imports in every worker process: a coverage map attributes them to the first test of a process, no test depends on them (a break there fails the group, which re-runs alone and passes), and taking them as an input of every test would select nearly every test. The measurement, and the rules the graph follows, are LAYOUT.md's and reach.mjs's.
 // `deepFor` (optional, with `select: "reach"`, globs in land.json): the files the WHOLE step must see (the project's database layer, which every test loads). A change to such a file selects by full reach, as above; a change to any other file selects only the test files that edit it or import it directly (a test that reaches it only through a hub is left to the project's release-candidate run), and the coverage map adds nothing for it. The reason line says how many files of each kind.
@@ -40,7 +40,7 @@ const need = (name, v, type) => {
 };
 
 /**
- * decide({ step: {id, retry, select?, reads?: (path) => boolean, made from the globs of land.json by the caller}, earlier, incoming, changed, files, graph, map?, deleted? }) -> { carry: boolean, reason: string, rerun: string[], select: string[] | null }
+ * decide({ step: {id, retry, select?, dir?, isTest?: (path) => boolean, reads?: (path) => boolean, made from the globs of land.json by the caller}, earlier, incoming, changed, files, graph, map?, deleted? }) -> { carry: boolean, reason: string, rerun: string[], select: string[] | null }
  *   select: when not null, the step runs ONLY these test files (chosen by reach or by the map; empty only for a step marked `select: "reach"`: no test of it reaches the change, so it does not run; the map alone never selects nothing: that step runs whole)
  *   by: with select, how it was chosen ("reach" or "reach, coverage map" or "coverage map")
  *   map: parseMap's answer (absent: no map is in play); deleted: the change's deleted paths (absent: none; null: unreadable, the full area runs)
@@ -247,6 +247,7 @@ const reachRun = ({ step, mapped, changed: touched, deleted, files, input }) => 
   need("own", input.own, "string");
   need("preload", input.preload, "array");
   const graph = input.graph;
+  const home = typeof step.dir === "string" && step.dir !== "." && step.dir !== "" ? `${step.dir.replace(/\/$/, "")}/` : null; // the step's own tree: the directory its tests run in
   for (const f of changed) {
     if (readByRunner(input, f)) return full(`${f} is read by the gate's own runner (${input.runner}): it can change how every step runs`);
     if (graph.isProse(f)) continue; // only people read prose: no test reaches it (a name in a path such as "migration" makes it no kind of input)
@@ -259,6 +260,10 @@ const reachRun = ({ step, mapped, changed: touched, deleted, files, input }) => 
   const under = runsUnder(graph, input.preload);
   const hit = changed.find((f) => under.has(f));
   if (hit) return full(`${hit} is what the step runs under (its command, its list, its environment's recipe or a file the project says every test runs under)`);
+  for (const f of changed) {
+    // code inside the step's own tree that no source imports or names and that is no test of any step (#8524): the graph cannot tell what loads it (a path built at run time), so it never narrows the step below the whole step
+    if (home && touched.includes(f) && f.startsWith(home) && isCode(f) && !files.includes(f) && !(typeof step.isTest === "function" && step.isTest(f)) && !(graph.importers.get(f)?.size > 0) && !graph.typed?.has(f)) return full(`${f} is source in the step's own tree that nothing imports or names: what loads it cannot be read`);
+  }
   // `deepFor`: the rule is the header of this file
   const hubs = typeof step.deepFor === "function" ? step.deepFor : null; // (path) => boolean, made from the project's globs by the caller
   const deep = hubs ? changed.filter((f) => hubs(f)) : changed;

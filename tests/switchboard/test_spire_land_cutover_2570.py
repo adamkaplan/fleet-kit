@@ -31,7 +31,7 @@ class TestSpireLandCutover2570(Base):
         node = shutil.which("node") or "/opt/homebrew/bin/node"
         done = subprocess.run([node, ".spire/tool/pin.mjs", "verify"], cwd=str(REPO), capture_output=True, text=True, timeout=30)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertIn("tool ok: 0.6.0 def97d882b78 b9290241962d", done.stdout)
+        self.assertIn("tool ok: 0.6.2 c275f63765b4", done.stdout)
         cfg = json.loads((REPO / ".spire" / "land.json").read_text(encoding="utf-8"))
         areas = cfg.get("areas") or []
         self.assertGreaterEqual(len(areas), 6)

@@ -504,9 +504,11 @@ test("land: a member that cannot answer is recorded as unable to review and the 
     assert.match(r.stdout, /UNABLE TO REVIEW/);
     assert.match(r.stdout, /did not block/);
     assert.match(r.stdout, /checks ok/);
+    assert.equal(r.stderr.split("\n").filter((l) => /^land: ERROR: the council cannot answer: COUNCIL_MODEL_KEY missing/.test(l)).length, 1, r.stderr); // the loud line, once
+    assert.ok(r.stdout.indexOf("checks ok") > -1 && r.stderr.indexOf("COUNCIL_MODEL_KEY") > -1);
     assert.equal(lastJson(r).result, "landed");
     assert.equal(git(w.bare, "rev-list", "--count", "main").trim(), "2"); // landed
-    assert.match(git(w.bare, "log", "-1", "--format=%B", "main"), /^Land-Council: ran: warden=unable to review \(no COUNCIL_MODEL_URL in the environment\) \(models fast, diff [0-9a-f]+\)$/m);
+    assert.match(git(w.bare, "log", "-1", "--format=%B", "main"), /^Land-Council: ran: warden=unable to review \(COUNCIL_MODEL_KEY missing\) \(models fast, diff [0-9a-f]+\)$/m);
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
@@ -871,7 +873,7 @@ test("review is by the viewpoints' calls, not size: the Warden reads every chang
       git(c, "commit", "-qm", `change ${file}`);
       const r = run();
       assert.equal(r.status, status, r.stdout + r.stderr);
-      assert.match(r.stdout, /no COUNCIL_MODEL_URL/); // the Warden was asked, and no member could answer
+      assert.match(r.stdout, /COUNCIL_MODEL_KEY missing/); // the Warden was asked, and no member could answer
     }
   } finally {
     rmSync(w.dir, { recursive: true, force: true });

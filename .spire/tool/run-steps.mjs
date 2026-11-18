@@ -342,7 +342,7 @@ if (keep && !retest) {
     }
     const known = m !== undefined && m.tree !== tree && run(".", ["git", "cat-file", "-e", `${m.tree}^{tree}`]).rc === 0;
     const reading = carryable(x) ? matcher(x.reads) : undefined;
-    const d = decide({ step: { id: x.id, retry: x.retry, select: x.select, deepFor: x.deepFor ? matcher(x.deepFor) : undefined, reads: reading }, passed: known && Array.isArray(m.files) ? m.files : undefined, earlier: known, incoming: known ? came(m.tree) : [], changed, files: x.files ?? null, graph: known || x.select === "reach" ? reach() : null, runner: `${relative(layout.root, layout.tool)}/run-steps.mjs`, own: `${relative(layout.root, layout.spire)}/`, map, deleted, preload: x.select === "reach" && x.retry === "test" && graph ? runnerInputs({ step: x, environments: cfg.environments, tracked: graph.files, root: layout.root }) : [] });
+    const d = decide({ step: { id: x.id, retry: x.retry, select: x.select, dir: x.dir, isTest: matcher(cfg.paths.tests), deepFor: x.deepFor ? matcher(x.deepFor) : undefined, reads: reading }, passed: known && Array.isArray(m.files) ? m.files : undefined, earlier: known, incoming: known ? came(m.tree) : [], changed, files: x.files ?? null, graph: known || x.select === "reach" ? reach() : null, runner: `${relative(layout.root, layout.tool)}/run-steps.mjs`, own: `${relative(layout.root, layout.spire)}/`, map, deleted, preload: x.select === "reach" && x.retry === "test" && graph ? runnerInputs({ step: x, environments: cfg.environments, tracked: graph.files, root: layout.root }) : [] });
     if (d.select) {
       selected.set(x.id, d.select);
       how.set(x.id, d.by ?? "coverage map");

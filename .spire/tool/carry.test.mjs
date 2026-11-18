@@ -538,7 +538,7 @@ const REACH_TREE = {
 const REACH_GRAPH = buildGraph({ files: [...Object.keys(REACH_TREE), "server/src/gone.mjs"], read: (p) => REACH_TREE[p] ?? null, isProse: (f) => f.endsWith(".md") });
 const SERVER_TESTS = ["server/tests/a.test.mjs", "server/tests/b.test.mjs", "server/tests/c.test.mjs", "server/tests/d.test.mjs"];
 const byReach = (changed, over = {}) =>
-  decide({ step: { id: "tests:server", retry: "test", select: "reach" }, earlier: false, incoming: [], changed, deleted: [], files: SERVER_TESTS, graph: REACH_GRAPH, preload: ["server/tests/helpers/preload.mjs"], ...RUN, ...over });
+  decide({ step: { id: "tests:server", retry: "test", select: "reach", dir: "server", isTest: (f) => /\.test\.mjs$/.test(f) }, earlier: false, incoming: [], changed, deleted: [], files: SERVER_TESTS, graph: REACH_GRAPH, preload: ["server/tests/helpers/preload.mjs"], ...RUN, ...over });
 
 test("a first run by reach: an app-only change selects zero server tests, and the step does not run", () => {
   const d = byReach(["app/src/page.tsx", "app/src/page.css"]);
@@ -562,7 +562,29 @@ test("a first run by reach: a server file selects the tests that reach it, throu
 test("a first run by reach: a file nothing imports selects its own tests, and a source nothing imports selects none", () => {
   assert.deepEqual(byReach(["server/tests/d.test.mjs"]).select, ["server/tests/d.test.mjs"]); // a test is imported by nobody: it selects itself
   assert.deepEqual(byReach(["server/tests/new-one.test.mjs"], { files: [...SERVER_TESTS, "server/tests/new-one.test.mjs"] }).select, ["server/tests/new-one.test.mjs"]);
-  assert.deepEqual(byReach(["server/src/lonely.mjs"]).select, []);
+  assert.deepEqual(byReach(["server/src/lonely.mjs"], { changed: ["app/src/page.tsx"] }).select, []); // not touched: nothing to select by
+  assert.deepEqual(byReach(["server/src/lonely.mjs"], { step: { id: "tests:server", retry: "test", select: "reach" } }).select, []); // a step that says no directory: the old rule, a source nothing imports selects none
+});
+
+test("#8524: source in the step's own tree that nothing imports or names runs the whole step (what loads it cannot be read); a test of another step, a file of another tree and a file something names do not", () => {
+  const d = byReach(["server/src/lonely.mjs"]);
+  assert.equal(d.select, null, JSON.stringify(d));
+  assert.match(d.reason, /server\/src\/lonely\.mjs is source in the step's own tree that nothing imports or names/);
+  const tree = { ...REACH_TREE, "server/tests/other-step.test.mjs": "", "scripts/hand-run.mjs": "", "app/src/entry.tsx": "" };
+  const graph = buildGraph({ files: Object.keys(tree), read: (p) => tree[p] ?? null, isProse: (f) => f.endsWith(".md") });
+  assert.deepEqual(byReach(["server/tests/other-step.test.mjs"], { graph }).select, [], "a test nothing imports is a test of some step: not this step's concern");
+  assert.deepEqual(byReach(["scripts/hand-run.mjs"], { graph }).select, [], "outside the step's tree");
+  assert.deepEqual(byReach(["app/src/entry.tsx"], { graph }).select, [], "another package's source");
+  assert.deepEqual(byReach(["server/src/feature.mjs"]).select, ["server/tests/a.test.mjs"], "a file a test imports is read");
+  const typedTree = { ...REACH_TREE, "server/src/shapes.mts": "export type S = 1;", "server/src/uses-shapes.mjs": 'import type { S } from "./shapes.mts";' };
+  const typedGraph = buildGraph({ files: Object.keys(typedTree), read: (p) => typedTree[p] ?? null, isProse: (f) => f.endsWith(".md") });
+  assert.deepEqual(byReach(["server/src/shapes.mts"], { graph: typedGraph }).select, [], "a file only a type-only import names is named: it is erased at run time, no test loads it");
+  // the project's directory is its word: "." (the root) names no tree, so no file of it is "in the step's own tree"
+  assert.deepEqual(byReach(["server/src/lonely.mjs"], { step: { id: "tests:server", retry: "test", select: "reach", dir: "." } }).select, []);
+  // the same on a re-check: a step that selects again as a first run reads the same rule
+  const re = decide({ step: { id: "tests:server", retry: "test", select: "reach", dir: "server", isTest: () => false }, earlier: true, passed: SERVER_TESTS, incoming: [], changed: ["server/src/lonely.mjs"], deleted: [], files: SERVER_TESTS, graph: REACH_GRAPH, preload: [], ...RUN });
+  assert.equal(re.carry, true, "nothing came in: the whole pass of the earlier tree stands for the same bytes");
+  assert.deepEqual(re.universe, SERVER_TESTS, "the universe is the whole step, not the empty selection");
 });
 
 test("a first run by reach: a deleted file reaches the files that still name it; a renamed one is its old path deleted", () => {

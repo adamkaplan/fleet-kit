@@ -29,7 +29,10 @@ import { matcher } from "./config.mjs";
 import { citeOf, loadReviewers, parseDefinition, rulesOf } from "./reviewers.mjs";
 import {
   COUNCIL_EFFORT_DEFAULT,
+  DEFAULT_MODEL_URL,
   mergeClasses,
+  noRouteCause,
+  routeProblem,
   GATEWAY_BEARER,
   hasAdvice,
   modelRoute,
@@ -293,16 +296,17 @@ test("the command: the Warden reads a docs-only change too (no key: unable to re
     w.change(`${DOCS}/a.md`, 3);
     const docs = w.run();
     assert.equal(docs.status, 0, docs.stdout + docs.stderr); // no route is a note, never a stop
-    assert.match(docs.stdout, /no COUNCIL_MODEL_URL/);
+    assert.match(docs.stdout, /COUNCIL_MODEL_KEY missing/);
     assert.match(docs.stdout, /UNABLE TO REVIEW/);
     assert.match(docs.stdout, /did not block/);
-    assert.match(last(docs).trailer, /^ran: warden=unable to review \(no COUNCIL_MODEL_URL in the environment\)/);
+    assert.match(last(docs).trailer, /^ran: warden=unable to review \(COUNCIL_MODEL_KEY missing\)/);
     assert.equal(last(docs).result, "unable-to-review");
     assert.match(docs.stdout, /whoever starts the command sets it/, "the sentence names its cause");
+    assert.match(docs.stdout, /COUNCIL_MODEL_URL is unset, so the provider's address https:\/\/openrouter\.ai\/api\/v1 is used/, "the default address is said");
     w.change("server/src/authority/x.ts", 40);
     const srv = w.run();
     assert.equal(srv.status, 0, srv.stdout + srv.stderr);
-    assert.match(srv.stdout, /no COUNCIL_MODEL_URL/);
+    assert.match(srv.stdout, /COUNCIL_MODEL_KEY missing/);
     writeFileSync(join(none.dir, ".spire/review/warden.md"), "---\nrole: warden\ncalls: []\n---\nremoved\n");
     none.git("add", "-A");
     none.git("commit", "-qm", "the project removes the Warden");
@@ -325,9 +329,45 @@ test("the model route comes only from the caller's environment: a named URL with
   // a gateway that names its turn by a bearer is sent that bearer, still never a key
   const relay = modelRoute({ COUNCIL_MODEL_URL: "https://gateway.test/model", COUNCIL_MODEL_BEARER: "turn-token" });
   assert.deepEqual([relay.via, relay.bearer, relay.url], ["gateway", "turn-token", "https://gateway.test/model/chat/completions"]);
-  // nothing is built in: a key alone, or an unusable URL, is no route
-  assert.equal(modelRoute({ COUNCIL_MODEL_KEY: "k" }), null);
+  // an unusable URL is no route; a blank one counts as unset
   assert.equal(modelRoute({ COUNCIL_MODEL_URL: "nonsense" }), null);
+  assert.equal(modelRoute({ COUNCIL_MODEL_URL: "nonsense", COUNCIL_MODEL_KEY: "k" }), null);
+});
+
+test("no COUNCIL_MODEL_URL: the provider's address is the default and a key is then required; a NAMED url keeps its gateway rule", () => {
+  // URL unset + key: the default address, the key sent
+  for (const url of [undefined, "", "  "]) {
+    const r = modelRoute({ COUNCIL_MODEL_URL: url, COUNCIL_MODEL_KEY: "k1" });
+    assert.deepEqual([r.via, r.bearer, r.url], ["key", "k1", `${DEFAULT_MODEL_URL}/chat/completions`]);
+  }
+  assert.equal(DEFAULT_MODEL_URL, "https://openrouter.ai/api/v1");
+  // URL unset + no key: no route (a gateway bearer is no key for the provider), and the NAME that is missing is the key's
+  assert.equal(modelRoute({}), null);
+  assert.equal(modelRoute({ COUNCIL_MODEL_BEARER: "turn-token" }), null);
+  assert.deepEqual(routeProblem({}).name, "COUNCIL_MODEL_KEY");
+  assert.match(noRouteCause({ COUNCIL_MODEL_KEY: " " }), /^COUNCIL_MODEL_KEY missing:/);
+  // both set, or a url named without a key (a gateway): unchanged, no problem
+  assert.equal(routeProblem({ COUNCIL_MODEL_URL: "http://127.0.0.1:1/v1", COUNCIL_MODEL_KEY: "k" }), null);
+  assert.equal(routeProblem({ COUNCIL_MODEL_URL: "http://127.0.0.1:1/v1" }), null);
+  assert.equal(routeProblem({ COUNCIL_MODEL_KEY: "k" }), null);
+  // a bad url is the URL's problem, by name
+  assert.equal(routeProblem({ COUNCIL_MODEL_URL: "relay-host", COUNCIL_MODEL_KEY: "k" }).name, "COUNCIL_MODEL_URL");
+});
+
+test("council-route: the loud start line names the missing variable once on stderr, never a value, and stops nothing; silent when there is a route", () => {
+  const run = (env) => spawnSync(process.execPath, [join(repo, "tool/council-route.mjs")], { encoding: "utf8", env: { PATH: process.env.PATH, ...env } });
+  const none = run({});
+  assert.equal(none.status, 0);
+  assert.equal(none.stdout, "");
+  assert.match(none.stderr, /^land: ERROR: the council cannot answer: COUNCIL_MODEL_KEY missing: /);
+  assert.equal(none.stderr.trim().split("\n").length, 1, "once");
+  const bad = run({ COUNCIL_MODEL_URL: "sekret-url-part", COUNCIL_MODEL_KEY: "sekret-key-value" });
+  assert.match(bad.stderr, /COUNCIL_MODEL_URL is set but is not an http\(s\) base URL/);
+  assert.doesNotMatch(bad.stderr + bad.stdout, /sekret/);
+  for (const env of [{ COUNCIL_MODEL_KEY: "sekret-key-value" }, { COUNCIL_MODEL_URL: "http://127.0.0.1:1/v1" }, { COUNCIL_MODEL_URL: "http://127.0.0.1:1/v1", COUNCIL_MODEL_KEY: "sekret-key-value" }]) {
+    const ok = run(env);
+    assert.deepEqual([ok.status, ok.stdout, ok.stderr], [0, "", ""]);
+  }
 });
 
 test("the council in a workroom: no key in its environment, every member's call goes to the named gateway on the registry's class, and the gateway alone holds one", async () => {
@@ -821,11 +861,11 @@ test("the council reads the project's principles and the reviewers' viewpoints a
   }
 });
 
-test("the no-route sentence names its cause: a value that is no URL, or none set by whoever started the command; never a value", async () => {
+test("the no-route sentence names its cause: a value that is no URL, or no key with the default address; never a value", async () => {
   const { noRouteCause } = await import("./council-lib.mjs");
-  assert.match(noRouteCause({ COUNCIL_MODEL_URL: "https://u:secret@" }), /is not an http\(s\) base URL/);
+  assert.match(noRouteCause({ COUNCIL_MODEL_URL: "secret@host" }), /is not an http\(s\) base URL/);
   assert.doesNotMatch(noRouteCause({ COUNCIL_MODEL_URL: "relay-host" }), /relay-host/);
-  assert.match(noRouteCause({}), /no COUNCIL_MODEL_URL in the environment/);
+  assert.match(noRouteCause({}), /^COUNCIL_MODEL_KEY missing: COUNCIL_MODEL_URL is unset/);
 });
 
 test("a COUNCIL_MODEL_URL that is set but is no URL is said so, not called absent, and the value is never printed", async () => {
@@ -835,7 +875,7 @@ test("a COUNCIL_MODEL_URL that is set but is no URL is said so, not called absen
     const r = await w.runVia({ COUNCIL_MODEL_URL: "relay-host" });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /COUNCIL_MODEL_URL is set but is not an http\(s\) base URL/);
-    assert.doesNotMatch(r.stdout, /no COUNCIL_MODEL_URL in the environment|relay-host/);
+    assert.doesNotMatch(r.stdout, /COUNCIL_MODEL_KEY missing|relay-host/);
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
