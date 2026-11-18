@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import signal
+import fcntl
 import subprocess
 import sys
 import tempfile
@@ -215,6 +216,14 @@ def mint_token(env):
     finally:
         sys.path.pop(0)
     directory = (env.get("CW_SECRET_DIR") or "").strip()
+    if not directory and not env.get("XDG_CONFIG_HOME"):
+        try:
+            with open(os.path.join(config_home(env), SWITCHBOARD, "cloud.env"), encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("CW_SECRET_DIR="):
+                        directory = line.partition("=")[2].strip()
+        except OSError:
+            pass
     if not directory:
         raise KubeUnusable("no cluster login for kubectl: CW_SECRET_DIR is not set (the minter kubeconfig is needed), or set CW_KUBECTL")
     try:
@@ -270,6 +279,15 @@ def prove(args, env, now=None, sleep=time.sleep):
     revision = read_revision(env, args.digest)
     worker = "proof-%s-%s" % (digest[7:19], now().strftime("%d%H%M%S"))
     remove_stale_scratch(env)
+    rdir = receipt_dir(env)
+    os.makedirs(rdir, mode=0o700, exist_ok=True)
+    lock_path = os.path.join(rdir, "%s.lock" % digest[7:19])
+    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lfd)
+        raise Refused("a proof for %s is already running; nothing was launched" % digest[7:19]) from None
     scratch = None
     previous = signal.getsignal(signal.SIGTERM)
     try:
@@ -280,6 +298,11 @@ def prove(args, env, now=None, sleep=time.sleep):
         signal.signal(signal.SIGTERM, previous)
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)   # removed whatever the verdict
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+        os.close(lfd)
 
 
 def _prove_in(args, env, now, sleep, digest, revision, worker, scratch, switchboard):
