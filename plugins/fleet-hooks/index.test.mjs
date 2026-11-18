@@ -362,7 +362,7 @@ test("setup with an api that offers none of it, or with events switched off, reg
   await plugin.setup({ shell: { hook() {} }, permission: { hook() {} } }, {}, { home, sender });
   assert.deepEqual(made, []);
   let hooked = 0;
-  await plugin.setup({ session: { hook: () => { hooked += 1; } }, shell: { hook() {} }, permission: { hook() {} } }, { FLEET_SWITCHBOARD_PLUGIN_EVENTS: "off" }, { home, sender });
+  await plugin.setup({ session: { hook: () => { hooked += 1; } }, shell: { hook() {} }, permission: { hook() {} } }, { FLEET_SWITCHBOARD_PLUGIN_EVENTS: "off", FLEET_SWITCHBOARD_COS_ORDERS_HOOK: "off" }, { home, sender });
   assert.equal(hooked, 0);
 });
 
@@ -594,7 +594,7 @@ test("a file over the limit is refused visibly, never cut", () => {
 test("setup registers the system hook, and not when turned off", async () => {
   const { home } = fakeHome();
   const hooks = [];
-  const api = { session: { hook: (name) => hooks.push(name) } };
+  const api = { session: { hook: (name) => hooks.push(name) }, permission: { hook() {} } };
   await plugin.setup(api, {}, { home, sender: null });
   assert.ok(hooks.includes("system"));
   hooks.length = 0;
