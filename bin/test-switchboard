@@ -25943,7 +25943,6 @@ class TestOwnerlessSummary(Base):
         return {   # kind: (labels, body, hidden)
             "future date": (lab, "Parked until: %s" % self.day(30), True),
             "tomorrow": (lab, "Parked until: %s" % self.day(1), True),
-            "foreign prefix": (["x:parked"], "Parked until: %s" % self.day(30), True),   # a label ENDING `:parked` parks, whatever the prefix (#926)
             "today": (lab, "Parked until: %s" % self.day(0), True),                 # parked through the end of that UTC day, as the reader and T3 say
             "past date": (lab, "Parked until: %s" % self.day(-2), False),
             "no date": (lab, "nothing here", False),
@@ -26022,11 +26021,14 @@ class TestOwnerlessSummary(Base):
         self.add(60, created=15, author="alice")
         self.go()
         self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 1)
-        # the mutant: the reader restricted to the fleet's own prefix must read this issue as not parked (the test fails against it)
+        # the mutant: a reader restricted to the fleet's own prefix must NOT park it, so the assertion above fails against it
         real, fleet = sb.parked_until, sb.label_names({})["parked"]
         with mock.patch.object(sb, "parked_until", lambda b, labels: real(b, [l for l in labels or () if l == fleet])):
-            self.assertIsNone(sb.parked_until(body, ["x:parked"]))
-        self.assertIsNotNone(sb.parked_until(body, ["x:parked"]))
+            self.setUp()
+            self.add(self.PARKED, created=40, updated=30, author="alice", labels=["x:parked"], body=body)
+            self.add(60, created=15, author="alice")
+            self.go()
+            self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 0)
 
     def test_the_parked_predicate_is_the_only_input_a_mutant_can_change(self):
         module = sb.load_module("triage_ownerless")
