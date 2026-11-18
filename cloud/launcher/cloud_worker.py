@@ -976,6 +976,13 @@ def _scrub_secrets(text, secrets_known):
     return _ScrubSpans(text, order, index, cand).run()
 
 
+def _token_or_path(m):
+    """A base64-shaped run that starts with '/' and has a further '/' is an absolute file path, not a token: it stays
+    (a segment of 40+ characters is still caught by the other shapes). Any other match is redacted."""
+    t = m.group(0)
+    return t if t.startswith("/") and "/" in t[1:].rstrip("=") else "[redacted]"
+
+
 def scrub(text, secrets_known=(), limit=300):
     """THE one place kubectl output (and anything built from it) is made safe to show, log or audit: the exact values
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
@@ -985,7 +992,7 @@ def scrub(text, secrets_known=(), limit=300):
     for pat, repl in CREDENTIAL_SHAPES:
         text = pat.sub(repl, text)
     for pat in TOKEN_SHAPES:
-        text = pat.sub("[redacted]", text)
+        text = pat.sub(_token_or_path, text)
     return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
 
 
