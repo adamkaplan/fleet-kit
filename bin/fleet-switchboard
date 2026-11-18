@@ -2824,7 +2824,9 @@ class Switchboard:
         self.pass_toasts = {}
         self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
-        discovery = self.discover(now)
+        timer = load_module("pass_timing").Timer(getattr(self, "pass_clock", time.monotonic))   # #279
+        with timer.stage("discover"):
+            discovery = self.discover(now)
         if self.state_dir is not None:   # the turn start is always recorded; steering stays gated by the setting
             try:
                 load_module("turn_start").note(self.state_dir, [(o.session_id, o.status) for o in discovery.agents.values()], now,
@@ -2839,7 +2841,8 @@ class Switchboard:
                     self._note(event, subject, detail)
             except Exception as err:
                 self._note("queued_wait.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-        early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
+        with timer.stage("derive"):
+            early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
         for observation in list(discovery.agents.values()):
@@ -2860,7 +2863,8 @@ class Switchboard:
                     report["sent"].extend(o for o in source.release(discovery, now) if o.get("sent"))
                 except Exception as err:
                     self._failed("reminders", "release", err, report)
-        facts, _ = self.collect_facts()
+        with timer.stage("facts"):
+            facts, _ = self.collect_facts()
         try:
             facts = filter_stopped_news(self, facts, discovery)
         except Exception as err:  # fail open: a broken judge never stops a delivery, the facts wake as today
@@ -2893,7 +2897,8 @@ class Switchboard:
                         release_held_sends(self.state_dir, recipient, [f.key for f in plan.pending if f.kind == "send"]) if self.state_dir is not None else None
             except Exception as err:
                 self._failed(recipient, "deliver", err, report)
-        self.render(discovery, held, now, report)
+        with timer.stage("render"):
+            self.render(discovery, held, now, report)
         try:
             held_sends_tick(self, self.now())
         except Exception as err:
@@ -2912,6 +2917,7 @@ class Switchboard:
         feed_tick(self)   # #290: the event feed's bounded re-sync and reconciliation reads (never raises)
         record_v2_calls(self)
         record_github_calls(self)
+        load_module("pass_timing").finish(timer, self.state_dir, self.audit, self.actor, iso(now))
         return report
 
     # -- render: the sidebar badge and the toast
@@ -12550,6 +12556,12 @@ def cmd_status(args, runner=subprocess.run, now=time.time):
             lane_lines = []
         if lane_lines:
             print("\n".join(lane_lines))
+        try:
+            passes_line = load_module("pass_timing").status_line(state_dir_path())
+        except Exception:
+            passes_line = None
+        if passes_line:
+            print(passes_line)
         if cloud_lines:
             print("\n".join(cloud_lines))
     return EXIT_OK if report["ok"] else EXIT_ERROR

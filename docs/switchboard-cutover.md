@@ -225,3 +225,7 @@ retiring the last v1 pane.
 | Switchboard | `status` lists the agent; a test note reaches it | The agent is missing |
 | Heartbeat | Still running while a v1 pane remains | Stopped too early |
 | Rollback | You know the v1 session id and have opened it once | Not tried |
+
+## Pass timing (#279)
+
+Each pass and each stage of it (discover, derive, facts, render) is timed. A pass or a stage over 30 s writes one `pass.slow` audit line: the slowest stage's name (`pass` when only the total is over), its seconds, the total and every stage's seconds. A pass of 30 s or less writes none. The last 20 passes are kept in `pass-timing.json` (private, written atomically; a failure to record is ignored and never slows or fails a pass). `status` prints one `passes` line: the longest of the last 20, its slowest stages, the last pass's duration and how many were over 30 s; with no record it prints nothing.
