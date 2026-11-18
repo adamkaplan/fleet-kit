@@ -391,13 +391,16 @@ class SyncEngine:
         again until the decision changes. Never a withdraw, an answer or a retry."""
         key, text = op["key"], core.line_of("%s: %s" % (type(err).__name__, err), 200)   # redacted like every other outside text
         self.ops = [o for o in self.ops if o["key"] != key]
-        self.host.audit("external.permanent_failure", key, {"op": op["op"], "error": text, "dropped_ops": 1})
+        what = op.get("decision") or {}
+        self.host.audit("external.permanent_failure", key, {"op": op["op"], "error": text, "dropped_ops": 1,
+                                                            "display_id": what.get("display_id"), "title": what.get("title")})
         if op.get("note_only"):
             return
         link = self.links.get(key)
         if link is not None:
             link.update(last_error=text, failed_op=op["op"])
         self.failed[key] = {"op": op["op"], "error": text, "at": now,
+                            "display_id": what.get("display_id"), "title": what.get("title"),
                             "sig": list((op.get("digest"), op.get("tier"), op.get("floor"))) if op.get("digest") else None}
 
     # -- inbound

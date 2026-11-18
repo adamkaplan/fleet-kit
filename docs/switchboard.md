@@ -3735,6 +3735,7 @@ a failing delivery of an inbound answer (the event is not marked, the cursor sta
   backoff. A permanent refusal is dropped from the outbox (with the operations queued behind it for that decision), audited
   as `external.permanent_failure`, marked on the link (`last_error`, `failed_op`) and counted in the status line (`N permanent
   failure(s)`). It never withdraws or answers anything, is not enqueued again while the decision is unchanged, and a later
+  A refused raise is audited as `external.permanent_failure` with the decision's display id and title, and `status` lists it under the permanent failures with those; read it there or in the audit log. Every raise carries an `about` string made from the decision's headline (its title when it has none), which the receiving tool requires.
   change of the decision enqueues a fresh operation. An `already decided` (or closed) reply to a revise, withdraw or status is NOT one of these failures (to a raise it still is: there is no link to settle): the adapter's `AlreadyDecided` carries
   `settled_outside = true`, and the engine reads it as the other side's answer. The operation (and the ones behind it) are dropped and
   audited as `external.settled_outside`, the link is marked `decided_outside`, nothing more is revised, withdrawn or reported for it,

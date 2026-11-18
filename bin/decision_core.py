@@ -999,8 +999,10 @@ def outward_rows(entry):
 def outward_payload(entry, floor):
     """What is said about a decision outside, from the list entry: text with anything shaped like a credential taken
     out, and the floor tier the mapping assigns its tier. `rows` (a batch) go as options by id."""
-    payload = {"title": line_of(entry.get("title"), DECISION_REPORT_TITLE_MAX),
-               "headline": line_of(entry.get("headline"), 300), "kind": entry.get("kind"),
+    title = line_of(entry.get("title"), DECISION_REPORT_TITLE_MAX)
+    headline = line_of(entry.get("headline"), 300)
+    payload = {"title": title, "about": headline or title or str(entry.get("id") or "decision"),
+               "headline": headline, "kind": entry.get("kind"),
                "display_id": entry.get("id"), "tier": entry.get("tier"), "floor": floor, "ask": entry.get("ask"),
                "repo": entry.get("repo"), "agent": entry.get("agent"), "since": entry.get("since")}
     if entry.get("rows"):

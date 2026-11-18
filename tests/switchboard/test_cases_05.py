@@ -1938,6 +1938,14 @@ class TestExternalDecisionRules(unittest.TestCase):
         self.assertNotIn("abcdef123456", json.dumps(payload))
         self.assertNotIn("sk-abcdefghij1234", json.dumps(payload))
 
+    def test_every_kind_is_raised_with_an_about_string(self):
+        for kind in ("issue", "report", "notice", "batch"):
+            payload = self.core.outward_payload({"title": "t", "headline": "h", "kind": kind, "id": "#2"}, "floor-b")
+            self.assertIsInstance(payload.get("about"), str)
+            self.assertTrue(payload["about"])
+        bare = self.core.outward_payload({"kind": "issue", "id": "#3"}, "floor-b")
+        self.assertTrue(bare["about"])
+
 
 class TestWorkItemRules(unittest.TestCase):
     ws = sb.work_sync
