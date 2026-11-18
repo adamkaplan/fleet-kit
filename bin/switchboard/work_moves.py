@@ -72,6 +72,11 @@ def charter_safe(text):
     return re.sub(r"[^A-Za-z0-9_.#-]", "?", str(text)[:40])
 
 
+def charter_repo_safe(text):
+    """A repository for the read-back: `owner/name` keeps its slash; anything else outside letters, digits and _ . # - / becomes ?, and at most 60 characters are shown."""
+    return re.sub(r"[^A-Za-z0-9_./#-]", "?", str(text)[:60])
+
+
 def charter_from_refusal(args):
     """The refusal text, or None: `charter set` never takes `--from` (a named caller), in the Lab or out of it: the caller is always the pane's own agent (#1143)."""
     if getattr(args, "sender", None) is not None:
@@ -165,7 +170,7 @@ def cmd_charter(args, runner, now):
     audit("charter.set", old=old, new=value, changed=got["changed"], replace=replace)
     print("charter of %s: %s -> %s%s" % (args.name, old, value, "" if got["changed"] else " (unchanged)"))
     row = registry.read(engine.state_dir)["agents"].get(args.name) or {}
-    print("registry row: %s role=%s charter=%s repo=%s" % (args.name, row.get("role"), ("#%s" % row["charter"]) if row.get("charter") is not None else "none", safe(row.get("repo"))))
+    print("registry row: %s role=%s charter=%s repo=%s" % (args.name, row.get("role"), ("#%s" % row["charter"]) if row.get("charter") is not None else "none", charter_repo_safe(row.get("repo"))))
     return EXIT_OK
 
 

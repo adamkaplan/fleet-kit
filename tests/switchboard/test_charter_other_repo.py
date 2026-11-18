@@ -52,6 +52,7 @@ def build(CharterRig, Base):
                 for p in patches:
                     stack.enter_context(p)
                 code, out, err = self.run_as("cos", "charter", "set", lane, value)
+            self.last_out = out
             return code, err, seen
 
         def test_s2_the_row_repo_is_read_and_the_live_404_is_no_parent(self):
@@ -80,6 +81,19 @@ def build(CharterRig, Base):
             self.assertEqual(self.recorded(b), 0)
             code, err, _ = self.run_set(c, "7", LIVE)
             self.assertEqual((code, self.recorded(c)), (0, 1), err)
+
+        def test_readback_keeps_the_slash_of_the_repo(self):
+            lane = self.lane("orch-rb")
+            code, err, _ = self.run_set(lane, "7", LIVE)
+            self.assertEqual(code, 0, err)
+            out = self.last_out
+            self.assertIn("repo=" + WIDGET, out)
+            self.assertNotIn("?", out)
+            hostile = sb.charter_repo_safe("acme-org/wid\x1b[2Jget\n" + "x" * 200)
+            self.assertIn("acme-org/wid", hostile)
+            self.assertNotRegex(hostile, r"[\x00-\x1f\x7f]")
+            self.assertLessEqual(len(hostile), 60)
+            self.assertEqual(sb.charter_safe(WIDGET).count("/"), 0)   # the mutant: the general escape replaces the slash
 
         def test_s5_a_reader_of_the_default_repo_is_caught(self):
             old = "engine.intents.parent(value, repo0, strict=True)"
