@@ -63,7 +63,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
     PATHS = [REPO / "agents" / "opencode" / "chief-of-staff.md", REPO / "agents" / "opencode" / "cos-subagent.md"]
     PATH = PATHS[0]
     TEMP = "/private/var/folders/ab/T/opencode"
-    MAX_BLOCK_LINES = 210
+    MAX_BLOCK_LINES = 250
 
     @staticmethod
     def block(path):

@@ -109,9 +109,41 @@ permissions:
   - {action: shell, resource: "herdr tab rename *", effect: allow}
   - {action: shell, resource: "herdr workspace focus *", effect: allow}
   - {action: shell, resource: "herdr tab focus *", effect: allow}
+  # sed reads only: a line range, a pattern's lines or an s///p preview, of a file or of stdin; the denies below (last) refuse every writing form
+  - {action: shell, resource: "sed -n '*,*p' *", effect: allow}
+  - {action: shell, resource: "sed -n '/*/p' *", effect: allow}
+  - {action: shell, resource: "sed -n 's/*/*/p' *", effect: allow}
   - {action: subagent, resource: "*", effect: deny}
   - {action: task, resource: "*", effect: deny}
   - {action: shell, resource: "timeout * fleet-switchboard launch *", effect: deny}
+  # sed: y z F = after a slash (read-only, but not listed), any option after the script (-i, --in-place, -s, -f, -e), redirects, here-documents, ; newline {, and w W e r R after a slash or in a range script
+  - {action: shell, resource: "sed * -*", effect: deny}
+  - {action: shell, resource: "sed *>*", effect: deny}
+  - {action: shell, resource: "sed *<*", effect: deny}
+  - {action: shell, resource: "sed *;*", effect: deny}
+  - {action: shell, resource: "sed *\n*", effect: deny}
+  - {action: shell, resource: "sed *{*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/ *'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/!*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/y*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/z*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/F*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/=*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/w*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*,*w*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*w*,*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/W*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*,*W*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*W*,*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/e*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*,*e*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*e*,*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/r*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*,*r*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*r*,*'*", effect: deny}
+  - {action: shell, resource: "sed -n '?*/R*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*,*R*'*", effect: deny}
+  - {action: shell, resource: "sed -n '*R*,*'*", effect: deny}
   - {action: shell, resource: "*fleet-switchboard decisions batch*", effect: deny}
   - {action: shell, resource: "*fleet-switchboard gates *enforce*", effect: deny}
   - {action: shell, resource: "*fleet-switchboard gates *ENFORCE*", effect: deny}
