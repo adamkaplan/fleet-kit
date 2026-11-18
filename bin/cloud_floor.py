@@ -509,6 +509,8 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     args.brief_text = brief
     engine, state, config = D["H"]["build_engine"](runner, now, "cli")
     check_floor_admission(args, repo, brief, config)
+    if not re.fullmatch(r"[a-z][a-z0-9]*-[0-9]+-[a-z0-9]+(?:-[a-z0-9]+){0,3}", str(name or "")):
+        print("%s: warning: worker name %s does not follow <repo-short>-<issue>-<slug> (e.g. fk-1011-orders-in-context)" % (D["H"]["PROG"], name), file=sys.stderr)
     pclass = check_priority_tier(args, engine, runner, now, repo=repo, config=config)
     D["check_allowed"](repo)
     D["cloud_pr_labels"].cloud_base.check(args)   # a base that is not a branch name is refused before anything is sent

@@ -256,7 +256,7 @@ def load_tick(engine, discovery):
     def wake(text):
         alert = getattr(context, "alert", None) or {}   # #1275: keyed by the DATA (the lane and its severity and reasons), never by the prose
         if add_repeat_reminder(engine.state_dir, cos, now, now, text, "load-alert", str(alert.get("agent") or "unknown"), str(alert.get("state") or "unknown"),
-                               wake_class=WAKE_LOAD) is None:
+                               wake_class=WAKE_LOAD, window=4 * 3600) is None:
             return
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})

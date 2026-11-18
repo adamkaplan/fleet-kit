@@ -63,7 +63,7 @@ so they do not come back to you as events: use plain `gh`.
 Report with `fleet-switchboard report <done|failed|blocked|question|working|paused|withdrawn> "one line"` at real
 deliverables, state changes and failures; the final report names the result and its evidence
 link, then you stop. After `blocked` or `question`, end the turn at once. Woken by something
-that changes nothing for you: do not report, do not answer at length.
+that changes nothing for you: do not report, and reply nothing (no "no action needed" message).
 
 When you wait on time (CI, a rate limit, a checkpoint, another agent), set a reminder for
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your

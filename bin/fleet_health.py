@@ -88,6 +88,23 @@ def references(text, branch=None, repo=None):
 def move_rows(event, payload, repo, now, closing=lambda text: []):
     """[(repo, numbers, kind)] a webhook delivery says about real movement: a push (a pull request synchronised), a pull request opened or
     merged. `numbers` are the pull request and the issues its body closes. Comments, reviews and labels are not movement."""
+    if event == "push" and isinstance(payload, dict):
+        commits = payload.get("commits") if isinstance(payload.get("commits"), list) else []
+        refs = []
+        for c in commits[:MOVES_NUMBERS_MAX]:
+            if isinstance(c, dict):
+                for n in list(closing(c.get("message"))) + references(c.get("message"), payload.get("ref"), repo):
+                    if n not in refs:
+                        refs.append(n)
+        refs = refs[:MOVES_NUMBERS_MAX]
+        return [{"at": now, "repo": repo, "numbers": list(refs), "refs": list(refs), "kind": "push"}] if refs else []
+    if event == "issues" and isinstance(payload, dict) and payload.get("action") == "closed":
+        issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+        num = issue.get("number")
+        if isinstance(num, int) and not isinstance(num, bool):
+            refs = [num] + [n for n in references(issue.get("body"), None, repo) if n != num]
+            refs = refs[:MOVES_NUMBERS_MAX]
+            return [{"at": now, "repo": repo, "numbers": list(refs), "refs": list(refs), "kind": "issue_closed"}]
     if event != "pull_request" or not isinstance(payload, dict):
         return []
     pr = payload.get("pull_request") if isinstance(payload.get("pull_request"), dict) else {}
@@ -231,7 +248,8 @@ def audit_moves(state_dir, since):
         return None
     rows = []
     for number, line in enumerate(data.decode("utf-8", "replace").splitlines()):
-        if (number == 0 and torn) or ("report on" not in line and "plan.review.consensus" not in line):
+        if (number == 0 and torn) or ("report on" not in line and "plan.review.consensus" not in line
+                                            and "push_watch.landed" not in line and "cloud.created" not in line):
             continue
         try:
             entry = json.loads(line)
@@ -245,6 +263,8 @@ def audit_moves(state_dir, since):
             found = _REF.search(str(detail.get("description") or ""))
             if found:
                 rows.append({"at": at, "repo": (found.group(1) + "/" if found.group(1) else "") + found.group(2), "numbers": [int(found.group(3))], "kind": "report"})
+        elif entry.get("event") == "cloud.created" and isinstance(detail.get("issue"), int) and not isinstance(detail.get("issue"), bool):
+            rows.append({"at": at, "repo": str(detail.get("repo") or ""), "numbers": [int(detail["issue"])], "refs": [int(detail["issue"])], "kind": "launch"})
         elif entry.get("event") == "plan.review.consensus" and "#" in str(entry.get("subject")):
             repo, _, ask = str(entry["subject"]).rpartition("#")
             if ask.isdigit():
@@ -446,7 +466,7 @@ def wake_text(fig, reasons, cfg):
     return text + " Recommended: " + "; or ".join(actions) + "."
 
 
-def judge(fig, cfg, previous):
+def judge(fig, cfg, previous, now=None):
     """(wake text or None, the episode's new state). Once per episode: again only when worse, or after recovery and a new crossing."""
     severity, reasons = crossing(fig, cfg)
     if fig["open_asks"] is None:
@@ -454,8 +474,8 @@ def judge(fig, cfg, previous):
     if not severity:
         return None, {"sent": 0}
     if severity > (previous or {}).get("sent", 0):
-        return wake_text(fig, reasons, cfg), {"sent": severity}
-    return None, previous
+        return wake_text(fig, reasons, cfg), {"sent": severity, "at": now}
+    return None, previous   # an unchanged severity is not repeated; a repeat is never sooner than 14400 seconds (4 hours) after the last wake
 
 
 # ---- the pass

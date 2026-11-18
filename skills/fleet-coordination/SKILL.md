@@ -19,6 +19,8 @@ Write GitHub text so a person can read it: short paragraphs, real Markdown lists
 
 ## The brief
 
+Name every launched worker `<repo-short>-<issue>-<2-3 word slug>` (for example `fk-1011-orders-in-context` or `widget-9191-remove-body-label`), keeping the name within the 32-character limit.
+
 Send one self-contained brief at dispatch. Later updates can be shorthand; the
 first one cannot. Write the brief with a quoted heredoc (`<<'E'`) or a file, never an unquoted one: a backtick or a dollar sign in an unquoted brief is run by the shell.
 

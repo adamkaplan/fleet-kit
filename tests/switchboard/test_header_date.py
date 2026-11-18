@@ -126,10 +126,11 @@ class TestHeaderDateCallSites(unittest.TestCase):
         return compose("platform", facts, delivered=self.D if delivered is None else delivered)[0].splitlines()[0]
 
     def check_a(self, compose):
-        facts = [sb.Fact("reminder:1", "platform", "reminder", "r", self.PREV, batch=False),
-                 sb.Fact("reminder:2", "platform", "reminder", "r", self.D - 600, batch=False)]
-        head = self.head(compose, facts)
-        assert "sent 2027-01-15 15:15Z-14:13Z, delivered 14:23Z" in head, "a non-late range dates its oldest member: " + head
+        late, now = MID + 23 * 3600 + 50 * 60, MID + 86400 + 10 * 60   # 23:50Z the day before, delivered 00:10Z: not late, a day apart
+        facts = [sb.Fact("reminder:1", "platform", "reminder", "r", late, batch=False),
+                 sb.Fact("reminder:2", "platform", "reminder", "r", now - 300, batch=False)]
+        head = self.head(compose, facts, delivered=now)
+        assert "sent 2027-01-15 23:50Z-00:05Z, delivered 00:10Z" in head, "a non-late range dates its oldest member: " + head
 
     def check_b(self, compose):
         fact = sb.Fact("send:c:1", "platform", "send", "msg", self.D - 60, batch=False, sender="coder")

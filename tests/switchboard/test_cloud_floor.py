@@ -429,6 +429,12 @@ class TestCloudFloorCutover(FloorCase):
         self.assertEqual(self.fake.submitted["priority_class"], "background")
         self.assertEqual(self.record("c1")["priority_class"], "background")
 
+    def test_non_descriptive_worker_name_prints_a_warning(self):
+        code, out, err = self.launch("fks1011")
+        self.assertIn("<repo-short>-<issue>-<slug>", err)
+        code, out, err = self.launch("fk-1011-orders-in-context")
+        self.assertNotIn("<repo-short>-<issue>-<slug>", err)
+
     def test_outage_is_for_cos_or_a_person_only(self):
         self.kind = ("agent", "widget-lead", "orchestrator")
         self.assertEqual(self.launch("o1", priority_class="outage")[0], 2)

@@ -286,8 +286,7 @@ def sent_at(fact):
 def in_late_scope(fact):
     """#1564: every delivered kind but the ones that carry their own mark (a plain reminder says "late by N min" itself): what the delayed mark is about.
     The digests (merged or not) and the load alerts that ride with them stay in scope as before."""
-    return (fact.kind not in OWN_LATE_MARK_KINDS or bool(getattr(fact, "members", None)) or bool(getattr(fact, "wake_class", None))
-            or fact.kind in ("triage", "sweep"))
+    return True
 
 
 def delayed_since(facts, delivered):
@@ -373,11 +372,17 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
         if shown is taken:
             idle = []  # nothing but idle riders: there is no news to fold them under
+        if replaced and len(replaced) < len(shown):
+            shown = [fact for fact in shown if fact.key not in replaced]
         lines = [head] + (sectioned_lines(shown, section, item) if section else [item(fact) for fact in shown])
         if idle:  # no-change worker lines are ONE quiet line next to real news (the keys are still carried)
             names = sorted({fact.sender or "a worker" for fact in idle})
             lines.append("- quiet: %d worker finish%s with no change (%s)" % (
                 len(idle), "" if len(idle) == 1 else "es", ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")))
+        if replaced:
+            by_sender = sorted({fact.sender or "a sender" for fact in taken if fact.key in replaced})
+            lines.append("- superseded: %d earlier message%s from %s on the same issue omitted (only the newest is shown)" % (
+                len(replaced), "" if len(replaced) == 1 else "s", ", ".join(by_sender)))
         rest = len(facts) - count
         if rest:
             lines.append("\u2026 and %d more: run fleet-switchboard pending %s" % (rest, recipient))
