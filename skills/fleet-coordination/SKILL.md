@@ -157,6 +157,8 @@ misunderstanding that would otherwise cost you an afternoon and a wasted branch.
 
 `send` messages are capped (about 3000 characters in practice, 4000 hard): put long text in a file made under `mktemp -d` and pass it as `"$(cat <file>)"`.
 
+Never put unescaped backticks inside a double-quoted `fleet-switchboard send` or `fleet-switchboard report` argument: the shell evaluates `` `...` `` as a command substitution before the CLI runs and replaces your SHA or number with an empty string. Use single quotes or `--file` when a message contains backticks.
+
 The daemon records the `ci` verdict itself about five minutes after CI is green at the head, so read `fleet-switchboard gates <pr>` and do not ask for `gates ci-record`, which stays for a hurry.
 
 ## Starting a named agent in a pane

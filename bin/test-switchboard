@@ -28272,7 +28272,8 @@ class TestReportCommand(ReportBase):
     def test_a_report_to_a_boss_that_cannot_be_written_to_is_held_like_send(self):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         code, _, err = self.cli("report", "done", "--from", "coder", "done")
-        self.assertEqual(code, 3)
+        self.assertEqual(code, 0, err)
+        self.assertIn("held for platform", err)
         self.assertEqual(self.world.admissions("platform"), [])
 
     def test_a_progress_report_is_recorded_not_delivered_and_wakes_nobody(self):

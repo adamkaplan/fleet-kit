@@ -3044,8 +3044,8 @@ class Switchboard:
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
-            if fact.kind == "send" and fact.key.startswith("send:") and self.state_dir is not None and held_send_applies(plan.observation):
-                return hold_send_fact(self, fact, now)   # #2051: a send to an agent with any hold reason is held, never refused
+            if fact.kind in ("send", REPORT) and fact.key.startswith(("send:", "report:")) and self.state_dir is not None and held_send_applies(plan.observation):
+                return hold_send_fact(self, fact, now)   # #2051, #34: a send or attention report to an agent with any hold reason is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
@@ -8986,14 +8986,16 @@ def read_errored_turn(engine, observation, now):
     observation.errored = bool(observation.turn_error)   # #2551: the text and message id are kept for stream_error_tick
     return observation.errored
 STREAM_RESUME_STATE = "stream-resumes.json"   # {agent: {"times": [epoch], "last_id": newest message id handled}}
-STREAM_RESUME_WINDOW = 3600
-STREAM_RESUME_MAX = 8
-STREAM_RESUME_AGENTS_MAX = 64
+STREAM_RESUME_WINDOW, STREAM_RESUME_MAX, STREAM_RESUME_AGENTS_MAX = 3600, 8, 64
+TRANSPORT_ERROR = re.compile(r"ECONNRESET|time(?:d)?[ -]?out|\b499\b", re.I)
+def probe_transport():
+    return True
 def stream_error_tick(engine, discovery):
-    """#2551: resume (through `resume_ended_turn` with `window=0`) each blocked agent on a provider stream failure; 9th in the hour goes to cos."""
+    """#2551, #34: resume blocked agents on provider stream failure; gate transport outages on probe_transport() with 1 cos summary line."""
     if discovery is None or engine.state_dir is None:
         return
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), "cos")
+    transport_ok, transport_resumed, had_outage = None, [], False
     for name, seen in sorted(discovery.agents.items()):
         try:
             if seen.status == "blocked" and not getattr(seen, "errored", False) and getattr(engine, "light", False) and not (engine.v2.permission_list(seen.session_id) or engine.v2.form_list(seen.session_id)):
@@ -9002,11 +9004,20 @@ def stream_error_tick(engine, discovery):
             error, message = getattr(seen, "turn_error", "") or "", getattr(seen, "turn_error_id", None)
             if seen.status != "blocked" or not getattr(seen, "errored", False) or not PROVIDER_ERROR.search(error):
                 continue
-            now, row = engine.now(), blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda s: None).get(name)
-            row = row if isinstance(row, dict) else {}
+            now, full_state = engine.now(), blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda s: None)
+            row = full_state.get(name) if isinstance(full_state.get(name), dict) else {}
+            if row.get("outage"):
+                had_outage = True
             current_err, current_id = (last_turn_error_and_id(engine, seen.session_id) if isinstance(message, str) and message and row.get("last_id") != message else ("", None))
             if current_id != message or not PROVIDER_ERROR.search(current_err):
                 continue
+            if TRANSPORT_ERROR.search(current_err):
+                if transport_ok is None:
+                    transport_ok = bool(probe_transport())
+                if not transport_ok:
+                    blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda st, _n=name, _r=dict(row, outage=True): dict(st, **{_n: _r}))
+                    engine._note("transport.outage", name, {"error": current_err, "message_id": message})
+                    continue
             times = [t for t in (row.get("times") if isinstance(row.get("times"), list) else []) if _is_number(t) and 0 <= now - t < STREAM_RESUME_WINDOW][-STREAM_RESUME_MAX:]
             if len(times) >= STREAM_RESUME_MAX:
                 outcome = engine.send("switchboard", cos, "[stream-error] %s failed %d times in the last hour on a provider stream error (%s); auto-resume capped at %d/hour." % (name, len(times) + 1, current_err, STREAM_RESUME_MAX)) if name != cos else {}
@@ -9019,6 +9030,8 @@ def stream_error_tick(engine, discovery):
                 except ResumeRefused:
                     continue
                 times.append(now)
+                if TRANSPORT_ERROR.search(current_err):
+                    transport_resumed.append(name)
             def save(state, _name=name, _times=times, _msg=message, _now=now):
                 kept = {k: v for k, v in state.items() if k != _name and isinstance(v, dict) and isinstance(v.get("times"), list) and any(_is_number(t) and 0 <= _now - t < STREAM_RESUME_WINDOW for t in v["times"])}
                 kept[_name] = {"times": _times, "last_id": _msg}
@@ -9026,6 +9039,8 @@ def stream_error_tick(engine, discovery):
             blocked_update(engine.state_dir, STREAM_RESUME_STATE, save)
         except Exception as err:
             engine._failed(name, "stream-error", err, {"errors": []})
+    if len(transport_resumed) >= 2 or (had_outage and transport_resumed):
+        engine.send("switchboard", cos, "[transport-outage] Provider transport probe succeeded; resumed %d agent(s) once (%s)." % (len(transport_resumed), ", ".join(transport_resumed)))
 
 def ended_turn_text(name, resumed):
     """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
@@ -9154,15 +9169,8 @@ def undelivered_wake_tick(engine, discovery):
     return done
 
 
-# ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported"). `hold_reason` holds a message for an agent
-# the terminal shows as blocked: nothing is typed into a prompt, and that is right. The missing part was the report. Once per
-# block (repeated at most every `repeat_minutes`, closed with one final line) its boss and the Chief of Staff are told. It reads
-# only what the pass already has (the observations, the held plans, the requests WorkerFacts read, reminders.json): no `gh` call.
-
-BLOCKED_ALERT_DEFAULTS = {"minutes": 20, "repeat_minutes": 60}
-BLOCKED_ALERT_STATE = "blocked-alert.json"
-
-
+# ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported").
+BLOCKED_ALERT_DEFAULTS, BLOCKED_ALERT_STATE = {"minutes": 20, "repeat_minutes": 60}, "blocked-alert.json"
 def validate_blocked_alert_config(config, source):
     """`blocked_alert`: absent or null is the defaults (on); false is off; else {"minutes", "repeat_minutes"}, numbers above 0."""
     if "blocked_alert" not in config or config["blocked_alert"] is None:
@@ -9387,20 +9395,11 @@ def blocked_tick(engine, discovery, held):
 # ------------------------------------------------- held sends (#2051): a send to an agent with any hold reason waits, it is not refused
 
 HELD_SENDS = "held-sends.json"       # {recipient: {"rows": [{"key", "from", "at", "text", "issue", "repo", "route"}]}}: a send held while its recipient was blocked
-HELD_SENDS_KEEP = 50                 # rows kept per recipient: the 51st send drops the oldest, and its sender is told
-HELD_SENDS_SECONDS = 24 * 3600       # a held send older than this is dropped, and its sender is told
-HELD_ROUTE_PANE, HELD_ROUTE_ENDPOINT = "pane", "endpoint"
-
-
+HELD_SENDS_KEEP, HELD_SENDS_SECONDS, HELD_ROUTE_PANE, HELD_ROUTE_ENDPOINT = 50, 24 * 3600, "pane", "endpoint"
 def held_send_applies(observation):
-    """#1400: a send is held for every hold reason (blocked, unknown status, a problem, a conflict); only a recipient that cannot be observed (gone) is refused."""
     return observation is not None and hold_reason(observation) is not None
-
-
 def _held_first_words(text):
     return _one_line(" ".join(str(text).split()[:8]), 60)
-
-
 def hold_send(state_dir, recipient, sender, text, issue, repo, now, route):
     """Keep one send. Returns (key, dropped rows of this recipient: the oldest over the cap, and any older than 24 hours)."""
     key = "send:%s:%s" % (sender, uuid.uuid4().hex[:16])
@@ -13445,7 +13444,10 @@ def _send_by_registry(args, runner, now):
         sender = args.sender
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
-    text = " ".join(args.text).strip()
+    raw_text = " ".join(args.text)
+    if "  " in raw_text.strip() and not getattr(args, "file", None):
+        sys.stderr.write("%s: warning: consecutive spaces in message text (did shell backticks swallow a value? use single quotes or --file)\n" % PROG)
+    text = raw_text.strip()
     if not text:
         sys.stderr.write("%s: nothing to send\n" % PROG)
         return EXIT_USAGE
@@ -13711,14 +13713,21 @@ def cmd_report(args, runner, now):
         sender = args.sender
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
+    raw_report = " ".join(args.text)
+    if "  " in raw_report.strip():
+        sys.stderr.write("%s: warning: consecutive spaces in report text (did shell backticks swallow a value? use single quotes)\n" % PROG)
     try:
-        outcome = engine.report(sender, args.state, " ".join(args.text), args.issue, args.everything)
+        outcome = engine.report(sender, args.state, raw_report, args.issue, args.everything)
     except (ReportError, IssueRefError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
     if outcome.get("action") == "rider":
         sys.stderr.write("%s: %s\n" % (PROG, outcome["reason"]))
         print(outcome["key"])
+        return EXIT_OK
+    if outcome.get("held"):
+        boss = outcome.get("recipient", "your boss")
+        sys.stderr.write("%s: held for %s: %s is blocked; it will be delivered when it unblocks\n" % (PROG, boss, boss))
         return EXIT_OK
     if not outcome["sent"]:
         sys.stderr.write("%s: not reported to %s: %s (%s)\n" % (PROG, outcome.get("recipient", "your boss"),
@@ -22828,11 +22837,6 @@ USE_ENSURE_PATIENCE = 2.0  # seconds a command waits for a daemon it started; th
 # ------------------------------------------------------------ the daemon on use
 
 def ensure_on_use(spawn=subprocess.Popen, patience=None, sleep=time.sleep, state_dir=None):
-    """Make sure a daemon runs before a command that needs one does its work. Quiet and bounded.
-
-    A command that cannot start the daemon still does its work: this writes one warning naming the log
-    and returns. A config the daemon could not read is the command's own error, not a second one here.
-    """
     if not ENSURE_ON_USE or fault("no-ensure-on-use"):
         return None
     try:
@@ -22878,13 +22882,8 @@ def daemon_record(config, environ=None):
     return {"key_source": key_source_of(config, environ)}
 
 
-KEY_UNSEEN_BY_DAEMON = ("The decision-model key is only in this shell's environment, and the running daemon was started "
-                        "without it: messages are not classified and tool calls are not judged. Run `%s key set` to "
-                        "save it as a file; the daemon reads the file when it needs the key." % PROG)
-KEY_UNSEEN_BY_SERVICE = ("The decision-model key is only in an environment variable, not in a file, and the service will "
-                         "not have it: launchd and systemd start the daemon without your shell's variables, so after a "
-                         "restart messages are not classified and tool calls are not judged. Run `%s key set` to save "
-                         "it as a file." % PROG)
+KEY_UNSEEN_BY_DAEMON = "The decision-model key is only in this shell's environment, and the running daemon was started without it: messages are not classified and tool calls are not judged. Run `%s key set` to save it as a file; the daemon reads the file when it needs the key." % PROG
+KEY_UNSEEN_BY_SERVICE = "The decision-model key is only in an environment variable, not in a file, and the service will not have it: launchd and systemd start the daemon without your shell's variables, so after a restart messages are not classified and tool calls are not judged. Run `%s key set` to save it as a file." % PROG
 
 
 def key_report(config, daemon=None, service=None):

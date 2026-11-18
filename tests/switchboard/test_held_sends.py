@@ -454,3 +454,23 @@ class TestHeldSends(Base):
             with self.assertRaises(AssertionError) as caught:
                 self.endpoint_two_sends()
         self.assertIn("held sends are delivered in the order they were sent", str(caught.exception))
+
+    def test_report_to_blocked_boss_is_held_and_delivered_on_unblock_and_backtick_gap_warns(self):
+        self.status("platform", "blocked")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ[sb.LAB_ENV] = "1"
+        with captured() as (out, err):
+            code = sb.main(["report", "done", "--from", "coder", "landed  on main"], runner=self.world.route, now=self.world.clock.now)
+        self.assertEqual(code, 0, err)
+        self.assertIn("held for platform", err)
+        self.assertIn("warning: consecutive spaces in report text", err)
+        self.assertEqual(len(self.held()), 1)
+        code2, _, err2 = self.cli("platform", "landed  at head")
+        self.assertEqual(code2, 0, err2)
+        self.assertIn("warning: consecutive spaces in message text", err2)
+        self.status("platform", "idle")
+        self.world.engine.run_pass()
+        texts = [a["text"] for a in self.world.admissions("platform")]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("done: landed  on main", texts[0])
+        self.assertIn("landed  at head", texts[0])

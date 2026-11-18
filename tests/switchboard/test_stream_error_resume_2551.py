@@ -255,4 +255,27 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             errors = [e for e in self.world.audit() if e["event"] == "error" and e["subject"] == "coder" and e["detail"].get("step") == "stream-error"]
             self.assertEqual(len(errors), 1)
 
+        def test_transport_outage_pauses_resumes_until_probe_succeeds_and_sends_one_cos_line(self):
+            self.world.add_agent("coder2", fleet=FLEET)
+            self.world.herdr.panes[self.world.panes["coder2"]]["status"] = "blocked"
+            sid2 = self.world.sessions["coder2"]
+            econn = {"type": "provider.transport", "message": "ECONNRESET: socket closed"}
+            self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_t1", "type": "assistant", "error": dict(econn)})
+            self.world.v2.sessions[sid2]["messages"].append({"id": "msg_t2", "type": "assistant", "error": dict(econn)})
+            with mock.patch.object(sb, "probe_transport", lambda: False):
+                for _ in range(10):
+                    self.tick(30)
+            self.assertEqual(self.resumes(), [])
+            self.assertEqual([a for a in self.world.admissions("coder2") if a["text"] == sb.RESUME_TEXT], [])
+            state = json.loads((self.world.state / sb.STREAM_RESUME_STATE).read_text())
+            self.assertEqual(state["coder"].get("times", []), [])
+            self.assertTrue(state["coder"].get("outage"))
+            with mock.patch.object(sb, "probe_transport", lambda: True):
+                self.tick(30)
+            self.assertEqual(len(self.resumes()), 1)
+            self.assertEqual(len([a for a in self.world.admissions("coder2") if a["text"] == sb.RESUME_TEXT]), 1)
+            outage_msgs = [a for a in self.world.admissions("cos") if "[transport-outage]" in a["text"]]
+            self.assertEqual(len(outage_msgs), 1)
+            self.assertIn("resumed 2 agent(s) once (coder, coder2)", outage_msgs[0]["text"])
+
     return TestStreamErrorResume

@@ -121,7 +121,7 @@ def submit_cloud_land(root, subcmd, app_id, app_key):
         if not pod:
             res = proof.kube_run(["kubectl", "-n", ns, "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"], env, config=cfg)
             names = (res.stdout or "").split() if res.returncode == 0 else []
-            pod = next((n for n in names if n.startswith(("fhex-", "land-", "nightly2570-"))), "")
+            pod = next((n for n in names if n.startswith(("fhex", "land-", "nightly2570-"))), "")
         if not pod:
             created_worker = "fhex-%s" % dt.datetime.now(dt.timezone.utc).strftime("%H%M%S")
             brief_path = os.path.join(tmp_dir, "brief.md")
@@ -130,7 +130,7 @@ def submit_cloud_land(root, subcmd, app_id, app_key):
             sw = os.path.join(root, "bin", "fleet-switchboard")
             out = subprocess.check_output([
                 sw, "launch", created_worker, "--cloud", "--shape", "L", "--role", "tester", "--no-commit",
-                "--repo", repo, "--branch", "main", "--agent", "coder", "--reports-to", "fleetkit",
+                "--repo", repo, "--branch", "main", "--agent", "coder", "--reports-to", env.get("CW_LAND_REPORTS_TO") or "cos",
                 "--checkpoint", "15m", "--overdue", "30m", "--brief-file", brief_path
             ], env=env, text=True, timeout=240)
             m = re.search(r'"runtime_id":\s*"pod/([a-z0-9-]+)"', out)
