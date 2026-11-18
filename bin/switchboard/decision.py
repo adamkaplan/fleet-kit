@@ -71,7 +71,7 @@ def github_tier(item, hub):
     if kind == "github.stage":
         return 2
     if kind in ("github.pr", "github.subissue"):
-        return 3
+        return "drop" if hub._fleet_login(getattr(item, "actor", None) or item.sender) else 3
     if kind == "github.check":
         return 1 if actionable else 3   # a failed check; a passing one is only carried
     if kind == "github.review":
@@ -88,6 +88,8 @@ def github_tier(item, hub):
             return 1
         if action in ("closed", "reopened") and not hub._fleet_login(actor):
             return 1   # an external close or reopen
+        if hub._fleet_login(actor or item.sender):
+            return "drop"
         return 3
     return None
 
@@ -190,6 +192,9 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     # and start the batch clock; when there is any other, every rider goes with it.
     orchestrator = is_orchestrator(observation)
     if orchestrator:
+        pending = [fact for fact in pending if fact_tier(fact) != "drop"]
+        if not pending:
+            return None
         mark_bucket_targets(recipient, pending, now)   # before the batching rule and before delayed_since: a fact flushed early is not late for its bucket
     chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider and not (orchestrator and fact_tier(fact) == 3)]   # #2545: tier 3 never starts a message
     if not chosen:

@@ -98,6 +98,7 @@ class TestOrchestratorUtcBatching(unittest.TestCase):
         table = [
             (dict(kind="github.conflict"), 1), (dict(kind="github.pr_green"), 1), (dict(kind="github.stage"), 2),
             (dict(kind="github.pr", actionable=False), 3), (dict(kind="github.subissue"), 3),
+            (dict(kind="github.subissue", sender="fleet-account"), "drop"), (dict(kind="github.pr", sender="fleet-account", actionable=False), "drop"),
             (dict(kind="github.check"), 1), (dict(kind="github.check", actionable=False), 3),   # failed; a passing check only rides
             (dict(kind="github.review"), 1), (dict(kind="github.review", actionable=False), 3),   # changes requested; approved or commented ride
             (dict(kind="github.review", key="github.botreview:helper:abc"), 2),
@@ -110,12 +111,31 @@ class TestOrchestratorUtcBatching(unittest.TestCase):
             (dict(kind="github.issue", action="unlabeled", label="alice:awaiting-answer", actor="alice"), 3),   # removed: not a wake
             (dict(kind="github.issue", action="labeled", label="bug", actor="alice"), 3),
             (dict(kind="github.issue", action="closed", actor="alice"), 1), (dict(kind="github.issue", action="reopened", actor="alice"), 1),
-            (dict(kind="github.issue", action="closed", actor="fleet-account"), 3),   # our own close
+            (dict(kind="github.issue", action="closed", actor="fleet-account"), "drop"),   # our own close
             (dict(kind="github.issue", action="edited", actor="alice"), 3), (dict(kind="github.issue"), 3),
             (dict(kind="alert"), None),
         ]
         for kw, want in table:
             self.assertEqual(tier_of(**kw), want, kw)
+
+    def test_self_echo_issue_and_subissue_events_are_dropped_for_an_orchestrator(self):
+        def facts(*items):
+            return [sb.tiered_fact(i, sb.Fact, HUB) for i in items]
+        own = [item("github.issue", key="github.issue:own", action="closed", actor="fleet-account"),
+               item("github.subissue", key="github.subissue:own", sender="fleet-account")]
+        ext = [item("github.issue", key="github.issue:ext", action="edited", actor="alice"),
+               item("github.subissue", key="github.subissue:ext", sender="alice")]
+        send = _make_fact("send:a", "send", batch=False, sender="boss")
+        p = plan([send] + facts(*own))
+        self.assertEqual(p.action, "wake")
+        self.assertEqual([f.key for f in p.pending], ["send:a"])
+        p = plan([send] + facts(*own, *ext))
+        self.assertEqual(p.action, "wake")
+        self.assertEqual(sorted(f.key for f in p.pending), ["github.issue:ext", "github.subissue:ext", "send:a"])
+        self.assertIsNone(plan(facts(*own)))
+        p = plan(facts(*own), role="chief-of-staff")
+        self.assertIsNotNone(p)
+        self.assertEqual(len(p.pending), 2)
 
     def test_a_summary_that_looks_like_a_wake_does_not_make_one(self):
         f = sb.tiered_fact(item("github.issue", action="unlabeled", label="alice:awaiting-answer", actor="alice", ), sb.Fact, HUB)
