@@ -66,14 +66,14 @@ class UnavailableArtifactError(FloorError):
 
 # ---------------------------------------------------------------- settings, scrubbing, routing
 
-def settings():
+def env_of():
     return os.environ
 
 
 def scrub(text, limit=200):
     """One line of `text` with every URL, host, bearer token, signature and long opaque string of the settings taken out."""
     text = str(text)
-    env = settings()
+    env = env_of()
     url = (env.get("CW_FLOOR_URL") or "").strip()
     forms = [url, urllib.parse.urlsplit(url).netloc if url else ""]
     token_file = env.get("CW_FLOOR_TOKEN_FILE")
@@ -102,7 +102,7 @@ def _matches(entry, repo):
 def route_repo(repo, config, env=None):
     """`floor` or `pod` for a repository. `CW_REMOTE_BACKEND=pod` is the rollback switch and wins; else `floor` when the backend is `floor` or the
     repository is in CW_FLOOR_REPOS; else `pod`. `config` is the switchboard's (it is not read here: the land gate is `check_floor_admission`)."""
-    env = settings() if env is None else env
+    env = env_of() if env is None else env
     backend = (env.get("CW_REMOTE_BACKEND") or "").strip().lower()
     if backend == "pod":
         return "pod"
@@ -118,7 +118,7 @@ def is_floor(record):
 
 
 def floor_who():
-    who = (settings().get("CW_FLOOR_CALLER") or "fleet").strip()
+    who = (env_of().get("CW_FLOOR_CALLER") or "fleet").strip()
     if not CALLER_RE.fullmatch(who):
         raise D["Refusal"]("CW_FLOOR_CALLER is not a caller id (a-z, 0-9, _ and -, up to 32); nothing was created")
     return who
@@ -188,7 +188,7 @@ class HttpTransport:
 
 
 def _token():
-    path = (settings().get("CW_FLOOR_TOKEN_FILE") or "").strip()
+    path = (env_of().get("CW_FLOOR_TOKEN_FILE") or "").strip()
     if not path:
         return None
     try:
@@ -206,7 +206,7 @@ def transport():
     if TRANSPORT is not None:
         return TRANSPORT
     D["use_settings"]()
-    url = (settings().get("CW_FLOOR_URL") or "").strip()
+    url = (env_of().get("CW_FLOOR_URL") or "").strip()
     if not url:
         raise D["Refusal"]("a repository routes to Floor but CW_FLOOR_URL is not set in the private settings; nothing was created")
     problem = D["endpoint_problem"](url)
@@ -517,7 +517,7 @@ def drain_check(state, expected_workers):
 def retire_pod_launcher(state, env=None):
     """Whether the pod launcher may be retired: only when the backend is `floor`, the rollback window is `closed`, no pod worker is live and no record
     is unreadable. It decides and changes nothing: a refusal says why (exit 2 through the command that asks)."""
-    env = settings() if env is None else env
+    env = env_of() if env is None else env
     Refusal = D["Refusal"]
     if (env.get("CW_REMOTE_BACKEND") or "").strip().lower() != "floor":
         raise Refusal("the pod launcher stays: CW_REMOTE_BACKEND is not floor; nothing was changed")
