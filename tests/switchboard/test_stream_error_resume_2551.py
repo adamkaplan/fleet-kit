@@ -1,4 +1,4 @@
-"""The #2551 tests: a blocked agent whose newest message ended on a provider stream failure is resumed by the next pass, at most three times an hour,
+"""The #2551 tests: a blocked agent whose newest message ended on a provider stream failure is resumed by the next pass, at most eight times an hour,
 and the next failure goes to the Chief of Staff; a working agent or one with an open request is never resumed. build() is called by bin/test-switchboard."""
 import json
 import os
@@ -41,26 +41,41 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
         def findings(self):
             return [a for a in self.world.admissions("cos") if "[stream-error]" in a["text"]]
 
-        def test_s1_resumed_within_two_minutes_three_times_an_hour_then_the_fourth_goes_to_cos(self):
-            for n in range(3):
+        def test_s1_resumed_within_two_minutes_eight_times_an_hour_then_the_ninth_goes_to_cos(self):
+            for n in range(8):
                 self.fail()
                 self.tick(90)
                 self.assertEqual(len(self.resumes()), n + 1)
                 self.tick(90)   # the same ended turn is not resumed twice
                 self.assertEqual(len(self.resumes()), n + 1)
-            self.assertEqual([e["detail"]["reason"].endswith(ERROR) for e in self.audited()], [True] * 3)
+            self.assertEqual([e["detail"]["reason"].endswith(ERROR) for e in self.audited()], [True] * 8)
             self.fail()
             self.tick(90)
             self.tick(90)
-            self.assertEqual(len(self.resumes()), 3)
+            self.assertEqual(len(self.resumes()), 8)
             (found,) = self.findings()
             self.assertIn("coder", found["text"])
             self.assertIn(ERROR, found["text"])
-            self.assertEqual([(e["subject"], e["detail"]["count"], e["detail"]["error"]) for e in self.escalations()], [("coder", 4, ERROR)])
+            self.assertEqual([(e["subject"], e["detail"]["count"], e["detail"]["error"]) for e in self.escalations()], [("coder", 9, ERROR)])
             self.world.clock.t += 3600
             self.fail()
             self.tick(90)
-            self.assertEqual(len(self.resumes()), 4)
+            self.assertEqual(len(self.resumes()), 9)
+
+        def test_econnreset_transport_error_resumes_within_one_tick_and_caps_at_eight_per_hour(self):
+            econn = {"type": "provider.transport", "message": "ECONNRESET: The socket connection was closed unexpectedly. For more information, pass verbose: true in the second argument to fetch()"}
+            for n in range(8):
+                self.count += 1
+                self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_err%d" % self.count, "type": "assistant", "error": dict(econn)})
+                self.tick(30)
+                self.assertEqual(len(self.resumes()), n + 1)
+            self.count += 1
+            self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_err%d" % self.count, "type": "assistant", "error": dict(econn)})
+            self.tick(30)
+            self.assertEqual(len(self.resumes()), 8)
+            (found,) = self.findings()
+            self.assertIn("ECONNRESET", found["text"])
+            self.assertIn("capped at 8/hour", found["text"])
 
         def test_s2_a_working_agent_or_a_turn_without_a_provider_error_is_never_resumed(self):
             self.pane["status"] = "working"
@@ -110,16 +125,16 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
         def check_hourly_cap(self):
             (self.world.state / sb.STREAM_RESUME_STATE).unlink() if (self.world.state / sb.STREAM_RESUME_STATE).exists() else None
             before_r, before_f = len(self.resumes()), len(self.findings())
-            for _ in range(4):
+            for _ in range(9):
                 self.fail()
                 self.tick()
-            self.assertEqual(len(self.resumes()) - before_r, 3, "hourly cap: resumes sent in 4 failures")
-            self.assertEqual(len(self.findings()) - before_f, 1, "hourly cap: findings sent in 4 failures")
+            self.assertEqual(len(self.resumes()) - before_r, 8, "hourly cap: resumes sent in 9 failures")
+            self.assertEqual(len(self.findings()) - before_f, 1, "hourly cap: findings sent in 9 failures")
 
         def test_s3_the_cap_mutant_is_killed(self):
             self.check_hourly_cap()   # passing control on the unmutated code
             with self.mutant("len(times) >= STREAM_RESUME_MAX", "False"):
-                with self.assertRaisesRegex(AssertionError, r"^4 != 3 : hourly cap: resumes sent in 4 failures$"):
+                with self.assertRaisesRegex(AssertionError, r"^9 != 8 : hourly cap: resumes sent in 9 failures$"):
                     self.check_hourly_cap()
 
         def check_phrase(self, phrase):
@@ -135,17 +150,17 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
                 with self.subTest(phrase=phrase):
                     self.check_phrase(phrase)   # passing control first
                     without = sb.re.compile("|".join(p for p in sb.STREAM_ERRORS if p != phrase), sb.re.I)
-                    with mock.patch.object(sb, "STREAM_ERROR", without):
+                    with mock.patch.object(sb, "PROVIDER_ERROR", without):
                         with self.assertRaisesRegex(AssertionError, r"^0 != 1 : stream error phrase %r was not resumed$" % phrase):
                             self.check_phrase(phrase)
 
         def test_secrets_and_ansi_control_sequences_are_scrubbed_from_audit_and_escalation(self):
             secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
             dirty = ERROR + " \x1b[31m\x07Bearer " + secret
-            for _ in range(4):
+            for _ in range(9):
                 self.fail(dirty)
                 self.tick(90)
-            self.assertEqual(len(self.resumes()), 3)
+            self.assertEqual(len(self.resumes()), 8)
             (found,) = self.findings()
             (esc,) = self.escalations()
             for text in [e["detail"]["reason"] for e in self.audited()] + [found["text"], esc["detail"]["error"]]:
@@ -205,7 +220,7 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
 
         def test_escalation_holds_when_cos_is_blocked_retries_when_refused_and_isolates_agent_errors(self):
             now = self.world.clock.now()
-            sb.blocked_update(self.world.state, sb.STREAM_RESUME_STATE, lambda _: {"coder": {"times": [now - 30, now - 20, now - 10], "last_id": "msg_old"}})
+            sb.blocked_update(self.world.state, sb.STREAM_RESUME_STATE, lambda _: {"coder": {"times": [now - 80 + i * 10 for i in range(8)], "last_id": "msg_old"}})
             self.fail()
             cos_pid = self.world.panes["cos"]
             cos_pane = self.world.herdr.panes.pop(cos_pid)   # cos unreachable -> send refused (held is falsy), last_id not saved

@@ -8987,7 +8987,7 @@ def read_errored_turn(engine, observation, now):
     return observation.errored
 STREAM_RESUME_STATE = "stream-resumes.json"   # {agent: {"times": [epoch], "last_id": newest message id handled}}
 STREAM_RESUME_WINDOW = 3600
-STREAM_RESUME_MAX = 3
+STREAM_RESUME_MAX = 8
 STREAM_RESUME_AGENTS_MAX = 64
 def stream_error_tick(engine, discovery):
     """#2551: resume (through `resume_ended_turn` with `window=0`) each blocked agent on a provider stream failure; 4th in the hour goes to cos."""
@@ -8997,14 +8997,14 @@ def stream_error_tick(engine, discovery):
     for name, seen in sorted(discovery.agents.items()):
         try:
             error, message = getattr(seen, "turn_error", "") or "", getattr(seen, "turn_error_id", None)
-            if seen.status != "blocked" or not getattr(seen, "errored", False) or not STREAM_ERROR.search(error):
+            if seen.status != "blocked" or not getattr(seen, "errored", False) or not PROVIDER_ERROR.search(error):
                 continue
             now, row = engine.now(), blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda s: None).get(name)
             row = row if isinstance(row, dict) else {}
             if not isinstance(message, str) or not message or row.get("last_id") == message:
                 continue
             current_err, current_id = last_turn_error_and_id(engine, seen.session_id)
-            if current_id != message or not STREAM_ERROR.search(current_err):
+            if current_id != message or not PROVIDER_ERROR.search(current_err):
                 continue
             times = [t for t in (row.get("times") if isinstance(row.get("times"), list) else []) if _is_number(t) and 0 <= now - t < STREAM_RESUME_WINDOW][-STREAM_RESUME_MAX:]
             if len(times) >= STREAM_RESUME_MAX:
