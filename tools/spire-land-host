@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 NOT_CONFIGURED = 70
@@ -106,7 +107,13 @@ def _origin_repo(root):
     return m.group(1)
 
 
+_KEEPALIVE_STOP = {}
+
+
 def _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid):
+    stop_ev = _KEEPALIVE_STOP.pop(lease_sid, None)
+    if stop_ev:
+        stop_ev.set()
     if not ctrl or not lease_sid:
         return
     proof.kube_run(
@@ -126,20 +133,23 @@ def _find_floor_heavy_pod(proof, env, cfg, ns, repo):
     names = (res.stdout or "").split() if res.returncode == 0 else []
     ctrl = next((n for n in names if n.startswith("floor-controller-")), "")
     lease_sid = "ses_host_heavy_%d" % os.getpid() if ctrl else ""
-    if ctrl:
-        ins = proof.kube_run(
+    def _pulse():
+        return proof.kube_run(
             ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
              "import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
              "fc._pg_run(\"INSERT INTO floor_live_sessions(session_id, state, repo, branch, round, updated_at) "
              "VALUES (%s, 'landing', %s, 'main', 1, NOW()) ON CONFLICT (session_id) DO UPDATE SET state='landing', updated_at=NOW();\" "
-             "% (fc._sql_str(sys.argv[1]), fc._sql_str(sys.argv[2]))); fc.set_fhex_scale(1)",
+             "% (fc._sql_str(sys.argv[1]), fc._sql_str(sys.argv[2]))); fc.set_fhex_scale(max(1, fc.get_fhex_scale()[0]))",
              lease_sid, repo],
             env, config=cfg,
         )
+
+    if ctrl:
+        ins = _pulse()
         if ins.returncode != 0:
             lease_sid = ""
     try:
-        for _ in range(30):
+        for i in range(90):
             r = proof.kube_run(
                 ["kubectl", "-n", ns, "get", "pods", "-o",
                  "jsonpath={range .items[*]}{.metadata.name}:{.status.phase}:{range .status.conditions[?(@.type=='Ready')]}{.status}{end}{\"\\n\"}{end}"],
@@ -148,7 +158,21 @@ def _find_floor_heavy_pod(proof, env, cfg, ns, repo):
             for line in (r.stdout or "").splitlines():
                 parts = line.strip().split(":")
                 if len(parts) >= 3 and parts[0].startswith("fhex-") and parts[1] == "Running" and parts[2] == "True":
+                    if ctrl and lease_sid:
+                        stop_ev = threading.Event()
+                        _KEEPALIVE_STOP[lease_sid] = stop_ev
+
+                        def _loop(ev=stop_ev):
+                            while not ev.wait(5):
+                                try:
+                                    _pulse()
+                                except Exception:
+                                    pass
+
+                        threading.Thread(target=_loop, daemon=True).start()
                     return parts[0], ctrl, lease_sid
+            if ctrl and lease_sid and i % 3 == 2:
+                _pulse()
             time.sleep(2)
     except BaseException:
         _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
