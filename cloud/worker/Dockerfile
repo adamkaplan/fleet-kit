@@ -96,6 +96,22 @@ RUN curl -fsSL https://github.com/jdx/mise/releases/download/${MISE_VERSION}/mis
  && install -o root -g root -m 0755 /tmp/mise/bin/mise /usr/local/bin/mise \
  && rm -rf /tmp/mise.tgz /tmp/mise
 # ---- end mise ----
+# ask #2565: headless Chromium binary (Chrome for Testing chrome-headless-shell linux64): one pinned release, its sha256 pinned here, checked before it is unpacked.
+# CHROME_PATH and the /usr/bin/{chromium,chromium-browser,google-chrome-stable} links point to /opt/chromium/chrome-headless-shell, root-owned and not writable by others.
+ARG CHROMIUM_VERSION=158.0.8127.36
+ARG CHROMIUM_SHA256=2d3a23017323c54fd457a678e4351f895c4076d8050e39d5aa6247f93448b73a
+RUN curl -fsSL https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}/linux64/chrome-headless-shell-linux64.zip -o /tmp/chromium.zip \
+ && echo "${CHROMIUM_SHA256}  /tmp/chromium.zip" | sha256sum -c - \
+ && python3 -m zipfile -e /tmp/chromium.zip /tmp/chromium \
+ && mv /tmp/chromium/chrome-headless-shell-linux64 /opt/chromium \
+ && chmod 0755 /opt/chromium/chrome-headless-shell /opt/chromium/*.so* \
+ && chown -R root:root /opt/chromium && chmod -R a+rX,go-w /opt/chromium \
+ && ln -s /opt/chromium/chrome-headless-shell /usr/bin/chromium \
+ && ln -s /opt/chromium/chrome-headless-shell /usr/bin/chromium-browser \
+ && ln -s /opt/chromium/chrome-headless-shell /usr/bin/google-chrome-stable \
+ && rm -rf /tmp/chromium.zip /tmp/chromium
+ENV CHROME_PATH=/usr/bin/chromium
+# ---- end Chromium ----
 
 # Non-root worker. It may start dockerd (and nothing else) as root: the daemon only
 # runs inside the Sysbox pod's own user namespace.
