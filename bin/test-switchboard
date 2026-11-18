@@ -540,6 +540,25 @@ class TestFakeV2(Base):
 
 # ------------------------------------------------------------------ the facts
 
+class TestPrivateDanglingSymlink(Base):
+    def test_dangling_symlink_is_refused_with_a_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "link"
+            link.symlink_to(Path(tmp) / "missing")
+            with self.assertRaises(sb.ConfigError):
+                sb.ensure_state_dir(link)
+            with self.assertRaises(sb.ConfigError):
+                sb._write_private(link / "f", "x")
+            with self.assertRaises(sb.ConfigError):
+                sb._write_private(link, "x")
+
+    def test_write_private_tolerates_existing_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sb._write_private(Path(tmp) / "a" / "f", "x")
+            sb._write_private(Path(tmp) / "a" / "f", "y")
+            self.assertEqual((Path(tmp) / "a" / "f").read_text(), "y")
+
+
 class TestFacts(Base):
     def test_round_trip_and_defaults(self):
         made = sb.Fact.from_json({"key": "lab.fact:1", "recipient": "platform", "kind": "review",
