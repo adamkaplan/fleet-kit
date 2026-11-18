@@ -11,6 +11,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 from support.core import Base, REAL_NODE
 from support.paths import REPO
@@ -26,6 +27,30 @@ def _load_script(rel_path, mod_name):
 
 
 class TestSpireLandCutover2570(Base):
+    def test_s3_floor_heavy_pod_finder_acquires_and_releases_lease_on_timeout(self):
+        host = _load_script("tools/spire-land-host", "spire_land_host_s3")
+        calls = []
+
+        class R:
+            def __init__(self, out=""):
+                self.returncode = 0
+                self.stdout = out
+                self.stderr = ""
+
+        class Proof:
+            def kube_run(self, argv, env, **kw):
+                calls.append(argv)
+                if argv[3:5] == ["get", "pods"] and "jsonpath={.items[*].metadata.name}" in argv:
+                    return R("floor-controller-abc other-pod")
+                return R("")
+
+        with mock.patch.object(host.time, "sleep", lambda _s: None):
+            with self.assertRaisesRegex(RuntimeError, "no Running Ready Floor heavy-executor pod"):
+                host._find_floor_heavy_pod(Proof(), {}, None, "cw", "acme-org/widget-service")
+        flat = [" ".join(c) for c in calls]
+        self.assertTrue(any("INSERT INTO floor_live_sessions" in c for c in flat))
+        self.assertTrue(any("DELETE FROM floor_live_sessions" in c for c in flat))
+
     def test_s1_pin_verify_and_land_json_areas(self):
         done = subprocess.run([REAL_NODE or "node", ".spire/tool/pin.mjs", "verify"], cwd=str(REPO), capture_output=True, text=True, timeout=30)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)

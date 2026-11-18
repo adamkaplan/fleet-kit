@@ -11,6 +11,7 @@ or present model key file is missing or unreadable.
 """
 import base64
 import datetime as dt
+import json
 import os
 import pwd
 import re
@@ -20,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 NOT_CONFIGURED = 70
 REFUSED_LOCAL = 64
@@ -104,6 +106,57 @@ def _origin_repo(root):
     return m.group(1)
 
 
+def _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid):
+    if not ctrl or not lease_sid:
+        return
+    proof.kube_run(
+        ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
+         "import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
+         "fc._pg_run(\"DELETE FROM floor_live_sessions WHERE session_id=%s;\" % fc._sql_str(sys.argv[1]))",
+         lease_sid],
+        env, config=cfg,
+    )
+
+
+def _find_floor_heavy_pod(proof, env, cfg, ns, repo):
+    pod = (env.get("CW_LAND_EXECUTOR_POD") or "").strip()
+    if pod:
+        return pod, "", ""
+    res = proof.kube_run(["kubectl", "-n", ns, "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"], env, config=cfg)
+    names = (res.stdout or "").split() if res.returncode == 0 else []
+    ctrl = next((n for n in names if n.startswith("floor-controller-")), "")
+    lease_sid = "ses_host_heavy_%d" % os.getpid() if ctrl else ""
+    if ctrl:
+        ins = proof.kube_run(
+            ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
+             "import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
+             "fc._pg_run(\"INSERT INTO floor_live_sessions(session_id, state, repo, branch, round, updated_at) "
+             "VALUES (%s, 'landing', %s, 'main', 1, NOW()) ON CONFLICT (session_id) DO UPDATE SET state='landing', updated_at=NOW();\" "
+             "% (fc._sql_str(sys.argv[1]), fc._sql_str(sys.argv[2]))); fc.set_fhex_scale(1)",
+             lease_sid, repo],
+            env, config=cfg,
+        )
+        if ins.returncode != 0:
+            lease_sid = ""
+    try:
+        for _ in range(30):
+            r = proof.kube_run(
+                ["kubectl", "-n", ns, "get", "pods", "-o",
+                 "jsonpath={range .items[*]}{.metadata.name}:{.status.phase}:{range .status.conditions[?(@.type=='Ready')]}{.status}{end}{\"\\n\"}{end}"],
+                env, config=cfg,
+            )
+            for line in (r.stdout or "").splitlines():
+                parts = line.strip().split(":")
+                if len(parts) >= 3 and parts[0].startswith("fhex-") and parts[1] == "Running" and parts[2] == "True":
+                    return parts[0], ctrl, lease_sid
+            time.sleep(2)
+    except BaseException:
+        _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
+        raise
+    _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
+    raise RuntimeError("no Running Ready Floor heavy-executor pod (fhex-*) found in namespace %s" % ns)
+
+
 def submit_cloud_land(root, subcmd, app_id, app_key):
     sys.path.insert(0, os.path.join(root, "bin"))
     import cloud_image_proof as proof
@@ -114,36 +167,18 @@ def submit_cloud_land(root, subcmd, app_id, app_key):
     council_url = env.get("CW_COUNCIL_URL") or cenv.get("CW_COUNCIL_URL") or "http://copilot-bridge.%s.svc:8080" % ns
     repo = _origin_repo(root)
     head_sha = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True, timeout=15).strip()
-    pod = (env.get("CW_LAND_EXECUTOR_POD") or "").strip()
-    created_worker = None
     tmp_dir = tempfile.mkdtemp(prefix="spire-land-bundle-")
+    ctrl = lease_sid = ""
     try:
-        if not pod:
-            res = proof.kube_run(["kubectl", "-n", ns, "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"], env, config=cfg)
-            names = (res.stdout or "").split() if res.returncode == 0 else []
-            pod = next((n for n in names if n.startswith(("fhex", "land-", "nightly2570-"))), "")
-        if not pod:
-            created_worker = "fhex-%s" % dt.datetime.now(dt.timezone.utc).strftime("%H%M%S")
-            brief_path = os.path.join(tmp_dir, "brief.md")
-            with open(brief_path, "w", encoding="utf-8") as bf:
-                bf.write("Heavy executor lander job for %s (%s).\n" % (repo, head_sha[:12]))
-            sw = os.path.join(root, "bin", "fleet-switchboard")
-            out = subprocess.check_output([
-                sw, "launch", created_worker, "--cloud", "--shape", "L", "--role", "tester", "--no-commit",
-                "--repo", repo, "--branch", "main", "--agent", "coder", "--reports-to", env.get("CW_LAND_REPORTS_TO") or "cos",
-                "--checkpoint", "15m", "--overdue", "30m", "--brief-file", brief_path
-            ], env=env, text=True, timeout=240)
-            m = re.search(r'"runtime_id":\s*"pod/([a-z0-9-]+)"', out)
-            if not m:
-                raise RuntimeError("cloud launch did not return a pod runtime_id")
-            pod = m.group(1)
+        pod, ctrl, lease_sid = _find_floor_heavy_pod(proof, env, cfg, ns, repo)
         bundle_path = os.path.join(tmp_dir, "cand.bundle")
         subprocess.run(["git", "-C", root, "bundle", "create", bundle_path, "HEAD"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         with open(bundle_path, "rb") as bf:
             b64_bundle = base64.b64encode(bf.read()).decode("ascii")
         prep = (
             "base64 -d > /tmp/cand.bundle && rm -rf /home/worker/land-ws && "
-            "git clone -q /work/repo /home/worker/land-ws && chmod 755 /home/worker/land-ws && "
+            "if [ -d /work/repo/.git ]; then git clone -q /work/repo /home/worker/land-ws; else git init -q /home/worker/land-ws; fi && "
+            "chmod 755 /home/worker/land-ws && "
             "git -C /home/worker/land-ws remote set-url origin https://github.com/%s.git && "
             "git -C /home/worker/land-ws fetch -q origin main && "
             "git -C /home/worker/land-ws fetch -q /tmp/cand.bundle HEAD && "
@@ -168,11 +203,61 @@ def submit_cloud_land(root, subcmd, app_id, app_key):
         return int(done.returncode)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        if created_worker:
-            sw = os.path.join(root, "bin", "fleet-switchboard")
-            ret = subprocess.run([sw, "retire", created_worker, "--close"], env=env, check=False, capture_output=True, text=True, timeout=90)
-            if ret.returncode != 0:
-                sys.stderr.write("spire-land-host: warning: retire %s exited %d: %s\n" % (created_worker, ret.returncode, (ret.stderr or "").strip()))
+        _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
+
+
+NIGHTLY_SUITES = (
+    "bin/test-switchboard --shard 1/6",
+    "bin/test-switchboard --shard 2/6",
+    "bin/test-switchboard --shard 3/6",
+    "bin/test-switchboard --shard 4/6",
+    "bin/test-switchboard --shard 5/6",
+    "bin/test-switchboard --shard 6/6",
+    "bin/test-gh-hold",
+    "bin/test-path-suites",
+    "bin/test-cloud-neutral-names",
+    "bin/test-cloud-worker",
+    "env KUBECONFIG=/dev/null CLOUD_TEST_SKIP_DOCKER=1 cloud/tests/test-cloud",
+)
+
+
+def run_floor_nightly(root):
+    sys.path.insert(0, os.path.join(root, "bin"))
+    import cloud_image_proof as proof
+    cenv = _cloud_env_map()
+    env = dict(os.environ, CW_SECRET_DIR=secret_dir() or "", CW_PROOF_KUBECTL_TIMEOUT="1800")
+    cfg = proof.mint_token(env)
+    ns = env.get("CW_CLOUD_NAMESPACE") or cenv.get("CW_CLOUD_NAMESPACE") or "cw"
+    repo = _origin_repo(root)
+    pod, ctrl, lease_sid = _find_floor_heavy_pod(proof, env, cfg, ns, repo)
+    try:
+        prep = (
+            "rm -rf /home/worker/nightly-ws && "
+            "if [ -d /work/repo/.git ]; then git clone -q /work/repo /home/worker/nightly-ws; "
+            "else git clone -q https://github.com/%s.git /home/worker/nightly-ws; fi && "
+            "git -C /home/worker/nightly-ws remote set-url origin https://github.com/%s.git && "
+            "git -C /home/worker/nightly-ws fetch -q origin main && "
+            "git -C /home/worker/nightly-ws checkout -q -f origin/main" % (repo, repo)
+        )
+        up = proof.kube_run(["kubectl", "-n", ns, "exec", pod, "--", "sh", "-c", prep], env, config=cfg)
+        if up.returncode != 0:
+            sys.stderr.write((up.stdout or "") + (up.stderr or ""))
+            return up.returncode or 1
+        results = []
+        failed = 0
+        for suite in NIGHTLY_SUITES:
+            t0 = time.monotonic()
+            cmd = "export FLEET_HEAVY=off PATH=\"/run/cw-tmp/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; cd /home/worker/nightly-ws && %s" % suite
+            r = proof.kube_run(["kubectl", "-n", ns, "exec", pod, "--", "bash", "-c", cmd], env, config=cfg)
+            elapsed = round(time.monotonic() - t0, 1)
+            ok = r.returncode == 0
+            if not ok:
+                failed += 1
+            results.append({"suite": suite, "rc": r.returncode, "seconds": elapsed, "ok": ok})
+        print(json.dumps({"pod": pod, "repo": repo, "failed": failed, "results": results}))
+        return 1 if failed else 0
+    finally:
+        _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
 
 
 def main(argv=None, workdir=None, runner=subprocess.run, platform=None):
@@ -185,6 +270,8 @@ def main(argv=None, workdir=None, runner=subprocess.run, platform=None):
         sys.stderr.write("spire-land-host: app not configured (%s): nothing was checked or pushed\n" % err)
         return NOT_CONFIGURED
     root = workdir or os.getcwd()
+    if "--nightly" in argv:
+        return run_floor_nightly(root)
     spire_bin = os.path.join(root, ".spire", "tool", "bin", "spire")
     if not os.access(spire_bin, os.X_OK):
         sys.stderr.write("spire-land-host: %s is not executable: nothing was checked or pushed\n" % spire_bin)
