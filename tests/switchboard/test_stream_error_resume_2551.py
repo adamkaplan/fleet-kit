@@ -63,6 +63,8 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             self.assertEqual(len(self.resumes()), 9)
 
         def test_econnreset_transport_error_resumes_within_one_tick_and_caps_at_eight_per_hour(self):
+            self.world.engine.light = True
+            self.world.engine.sent = sb.SentLedger(self.world.state)
             econn = {"type": "provider.transport", "message": "ECONNRESET: The socket connection was closed unexpectedly. For more information, pass verbose: true in the second argument to fetch()"}
             for n in range(8):
                 self.count += 1
@@ -71,6 +73,7 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
                 self.assertEqual(len(self.resumes()), n + 1)
             self.count += 1
             self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_err%d" % self.count, "type": "assistant", "error": dict(econn)})
+            self.tick(30)
             self.tick(30)
             self.assertEqual(len(self.resumes()), 8)
             (found,) = self.findings()

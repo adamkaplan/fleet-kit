@@ -8990,20 +8990,21 @@ STREAM_RESUME_WINDOW = 3600
 STREAM_RESUME_MAX = 8
 STREAM_RESUME_AGENTS_MAX = 64
 def stream_error_tick(engine, discovery):
-    """#2551: resume (through `resume_ended_turn` with `window=0`) each blocked agent on a provider stream failure; 4th in the hour goes to cos."""
+    """#2551: resume (through `resume_ended_turn` with `window=0`) each blocked agent on a provider stream failure; 9th in the hour goes to cos."""
     if discovery is None or engine.state_dir is None:
         return
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), "cos")
     for name, seen in sorted(discovery.agents.items()):
         try:
+            if seen.status == "blocked" and not getattr(seen, "errored", False) and getattr(engine, "light", False) and not (engine.v2.permission_list(seen.session_id) or engine.v2.form_list(seen.session_id)):
+                err, mid = last_turn_error_and_id(engine, seen.session_id)
+                seen.turn_error, seen.turn_error_id, seen.errored = (err, mid, True) if PROVIDER_ERROR.search(err) else ("", None, False)
             error, message = getattr(seen, "turn_error", "") or "", getattr(seen, "turn_error_id", None)
             if seen.status != "blocked" or not getattr(seen, "errored", False) or not PROVIDER_ERROR.search(error):
                 continue
             now, row = engine.now(), blocked_update(engine.state_dir, STREAM_RESUME_STATE, lambda s: None).get(name)
             row = row if isinstance(row, dict) else {}
-            if not isinstance(message, str) or not message or row.get("last_id") == message:
-                continue
-            current_err, current_id = last_turn_error_and_id(engine, seen.session_id)
+            current_err, current_id = (last_turn_error_and_id(engine, seen.session_id) if isinstance(message, str) and message and row.get("last_id") != message else ("", None))
             if current_id != message or not PROVIDER_ERROR.search(current_err):
                 continue
             times = [t for t in (row.get("times") if isinstance(row.get("times"), list) else []) if _is_number(t) and 0 <= now - t < STREAM_RESUME_WINDOW][-STREAM_RESUME_MAX:]
@@ -9021,8 +9022,7 @@ def stream_error_tick(engine, discovery):
             def save(state, _name=name, _times=times, _msg=message, _now=now):
                 kept = {k: v for k, v in state.items() if k != _name and isinstance(v, dict) and isinstance(v.get("times"), list) and any(_is_number(t) and 0 <= _now - t < STREAM_RESUME_WINDOW for t in v["times"])}
                 kept[_name] = {"times": _times, "last_id": _msg}
-                newest = sorted(kept, key=lambda n: max([t for t in kept[n].get("times", []) if _is_number(t)] or [0]), reverse=True)
-                return {n: kept[n] for n in newest[:STREAM_RESUME_AGENTS_MAX]}
+                return {n: kept[n] for n in sorted(kept, key=lambda n: max([t for t in kept[n].get("times", []) if _is_number(t)] or [0]), reverse=True)[:STREAM_RESUME_AGENTS_MAX]}
             blocked_update(engine.state_dir, STREAM_RESUME_STATE, save)
         except Exception as err:
             engine._failed(name, "stream-error", err, {"errors": []})
