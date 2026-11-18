@@ -26015,21 +26015,6 @@ class TestOwnerlessSummary(Base):
         self.assertIn("parked_until(", inspect.getsource(sb.triage_norm))
         self.assertIn("triage_parked_now(", inspect.getsource(sb.triage_rules))   # T3 uses the same predicate
 
-    def test_926_a_foreign_prefix_parked_label_parks_and_a_fleet_prefix_only_mutant_does_not(self):
-        body = "Parked until: %s" % self.day(30)
-        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["x:parked"], body=body)
-        self.add(60, created=15, author="alice")
-        self.go()
-        self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 1)
-        # the mutant: a reader restricted to the fleet's own prefix must NOT park it, so the assertion above fails against it
-        real, fleet = sb.parked_until, sb.label_names({})["parked"]
-        with mock.patch.object(sb, "parked_until", lambda b, labels: real(b, [l for l in labels or () if l == fleet])):
-            self.setUp()
-            self.add(self.PARKED, created=40, updated=30, author="alice", labels=["x:parked"], body=body)
-            self.add(60, created=15, author="alice")
-            self.go()
-            self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 0)
-
     def test_the_parked_predicate_is_the_only_input_a_mutant_can_change(self):
         module = sb.load_module("triage_ownerless")
         item = {"number": 1, "pr": False, "state": "open", "labels": set(), "author": "alice", "assignees": [], "updated": 0.0, "owner_body": False}
@@ -67110,6 +67095,7 @@ _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
 # The tests #924 added (moved out of this file, its line ceiling); the host module gives the classes their fixtures.
 _t924 = importlib.import_module("test_924")
+_t926 = importlib.import_module("test_926"); TestForeignPrefixParkedLabel = _t926.TestForeignPrefixParkedLabel
 _t924.HOST = sys.modules[__name__]
 TestPR8Source924, TestImpactHold924 = _t924.load()
 TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
