@@ -804,7 +804,11 @@ every interface by default; its HTTP server reads the `HOST` variable, so the en
 (`cloud/copilot-bridge/bridge-front.mjs`, Node standard library only) is the only listener a pod can reach: it forwards `POST /chat/completions` and
 `POST /v1/chat/completions` only, answers `GET /usage`, refuses a body over `BRIDGE_MAX_BODY` (400000 bytes), refuses an id containing `opus` (any case) with
 403 and `model banned from the council: opus`, maps every non-`opus` model to `claude-haiku-5.5` with the caller's effort (council default `low`),
-answers 429 past `BRIDGE_DAILY_BUDGET` requests a day (default 500), and logs one count line per request: never a body, an answer, a header or a token.
+answers 429 (`daily AI credit budget spent: <spent> of <budget> credits`) once the UTC day's spend reaches `BRIDGE_DAILY_CREDITS` (default 500), and logs one count line per request: never a body, an answer, a header or a token.
+Spend is the GitHub AI Credit (one credit is one cent, per GitHub's usage-based billing since 1 June 2026): each answer's
+`copilot_usage.total_nano_aiu` (billionths; one AIU is treated as one credit), else the sum of `token_count * cost_per_batch / batch_size` over
+`token_details`, else `BRIDGE_FALLBACK_CREDITS` (default 1) and one `unpriced` log line. A request that crosses the budget completes. `GET /usage` shows per
+day and per model the credits (four decimals), requests, refused and the budget. The owner checks the first day against the billing usage export.
 The bridge forwards the whole body to Copilot unchanged, so the front sets both `reasoning.effort` and `reasoning_effort`.
 
 The owner's steps (nothing here is applied by the repository):

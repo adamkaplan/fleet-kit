@@ -74,7 +74,7 @@ class Manifest(unittest.TestCase):
         self.assertEqual((mounts["github-token"]["mountPath"], mounts["github-token"]["readOnly"]), ("/run/copilot", True))
         self.assertEqual(mounts["home"]["mountPath"], "/run/home")
         self.assertIn({"name": "HOME", "value": "/run/home"}, self.c["env"])
-        self.assertIn("BRIDGE_DAILY_BUDGET", [e["name"] for e in self.c["env"]])
+        self.assertIn("BRIDGE_DAILY_CREDITS", [e["name"] for e in self.c["env"]])
 
     def test_non_root_and_no_privilege(self):
         self.assertTrue(self.pod["securityContext"]["runAsNonRoot"])

@@ -29,13 +29,17 @@ class Fake:
 
     def __init__(self):
         self.seen = []
+        self.usage = None   # the copilot_usage block of every answer; None: no block
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 n = int(self.headers.get("content-length") or 0)
                 outer.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": json.loads(self.rfile.read(n))})
-                out = json.dumps({"choices": [{"message": {"role": "assistant", "content": ANSWER}}]}).encode()
+                ans = {"choices": [{"message": {"role": "assistant", "content": ANSWER}}]}
+                if outer.usage is not None:
+                    ans["copilot_usage"] = outer.usage
+                out = json.dumps(ans).encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(out)))
@@ -169,7 +173,7 @@ class Paths(Base):
         usage = json.loads(text)
         day = usage["day"]
         self.assertEqual(usage["days"][day]["requests"], 1)
-        self.assertEqual(usage["days"][day]["models"], {"claude-haiku-5.5": 1})
+        self.assertEqual(list(usage["days"][day]["models"]), ["claude-haiku-5.5"])
         for s in (ANSWER, "hello", "messages", "xxxx"):
             self.assertNotIn(s, text)
 
@@ -202,24 +206,94 @@ class Hardening(Base):
         self.assertEqual(used["days"][used["day"]]["requests"], 1)   # the refused one was not counted
 
 
+def clock_front(test, **env):
+    clock = os.path.join(test.tmp, "day")
+    with open(clock, "w") as fh:
+        fh.write("2026-11-10")
+    return test.run_front(BRIDGE_CLOCK_FILE=clock, **env), clock
+
+
+def post(f):
+    """One request; returns after its count line is written, which is after its spend is added."""
+    before = sum('"status"' in l for l in f.lines)
+    out = f.request("POST", "/chat/completions", chat("gpt-4o"))
+    f.wait_for_counts(before + 1)
+    return out
+
+
 class Budget(Base):
-    def test_s4_daily_budget(self):
-        clock = os.path.join(self.tmp, "day")
-        with open(clock, "w") as fh:
-            fh.write("2026-11-10")
-        f = self.run_front(BRIDGE_DAILY_BUDGET=3, BRIDGE_CLOCK_FILE=clock)
-        codes = [f.request("POST", "/chat/completions", chat("gpt-4o"))[0] for _ in range(3)]
-        status, text = f.request("POST", "/chat/completions", chat("gpt-4o"))
+    def test_spend_adds_up_and_the_budget_answers_429_with_the_text(self):
+        self.fake.usage = {"total_nano_aiu": 7400000}
+        f, clock = clock_front(self, BRIDGE_DAILY_CREDITS="0.02")
+        codes = [post(f)[0] for _ in range(3)]   # 0.0074 x 3 = 0.0222: the third crosses the budget and completes
         self.assertEqual(codes, [200, 200, 200])
+        status, text = post(f)
         self.assertEqual(status, 429)
-        self.assertIn("budget", json.loads(text)["error"])
+        self.assertEqual(json.loads(text)["error"], "daily AI credit budget spent: 0.0222 of 0.02 credits")
         self.assertEqual(len(self.fake.seen), 3)
+        day = json.loads(f.request("GET", "/usage")[1])["days"]["2026-11-10"]
+        self.assertEqual((day["credits"], day["requests"], day["refused"], day["budget"]), (0.0222, 3, 1, 0.02))
+        self.assertEqual(day["models"], {"claude-haiku-5.5": {"requests": 3, "credits": 0.0222}})
         with open(clock, "w") as fh:
             fh.write("2026-11-11")
-        self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o"))[0], 200)
-        self.assertEqual(len(self.fake.seen), 4)
+        self.assertEqual(post(f)[0], 200)
         days = json.loads(f.request("GET", "/usage")[1])["days"]
         self.assertEqual({d: v["requests"] for d, v in days.items()}, {"2026-11-10": 3, "2026-11-11": 1})
+
+    def test_spend_is_computed_from_token_details_when_the_total_is_absent(self):
+        self.fake.usage = {"token_details": [
+            {"token_type": "input", "token_count": 17, "batch_size": 1, "cost_per_batch": 100000},
+            {"token_type": "output", "token_count": 4, "batch_size": 2, "cost_per_batch": 1000000}]}
+        f, _ = clock_front(self)
+        self.assertEqual(post(f)[0], 200)
+        f.wait_for_counts(1)
+        day = json.loads(f.request("GET", "/usage")[1])["days"]["2026-11-10"]
+        self.assertEqual(day["credits"], 0.0037)   # (1.7 + 2.0) million nano
+        self.assertNotIn("unpriced", "".join(f.lines))
+
+    def test_fallback_and_one_unpriced_line_when_both_are_absent(self):
+        f, _ = clock_front(self, BRIDGE_FALLBACK_CREDITS="2")
+        self.assertEqual(post(f)[0], 200)
+        f.wait_for_counts(1)
+        self.assertEqual(json.loads(f.request("GET", "/usage")[1])["days"]["2026-11-10"]["credits"], 2)
+        self.assertEqual(sum('"unpriced"' in l for l in f.lines), 1)
+
+
+def count_budget_problems(script, test):
+    """Two answers of 0.0074 credits against a budget of 0.01: by credits the second completes and the third is refused."""
+    fake = Fake()
+    fake.usage = {"total_nano_aiu": 7400000}
+    try:
+        tmp = tempfile.mkdtemp(prefix="front-b-")
+        test.addCleanup(shutil.rmtree, tmp, True)
+        f = Running(test, script, fake, BRIDGE_DAILY_CREDITS="0.01")
+        try:
+            codes = [post(f)[0] for _ in range(3)]
+        finally:
+            f.stop()
+    finally:
+        fake.close()
+    if codes != [200, 200, 429]:
+        test.fail("the budget did not count credits: %s" % codes)
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class BudgetMutant(unittest.TestCase):
+    OLD = "if (row.nano / NANO >= BUDGET)"
+    NEW = "if (row.requests >= BUDGET)"
+
+    def test_control_first_then_a_request_counting_mutant_fails_with_the_anchored_text(self):
+        with open(FRONT, encoding="utf-8") as fh:
+            src = fh.read()
+        count_budget_problems(FRONT, self)   # the control
+        self.assertEqual(src.count(self.OLD), 1)
+        scratch = tempfile.mkdtemp(prefix="front-mutant-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        path = os.path.join(scratch, "bridge-front.mjs")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(src.replace(self.OLD, self.NEW))
+        with self.assertRaisesRegex(AssertionError, r"\Athe budget did not count credits"):
+            count_budget_problems(path, self)
 
 
 def log_problems(script, test):
