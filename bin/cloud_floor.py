@@ -13,6 +13,7 @@ Private settings (cloud.env or the environment, never in this file):
   CW_FLOOR_URL            the base URL of the Floor caller API (https, or plain http to a loopback address)
   CW_FLOOR_CALLER         the caller id of this fleet (default `fleet`)
   CW_FLOOR_TOKEN_FILE     optional path of a 0600 bearer-token file
+  CW_FLOOR_VERIFY_ENABLED `1` or `true` (default off): a tester, --no-commit or rehearsal launch is routed to Floor as mode `verify-only` or `rehearse` (no author runs)
   CW_POD_ROLLBACK_WINDOW  `open` (the default) or `closed`: the pod launcher may be retired only once it is `closed`
 
 The transport object has five calls (the caller API of Floor): submit, message, cancel, observe, result. A test sets `TRANSPORT`; otherwise an
@@ -89,6 +90,7 @@ def scrub(text, limit=200):
     for key in ("CW_FLOOR_QUEUE_SAS", "CW_FLOOR_BLOB_SAS"):
         value = (env.get(key) or "").strip().lstrip("?")
         forms += [value] if len(value) > 3 else []
+        forms += [part.partition("=")[2] for part in value.split("&") if len(part.partition("=")[2]) >= 6]   # each parameter value of the SAS alone
     token_file = env.get("CW_FLOOR_TOKEN_FILE")
     if token_file:
         try:
@@ -230,7 +232,7 @@ class QueueBlobTransport:
         text = base64.b64encode(json.dumps(full, sort_keys=True).encode("utf-8")).decode("ascii")
         if payload and len(text) > PAYLOAD_LIMIT:
             path = "payload/%s.json" % command["cmd_id"]
-            blob = json.dumps(dict(payload, env={}), sort_keys=True).encode("utf-8")
+            blob = json.dumps(dict({"env": {}}, **payload), sort_keys=True).encode("utf-8")
             _request("PUT", self._url(self.blob, "/" + path, self.blob_sas), blob, [("x-ms-blob-type", "BlockBlob"), ("Content-Type", "application/json")])
             text = base64.b64encode(json.dumps(dict(command, payload=path), sort_keys=True).encode("utf-8")).decode("ascii")
         body = ("<QueueMessage><MessageText>%s</MessageText></QueueMessage>" % text).encode("ascii")
@@ -248,16 +250,13 @@ class QueueBlobTransport:
         state["acks"] = acks if isinstance(acks, dict) else {}
         return state
 
-    def _text(self, session_id):
+    def _blob(self, session_id):
         status, raw = _request("GET", self._url(self.blob, "/msg/%s.json" % urllib.parse.quote(session_id, safe=""), self.blob_sas), None, [("Accept", "application/json")], missing_ok=True)
-        if status == 404:
-            return ""
-        text = _parse(raw).get("text")
-        return text if isinstance(text, str) else ""
+        return {} if status == 404 else _parse(raw)
 
-    def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", **ignored):
-        command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main")
-        self._enqueue(command, {"brief": brief})
+    def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", mode=None, env=None, **ignored):
+        command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main", **({"mode": mode} if mode else {}))
+        self._enqueue(command, dict({"brief": brief}, **({"env": env} if env else {})))
         return {"work_id": session_id, "session_id": session_id, "seq": 1}
 
     def message(self, caller, work_id, cmd_id, seq, text):
@@ -280,13 +279,14 @@ class QueueBlobTransport:
         state = self._state()
         found = state["sessions"].get(work_id)
         found = found if isinstance(found, dict) else {}
-        text = self._text(work_id)
-        return {"state": found.get("state", "queued"), "busy": bool(found.get("busy")), "landed_sha": found.get("landed_sha"), "rounds": found.get("rounds", 0),
+        blob = self._blob(work_id)
+        text = blob.get("text") if isinstance(blob.get("text"), str) else ""
+        return {"manifest": blob.get("manifest"), "log_tail": blob.get("log_tail"), "state": found.get("state", "queued"), "busy": bool(found.get("busy")), "landed_sha": found.get("landed_sha"), "rounds": found.get("rounds", 0),
                 "error": found.get("error"), "last_update": found.get("last_update"), "messages": [{"role": "assistant", "text": text}] if text else []}
 
     def result(self, caller, work_id):
         seen = self.observe(caller, work_id)
-        return {"state": seen["state"], "landed_sha": seen["landed_sha"], "error": seen["error"]}
+        return {"state": seen["state"], "landed_sha": seen["landed_sha"], "error": seen["error"], "manifest": seen["manifest"], "log_tail": seen["log_tail"]}
 
 
 def _token():
@@ -356,8 +356,23 @@ def _call(function, *args, **kwargs):
 
 # ---------------------------------------------------------------- admission and the brief
 
+def verify_enabled(env=None):
+    """True when Floor's verify workflows are on (CW_FLOOR_VERIFY_ENABLED is `1` or `true`)."""
+    return ((env_of() if env is None else env).get("CW_FLOOR_VERIFY_ENABLED") or "").strip().lower() in ("1", "true")
+
+
+def verify_mode(args, brief):
+    """`verify-only` for a tester, `rehearse` for --no-commit or a rehearsal brief, else None (an author launch)."""
+    if getattr(args, "role", None) == "tester":
+        return "verify-only"
+    if getattr(args, "no_commit", False) or str(brief or "").lstrip().startswith("REHEARSAL BRIEF"):
+        return "rehearse"
+    return None
+
+
 def check_floor_admission(args, repo, brief, config):
-    """Refuse (exit 2, nothing created) what Floor cannot work: a repository outside `land_repos`, and every role that is not a coder or worker author."""
+    """Refuse (exit 2, nothing created) what Floor cannot work: a repository outside `land_repos`, and every role that is not a coder or worker author.
+    With CW_FLOOR_VERIFY_ENABLED a tester, --no-commit or rehearsal launch is admitted as a verify mode (see `verify_mode`)."""
     if route_repo(repo, config) != "floor":
         return
     Refusal = D["Refusal"]
@@ -369,12 +384,15 @@ def check_floor_admission(args, repo, brief, config):
         raise Refusal("refused: %s routes to Floor: --agent orchestrator and --persistent are not Floor authors; nothing was created" % repo)
     if getattr(args, "role", None) == "reviewer" or str(agent or "").startswith("reviewer"):
         raise Refusal("refused: %s routes to Floor: reviewer pods are not launched separately (Floor runs council in the workflow); nothing was created" % repo)
-    if getattr(args, "role", None) == "tester" or getattr(args, "no_commit", False) or text.lstrip().startswith("REHEARSAL BRIEF"):
+    mode = verify_mode(args, brief)
+    if mode and not verify_enabled():
         raise Refusal("refused: %s routes to Floor: --role tester, --no-commit and rehearsal pods have no standalone Floor author equivalent yet "
-                      "(Floor runs checks on the heavy executor); nothing was created" % repo)
+                      "(Floor runs checks on the heavy executor; CW_FLOOR_VERIFY_ENABLED turns the verify workflows on); nothing was created" % repo)
     if getattr(args, "stack", False) or re.search(r"^\s*NEEDS:\s*docker\s*$", text, re.I | re.M):
         raise Refusal("refused: %s routes to Floor: --stack and NEEDS: docker are not valid for an ACA author sandbox (heavy services run on Floor's "
                       "heavy executor pool); nothing was created" % repo)
+    if mode:
+        return   # no author runs: the agent name is not mapped
     if agent not in AUTHORS:
         raise Refusal("refused: %s routes to Floor: --agent %s has no Floor author mapping (only coder/worker authors route to Floor); nothing was created"
                       % (repo, str(agent)[:40]))
@@ -462,8 +480,10 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     session_id = existing.get("session") if existing else None
     session_id = session_id if isinstance(session_id, str) and session_id else session_key(who, name, repo)
     base = getattr(args, "base", None) or "main"
+    mode = verify_mode(args, brief)
+    extra = {"mode": mode, "env": {"FLOOR_WORKFLOW": mode}} if mode else {}   # a verify launch: Floor runs it on the heavy executor, nothing is translated to author commits
     answer = submit_work(who, launch_key(who, session_id), session_id=session_id, repo=repo, ref=base, branch=branch, title=name,
-                         brief=translate_brief(brief, repo, branch, base))
+                         brief=str(brief or "") if mode else translate_brief(brief, repo, branch, base), **extra)
     work_id = answer.get("work_id") if isinstance(answer, dict) else None
     if not isinstance(work_id, str) or not work_id:
         raise D["CloudError"]("Floor: the answer to the submit names no work")
@@ -474,7 +494,7 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
         return D["H"]["EXIT_OK"]
     stamp = now()
     record = {"worker": name, "backend": "floor", "session": session_id, "work_id": work_id, "runtime_id": "floor/" + session_id, "url": ENDPOINT_URL,
-              "seq": 1, "repo": repo, "branch": branch, "base": base, "agent": args.agent,
+              "seq": 1, "repo": repo, "branch": branch, "base": base, "agent": args.agent, **({"mode": mode} if mode else {}),
               "idle_deadline": _stamp(_seconds(getattr(args, "idle", None), 3600), stamp), "hard_deadline": _stamp(_seconds(getattr(args, "hard", None), 8 * 3600), stamp)}
     if getattr(args, "reports_to", None):
         record.update(reports_to=args.reports_to)
@@ -571,6 +591,13 @@ def _read_floor(args, record):
     for message in [m for m in (seen.get("messages") or []) if isinstance(m, dict) or isinstance(m, str)][-limit:]:
         print(_line(message))
     print(scrub("floor: state %s, landed_sha %s" % (done.get("state", seen.get("state")), done.get("landed_sha", seen.get("landed_sha")))))
+    manifest = done.get("manifest", seen.get("manifest"))
+    if manifest is not None:
+        print(scrub("manifest: " + json.dumps(manifest, sort_keys=True), 2000))
+    tail = done.get("log_tail", seen.get("log_tail"))
+    tail = tail.splitlines() if isinstance(tail, str) else tail if isinstance(tail, list) else []
+    for line in tail[-40:]:
+        print(scrub("log_tail: " + str(line), 400))
     return D["H"]["EXIT_OK"]
 
 

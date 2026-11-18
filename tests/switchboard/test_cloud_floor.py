@@ -14,6 +14,7 @@ Every input and external call:
   read, status (observe, result)                 test_read_and_status_show_the_work                                    S1
   retire (cancel, reserved custody)              test_retire_waits_for_custody_then_removes_the_record                 S1
   retire by a stranger                           test_retire_by_a_stranger_is_refused_and_asks_nothing                 S1
+  CW_FLOOR_VERIFY_ENABLED off / on (tester, rehearse)  TestCloudFloorRolesAndBriefs.test_verify_*                                     S3
   local pane and --headless launch, local read   test_a_local_launch_and_read_make_no_floor_call                       S1
   CW_REMOTE_BACKEND flips, pod records           test_a_worker_stays_on_the_side_that_admitted_it                      S2
   the route table (backend, CW_FLOOR_REPOS)      test_the_route_rule                                                   S2
@@ -32,6 +33,7 @@ Mutants (each is applied to bin/cloud_floor.py in memory; the test named must FA
   M1  translate_brief returns the brief unchanged, or the send key drops the seq   -> the brief test, the send test
   M2  send and retire pick the side by the CW_REMOTE_BACKEND of the day            -> test_a_worker_stays_on_the_side_that_admitted_it
   M3  the admission matrix lets every repository and role through                  -> test_the_matrix_refuses_what_floor_cannot_work
+  M6  the verify setting is ignored (verify launches are admitted while it is off) -> test_verify_modes_are_refused_while_the_setting_is_off
   M5  a failed submit is swallowed and the record is written anyway                -> test_an_outage_on_submit_writes_no_record
 """
 import argparse
@@ -67,7 +69,7 @@ class FakeFloor:
         self.floor, self.calls = floor, []
         self.works, self.keys = {}, {}
         self.down = self.reserved = self.bad_artifact = False
-        self.landed = None
+        self.landed = self.manifest = self.log_tail = None
 
     def _fail(self, verb):
         self.calls.append(verb)
@@ -125,13 +127,14 @@ class FakeFloor:
         self._fail("observe")
         self._artifact()
         work = self._work(work_id)
-        return {"state": "cancelled" if work["cancelled"] else "running", "busy": True, "landed_sha": self.landed, "rounds": 2, "messages": list(work["messages"])}
+        return {"state": "cancelled" if work["cancelled"] else "running", "busy": True, "landed_sha": self.landed, "rounds": 2, "messages": list(work["messages"]),
+                "manifest": self.manifest, "log_tail": self.log_tail}
 
     def result(self, caller, work_id):
         self._fail("result")
         self._artifact()
         self._work(work_id)
-        return {"state": "landed" if self.landed else "running", "landed_sha": self.landed}
+        return {"state": "landed" if self.landed else "running", "landed_sha": self.landed, "manifest": self.manifest, "log_tail": self.log_tail}
 
 
 class Quiet:
@@ -263,7 +266,7 @@ class FloorCase(Base):
 
 
 class TestCloudFloor(FloorCase):
-    # ------------------------------------------------------------ S1
+
     def test_a_launch_makes_one_work_and_a_repeat_returns_it(self):
         code, out, err = self.launch()
         self.assertEqual(code, 0, err)
@@ -286,23 +289,6 @@ class TestCloudFloor(FloorCase):
         self.assertEqual(len(self.fake.works), 1)
         self.assertEqual(self.launch()[0], 0)
         self.assertEqual((len(self.fake.works), self.record("f1")["work_id"]), (1, next(iter(self.fake.works))))
-
-    def test_the_brief_loses_every_delivery_step_and_gains_the_contract(self):
-        self.launch()
-        sent = self.fake.submitted["brief"]
-        self.assertTrue(sent.startswith("Floor Author Contract"))
-        body = sent.split("Task:\n", 1)[1]
-        self.assertNotRegex(body, r"git push|gh pr create|prove")
-        self.assertIn("Add a retry to the fetch loop.", body)
-        self.assertIn("keep the change small", body)
-        self.assertEqual({k: self.fake.submitted[k] for k in ("repo", "branch", "title", "ref")}, {"repo": REPO_NAME, "branch": "work/f1", "title": "f1", "ref": "main"})
-        pod_text = self.m.POD_HEADER + self.m.H["setup_with_land"](self.m.SETUP_PREAMBLE, CONFIG, REPO_NAME) % {"repo": REPO_NAME, "branch": "b"} + "Do the task.\n"
-        translated = self.floor.translate_brief(pod_text, REPO_NAME, "b")
-        self.assertNotIn("Setup (do this first", translated)
-        self.assertNotIn("/work/land.log", translated)
-        self.assertNotIn("nohup", translated)
-        self.assertIn("Do the task.", translated)
-        self.assertEqual(translated.count("Floor Author Contract"), 1)
 
     def test_sends_are_ordered_and_a_retry_is_the_same_command(self):
         self.launch()
@@ -364,98 +350,6 @@ class TestCloudFloor(FloorCase):
             self.read("nobody")
         self.assertEqual((self.floor_calls(), self.pod_calls), (0, []))
 
-    # ------------------------------------------------------------ S2
-    def test_the_route_rule(self):
-        route = self.floor.route_repo
-        cases = [({}, "pod"), ({"CW_REMOTE_BACKEND": "floor"}, "floor"), ({"CW_REMOTE_BACKEND": " Pod "}, "pod"),
-                 ({"CW_REMOTE_BACKEND": "pod", "CW_FLOOR_REPOS": "*"}, "pod"), ({"CW_FLOOR_REPOS": "acme-org/*"}, "floor"),
-                 ({"CW_FLOOR_REPOS": "acme-org/other,ACME-ORG/Widget-Service"}, "floor"), ({"CW_FLOOR_REPOS": "acme-org/other"}, "pod"),
-                 ({"CW_FLOOR_REPOS": "*"}, "floor"), ({"CW_FLOOR_REPOS": ""}, "pod")]
-        for env, want in cases:
-            self.assertEqual(route(REPO_NAME, CONFIG, env), want, env)
-
-    def test_a_worker_stays_on_the_side_that_admitted_it(self):
-        os.environ["CW_REMOTE_BACKEND"] = "pod"
-        self.pod_record("p1")
-        os.environ["CW_REMOTE_BACKEND"] = "floor"
-        for name in ("f1", "f2"):
-            self.assertEqual(self.launch(name)[0], 0)
-        os.environ["CW_REMOTE_BACKEND"] = "pod"   # the rollback switch: the Floor workers are still Floor's
-        with mock.patch.dict(self.m.H, {"launch_model_cloud": mock.Mock(side_effect=PodWorld)}):
-            with self.assertRaises(PodWorld):   # a new admission goes to the pod code
-                self.launch("p2")
-        self.pod_record("p2")
-        self.assertEqual(len(self.fake.works), 2)
-        self.fake.calls.clear()
-        self.pod_calls.clear()
-        for name in ("f1", "f2"):
-            self.assertEqual(self.send(name, "go on")[0], 0)
-            self.assertEqual(self.read(name)[0], 0)
-        self.assertEqual(self.retire("f1")[0], 0)
-        self.assertEqual(self.pod_calls, [], "a Floor worker never reaches the pod launcher")
-        self.fake.calls.clear()
-        for name in ("p1", "p2"):
-            self.assertEqual(self.send(name, "go on")[0], 0)
-            self.assertEqual(self.read(name)[0], 0)
-            self.assertEqual(self.retire(name)[0], 0)
-        self.assertEqual(self.fake.calls, [], "a pod worker never reaches Floor")
-        self.assertIn("stop", self.pod_calls)
-        os.environ["CW_REMOTE_BACKEND"] = "floor"   # flipping again changes nothing for the one that is left
-        self.assertEqual(self.send("f2", "still here")[0], 0)
-        self.assertEqual(self.record("f2")["seq"], 3)
-
-    def test_status_gives_the_launcher_only_the_pod_records(self):
-        self.pod_record("p1")
-        self.launch("f1")
-        lines, rows = self.status()
-        self.assertEqual(sorted(r["worker"] for r in rows), ["f1", "p1"])
-        self.assertEqual(self.pod_calls.count("snapshot"), 1)
-        self.assertEqual(self.pod_calls.count("status"), 1)   # one pod record, one launcher status
-        self.pod_calls.clear()
-        self.m.remove_record(str(self.state), "p1")
-        self.status()
-        self.assertEqual(self.pod_calls, [])
-
-    # ------------------------------------------------------------ S3
-    def test_the_matrix_refuses_what_floor_cannot_work(self):
-        cases = [("reviewer", dict(role="reviewer"), BRIEF), ("tester", dict(role="tester"), BRIEF), ("no-commit", dict(no_commit=True), BRIEF),
-                 ("rehearsal", {}, "REHEARSAL BRIEF\nmeasure it"), ("stack", dict(stack=True), BRIEF), ("docker", {}, "Do it\nNEEDS: docker\n"),
-                 ("orchestrator", dict(agent="orchestrator"), BRIEF), ("persistent", dict(persistent=True), BRIEF),
-                 ("other agent", dict(agent="scribe"), BRIEF), ("merger", {}, "Run: gh pr merge 12 --squash\n"),
-                 ("not a land repo", dict(repo=OTHER_REPO), BRIEF)]
-        for label, over, brief in cases:
-            self.brief = brief
-            code, out, err = self.run_cmd(self.m.cmd_launch, self.args("r1", **over), None, lambda: 1000.0)
-            self.assertEqual(code, 2, label)
-            self.assertIn("nothing was created", err, label)
-            self.assertEqual((self.floor_calls(), self.pod_calls, list(Path(self.state).glob("cloud/*.json"))), (0, [], []), label)
-        self.assertIn("pull requests and gates", err)
-
-    def test_every_eligible_admission_goes_to_floor_and_none_to_the_launcher(self):
-        for index, agent in enumerate(["coder", "worker", "coder", "worker"]):
-            self.assertEqual(self.launch("e%d" % index, agent=agent)[0], 0)
-        self.assertEqual((len(self.fake.works), self.pod_calls.count("create"), self.pod_calls), (4, 0, []))
-        self.assertEqual({self.record("e%d" % i)["backend"] for i in range(4)}, {"floor"})
-
-    def test_the_pod_launcher_retires_only_when_closed_and_drained(self):
-        state, retire = str(self.state), self.floor.retire_pod_launcher
-        self.pod_record("p1")
-        self.launch("f1")
-        env = {"CW_REMOTE_BACKEND": "floor", "CW_POD_ROLLBACK_WINDOW": "open"}
-        for change, word in (({}, "rollback window"), ({"CW_POD_ROLLBACK_WINDOW": "closed"}, "pod worker"),
-                             ({"CW_REMOTE_BACKEND": "pod", "CW_POD_ROLLBACK_WINDOW": "closed"}, "not floor")):
-            with self.assertRaises(self.m.Refusal) as caught:
-                retire(state, dict(env, **change))
-            self.assertIn(word, str(caught.exception))
-        self.assertTrue(self.m.record_path(state, "p1").exists())   # nothing was changed
-        self.assertEqual(self.retire("p1")[0], 0)
-        self.assertEqual(self.floor.drain_check(state, ["f1"]), {"lost": 0, "twice": 0})
-        self.assertEqual(retire(state, dict(env, CW_POD_ROLLBACK_WINDOW="closed"))["ready"], True)
-        self.assertEqual(self.floor.drain_check(state, ["f1", "gone"]), {"lost": 1, "twice": 0})
-        self.m.save_record(state, dict(self.record("f1"), worker="f9"))   # a second record claiming the same work
-        self.assertEqual(self.floor.drain_check(state, ["f1"])["twice"], 1)
-
-    # ------------------------------------------------------------ S5
     def test_an_outage_on_submit_writes_no_record(self):
         self.fake.down = True
         code, out, err = self.run_cmd_catching(self.m.cmd_launch, self.args("o1"), None, lambda: 1000.0)
@@ -522,7 +416,186 @@ class TestCloudFloor(FloorCase):
         self.assertEqual([path for path, _ in seen], ["/v1/callers/fleet/submissions", "/v1/callers/fleet/works/w-1/cancel"])
         self.assertTrue(all(auth == "Bearer tok-PLANTED-0123456789" for _, auth in seen))
 
-    # ------------------------------------------------------------ U1
+
+
+
+class TestCloudFloorCutover(FloorCase):
+
+    def test_the_route_rule(self):
+        route = self.floor.route_repo
+        cases = [({}, "pod"), ({"CW_REMOTE_BACKEND": "floor"}, "floor"), ({"CW_REMOTE_BACKEND": " Pod "}, "pod"),
+                 ({"CW_REMOTE_BACKEND": "pod", "CW_FLOOR_REPOS": "*"}, "pod"), ({"CW_FLOOR_REPOS": "acme-org/*"}, "floor"),
+                 ({"CW_FLOOR_REPOS": "acme-org/other,ACME-ORG/Widget-Service"}, "floor"), ({"CW_FLOOR_REPOS": "acme-org/other"}, "pod"),
+                 ({"CW_FLOOR_REPOS": "*"}, "floor"), ({"CW_FLOOR_REPOS": ""}, "pod")]
+        for env, want in cases:
+            self.assertEqual(route(REPO_NAME, CONFIG, env), want, env)
+
+    def test_a_worker_stays_on_the_side_that_admitted_it(self):
+        os.environ["CW_REMOTE_BACKEND"] = "pod"
+        self.pod_record("p1")
+        os.environ["CW_REMOTE_BACKEND"] = "floor"
+        for name in ("f1", "f2"):
+            self.assertEqual(self.launch(name)[0], 0)
+        os.environ["CW_REMOTE_BACKEND"] = "pod"   # the rollback switch: the Floor workers are still Floor's
+        with mock.patch.dict(self.m.H, {"launch_model_cloud": mock.Mock(side_effect=PodWorld)}):
+            with self.assertRaises(PodWorld):   # a new admission goes to the pod code
+                self.launch("p2")
+        self.pod_record("p2")
+        self.assertEqual(len(self.fake.works), 2)
+        self.fake.calls.clear()
+        self.pod_calls.clear()
+        for name in ("f1", "f2"):
+            self.assertEqual(self.send(name, "go on")[0], 0)
+            self.assertEqual(self.read(name)[0], 0)
+        self.assertEqual(self.retire("f1")[0], 0)
+        self.assertEqual(self.pod_calls, [], "a Floor worker never reaches the pod launcher")
+        self.fake.calls.clear()
+        for name in ("p1", "p2"):
+            self.assertEqual(self.send(name, "go on")[0], 0)
+            self.assertEqual(self.read(name)[0], 0)
+            self.assertEqual(self.retire(name)[0], 0)
+        self.assertEqual(self.fake.calls, [], "a pod worker never reaches Floor")
+        self.assertIn("stop", self.pod_calls)
+        os.environ["CW_REMOTE_BACKEND"] = "floor"   # flipping again changes nothing for the one that is left
+        self.assertEqual(self.send("f2", "still here")[0], 0)
+        self.assertEqual(self.record("f2")["seq"], 3)
+
+    def test_status_gives_the_launcher_only_the_pod_records(self):
+        self.pod_record("p1")
+        self.launch("f1")
+        lines, rows = self.status()
+        self.assertEqual(sorted(r["worker"] for r in rows), ["f1", "p1"])
+        self.assertEqual(self.pod_calls.count("snapshot"), 1)
+        self.assertEqual(self.pod_calls.count("status"), 1)   # one pod record, one launcher status
+        self.pod_calls.clear()
+        self.m.remove_record(str(self.state), "p1")
+        self.status()
+        self.assertEqual(self.pod_calls, [])
+
+    def test_every_eligible_admission_goes_to_floor_and_none_to_the_launcher(self):
+        for index, agent in enumerate(["coder", "worker", "coder", "worker"]):
+            self.assertEqual(self.launch("e%d" % index, agent=agent)[0], 0)
+        self.assertEqual((len(self.fake.works), self.pod_calls.count("create"), self.pod_calls), (4, 0, []))
+        self.assertEqual({self.record("e%d" % i)["backend"] for i in range(4)}, {"floor"})
+
+    def test_the_pod_launcher_retires_only_when_closed_and_drained(self):
+        state, retire = str(self.state), self.floor.retire_pod_launcher
+        self.pod_record("p1")
+        self.launch("f1")
+        env = {"CW_REMOTE_BACKEND": "floor", "CW_POD_ROLLBACK_WINDOW": "open"}
+        for change, word in (({}, "rollback window"), ({"CW_POD_ROLLBACK_WINDOW": "closed"}, "pod worker"),
+                             ({"CW_REMOTE_BACKEND": "pod", "CW_POD_ROLLBACK_WINDOW": "closed"}, "not floor")):
+            with self.assertRaises(self.m.Refusal) as caught:
+                retire(state, dict(env, **change))
+            self.assertIn(word, str(caught.exception))
+        self.assertTrue(self.m.record_path(state, "p1").exists())   # nothing was changed
+        self.assertEqual(self.retire("p1")[0], 0)
+        self.assertEqual(self.floor.drain_check(state, ["f1"]), {"lost": 0, "twice": 0})
+        self.assertEqual(retire(state, dict(env, CW_POD_ROLLBACK_WINDOW="closed"))["ready"], True)
+        self.assertEqual(self.floor.drain_check(state, ["f1", "gone"]), {"lost": 1, "twice": 0})
+        self.m.save_record(state, dict(self.record("f1"), worker="f9"))   # a second record claiming the same work
+        self.assertEqual(self.floor.drain_check(state, ["f1"])["twice"], 1)
+
+
+
+
+class TestCloudFloorRolesAndBriefs(FloorCase):
+
+    def test_the_brief_loses_every_delivery_step_and_gains_the_contract(self):
+        self.launch()
+        sent = self.fake.submitted["brief"]
+        self.assertTrue(sent.startswith("Floor Author Contract"))
+        body = sent.split("Task:\n", 1)[1]
+        self.assertNotRegex(body, r"git push|gh pr create|prove")
+        self.assertIn("Add a retry to the fetch loop.", body)
+        self.assertIn("keep the change small", body)
+        self.assertEqual({k: self.fake.submitted[k] for k in ("repo", "branch", "title", "ref")}, {"repo": REPO_NAME, "branch": "work/f1", "title": "f1", "ref": "main"})
+        pod_text = self.m.POD_HEADER + self.m.H["setup_with_land"](self.m.SETUP_PREAMBLE, CONFIG, REPO_NAME) % {"repo": REPO_NAME, "branch": "b"} + "Do the task.\n"
+        translated = self.floor.translate_brief(pod_text, REPO_NAME, "b")
+        self.assertNotIn("Setup (do this first", translated)
+        self.assertNotIn("/work/land.log", translated)
+        self.assertNotIn("nohup", translated)
+        self.assertIn("Do the task.", translated)
+        self.assertEqual(translated.count("Floor Author Contract"), 1)
+
+    def test_the_matrix_refuses_what_floor_cannot_work(self):
+        cases = [("reviewer", dict(role="reviewer"), BRIEF), ("tester", dict(role="tester"), BRIEF), ("no-commit", dict(no_commit=True), BRIEF),
+                 ("rehearsal", {}, "REHEARSAL BRIEF\nmeasure it"), ("stack", dict(stack=True), BRIEF), ("docker", {}, "Do it\nNEEDS: docker\n"),
+                 ("orchestrator", dict(agent="orchestrator"), BRIEF), ("persistent", dict(persistent=True), BRIEF),
+                 ("other agent", dict(agent="scribe"), BRIEF), ("merger", {}, "Run: gh pr merge 12 --squash\n"),
+                 ("not a land repo", dict(repo=OTHER_REPO), BRIEF)]
+        for label, over, brief in cases:
+            self.brief = brief
+            code, out, err = self.run_cmd(self.m.cmd_launch, self.args("r1", **over), None, lambda: 1000.0)
+            self.assertEqual(code, 2, label)
+            self.assertIn("nothing was created", err, label)
+            self.assertEqual((self.floor_calls(), self.pod_calls, list(Path(self.state).glob("cloud/*.json"))), (0, [], []), label)
+        self.assertIn("pull requests and gates", err)
+
+    def verify_launch(self, name, **over):
+        return self.run_cmd(self.m.cmd_launch, self.args(name, **over), None, lambda: 1000.0)
+
+    def test_verify_modes_are_refused_while_the_setting_is_off(self):
+        for off in (None, "", "0", "false"):
+            os.environ.pop("CW_FLOOR_VERIFY_ENABLED", None)
+            if off is not None:
+                os.environ["CW_FLOOR_VERIFY_ENABLED"] = off
+            for label, over, brief in (("tester", dict(role="tester"), BRIEF), ("no-commit", dict(no_commit=True), BRIEF), ("rehearsal", {}, "REHEARSAL BRIEF\nmeasure it")):
+                self.brief = brief
+                code, out, err = self.verify_launch("v1", **over)
+                self.assertEqual(code, 2, (off, label))
+                self.assertIn("nothing was created", err)
+                self.assertEqual((self.floor_calls(), self.pod_calls, list(Path(self.state).glob("cloud/*.json"))), (0, [], []), label)
+
+    def test_verify_modes_are_routed_to_floor_when_the_setting_is_on_and_the_manifest_is_readable(self):
+        os.environ["CW_FLOOR_VERIFY_ENABLED"] = "1"
+        raw = "REHEARSAL BRIEF\nrun the checks: git push origin HEAD would be here"
+        for name, over, brief, mode in (("v1", dict(role="tester", agent="scribe"), BRIEF, "verify-only"), ("v2", dict(no_commit=True), BRIEF, "rehearse"),
+                                        ("v3", {}, raw, "rehearse")):
+            self.brief = brief
+            code, out, err = self.verify_launch(name, **over)
+            self.assertEqual(code, 0, (name, err))
+            sent = self.fake.submitted
+            self.assertEqual((sent["mode"], sent["env"]), (mode, {"FLOOR_WORKFLOW": mode}), name)
+            self.assertEqual(sent["brief"], brief, "a verify launch is not translated to author commits")
+            self.assertNotIn("Floor Author Contract", sent["brief"])
+            self.assertEqual(self.record(name)["mode"], mode)
+            self.fake.manifest = {"mode": mode, "checks": [{"name": "unit", "ok": True}]}
+            self.fake.log_tail = "step one\nstep two ok"
+            code, out, err = self.read(name)
+            self.assertEqual(code, 0, err)
+            self.assertIn('manifest: {"checks": [{"name": "unit", "ok": true}], "mode": "%s"}' % mode, out)
+            self.assertIn("log_tail: step two ok", out)
+            self.assertIn("landed_sha None", out)
+        self.assertEqual(self.pod_calls, [])
+        os.environ["CW_FLOOR_VERIFY_ENABLED"] = "true"   # the other spelling
+        self.brief = BRIEF
+        self.assertEqual(self.verify_launch("v4", role="tester")[0], 0)
+        for label, over, brief in (("reviewer", dict(role="reviewer"), BRIEF), ("stack", dict(role="tester", stack=True), BRIEF), ("not land", dict(role="tester", repo=OTHER_REPO), BRIEF)):
+            self.brief = brief
+            self.assertEqual(self.verify_launch("v9", **over)[0], 2, label)   # the rest of the matrix still holds
+
+    def test_a_verify_launch_over_the_queue_names_its_mode(self):
+        os.environ["CW_FLOOR_VERIFY_ENABLED"] = "1"
+        mini = MiniFloor()
+        self.addCleanup(mini.close)
+        self.floor.TRANSPORT = None
+        os.environ.update({"CW_FLOOR_QUEUE_URL": mini.base + "/q", "CW_FLOOR_QUEUE_SAS": MiniFloor.QUEUE_SAS, "CW_FLOOR_BLOB_URL": mini.base + "/b", "CW_FLOOR_BLOB_SAS": MiniFloor.BLOB_SAS})
+        self.assertEqual(self.verify_launch("v5", role="tester")[0], 0)
+        command = mini.commands[0]
+        self.assertEqual((command["mode"], command["env"], command["brief"]), ("verify-only", {"FLOOR_WORKFLOW": "verify-only"}, BRIEF))
+        sid = self.record("v5")["session"]
+        mini.texts[sid] = {"text": "", "manifest": {"ok": True}, "log_tail": ["a", "b"]}
+        code, out, err = self.read("v5")
+        self.assertEqual(code, 0, err)
+        self.assertIn('manifest: {"ok": true}', out)
+        self.assertIn("log_tail: b", out)
+
+
+
+
+class TestCloudFloorPublicSafe(FloorCase):
+
     def test_planted_private_values_never_reach_output_or_files(self):
         host, token = "floor-planted.corp.example", "tok-PLANTED-" + "z9" * 12
         token_file = self.home / "floor.token"
@@ -553,6 +626,9 @@ class TestCloudFloor(FloorCase):
         for argv in (["tools/new-module-demands", "bin/cloud_floor.py"], ["tools/new-test-checks", "tests/switchboard/test_cloud_floor.py"]):
             done = subprocess.run([sys.executable] + argv, cwd=str(REPO), capture_output=True, text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+
 
 
 class MiniFloor:
@@ -610,7 +686,10 @@ class MiniFloor:
                     return self._send(200, json.dumps(body).encode())
                 name = path[len("/b/msg/"):-len(".json")]
                 if path.startswith("/b/msg/") and name in mini.texts:
-                    return self._send(200, json.dumps({"v": 1, "session_id": name, "state": "idle", "text": mini.texts[name], "at": "2030-01-01T00:00:00Z", "round": 1}).encode())
+                    held = mini.texts[name]
+                    body = {"v": 1, "session_id": name, "state": "idle", "text": held, "at": "2030-01-01T00:00:00Z", "round": 1}
+                    body.update(held if isinstance(held, dict) else {})
+                    return self._send(200, json.dumps(body).encode())
                 self._send(404)
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -740,7 +819,8 @@ class TestCloudFloorMutants(Base):
         with contextlib.ExitStack() as stack:
             for name, value in patches.items():
                 stack.enter_context(mock.patch.object(floor, name, value))
-            TestCloudFloor(test).run(result)
+            owner = next(c for c in (TestCloudFloor, TestCloudFloorCutover, TestCloudFloorRolesAndBriefs, TestCloudFloorPublicSafe) if test in vars(c))
+            owner(test).run(result)
         return bool(result.failures or result.errors)
 
     def check(self, test, **patches):
@@ -759,6 +839,9 @@ class TestCloudFloorMutants(Base):
 
     def test_m3_the_matrix_lets_everything_through(self):
         self.check("test_the_matrix_refuses_what_floor_cannot_work", check_floor_admission=lambda *a, **k: None)
+
+    def test_m6_the_verify_setting_is_ignored(self):
+        self.check("test_verify_modes_are_refused_while_the_setting_is_off", verify_enabled=lambda env=None: True)
 
     def test_m5_a_failed_submit_is_swallowed(self):
         self.check("test_an_outage_on_submit_writes_no_record", submit_work=lambda who, cmd_id, **fields: {"work_id": "w-lost"})
