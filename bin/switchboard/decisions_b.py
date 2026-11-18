@@ -663,8 +663,9 @@ def work_status_line(config, state_dir, now):
     if body is None:
         return "work items  waiting for the daemon's first pass"
     last = body.get("last_write")
-    return "work items  %s open, last write %s, %s error(s)%s" % (
+    return "work items  %s open, last write %s, %s error(s)%s%s" % (
         body.get("open", 0), "%s ago" % format_age(now - last) if last else "never", body.get("errors", 0),
+        ", %s refused for good" % body["permanent"] if body.get("permanent") else "",
         "; ALARM: writes are piling up" if body.get("alarm") else "")
 
 

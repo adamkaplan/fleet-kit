@@ -3758,7 +3758,9 @@ the worker is idle awaiting input, `blocked`), `progress` (one line from its lat
 the outside item id of the decision linked to that ask when there is one, else the issue ref `<repo>#<N>` as text. An
 assignment ends as `done`, `failed` (its report) or `cancelled` (withdrawn, or the agent gone without a final report for
 `work_grace_seconds`), finished exactly once. Writes to one item are at most one per interval (the sink's, never under 60
-seconds; the last state wins); a failed write is retried with backoff and never blocks the pass; more than
+seconds; the last state wins); a failed write is retried with backoff and never blocks the pass (a timeout, a 429 or a 5xx); a write the door refuses for good (a status
+400, 404, 409 or 422) is not sent again until the item's content changes: it is audited once as
+`work.permanent_failure` (item key, status, first error line) and `status` shows the count; more than
 `work_outbox_alarm_depth` waiting writes raise an alarm and none is dropped. The pump keeps `work-items.json` in the
 state directory (disposable: a lost file re-puts the same ids). `status` shows `work items  N open, last write ..., N error(s)`.
 

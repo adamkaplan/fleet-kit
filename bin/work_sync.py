@@ -33,6 +33,7 @@ MIN_INTERVAL = 60                 # seconds between two writes of one item, what
 FINISHED_KEEP_SECONDS = 7 * 86400
 STATES = ("queued", "running", "awaiting", "blocked")
 ENDS = ("done", "failed", "cancelled")
+PERMANENT_STATUSES = (400, 404, 409, 422)   # a refusal a retry cannot change
 _SPACE = uuid.UUID("2b7d9a64-5e1f-4c3a-8d20-7a9c1e4f6b35")
 
 
@@ -233,6 +234,8 @@ class WorkSync:
             item = self.items[key]
             if item["finished"] or item["next_at"] > now or "want" not in item:
                 continue
+            if item.get("refused") is not None and item["refused"] == self._content(item):
+                continue   # refused for good: nothing is sent until the content changes
             want = self._fields(item["want"])
             try:
                 if not item["put"]:
@@ -258,13 +261,27 @@ class WorkSync:
                     item["last_write"] = now
                     self.last_write = now
                     self.host.audit("work.patch", key, {"work_id": item["work_id"], "fields": sorted(changed)})
-                item.update(error=None, tries=0)
-            except Exception as err:   # retried later; never blocks the others and never raises
+                item.update(error=None, tries=0, refused=None)
+            except Exception as err:   # transient: retried later; never blocks the others and never raises
+                if self._permanent(err):
+                    item["error"] = core.one_line("%s: %s" % (type(err).__name__, err), 160)
+                    item["refused"] = self._content(item)
+                    self.host.audit("work.permanent_failure", key, {"status": getattr(err, "status", None),
+                                                                    "error": item["error"]})
+                    continue
                 item["tries"] += 1
                 item["error"] = core.one_line("%s: %s" % (type(err).__name__, err), 160)
                 item["next_at"] = now + min(self.settings["retry_max_seconds"],
                                              self.settings["retry_base_seconds"] * 2 ** (item["tries"] - 1))
                 self.host.audit("work.failed", key, {"tries": item["tries"], "error": item["error"]})
+
+    @staticmethod
+    def _permanent(err):
+        return getattr(err, "status", None) in PERMANENT_STATUSES
+
+    @staticmethod
+    def _content(item):
+        return json.dumps([item.get("want"), item.get("end")], sort_keys=True)
 
     def _pending(self, item):
         if item["finished"] or "want" not in item:
@@ -278,7 +295,9 @@ class WorkSync:
         open_items = [i for i in self.items.values() if not i["finished"]]
         outbox = sum(1 for i in open_items if self._pending(i))
         errors = sum(1 for i in open_items if i.get("error"))
-        return {"open": len(open_items), "outbox": outbox, "errors": errors, "last_write": self.last_write,
+        refused = sum(1 for i in open_items if i.get("refused") is not None)
+        return {"open": len(open_items), "outbox": outbox, "errors": errors, "permanent": refused,
+                "last_write": self.last_write,
                 "alarm": outbox > self.settings["work_outbox_alarm_depth"],
                 "error": next((i["error"] for i in open_items if i.get("error")), None)}
 

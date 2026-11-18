@@ -675,9 +675,12 @@ class FakeWorkSink(sb.work_sync.WorkSink):
     interval = 60
 
     def __init__(self):
-        self.calls, self.down, self.defer = [], False, None
+        self.calls, self.down, self.defer, self.refuse, self.attempts = [], False, None, None, 0
 
     def _do(self, *call):
+        self.attempts += 1
+        if self.refuse:
+            raise self.refuse
         if self.down:
             raise ConnectionError("the sink is down")
         self.calls.append(call)
@@ -728,6 +731,7 @@ def report(state, text="", at=1, sender="w1", issue=2):
 
 class PermanentRefusal(Exception):
     permanent = True
+    status = 409
 
 
 class PickyExternal(FakeExternal):

@@ -1665,6 +1665,35 @@ class TestWorkSyncPump(unittest.TestCase):
         self.cycle(5000)
         self.assertEqual(self.sink.kinds(), ["put", "finish"], "finished once, never again, not cancelled later")
 
+    def test_a_permanent_refusal_is_sent_once_until_the_content_changes(self):
+        for status in (409, 400):
+            self.sink.refuse = type("Refusal", (Exception,), {"status": status})("refused\nsecond line")
+            self.sink.attempts, self.host.events[:] = 0, []
+            self.host.agent_list = [worker(issue=status)]
+            for _ in range(50):
+                status_now = self.cycle(1000)
+            self.assertEqual(self.sink.attempts, 1)
+            lines = [e for e in self.host.events if e[0] == "work.permanent_failure"]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0][2]["status"], status)
+            self.assertNotIn("\n", lines[0][2]["error"])
+            self.assertEqual(status_now["permanent"], 1)
+            self.host.agent_list = [worker(issue=status, status="working")]
+            for _ in range(5):
+                self.cycle(1000)
+            self.assertEqual(self.sink.attempts, 2)
+            self.sink.refuse = None
+            self.cycle(1000)
+            self.assertEqual(self.cycle(1000)["permanent"], 0)
+
+    def test_a_transient_error_keeps_retrying_and_is_not_permanent(self):
+        self.sink.refuse = type("Slow", (Exception,), {"status": 429})("slow down")
+        self.host.agent_list = [worker()]
+        for _ in range(10):
+            self.cycle(1000)
+        self.assertEqual(self.sink.attempts, 10)
+        self.assertEqual([e for e in self.host.events if e[0] == "work.permanent_failure"], [])
+
     def test_a_restart_makes_no_duplicate(self):
         self.host.agent_list = [worker()]
         self.cycle()
