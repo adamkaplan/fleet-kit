@@ -262,7 +262,16 @@ def cmd_remind(args, runner, now):
     warning = None
     if number is not None and repo and not args.keep_if_closed:
         try:
-            ref_state = read_ref_state(engine, repo, number, "issue")
+            try:
+                with engine.phase("gh_ms"):
+                    ref_state = read_ref_state(engine, repo, number, "issue")
+            except TimeoutError:   # #2553: one retry
+                with engine.phase("gh_ms"):
+                    ref_state = read_ref_state(engine, repo, number, "issue")
+        except TimeoutError:
+            sys.stderr.write("%s: remind: step gh_ref_state (%s#%d) timed out (retried once); nothing armed\n" % (PROG, repo, number))
+            engine.note_cli_timing("remind", args.name, moment)
+            return EXIT_ERROR
         except Exception:   # the warning never fails a command
             ref_state = "open"   # unreadable: warned as open, never refused
         if ref_state in ("closed", "merged"):
@@ -283,9 +292,10 @@ def cmd_remind(args, runner, now):
         sys.stderr.write("%s: remind: %s; nothing armed\n" % (PROG, err))
         return EXIT_USAGE
     try:
-        item = add_reminder(state, args.name, at, moment,
-                            text, number, sender, repo, condition=condition or None,
-                            key=_one_line(args.key, 80) if args.key else None, ttl=ttl, every=every, check_chain=True)
+        with engine.phase("lock_ms"):
+            item = add_reminder(state, args.name, at, moment,
+                                text, number, sender, repo, condition=condition or None,
+                                key=_one_line(args.key, 80) if args.key else None, ttl=ttl, every=every, check_chain=True)
     except ReminderError as err:
         sys.stderr.write("%s: remind: %s; nothing armed\n" % (PROG, err))
         return EXIT_USAGE
@@ -298,6 +308,7 @@ def cmd_remind(args, runner, now):
     sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
     if warning:
         sys.stderr.write(warning)
+    engine.note_cli_timing("remind", args.name, moment)
     return EXIT_OK
 
 

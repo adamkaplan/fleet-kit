@@ -1360,7 +1360,6 @@ class HerdrClient:
 
 
 # ---------------------------------------------------------------- the event feed (#290 slice 2)
-#
 # The daemon used to learn what happened in a session by READING its history on a timer. The service pushes the news: `GET /api/event` is ONE global
 # server-sent stream (a turn ended: `session.execution.succeeded`; a step ended; a permission or a form asked for). By contract it is VOLATILE (a
 # slow consumer overflows, events while disconnected are missed), so the feed is a HINT, never a ledger and never a source of TEXT (an event's text
@@ -2008,6 +2007,18 @@ class Switchboard:
             observation.problem = "pane %s of %s runs a different opencode than the configured v2 (%s): %s" % (
                 observation.pane, observation.name, self.executable,
                 _one_line("; ".join(str(c) for c in programs), 120) or "nothing")
+
+    @contextmanager
+    def phase(self, name):
+        began = self.now()
+        try: yield
+        finally: _CLI_TIMING[name] = _CLI_TIMING.get(name, 0) + int(round(max(0.0, float(self.now()) - float(began)) * 1000))
+
+    def note_cli_timing(self, command, target, started):
+        total = max(0.0, float(self.now()) - float(started))
+        if total > CLI_SLOW_SECONDS and self.audit is not None:
+            self.audit.append("cli", "cli.timing", target, {"command": command, "total_ms": int(round(total * 1000)), **_CLI_TIMING})
+        for key in ("discover_ms", "gh_ms", "lock_ms", "v2_ms"): _CLI_TIMING[key] = 0
 
     def discover(self, now, entries=None):
         """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`. Also marks the `agents` input (#805): not whole when
@@ -4200,13 +4211,10 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     return done
 
 
-# ======================================================================
 # The control plane (cos repairs a detached or dead pane through the switchboard, never by typing into one)
-#
 # A pane is ATTACHED when what it shows names the agent: its terminal title or the visible screen holds the agent's name or its session id.
 # herdr's own `agent_session` value is NOT trusted alone (it kept naming the old session while the pane showed a fresh Build screen). A pane
 # that shows something else is DETACHED; a pane herdr no longer has is DEAD. Both wake the Chief of Staff, which can `reattach`.
-# ======================================================================
 
 PANE_SETTLE_SECONDS = 5      # the two looks before a close are this far apart: a pane that is still active between them is never closed
 PANE_READ_MAX = 8000         # characters of a pane's screen kept
@@ -5606,7 +5614,6 @@ def retire_idle_evidence(engine, now, name, seen, herdr_status):
 
 
 # ---------------------------------------------------------------- no orphan workers (#838)
-#
 # A worker always has a boss that is a live agent. ONE step writes every boss change this ask makes (`write_boss_records`): the daemon pass,
 # the retire of an orchestrator, the launch of one (relaunch, replace), the move of an ask (split) and the close of a retired worker's pane
 # call it, so they cannot differ. The boss is written in the per-worker boss record of `bin/reassign.py` (bound to the worker's session), which
@@ -6332,7 +6339,6 @@ def cmd_retire(args, runner, now):
 
 
 # ---------------------------------------------------------------- the orphan reaper (#321 slice S7)
-#
 # A process whose parent is launchd (pid 1) and whose command matches an EXACT allow-list, that this user owns and that has run longer than the grace
 # (`orphan_reaper.grace_hours`, default 6), is an orphan of a finished test or agent: it is listed by `status` and by `disk reap-orphans`, and
 # `disk reap-orphans --apply` sends it SIGTERM, then SIGKILL after a few seconds, each audited. A dry run is the default; the kill switch is
@@ -6807,9 +6813,7 @@ def add_reattach_parsers(sub):
     reattach.add_argument("--repo", help="Refused when it differs from the session's stored repo (a reattach keeps the stored identity)")
 
 
-# ======================================================================
 # PR 8: foreground and background
-#
 # One section, so the stack rebases cleanly. docs/switchboard.md,
 # "Foreground and background". Registered in these places, one line each:
 #   DEFAULTS            `classifier_mode` (below), checked by validate_foreground_config
@@ -6821,7 +6825,6 @@ def add_reattach_parsers(sub):
 #   build_parser, main  the `handoff` command
 # The decoration is a fact like any other: it is delivered by the one delivery
 # path, as a note, and the key in the transcript is what stops a repeat.
-# ======================================================================
 
 FOREGROUND_DEFAULTS = {
     # "shadow": the classifier only logs (PR 7). "act": it also decorates the
@@ -7300,9 +7303,7 @@ def prune_report_riders(engine, discovery):
     return sorted(gone)
 
 
-# ======================================================================
 # PR 14: Decisions, a read-only list of what waits on you
-#
 # docs/switchboard.md, "Decisions (PR 14)". The list is derived on every pass from facts that already
 # exist and is never the source of truth (invariant 1): the issues that carry your awaiting-user label
 # (the hub's picture, kept by webhook events and the catch-up read), the pending permission requests and
@@ -7310,7 +7311,6 @@ def prune_report_riders(engine, discovery):
 # reports a boss has been sent and nobody has answered. The daemon writes it to $STATE/decisions.json
 # when it changes, a disposable projection: deleting the file loses nothing and the next pass makes it
 # again. `fleet-switchboard decisions` and the TUI plugin only read the file.
-# ======================================================================
 
 DECISIONS_FILE = "decisions.json"
 DECISIONS_STALE_SECONDS = 180   # a file this old (by mtime, which every pass refreshes) is not current
@@ -7832,12 +7832,13 @@ def read_ref_state(engine, repo, number, kind):
     argv = [engine.config["gh"], "issue", "view", str(number), "--repo", repo, "--json", "state"]
     try:
         done = (engine.gh_runner or subprocess.run)(argv, capture_output=True, text=True,
-                                                    timeout=min(engine.config["call_timeout_seconds"],
-                                                                GITHUB_ROUTE_READ_TIMEOUT),
-                                                    stdin=subprocess.DEVNULL, **extra)
+                                                    timeout=min(engine.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT,
+                                                                CLI_CALL_TIMEOUT_SECONDS), stdin=subprocess.DEVNULL, **extra)
         if done.returncode != 0:
             raise NoticeError("gh issue view %s#%d failed" % (repo, number))
         state = json.loads(done.stdout or "").get("state")
+    except subprocess.TimeoutExpired:
+        raise TimeoutError("gh issue view %s#%d timed out" % (repo, number)) from None   # #2553: the caller retries once
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         raise NoticeError("gh issue view %s#%d could not be read" % (repo, number)) from None
     if not isinstance(state, str):
@@ -9617,9 +9618,7 @@ cmd_budget_notice.direct = True   # run by the gh shim: no daemon start, no erro
 
 
 # ======================================================= GitHub events (PR 5)
-#
 # One section, self-contained. The pieces, in the order they are built:
-#
 #   config      `_validate_github`, called from validate_config
 #   verify      `signature_matches`: HMAC-SHA256 of the raw body, constant time
 #   items       webhook payloads and catch-up reads -> GitHubItem, with keys
@@ -9628,7 +9627,6 @@ cmd_budget_notice.direct = True   # run by the gh shim: no daemon start, no erro
 #               `gh webhook forward` child per watched repo, the in-memory
 #               queue the fact source drains, the catch-up read, routing
 #   status      `github_status` / `format_github`
-#
 # Facts are not stored. Webhook arrivals wait in memory until the engine
 # reports them delivered (or found in the recipient's transcript); a daemon
 # restart relies on the catch-up read. The webhook secret is made for every
@@ -9651,6 +9649,8 @@ GITHUB_BODY_LIMIT = 5 * 1024 * 1024
 GITHUB_QUEUE_LIMIT = 2000
 GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
 GITHUB_ROUTE_READ_TIMEOUT = 8  # seconds for one such lookup
+CLI_CALL_TIMEOUT_SECONDS, CLI_SLOW_SECONDS = 15, 5.0   # #2553: the bound of one remind/send external call; over the second, a cli.timing audit line
+_CLI_TIMING = {"discover_ms": 0, "gh_ms": 0, "lock_ms": 0, "v2_ms": 0}   # #2553: phase durations of this process's one remind/send, mutated in place
 GITHUB_CATCHUP_STUCK_PASSES = 3   # #494: a catch-up that stopped this many passes in a row is said in `status`, not silently starved
 GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
 GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
@@ -13350,7 +13350,15 @@ def resolve_for_sender(engine, config, issue, sender):
     """(repo, number) for an issue reference given by `sender`: its own repo is the default (PR 15)."""
     if issue is None:
         return None, None
-    fleets = discovered_fleets(engine.discover(engine.now()))
+    if not fault("bare-issue-number") and issue_repo(issue):
+        return issue_repo(issue), int(issue)   # #2553: a repo-qualified reference needs no pane discovery
+    try: reg = load_module("registry").read(engine.state_dir) if engine.state_dir is not None and isinstance(sender, str) and sender else None
+    except Exception: reg = None
+    row = ((reg.get("agents") or {}).get(sender) if isinstance(reg, dict) and reg.get("whole") else None)
+    if isinstance(row, dict) and row.get("state") != "retired" and isinstance(row.get("repo"), str) and row["repo"]:
+        return resolve_issue(config, issue, {"repo": row["repo"]})
+    with engine.phase("discover_ms"):
+        fleets = discovered_fleets(engine.discover(engine.now()))
     return resolve_issue(config, issue, fleets.get(sender, {}), watched_repos(config, fleets))
 
 
@@ -13372,6 +13380,20 @@ def run_bounded(work, seconds):
     if "error" in box:
         raise box["error"]
     return True, box.get("result")
+
+
+def deliver_bounded(engine, config, sender, recipient, text, number, repo, interrupt, started):
+    """#2553: the delivery call, bounded, with one retry; None (a named error written, a timing line audited) when both tries timed out."""
+    step = min(config.get("send_timeout_seconds", CLI_CALL_TIMEOUT_SECONDS), CLI_CALL_TIMEOUT_SECONDS)
+    for _ in (1, 2):
+        with engine.phase("v2_ms"):
+            done, outcome = run_bounded(lambda: engine.send(sender, recipient, text, number, repo, interrupt=interrupt), step)
+        if done:
+            return outcome
+    sys.stderr.write("%s: send to %s: step v2_send timed out after %s s (retried once): check `%s pending %s` before sending again\n" % (
+        PROG, _one_line(recipient, 80), step, PROG, _one_line(recipient, 80)))
+    engine.note_cli_timing("send", recipient, started)
+    return None
 
 
 def cmd_send(args, runner, now):
@@ -13494,6 +13516,7 @@ def _cmd_send(args, runner, now):
 def _send_one(args, runner, now):
     system = load_module("system_sender")   # #2518: a registered system sender is proved by the calling process; the claim variable and --from only NAME one
     claim = os.environ.get(system.SYSTEM_SENDER_ENV) or None
+    args.system_proven = False
     if claim or system.registered(args.sender):
         line = system.refusal(claim or args.sender, args.name, KIT_ROOT, from_name=args.sender)
         if line:
@@ -13506,13 +13529,14 @@ def _send_one(args, runner, now):
     remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
     if remote is not None:
         return run_cloud("cmd_send", args, runner, now, remote)
+    started = now()
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)
     if refusal:
         sys.stderr.write("%s: %s\n" % (PROG, refusal))
         return EXIT_USAGE
     if args.sender is not None:
-        if os.environ.get(LAB_ENV) != "1" and not getattr(args, "system_proven", False):
+        if os.environ.get(LAB_ENV) != "1" and not args.system_proven:
             sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
                              % (PROG, LAB_ENV))
             return EXIT_USAGE
@@ -13532,9 +13556,12 @@ def _send_one(args, runner, now):
     if lane_problem:
         sys.stderr.write("%s: not sent, %s\n" % (PROG, lane_problem))
         return EXIT_USAGE
-    verdict = check_approval(config, runner, now, text, repo, number, sender)   # #951, #1463: every approval hash in the message; only the Chief of Staff's; GETs only; never raises
+    with engine.phase("gh_ms"):
+        verdict = check_approval(config, runner, now, text, repo, number, sender)   # #951, #1463: every approval hash in the message; only the Chief of Staff's; GETs only; never raises
     try:
-        outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
+        outcome = deliver_bounded(engine, config, sender, args.name, text, number, repo, args.interrupt, started)
+        if outcome is None:
+            return EXIT_ERROR
     except InterruptRefused as err:
         sys.stderr.write("%s: not interrupted, nothing sent: %s\n" % (PROG, err))
         return EXIT_USAGE
@@ -13550,6 +13577,7 @@ def _send_one(args, runner, now):
     record_approval(engine, verdict, sender, args.name, repo, number)
     print(outcome["message_id"])
     sys.stderr.write("%s: %s delivered to %s\n" % (PROG, outcome["action"], args.name))
+    engine.note_cli_timing("send", args.name, started)
     return EXIT_OK
 
 
@@ -13872,14 +13900,11 @@ def cmd_pending(args, runner, now):
 cmd_pending.header_cache = True    # #1520: its header banner may be served from the shared file cache
 
 
-# ============================================================================
 # PR 15: one Chief of Staff, many independent projects
-#
 # One section. docs/switchboard.md, "Many repos (PR 15)". The watched repos are
 # derived on every pass, never listed (`watched_repos`); an issue is named by
 # repo and number (`RepoIssue`, `resolve_issue`); and every repo has its own
 # `gh` account (`GhAccounts`), whose token exists only in a child's environment.
-# ============================================================================
 
 class IssueRefError(Exception):
     """An issue reference that cannot be resolved to one repo."""
@@ -14304,7 +14329,6 @@ def launch_account_problem(config, accounts, repo):
 
 
 # ------------------------------------------------- intent lines (PR 6)
-#
 # Every message names its ask and carries the ask's Intent and Done-when
 # (docs/switchboard.md, "Intent lines"). GitHub is the only copy: this section
 # reads an issue's `## Intent` section through `gh api` (GET only, invariant 6)
@@ -18752,7 +18776,6 @@ def enforced_gates_of(ctx):
 
 
 # ---------------------------------------------------------------- `gates-check` and the mode switches (#107 slice 3a)
-#
 # docs/plan-gate-engine-design.md. `gates-check` answers one question for a future shim: allow or refuse? It is read-only.
 # Exit 0 allow, 10 refuse, anything else a fail-open (the caller allows). Nothing calls it yet and, with every repo in `shadow`
 # or unlisted, it never refuses. Only exit 10 refuses; a Python exception exits 3 (fail-open), never 10.
@@ -20990,7 +21013,6 @@ def cmd_review_checkout(args, runner, now):
 
 
 # ---------------------------------------------------------------- `review measure` (#179, slice L7)
-#
 # Read-only. Did moving coding-hygiene text out of the agent definitions into the reviewers' standards make changes land faster and cleaner? It
 # prints, for the merged PRs a repository has, per PR: minutes from the first commit to green CI, review rounds, findings and escaped defects,
 # and the medians of a BASELINE group (the N merged before a split PR) and an AFTER group (the N merged from it on). HEURISTICS, stated:
@@ -21218,7 +21240,6 @@ def add_impact_parsers(sub):
 
 
 # ---------------------------------------------------------------- `disk report` (#321 slice 1): what holds the disk, read only
-#
 # On demand only: the daemon's pass never runs it (the status line stays one stat). It lists free space, docker usage (ONE `docker system df`), the
 # registered worktrees per agent with size and git state (capped), cache sizes (a bounded walk, no `du`), and orphan CANDIDATES (a process
 # parented to init that works inside a registered worktree or the temp dir: a count, never a kill). It writes and removes nothing.
@@ -22308,18 +22329,15 @@ def scrubbed_flag_text(text, limit=OVERRIDE_TEXT_LIMIT):
 
 
 # PR 10: move a v1 session into v2 (`import-v1`)
-#
 # One section, so the stack rebases cleanly. docs/switchboard.md, "v1
 # sessions: Imported, not restarted"; docs/switchboard-cutover.md is the
 # runbook. Registered in six places: `DEFAULTS` (below), `validate_config`
 # (`validate_v1_move_config`), `KNOWN_FAULTS` (`no-import-metadata`),
 # `V2Client._call` (`envelope`, so a page keeps its cursor), `build_parser`
 # (`add_v1_move_parsers`) and `main` (`V1_MOVE_COMMANDS`).
-#
 # Three parts: a pure converter (v1's `opencode export` JSON -> v2's
 # Session.Info and messages), a checker for the v2 shapes the converter emits,
 # and the command. The v1 session is only ever read (`export`), never touched.
-# ============================================================================
 V1_MOVE_DEFAULTS = {
     # The OpenCode v1 binary, by absolute path; the only thing it is ever asked is
     # `export <session>`. No default: a bare name would be resolved through PATH.
@@ -22523,7 +22541,6 @@ except Exception as _err:
 
 
 # ---------------------------------------------------------------- the front door: self-registering commands
-#
 # A command is two functions named for it and nothing else: `add_<name>_parsers(sub)` (registers its argparse parsers; found by name) and
 # `cmd_<action with - as _>(args, ...)` (runs it; found by name). `main` lists neither. The few special cases are explicit, here, and are the only
 # things a new command could ever need to edit: nothing shared. Its dispatch group is said next to its own definition, as an attribute of the
@@ -22744,10 +22761,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
 del _WINDOW
 
 
-# ============================================================================
 # PR 16: install, a service that keeps the daemon alive, the decision-model
 # key as a file, the daemon started on use, and `bootstrap`
-#
 # One section, so the stack rebases cleanly. docs/switchboard.md, "Install
 # (PR 16)". Registered in these places:
 #   KNOWN_FAULTS         `key-missing-silent`, `no-ensure-on-use`, `shared-profile-default`, `key-env-only-unseen`
@@ -22757,7 +22772,6 @@ del _WINDOW
 #   HerdrClient          workspace_list, workspace_create (the one `--focus`)
 # The pieces `install` puts into OpenCode's profile are plain functions that
 # bin/switchboard-trial calls too: there is one path, not two installers.
-# ============================================================================
 from xml.sax.saxutils import escape as xml_escape
 
 KIT_ROOT = Path(__file__).resolve().parent.parent
@@ -23442,7 +23456,6 @@ RESTART_PATIENCE = 15  # seconds a stopping daemon has to let go of its lock
 
 
 # ---------------------------------------------------------------- `daemon status | start | stop | restart` (#858)
-#
 # One command for the daemon, however it was started (a launchd job, or `ensure`). It touches no state file: it ends or begins a
 # process, and reads daemon.json, run.lock, decisions.json and github-watch.json. The one file it makes is its own command lock.
 # docs/switchboard.md, "The daemon command".
@@ -23718,13 +23731,11 @@ def add_daemon_parsers(sub):
 
 INSTALL_COMMANDS = {"key": cmd_key}
 # PR 17: standing orders, `fleet-switchboard orders list|add|remove`
-#
 # docs/switchboard.md, "Standing orders (PR 17)". The orders live in the charter
 # issue's `## Standing orders` section on GitHub (parse_orders, above). Only the
 # Chief of Staff writes them, through this one command, which edits only that
 # section of the body through `gh api` PATCH, reads the issue back and fails
 # loudly when the change is not there. The reader (IntentReader) stays GET-only.
-# ============================================================================
 
 ORDERS_KIND = "orders"
 COMPACTIONS_READ = 20  # compaction messages read per agent per pass, newest first
@@ -24124,9 +24135,7 @@ def add_orders_parsers(sub):
     remove.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
 
-# ============================================================================
 # PR 18: decision tiers, the Chief of Staff's own standing orders, per-repo views
-#
 # docs/switchboard.md, "Decision tiers and the Chief of Staff's orders (PR 18)". The faults added here:
 # tier-flat, cos-orders-unfed, anyone-edits-cos-orders, answer-unjudged. Registered elsewhere:
 #   DEFAULTS            awaiting_cos_label, decisions_cos_grace_seconds, cos_orders_file
@@ -24135,7 +24144,6 @@ def add_orders_parsers(sub):
 #   OrdersFacts         the Chief of Staff's orders, found by role, from the file
 #   PolicyJudge         context_of feeds the file as `authority`; the guard on the file
 #   launch_agent        FLEET_SWITCHBOARD_ROLE and FLEET_SWITCHBOARD_REPO in the pane's environment
-# ============================================================================
 
 COS_ORDERS_NAME = "standing-orders.md"
 COS_ORDERS_MAX_BYTES = 8192
