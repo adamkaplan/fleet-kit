@@ -3,6 +3,7 @@ param storageAccountName string
 param storageTags object
 param blobContainers array
 param storageQueues array
+param blobContainerMetadata object = {}
 
 resource sa 'Microsoft.Storage/storageAccounts@2026-06-01' = {
   name: storageAccountName
@@ -30,17 +31,29 @@ resource sa 'Microsoft.Storage/storageAccounts@2026-06-01' = {
 resource blob 'Microsoft.Storage/storageAccounts/blobServices@2026-06-01' = {
   parent: sa
   name: 'default'
+  properties: {
+    deleteRetentionPolicy: { allowPermanentDelete: false, enabled: false }
+    staticWebsite: { enabled: false }
+  }
 }
 
 resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2026-06-01' = [for c in blobContainers: {
   parent: blob
   name: c
-  properties: { publicAccess: 'None' }
+  properties: {
+    publicAccess: 'None'
+    defaultEncryptionScope: '$account-encryption-key'
+    denyEncryptionScopeOverride: false
+    metadata: blobContainerMetadata[?c]
+  }
 }]
 
 resource queueSvc 'Microsoft.Storage/storageAccounts/queueServices@2026-06-01' = {
   parent: sa
   name: 'default'
+  properties: {
+    logging: { delete: false, read: false, retentionPolicy: { enabled: false }, version: '1.0', write: false }
+  }
 }
 
 resource queues 'Microsoft.Storage/storageAccounts/queueServices/queues@2026-06-01' = [for q in storageQueues: {
@@ -51,7 +64,10 @@ resource queues 'Microsoft.Storage/storageAccounts/queueServices/queues@2026-06-
 resource fileSvc 'Microsoft.Storage/storageAccounts/fileServices@2026-06-01' = {
   parent: sa
   name: 'default'
-  properties: { shareDeleteRetentionPolicy: { days: 7, enabled: true } }
+  properties: {
+    protocolSettings: { smb: { directoryLease: { enabled: false } } }
+    shareDeleteRetentionPolicy: { days: 7, enabled: true }
+  }
 }
 
 resource tableSvc 'Microsoft.Storage/storageAccounts/tableServices@2026-06-01' = {

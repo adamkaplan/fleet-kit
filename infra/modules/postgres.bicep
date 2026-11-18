@@ -13,6 +13,10 @@ resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2026-04-01-preview' = {
   tags: postgresTags
   properties: {
     version: '16'
+    dataEncryption: { type: 'SystemManaged' }
+    fipsMode: 'Disabled'
+    replica: { role: 'Primary' }
+    replicationRole: 'Primary'
     administratorLogin: postgresAdminLogin
     authConfig: { activeDirectoryAuth: 'Disabled', passwordAuth: 'Enabled' }
     storage: { storageSizeGB: 32, autoGrow: 'Disabled', tier: 'P4', iops: 120, type: 'Premium_LRS' }
@@ -33,7 +37,11 @@ resource dbs 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2026-04-01-pre
 resource rules 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2026-04-01-preview' = [for r in postgresFirewallRules: {
   parent: pg
   name: r.name
-  properties: { startIpAddress: r.startIpAddress, endIpAddress: r.endIpAddress }
+  properties: {
+    startIpAddress: r.startIpAddress
+    endIpAddress: r.endIpAddress
+    sourceAddressPrefixes: r.?sourceAddressPrefixes
+  }
 }]
 
 resource atp 'Microsoft.DBforPostgreSQL/flexibleServers/advancedThreatProtectionSettings@2026-04-01-preview' = {

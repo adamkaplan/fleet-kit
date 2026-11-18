@@ -23,6 +23,20 @@ param agentPools = [
     nodeLabels: {}
     tags: {}
   }
+  {
+    name: 'floorheavyv7'
+    mode: 'User'
+    vmSize: 'Standard_D32ads_v7'
+    osDiskSizeGB: 1760
+    osDiskType: 'Ephemeral'
+    count: 0
+    minCount: 0
+    maxCount: 2
+    enableAutoScaling: true
+    nodeLabels: { 'spire-floor-pool': 'heavy', 'sysbox-install': 'yes' }
+    nodeTaints: ['spire-floor/heavy=true:NoSchedule']
+    tags: {}
+  }
 ]
 
 param sandboxGroupName = 'sbxg-fleetkit-example'

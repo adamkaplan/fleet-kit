@@ -14,10 +14,13 @@ param aksNodeResourceGroup string
 param agentPools array
 param aksMaintenanceStartTime string = '07:00'
 param aksMaintenanceUtcOffset string = '+00:00'
+param aksMaintenanceStartDate string = '2026-11-11'
+param aksExtraProperties object = {}
 
 param sandboxGroupName string
 param sandboxGroupTags object = {}
 param connectorGatewayName string = ''
+param connectorGatewayId string = ''
 
 param acrName string
 param keyVaultName string
@@ -26,6 +29,7 @@ param storageAccountName string
 param storageTags object = {}
 param blobContainers array
 param storageQueues array
+param blobContainerMetadata object = {}
 
 param postgresServerName string
 param postgresAdminLogin string
@@ -62,6 +66,8 @@ module aks 'modules/aks.bicep' = {
     agentPools: agentPools
     maintenanceStartTime: aksMaintenanceStartTime
     maintenanceUtcOffset: aksMaintenanceUtcOffset
+    maintenanceStartDate: aksMaintenanceStartDate
+    aksExtraProperties: aksExtraProperties
   }
 }
 
@@ -72,6 +78,7 @@ module sandbox 'modules/sandbox-group.bicep' = {
     sandboxGroupName: sandboxGroupName
     sandboxGroupTags: sandboxGroupTags
     connectorGatewayName: connectorGatewayName
+    connectorGatewayId: connectorGatewayId
   }
 }
 
@@ -93,6 +100,7 @@ module storage 'modules/storage.bicep' = {
     storageTags: storageTags
     blobContainers: blobContainers
     storageQueues: storageQueues
+    blobContainerMetadata: blobContainerMetadata
   }
 }
 

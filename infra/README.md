@@ -32,8 +32,10 @@ Role definitions are passed as a full id or a bare GUID of a built-in role (thes
 
 ```
 az deployment group what-if -g <fleet-rg> -f infra/main.bicep -p infra/live.bicepparam \
-  --mode Incremental --exclude-change-types Ignore NoEffect
+  --mode Incremental --exclude-change-types Ignore NoChange
 ```
+
+`Ignore`, `NoChange` and `NoEffect` are the what-if change types that carry no change; the CLI flag takes `Ignore` and `NoChange`.
 
 Expect no `Create`, `Delete` or `Modify`. Otherwise fix the parameters (not the live resources) until it is clean.
 

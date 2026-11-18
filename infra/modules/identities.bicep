@@ -7,6 +7,7 @@ resource ids 'Microsoft.ManagedIdentity/userAssignedIdentities@2025-05-31-previe
   name: i.name
   location: i.location
   tags: i.tags
+  properties: { isolationScope: 'None' }
 }]
 
 @batchSize(1)

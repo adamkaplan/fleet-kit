@@ -27,7 +27,7 @@ resource blob 'Microsoft.Storage/storageAccounts/blobServices@2026-06-01' existi
 resource queueSvc 'Microsoft.Storage/storageAccounts/queueServices@2026-06-01' existing = { parent: sa, name: 'default' }
 
 // roleDefinitionId is the full resource id, or a bare GUID of a built-in role (documented in README).
-func roleId(id string) string => contains(id, '/') ? id : '/providers/Microsoft.Authorization/roleDefinitions/${id}'
+func roleId(id string) string => contains(id, '/') ? id : subscriptionResourceId('Microsoft.Authorization/roleDefinitions', id)
 
 resource rg 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for a in rgRoleAssignments: {
   name: a.name

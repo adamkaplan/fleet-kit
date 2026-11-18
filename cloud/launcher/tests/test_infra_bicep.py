@@ -144,7 +144,7 @@ class TestReadme(unittest.TestCase):
         self.t = slurp(os.path.join(INFRA, "README.md"))
 
     def test_rules(self):
-        for s in ["--mode Incremental", "--exclude-change-types Ignore NoEffect", "NEVER `--mode Complete`",
+        for s in ["--mode Incremental", "--exclude-change-types Ignore NoChange", "NEVER `--mode Complete`",
                   "infra-live-bicepparam", "No new identity gets Key Vault access", "operator only",
                   "NEVER target the AKS node resource group", "## Resource groups", "## Rollback",
                   "## What-if", "## Deploy", "Smoke checks", "Run-by-hand mutant"]:
