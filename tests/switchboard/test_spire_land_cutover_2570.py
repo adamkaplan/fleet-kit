@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from support.core import Base
+from support.core import Base, REAL_NODE
 from support.paths import REPO
 
 
@@ -27,9 +27,7 @@ def _load_script(rel_path, mod_name):
 
 class TestSpireLandCutover2570(Base):
     def test_s1_pin_verify_and_land_json_areas(self):
-        import os, shutil
-        node = shutil.which("node") or "/opt/homebrew/bin/node"
-        done = subprocess.run([node, ".spire/tool/pin.mjs", "verify"], cwd=str(REPO), capture_output=True, text=True, timeout=30)
+        done = subprocess.run([REAL_NODE or "node", ".spire/tool/pin.mjs", "verify"], cwd=str(REPO), capture_output=True, text=True, timeout=30)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("tool ok: 0.6.2 c275f63765b4", done.stdout)
         cfg = json.loads((REPO / ".spire" / "land.json").read_text(encoding="utf-8"))
