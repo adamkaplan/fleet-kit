@@ -19,13 +19,8 @@ PASS = "import sys\nsys.exit(0)\n"
 PLANT = "PLANTED_" + "TOK" + "EN_VALUE"  # assembled at runtime; a fake value only
 
 
-GIT_FLAGS = ("-c", "maintenance.auto=0", "-c", "gc.auto=0")
-
-
-def git(cwd, *a, runner=None):
-    if runner is not None:
-        return runner(["git", *GIT_FLAGS, *a])
-    p = subprocess.run(["git", *GIT_FLAGS, *a], cwd=cwd, capture_output=True, text=True, env=ENV)
+def git(cwd, *a):
+    p = subprocess.run(["git"] + list(a), cwd=cwd, capture_output=True, text=True, env=ENV)
     assert p.returncode == 0, (a, p.stderr)
 
 
@@ -97,19 +92,6 @@ class PreflightStep(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="prepush-pf-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
-
-    def test_git_helper_disables_auto_maintenance(self):
-        seen = []
-        git(self.tmp, "status", runner=seen.append)
-
-        def mutant_git(cwd, *a, runner=None):   # omits maintenance.auto=0
-            return runner(["git", "-c", "gc.auto=0", *a])
-        mutant_seen = []
-        mutant_git(self.tmp, "status", runner=mutant_seen.append)
-        good = " ".join(seen[0])
-        self.assertIn("-c maintenance.auto=0", good)
-        self.assertIn("-c gc.auto=0", good)
-        self.assertNotIn("-c maintenance.auto=0", " ".join(mutant_seen[0]))
 
     def test_failing_preflight_prints_its_lines_and_runs_no_test(self):
         repo = make_repo(self.tmp, TESTS)

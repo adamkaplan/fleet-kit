@@ -115,12 +115,13 @@ class TestLandText(unittest.TestCase):
     OLD_LINE = "- This repository lands with `spire land`: when done, commit, run `.spire/tool/bin/spire land` and report `landed <sha>`, or the exit code and what stopped it; exit 22 = held for a person: stop and say so.\n"   # the launch line before this fix
 
     def detached_problems(self, text):
-        """What is wrong with a launch text's land step: a `spire land` run outside the detached `nohup sh -c '...' &` command, or no detached command, poll or progress report."""
-        detached = r"nohup sh -c '\.spire/tool/bin/spire land > /work/land\.log 2>&1;[^']*' > /dev/null 2>&1 &"
+        """What is wrong with a launch text's land step: a `spire land` run outside the detached `cw-run start --name land -- ...` command, a raw nohup, or no detached command, poll or progress report."""
+        detached = r"cw-run start --name land -- \.spire/tool/bin/spire land"
         bad = []
         rest = re.sub(detached, "", text)
         bad += [("foreground run", m) for m in re.findall(r"\.spire/tool/bin/spire land", rest)]
-        for need in ("sleep 120; tail -n 20 /work/land.log", "land step"):
+        bad += [("raw nohup", "nohup") for ln in text.splitlines() if "spire land" in ln and re.search(r"\bnohup\b", ln)]
+        for need in ("cw-run wait land 120", "cw-run tail land 50", "land step"):
             if need not in text:
                 bad.append(("missing", need))
         if not re.search(detached, text):
@@ -136,6 +137,13 @@ class TestLandText(unittest.TestCase):
         self.assertIn(("foreground run", ".spire/tool/bin/spire land"), self.detached_problems(text))
         self.assertIn(("missing", "the detached command"), self.detached_problems(text))
         self.assertIn(("foreground run", ".spire/tool/bin/spire land"), self.detached_problems(".spire/tool/bin/spire land > /work/land.log 2>&1 &"))   # redirected but not under nohup
+
+    def test_mutant_not_detached_is_caught(self):
+        self.assertEqual(self.detached_problems(fpn.sb.LAND_SETUP_LINE), [])   # the control first
+        mutant = fpn.sb.LAND_SETUP_LINE.replace("cw-run start --name land -- ", "nohup ")
+        self.assertNotEqual(mutant, fpn.sb.LAND_SETUP_LINE)
+        with self.assertRaisesRegex(AssertionError, "foreground run|missing"):
+            self.assertEqual(self.detached_problems(mutant), [])
 
     def test_no_text_claims_an_acme_org_default_for_land_repos(self):
         for path in ("docs/switchboard.md", "skills/fleet-coordination/SKILL.md", "skills/fleet-review/SKILL.md", "skills/fleet-explainer/SKILL.md"):
@@ -160,7 +168,8 @@ class TestLandText(unittest.TestCase):
             text = (ROOT / path).read_text()
             self.assertIn(".spire/tool/bin/spire land", text, path)
             self.assertIn("exit 22 = held for a person: stop and say so", text, path)
-            self.assertIn("nohup sh -c '.spire/tool/bin/spire land > /work/land.log 2>&1;", text, path)
+            self.assertIn("cw-run start --name land -- .spire/tool/bin/spire land", text, path)
+            self.assertNotIn("nohup", fpn.sb.LAND_STEP, path)   # the checklist's scan-avoidance line may name it; the land step never does
             self.assertIn(fpn.sb.LAND_STEP, text, path)   # the step is the launcher's own, word for word (no drift)
             self.assertEqual(self.detached_problems(text), [], path)
             self.assertIn("This repository lands with `spire land`", text, path)   # tied to the launcher's own marker

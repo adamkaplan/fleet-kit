@@ -53,6 +53,11 @@ def problems(t):
     flat = t.replace("\\\n", " ")
     if re.search(r"^(?:RUN|ENV)\b[^\n]*(?:\bln\b[^\n]*\bpython3?\b|update-alternatives[^\n]*python)", flat, re.M):
         out.append("python3 or python linked")
+    pin = "USER worker\nWORKDIR /home/worker\nRUN /usr/local/bin/mise install python@3.11"
+    at = t.find(pin)
+    tail = t[at:t.find("EXPOSE 4096", at)] if at >= 0 else ""
+    if at < 0 or "EXPOSE 4096" not in t[at:] or "/home/worker/.cache/mise" not in tail or "lib/python*/test" not in tail:
+        out.append("python@3.11 not preinstalled for worker")
     envs = re.findall(r"^ENV\b((?:[^\n]*\\\n)*[^\n]*)", t, re.M)
     for e in envs:
         for name in re.findall(r"(?:^|\s)([A-Za-z_]\w*)=", e.replace("\\\n", " ")):
@@ -83,6 +88,10 @@ class T(unittest.TestCase):
         self.assertEqual(problems(read(DF)), [])  # the control first
         self.assertIn(UNCHECKED, problems(self.mut(CHECK, "")))
 
+    def test_mutant_python311_dropped(self):
+        self.assertEqual(problems(read(DF)), [])  # the control first
+        self.assertIn("python@3.11 not preinstalled for worker", problems(self.mut("RUN /usr/local/bin/mise install python@3.11", "RUN true")))
+
     def test_mutant_masked(self):
         self.assertTrue(problems(self.mut("sha256sum -c - \\\n && tar -xzf /tmp/mise.tgz", "sha256sum -c - || true \\\n && tar -xzf /tmp/mise.tgz")))
 
@@ -99,7 +108,7 @@ class T(unittest.TestCase):
 
     def test_docs(self):
         d = read(os.path.join(CLOUD, "README.md"))
-        self.assertTrue("mise` v2026.11.6" in d and "MISE_VERSION" in d and "MISE_SHA256" in d and "install at run time" in d)
+        self.assertTrue("mise` v2026.11.6" in d and "MISE_VERSION" in d and "MISE_SHA256" in d and "`python@3.11` is preinstalled" in d and "image build time" in d)
 
 
 if __name__ == "__main__":
