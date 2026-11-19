@@ -3,6 +3,7 @@
 {"<consumer>|<repository>": the created_at (ISO, UTC) of the newest comment held}. Bounded: at most MAX_KEYS keys and MAX_BYTES bytes; written only when
 the content changes (mode 0600, renamed into place). Read through `parse` (record_json.parse_bounded, handed in by the daemon).
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -82,7 +83,11 @@ def load_gaps(state_dir, parse):
 
 def save_gaps(state_dir, gaps, parse):
     """Writes the open gaps atomically (mode 0600) when the content changes; bounded in keys, ids and bytes. False when it could not be written."""
-    new = {k: dict({"edge": v["edge"], "ids": list(v["ids"])[-GAP_MAX_IDS:]}, **({"gap": v["gap"]} if v.get("gap") else {})) for k, v in sorted(gaps.items(), key=lambda kv: kv[1]["edge"])[-GAP_MAX_KEYS:]}
+    new = {}
+    for k, v in sorted(gaps.items(), key=lambda kv: kv[1]["edge"])[-GAP_MAX_KEYS:]:
+        new[k] = {"edge": v["edge"], "ids": list(v["ids"])[-GAP_MAX_IDS:]}
+        if v.get("gap"):
+            new[k]["gap"] = v["gap"]
     if load_gaps(state_dir, parse) == new:
         return True
     path = Path(state_dir) / GAP_FILE
@@ -104,7 +109,6 @@ HELD_MAX_BYTES = 24 << 20
 
 
 def _held_path(state_dir, name):
-    import hashlib
     return Path(state_dir) / ("comment-held-%s.json" % hashlib.sha1(name.encode("utf-8")).hexdigest()[:16])
 
 

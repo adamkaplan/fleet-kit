@@ -11637,8 +11637,11 @@ class GitHubHub:
             self._comment_gap_edges.pop(key, None)
         self._keep_comment_gap(key, since, have, gaps, kept, parse, store)
         newest = max((v["created_at"] for v in have.values()), default=None)
-        store.save_held(self.state_dir, name, have)
-        if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
+        kept_held = store.save_held(self.state_dir, name, have)   # the cursor never runs ahead of the held file: a restart would skip the comments between
+        if not kept_held and self.audit is not None and name not in self.__dict__.setdefault("_held_unwritten", set()):
+            self._held_unwritten.add(name)
+            self.audit.append(self.actor, "comment_cursor.held_unwritten", repo, {"repo": repo, "consumer": consumer})
+        if kept_held and newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
             cursors[name] = newest
             store.save(self.state_dir, cursors, parse)
         merged = sorted(have.values(), key=lambda r: r["created_at"], reverse=True) + list(loose_held.values())   # stable: equal seconds keep the API order, as read_pages gave them
