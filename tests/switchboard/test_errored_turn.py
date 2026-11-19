@@ -82,6 +82,7 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             self.assertEqual(code, 0, err.getvalue())
             self.assertEqual(len(self.world.admissions("c6-499")), 1)
             self.assertEqual(self.holds(), [])
+            self.world.engine.collect_facts()   # as a real pass does: the open requests are known
             for name in REAL:
                 self.assertFalse(self.world.engine.send("cos", name, "hello")["sent"])
                 self.assertEqual(self.world.admissions(name), [])

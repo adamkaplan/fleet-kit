@@ -383,6 +383,7 @@
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
+        "bin/caretaker_config.py": ["validate"],
         "bin/agent_presence.py": [
           "*"
         ],

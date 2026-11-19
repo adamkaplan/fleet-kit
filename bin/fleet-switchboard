@@ -70,6 +70,7 @@ def _fleet_parts(after=False):
         exec(code, globals())
 
 
+_ENTRY_DOC = __doc__
 _fleet_parts()
 import argparse
 import base64
@@ -338,7 +339,8 @@ triage_digest = load_triage_digest()
 dead_hint = load_dead_hint()
 
 VERSION = "0.1.0"
-PROG, EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PARTIAL, EXIT_HELD, EXIT_MEMORY, EXIT_CRASH = (getattr(load_module("switchboard_names"), n) for n in ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "EXIT_PARTIAL", "EXIT_HELD", "EXIT_MEMORY", "EXIT_CRASH"))   # bin/switchboard_names.py: the names a command needs
+PROG = "fleet-switchboard"
+EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PARTIAL, EXIT_HELD, EXIT_MEMORY, EXIT_CRASH = (getattr(load_module("switchboard_names"), n) for n in ("EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "EXIT_PARTIAL", "EXIT_HELD", "EXIT_MEMORY", "EXIT_CRASH"))   # bin/switchboard_names.py: the names a command needs
 
 # ------------------------------------------------------------------ the config
 
@@ -9185,7 +9187,8 @@ def undelivered_wake_tick(engine, discovery):
 
 
 # ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported").
-BLOCKED_ALERT_DEFAULTS, BLOCKED_ALERT_STATE = {"minutes": 20, "repeat_minutes": 60}, "blocked-alert.json"
+BLOCKED_ALERT_DEFAULTS = {"minutes": 20, "repeat_minutes": 60}
+BLOCKED_ALERT_STATE = "blocked-alert.json"
 def validate_blocked_alert_config(config, source):
     """`blocked_alert`: absent or null is the defaults (on); false is off; else {"minutes", "repeat_minutes"}, numbers above 0."""
     if "blocked_alert" not in config or config["blocked_alert"] is None:
@@ -9550,7 +9553,7 @@ def hold_send_fact(engine, fact, now):
     if engine.audit is not None:
         engine.audit.append(engine.actor, "held", fact.recipient, {"from": blocked_sender(fact.sender), "key": key})
     tell_dropped_sends(engine, [(fact.recipient, r) for r in dropped], now, "over %d held sends or older than 24 hours" % HELD_SENDS_KEEP)
-    return {"sent": False, "held": True, "action": "held", "key": key, "reason": "held until %s unblocks" % fact.recipient}
+    return {"sent": False, "held": True, "action": "held", "key": key, "recipient": fact.recipient, "reason": "held until %s unblocks" % fact.recipient}
 
 
 def hold_send_endpoint(engine, name, sender, text, issue, now):
@@ -11638,7 +11641,7 @@ class GitHubHub:
             self._comment_gap_edges.pop(key, None)
         self._keep_comment_gap(key, since, have, gaps, kept, parse, store)
         newest = max((v["created_at"] for v in have.values()), default=None)
-        kept_held = store.save_held(self.state_dir, name, have)   # the cursor never runs ahead of the held file: a restart would skip the comments between
+        kept_held = store.save_held(self.state_dir, name, {k: dict(v, body=scrub_signed_links(v["body"])) if isinstance(v, dict) and isinstance(v.get("body"), str) else v for k, v in have.items()})   # a signed link token never reaches the file;  the cursor never runs ahead of the held file: a restart would skip the comments between
         if not kept_held and self.audit is not None and name not in self.__dict__.setdefault("_held_unwritten", set()):
             self._held_unwritten.add(name)
             self.audit.append(self.actor, "comment_cursor.held_unwritten", repo, {"repo": repo, "consumer": consumer})
@@ -24580,7 +24583,8 @@ def derive_action_groups():
     ENSURE_ON_USE_COMMANDS = tuple(chosen["ensure_on_use"])
 
 
-_fleet_parts(after=True)   # the parts listed after the entry, before the command groups are read from them
+_fleet_parts(after=True)
+__doc__ = _ENTRY_DOC; globals().pop("_ENTRY_DOC", None)   # the parts listed after the entry, before the command groups are read from them
 derive_action_groups()
 
 

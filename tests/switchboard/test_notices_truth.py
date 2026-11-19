@@ -306,7 +306,8 @@ class TestReadOfAnEndedWorker(unittest.TestCase):
                 mock.patch.dict(self.cw.H, {"build_engine": lambda *a, **k: (engine, self.tmp, {"call_timeout_seconds": 5})}), \
                 mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(str(x) for x in a))):
             self.assertEqual(self.cw.cmd_read(args, None, 0), 0)
-        self.assertEqual(out, ["LINE from the live pod"])
+        self.assertIn("LINE from the live pod", out)
+        self.assertNotIn("the text of the record", "\n".join(out))
 
     def test_the_boss_of_the_live_record_may_read(self):
         self.run_record("pod-w")

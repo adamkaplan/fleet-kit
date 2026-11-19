@@ -8,6 +8,7 @@ import time
 FILE = "pass-timing.json"
 SLOW_SECONDS = 30
 KEEP = 20
+HEARTBEAT_SECONDS = 300   # an idle pass rewrites the record at most this often
 READ_CAP = 256 * 1024
 
 
@@ -53,7 +54,8 @@ def finish(timer, state_dir, audit, actor, at):
         if slow and audit is not None:
             seconds = got["stages"].get(got["slowest"], got["total"])
             audit.append(actor, "pass.slow", None, {"stage": got["slowest"], "seconds": seconds, "total": got["total"], "stages": got["stages"]})
-        if state_dir is not None:
+        path = None if state_dir is None else os.path.join(str(state_dir), FILE)
+        if path is not None and (slow or not os.path.exists(path) or time.time() - os.path.getmtime(path) >= HEARTBEAT_SECONDS):
             passes = load(state_dir) + [dict(got, at=at)]
             path = os.path.join(str(state_dir), FILE)
             tmp = "%s.%d.tmp" % (path, os.getpid())

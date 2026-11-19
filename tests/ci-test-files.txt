@@ -23,3 +23,5 @@ exempt plugins/opencode-todolist/tests/timing.test.ts | a TypeScript test: the w
 exempt plugins/opencode-todolist/tests/todolist.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
 exempt plugins/opencode-todolist/tests/tui-data.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
 exempt plugins/opencode-todolist/tests/tui-settings.test.ts | a TypeScript test: the workflow installs no TypeScript runner (no bun, no setup-node), so CI cannot run it
+exempt tests/test_pass_timing.py | run by the switchboard suite's own runner rather than by a workflow step of its own
+exempt tests/test_worker_turns.py | run by the switchboard suite's own runner rather than by a workflow step of its own

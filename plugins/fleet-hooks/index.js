@@ -45,7 +45,7 @@ export function toolOf(action) {
 export function childEnv(env = process.env) {
   const out = {};
   for (const [name, value] of Object.entries(env)) {
-    if (CHILD_ENV.includes(name) || name.startsWith("FLEET_SWITCHBOARD_")) out[name] = value;
+    if (CHILD_ENV.includes(name) || (name.startsWith("FLEET_SWITCHBOARD_") && !name.startsWith("FLEET_SWITCHBOARD_PORT") && !name.startsWith("FLEET_SWITCHBOARD_SERVICE_"))) out[name] = value;
   }
   return out;
 }

@@ -213,13 +213,13 @@ def repeat_record(state_dir, to, kind, subject, state, now, window=None):
             raise
 
 
-def add_repeat_reminder(state_dir, to, at, created, text, kind, subject, state, first=False, answered_at=None, **more):
+def add_repeat_reminder(state_dir, to, at, created, text, kind, subject, state, first=False, answered_at=None, window=REPEAT_WINDOW, **more):
     """add_reminder behind the repeat rule: returns the item, or None when it is a repeat held back. The repeat is recorded only AFTER the
     reminder was stored: a failed add leaves nothing recorded, so the next tick delivers it."""
-    if repeat_held(state_dir, to, kind, subject, state, at, first=first, answered_at=answered_at):
+    if repeat_held(state_dir, to, kind, subject, state, at, first=first, answered_at=answered_at, window=window):
         return None
     item = add_reminder(state_dir, to, at, created, text, **more)
-    repeat_record(state_dir, to, kind, subject, state, at)
+    repeat_record(state_dir, to, kind, subject, state, at, window=window)
     return item
 
 

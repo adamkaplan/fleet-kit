@@ -3064,7 +3064,7 @@ class TestEnsure(Base):
         for name in ("HERDR_PLUGIN_ID", "HERDR_PLUGIN_EVENT", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"):
             self.assertNotIn(name, env)
         self.assertEqual(stat.S_IMODE((self.state / "daemon.log").stat().st_mode), 0o600)
-        self.assertNotIn(kwargs["stdout"], (subprocess.PIPE, None, sys.stdout.fileno()))
+        self.assertNotIn(kwargs["stdout"], (subprocess.PIPE, None, sys.__stdout__.fileno()))
         self.assertEqual(kwargs["stdout"], kwargs["stderr"])
 
     def test_a_running_daemon_is_left_alone(self):
@@ -13694,7 +13694,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
     def test_a_mutant_without_the_escape_shows_the_hostile_text(self):
         """One escape for every sink: with it removed the hostile value shows in the audit and on stderr (so the tests above fail for it)."""
         self.orchestrator("orch-b", registry=None)
-        with mock.patch.object(sb, "charter_safe", lambda text: str(text)):
+        with mock.patch.object(sb, "charter_safe", lambda text: str(text)), mock.patch.object(sb, "charter_repo_safe", lambda text: str(text)):
             code, out, err = self.run_as("cos", "charter", "set", "orch-b", "<b>x\ny")
         self.assertIn("<b>", err)
         self.assertIn("<b>", json.dumps([e["detail"] for e in self.audit_lines()]))
@@ -80321,6 +80321,7 @@ TestBriefPiecesPure, TestBriefPiecesFloor, TestBriefPiecesRecord = _ibp.TestBrie
 # A class in the first group that builds a World or a rig fails the test below: it must derive from Base.
 NOT_ISOLATED_BY_BASE = {
     "builds no World, rig or state path: it reads source text, parses strings or runs pure functions": (
+    "TestCaretaker2573", "TestForeignPrefixParkedLabel", "TestIntentToastOnce", "TestPublicNamesGuard",
     "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
     "Fixture", "HubFilesUnchanged", "JanitorIdentity", "Launcher", "OneWorkerAndCancel", "PendingJobs", "RelayLoopCadence", "RelayObeysTheTreeGuard",
     "ReviewCommentIsolationTests", "Rig", "TestReminderGridAndRecurring", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
@@ -80394,7 +80395,7 @@ NOT_ISOLATED_BY_BASE = {
     "TestReviewerBlockLines", "TestReviewerBlockLinesControl",   # (#2512) read text files of the repository and strings in memory: no World, rig or state path
     ),
     "makes its own temporary directory or state (a tempfile.mkdtemp, a patched environment or its own isolating setUp) and never reads the real one": (
-    "TestEveryTestClassIsolates", "TestGatedDaemonSends", "TestJobsActiveFor", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
+    "TestEveryTestClassIsolates", "TestClassLabels", "TestGatedDaemonSends", "TestJobsActiveFor", "BodyRig", "TestDirectReads", "TestGateProbeReads", "TestGhBodyGuard", "TestGhBodyMutants", "TestGhBodyRefusalIsPure",
     "TestImpactEntriesLoader", "TestImpactEntriesMerge", "TestImpactEntriesMissing",   # (#2247) each makes its own private directory (a mkdtemp or a TemporaryDirectory); the files came with #2215, #2219, #2220
     "Case", "HeaderCacheBase", "TestCloudWatchBounds", "TestCloudWatchTick", "TestGatePass", "TestHostDisk", "TestIsolation", "TestSafety",
     "TestBatchCarry", "TestGhBodyReadHasItsOwnClock", "TestEndNoticeLastHead", "TestReadOfAnEndedWorker", "TestRunRecordKeepsTheResultsFile", "TestTheProductionWiring",   # (#2247, #2392) each makes its own TemporaryDirectory or mkdtemp (removed by addCleanup; TestReadOfAnEndedWorker also patches CW_RUN_RECORD_DIR to it) and reads no real state; TestBatchCarry and TestGhBodyReadHasItsOwnClock came with #1028 and #2257, the last three with #2392

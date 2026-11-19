@@ -123,6 +123,7 @@ cloud/launcher/tests/test_run_record.py
 cloud/launcher/tests/test_safe_to_evict.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_scrub_linear.py
+cloud/launcher/tests/test_scrub_path.py
 cloud/launcher/tests/test_scrub_pieces.py
 cloud/launcher/tests/test_secret_dir.py
 cloud/launcher/tests/test_secret_dir_publish.py

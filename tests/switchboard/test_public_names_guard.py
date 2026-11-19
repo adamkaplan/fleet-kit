@@ -10,7 +10,7 @@ class TestPublicNamesGuard(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.audit = mock.Mock()
-        mod = HOST
+        mod = HOST.sb
         self.sb = mod
         self.write = mod.github_audited(lambda repo, body: (self.audit, "cli", "POST", "repos/%s/issues/1/comments" % repo, repo, 1))(
             lambda repo, body: self.calls.append(body) or "ok")

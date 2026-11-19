@@ -19,6 +19,18 @@ PROTECTED_SUFFIXES = (":charter", ":orchestrator", ":parked", ":awaiting-user", 
 OBSOLETE_RE = re.compile(r"\b(cw-worker|pod-launch|pod reaper|cloud_reaper|integration branch)\b", re.I)
 
 
+if "github_write" not in globals():   # imported standalone: the audit is the switchboard's own when it is assembled, a no-op here
+    class github_write:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return {}
+
+        def __exit__(self, *exc):
+            return False
+
+
 DEFAULT_OTHER_LABELS = ("agent:firstmate",)
 
 
@@ -52,7 +64,7 @@ def classify_issue(issue, cutoff_iso, other_owners=(), other_labels=DEFAULT_OTHE
     return ("raise", "cos")
 
 
-def run_caretaker(config=None, apply_changes=False, days=14, now_dt=None, runner=subprocess.run, gh_bin="gh"):
+def run_caretaker(config=None, apply_changes=False, days=14, now_dt=None, runner=subprocess.run, gh_bin="gh", audit=None):
     """Scan watched repos for 14+ day stale open issues, close obsolete ones when apply_changes=True, and return a 1-line summary."""
     if config is None:
         home = pwd.getpwuid(os.getuid()).pw_dir
@@ -103,10 +115,13 @@ def run_caretaker(config=None, apply_changes=False, days=14, now_dt=None, runner
                 skipped_parked.append(ref)
             elif action == "close":
                 if apply_changes:
-                    cl = runner(
-                        [gh_bin, "issue", "close", str(num), "-R", repo, "--reason", "not planned", "--comment", detail],
-                        capture_output=True, text=True, env=env, timeout=30,
-                    )
+                    if audit is None and "github_state_audit" in globals():
+                        audit = globals()["github_state_audit"]()
+                    with github_write(audit, "caretaker", "POST", "repos/%s/issues/%s" % (repo, num), repo, num):
+                        cl = runner(
+                            [gh_bin, "issue", "close", str(num), "-R", repo, "--reason", "not planned", "--comment", detail],
+                            capture_output=True, text=True, env=env, timeout=30,
+                        )
                     if cl.returncode != 0:
                         errors.append("%s:close-failed" % ref)
                         continue

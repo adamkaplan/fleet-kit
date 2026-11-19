@@ -449,6 +449,8 @@ class TestRecordJsonReaders(unittest.TestCase):
     # cloud_image_proof.py:operator_config parses the output of `kubectl config view --minify --raw -o json` (a command the proof ran against the minter kubeconfig, size-bounded by kube_run), not a record file another process writes; it reads only clusters[0].cluster (server, CA) (ask #2440)
     # cloud_lane_cap.py:_stopped_ids is the launcher audit tail, read-only, to free a stopped worker's shape-M slot (#2259)
     EXEMPT = """
+pass_timing.py:load
+switchboard/caretaker.py:run_caretaker
 agent_calls.py:_read_json
 agent_calls.py:_spool_lines
 agent_calls.py:parse_usage

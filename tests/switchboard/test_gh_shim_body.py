@@ -279,6 +279,11 @@ class TestGhBodyReadHasItsOwnClock(FakeGhMixin, unittest.TestCase):
 
     def test_S2_control_today_s_code_refuses_with_the_old_text(self):
         import subprocess as sp
+        sha = "18923d472731d74b58033e1a9ddd6f0accf631c4"
+        if sp.run(["git", "rev-parse", "--verify", "--quiet", sha + "^{commit}"], cwd=str(REPO), capture_output=True).returncode != 0:   # a shallow clone
+            sp.run(["git", "fetch", "--depth=1", "origin", sha], cwd=str(REPO), capture_output=True)
+            if sp.run(["git", "rev-parse", "--verify", "--quiet", sha + "^{commit}"], cwd=str(REPO), capture_output=True).returncode != 0:
+                self.skipTest("the control commit is not available (shallow clone, offline)")
         source = sp.run(["git", "show", "18923d472731d74b58033e1a9ddd6f0accf631c4:shims/gh_body.py"], cwd=str(REPO), capture_output=True, text=True, check=True).stdout
         path = pathlib.Path(self.dir.name) / "old_gh_body.py"
         path.write_text(source)

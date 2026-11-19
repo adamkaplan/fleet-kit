@@ -662,7 +662,7 @@ class TestPrFlag(unittest.TestCase):
     def test_the_pull_requests_own_head_is_read(self):
         root = merged_fixture()
         path = fake_gh(git(root, "rev-parse", "HEAD").stdout.strip())
-        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main", "--pr", "7", env={"PATH": path})
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main", "--pr", "7", env={"PATH": path, "FLEET_REAL_GH": path.split(os.pathsep)[0] + "/gh"})
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("lib/calc.py", done.stdout + done.stderr)
 
