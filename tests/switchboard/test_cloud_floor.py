@@ -1007,13 +1007,15 @@ class TestFloorAuthority(FloorCase):
                 self.name, self.session_id, self.pane, self.status, self.fleet = name, session_id, pane, status, fleet
                 self.errored = False
 
-        names = ("widget-api", "widget-web", "widget-bad")
+        names = ("widget-api", "widget-web", "widget-bad", "widget-fail")
         disc = argparse.Namespace(agents={n: Obs(n, "ses_" + n, None, "working", {}) for n in names})
         self.floor.apply_pane_state_to_discovery({
             "widget-api": {"status": "idle", "idle_at": 1},
             "widget-web": {"status": "idle", "outcome": "done"},
             "widget-bad": {"status": "idle", "errored": True},
+            "widget-fail": {"status": "idle", "outcome": "failed"},
         }, disc)
+        self.assertEqual(disc.agents["widget-fail"].outcome, "failed")
         self.assertEqual(disc.agents["widget-api"].outcome, "succeeded")
         self.assertEqual(disc.agents["widget-web"].outcome, "done")
         self.assertIsNone(disc.agents["widget-bad"].outcome)
