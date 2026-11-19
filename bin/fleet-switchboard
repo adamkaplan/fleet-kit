@@ -13722,14 +13722,7 @@ def _cmd_send(args, runner, now):
     return EXIT_OK
 
 
-def _send_one(args, runner, now):
-    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
-    if remote is not None:
-        return run_cloud("cmd_send", args, runner, now, remote)
-    if relay_cli_done("send", {"to": args.name, "text": " ".join(args.text).strip(), "issue": getattr(args, "issue", None)}):
-        print("msg_cluster_" + uuid.uuid4().hex[:16])
-        sys.stderr.write("%s: delivered to %s (cluster)\n" % (PROG, args.name))
-        return EXIT_OK
+def _send_system_check(args):
     system = load_module("system_sender")   # #2518: a registered system sender is proved by the calling process; the claim variable and --from only NAME one
     claim = os.environ.get(system.SYSTEM_SENDER_ENV) or None
     args.system_proven = False
@@ -13739,6 +13732,23 @@ def _send_one(args, runner, now):
             sys.stderr.write("%s: %s\n" % (PROG, line))
             return EXIT_ERROR
         args.sender, args.system_proven = claim, True
+    return None
+
+
+def _send_one(args, runner, now):
+    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
+    if remote is not None:
+        refused = _send_system_check(args)
+        if refused is not None:
+            return refused
+        return run_cloud("cmd_send", args, runner, now, remote)
+    if relay_cli_done("send", {"to": args.name, "text": " ".join(args.text).strip(), "issue": getattr(args, "issue", None)}):
+        print("msg_cluster_" + uuid.uuid4().hex[:16])
+        sys.stderr.write("%s: delivered to %s (cluster)\n" % (PROG, args.name))
+        return EXIT_OK
+    refused = _send_system_check(args)
+    if refused is not None:
+        return refused
     routed = _send_by_registry(args, runner, now)
     if routed is not None:
         return routed

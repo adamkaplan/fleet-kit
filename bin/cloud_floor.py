@@ -1079,7 +1079,7 @@ def pane_relay_pass(engine, sb_mod, env=None):
     for source in getattr(engine, "sources", ()):
         if facts is not None and isinstance(source, facts):
             try:
-                source.poll(discovery, engine.now())
+                source()   # WorkerFacts is callable and reads engine.discovery
             except Exception as err:
                 _warn("worker fact collection", err)
     try:
