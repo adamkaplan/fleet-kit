@@ -618,11 +618,16 @@
         "bin/switchboard/audit.py": [
           "AuditLog",
           "GithubAuditRefused",
+          "PublicNamesListBad",
+          "PublicNamesRefused",
           "_sensitive",
+          "_strings_of",
           "github_state_audit",
           "github_write",
           "github_write_subject",
+          "private_name_terms",
           "redact",
+          "refuse_private_names",
           "utc_now"
         ],
         "bin/switchboard/decision.py": [
