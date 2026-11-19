@@ -979,6 +979,18 @@ class TestFloorAuthority(FloorCase):
         self.assertIn("build broke", texts[1])
         self.assertEqual(audit.append.call_count, 2)
 
+    def test_watch_sync_observes_a_transport_with_no_session_map(self):
+        class T:
+            pass
+        self.floor.TRANSPORT = T()
+        engine = mock.Mock(audit=mock.Mock(), actor="sw")
+        records = [{"worker": "a", "backend": "floor", "work_id": "w-1", "reports_to": "cos"}]
+        with mock.patch.object(self.m, "save_record", lambda *a: None), \
+                mock.patch.object(self.floor, "_observe", return_value={"state": "done", "landed_sha": "def456"}):
+            self.floor.floor_watch_sync(self.state, records, engine)
+        self.assertEqual(records[0]["floor_state"], "done")
+        self.assertIn("landed_sha=def456", engine.send.call_args.args[2])
+
     def test_pod_silence_summary_reads_a_floor_session_without_the_launcher(self):
         cloud = mock.Mock()
         cloud.route.return_value = {"worker": "a", "backend": "floor", "session": "ses_example"}

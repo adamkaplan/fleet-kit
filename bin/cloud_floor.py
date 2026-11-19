@@ -941,6 +941,8 @@ def floor_watch_sync(state_dir, records, engine=None):
     try:
         held = transport()
         sessions = held._state()["sessions"] if hasattr(held, "_state") else getattr(held, "works", None)
+        if sessions is None and not hasattr(held, "_state"):
+            sessions = {}   # a transport with no session map (HTTP): each record is observed one by one below
         if not isinstance(sessions, dict):
             return records
         sessions = {k: v for k, v in sessions.items() if isinstance(v, dict)}
@@ -962,7 +964,8 @@ def floor_watch_sync(state_dir, records, engine=None):
         if found is None and not hasattr(held, "_state"):
             try:
                 found = _observe(record)
-            except Exception:
+            except Exception as err:
+                print("floor_watch_sync: the Floor session of %s was not read (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
                 found = None
         found = found if isinstance(found, dict) else {}
         s_state = found.get("state")
@@ -989,9 +992,9 @@ def floor_watch_sync(state_dir, records, engine=None):
                 else:
                     msg = "Floor worker %s finished (failed): %s" % (record["worker"], scrub(found.get("error") or "unknown error", 200))
                 try:
-                    engine.send("switchboard", boss.strip(), msg, issue=record.get("issue"), repo=record.get("repo"))
-                    record["terminal_woken"] = True
+                    record["terminal_woken"] = True   # saved BEFORE the send: a failed save never leads to a second wake
                     D["save_record"](state_dir, record)
+                    engine.send("switchboard", boss.strip(), msg, issue=record.get("issue"), repo=record.get("repo"))
                 except Exception as err:
                     record.pop("terminal_woken", None)
                     print("floor_watch_sync: terminal wake for %s failed (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
