@@ -777,16 +777,21 @@ def ensure_switchboard_auth_file(env=None, fetch_secret=None):
     if fetch_secret is None:
         def fetch_secret(vault_name, name):
             import subprocess
-            done = subprocess.run(["az", "keyvault", "secret", "show", "--vault-name", vault_name, "--name", name, "--query", "value", "-o", "tsv"],
-                                  capture_output=True, text=True, timeout=15)
-            return done.stdout.strip() if done.returncode == 0 else ""
+            try:
+                done = subprocess.run(["az", "keyvault", "secret", "show", "--vault-name", vault_name, "--name", name, "--query", "value", "-o", "tsv"],
+                                      capture_output=True, text=True, timeout=15)
+            except subprocess.TimeoutExpired:
+                raise FloorError(504, "reading secret %s from vault %s timed out after 15s: retry" % (name, vault_name))
+            if done.returncode != 0:
+                raise FloorError(502, "could not read secret %s from vault %s (az exit %d): check az login and access" % (name, vault_name, done.returncode))
+            return done.stdout.strip()
     value = fetch_secret(vault, secret_name)
     if not isinstance(value, str) or not value.strip():
         return None
     path = auth_file or os.path.join(os.path.expanduser("~"), ".config", "fleet-switchboard", "switchboard-relay.auth")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = "%s.tmp%d" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".relay-auth-", dir=os.path.dirname(path) or ".")
     with os.fdopen(fd, "w") as handle:
         handle.write(value.strip() + "\n")
     os.chmod(tmp, 0o600)
@@ -822,12 +827,12 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
             state["audit"].append({"event": "spoofed_sender", "agent": auth["agent"], "session": auth["session"], "claimed": scrub(body[spoof], 40)})
     text = scrub(body.get("text", ""), 4000) if isinstance(body.get("text", ""), str) else ""
     if route in (("POST", "/v1/intent"), ("GET", "/v1/intent")):
-        if route[0] == "GET" or body.get("action") == "list":
+        if route[0] == "GET" or body.get("action") in ("list", "show"):
             return 200, {"intents": state.get("intents") or []}
         state.setdefault("intents", []).append({"action": body.get("action") or "set", "issue": body.get("issue"), "text": text, "from": auth["agent"]})
         return 200, {"recorded": True, "intents": state["intents"]}
     if route in (("POST", "/v1/decisions"), ("GET", "/v1/decisions")):
-        if route[0] == "GET" or body.get("action") == "list":
+        if route[0] == "GET" or body.get("action") in ("list", "show"):
             return 200, {"decisions": state.get("decisions") or []}
         title = body.get("title", "")
         state.setdefault("decisions", []).append({"action": body.get("action") or "batch", "title": scrub(title, 200) if isinstance(title, str) else "",
