@@ -390,6 +390,11 @@ def build():
             self.assertTrue(reads)
             self.assertEqual(self.audit("plan_wake.announced"), [])
 
+        def test_a_truncated_held_plan_whose_reread_returns_nothing_is_skipped(self):
+            record, full, reads = self.truncated_world(None)
+            self.assertTrue(reads)
+            self.assertEqual(self.audit("plan_wake.announced"), [])
+
         def test_s5_a_work_item_with_its_own_done_when_is_checked_against_it_not_its_asks(self):
             self.add(3, parent=2, body="## Intent\nx\nDone when: " + "an entirely different own outcome that the plan does not state")
             self.post(3, self.plan())

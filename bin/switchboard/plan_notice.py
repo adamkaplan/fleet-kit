@@ -104,9 +104,11 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
                     budget[0] -= 1
                 try:
                     full = hub._read_one(repo, "issues/comments/%d" % plan["id"], now, fresh=True)
-                except Exception:
+                except Exception as err:
+                    engine._note("plan_wake.error", "%s#%d" % (repo, number), {"error": "the full plan body cannot be re-read: %s" % _one_line(type(err).__name__, 40)})
                     continue
                 if not isinstance(full, dict) or not isinstance(full.get("body"), str) or "\n" not in full["body"]:
+                    engine._note("plan_wake.error", "%s#%d" % (repo, number), {"error": "the re-read comment is not a full plan body"})
                     continue
                 plan["body"] = body = full["body"]
                 plan.pop("body_truncated", None)
