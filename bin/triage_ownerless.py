@@ -43,7 +43,7 @@ def lane_named(item, lanes):
     return bool(name) and name.lower() in lanes
 
 
-def is_other_owner(item, other_owners):
+def is_others_issue(item, other_owners):
     """True when the issue's author or any assignee is in `other_owners` (case-insensitive)."""
     others = {str(x).strip().lower() for x in (other_owners or ()) if str(x).strip()}
     if not others:
@@ -54,13 +54,13 @@ def is_other_owner(item, other_owners):
     return any(str(a).strip().lower() in others for a in (item.get("assignees") or ()) if str(a).strip())
 
 
-def other_owner_count(items, other_owners, now, days=DEFAULT_DAYS):
+def others_issue_count(items, other_owners, now, days=DEFAULT_DAYS):
     """How many open non-PR issues in `items` belong to `other_owners` and have been quiet for `days` or more."""
     if not other_owners:
         return 0
     count = 0
     for item in items.values():
-        if not item.get("pr") and item.get("state") == "open" and (now - item["updated"]) / 86400.0 >= days and is_other_owner(item, other_owners):
+        if not item.get("pr") and item.get("state") == "open" and (now - item["updated"]) / 86400.0 >= days and is_others_issue(item, other_owners):
             count += 1
     return count
 
@@ -75,7 +75,7 @@ def ownerless_split(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, l
     for number, item in items.items():
         if item.get("pr") or item.get("state") != "open":
             continue
-        if is_other_owner(item, other_owners):   # another owner's issue is counted apart (other_owner_count), never ours to act on
+        if is_others_issue(item, other_owners):   # another owner's issue is counted apart (others_issue_count), never ours to act on
             continue
         if strict and label_owned(item["labels"], label_owners):
             continue

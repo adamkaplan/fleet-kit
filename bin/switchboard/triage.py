@@ -935,7 +935,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
             rows, parked = module.ownerless_split(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
                                                   options["label_owners"].get(repo), lanes, triage_parked_now, other_owners=other_owners)   # #889: a future-parked issue is counted apart, never listed
             read, total = len(unit["data"]), unit.get("total")
-            other_cnt = module.other_owner_count(items, other_owners, now, options["days"])
+            other_cnt = module.others_issue_count(items, other_owners, now, options["days"])
             shown[repo] = {"count": len(rows), "parked": len(parked), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None,
                            **({"other_owner": other_cnt} if other_cnt else {})}
             if not rows:
