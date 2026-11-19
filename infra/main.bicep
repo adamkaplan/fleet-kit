@@ -27,6 +27,14 @@ param extraSandboxGroups array = []
 param readerIdentityName string = ''
 
 param acrName string
+@description('ACR pull-through cache rules. Each: name, sourceRepository, targetRepository, credentialSetResourceId (optional).')
+param acrCacheRules array = [
+  {
+    name: 'dockerhub-library'
+    sourceRepository: 'docker.io/library/*'
+    targetRepository: 'dockerhub/library/*'
+  }
+]
 param keyVaultName string
 
 param storageAccountName string
@@ -89,7 +97,7 @@ module sandbox 'modules/sandbox-group.bicep' = {
 
 module acr 'modules/acr.bicep' = {
   name: 'acr'
-  params: { location: location, acrName: acrName }
+  params: { location: location, acrName: acrName, acrCacheRules: acrCacheRules }
 }
 
 module keyvault 'modules/keyvault.bicep' = {

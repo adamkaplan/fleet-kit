@@ -9,7 +9,8 @@ IPV4 = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 OK_IPS = {"203.0.113.10", "10.244.0.0", "10.0.0.0", "10.0.0.10"}
 TYPES = [
     "Microsoft.ContainerService/managedClusters", "Microsoft.App/sandboxGroups",
-    "Microsoft.ContainerRegistry/registries", "Microsoft.KeyVault/vaults",
+    "Microsoft.ContainerRegistry/registries", "Microsoft.ContainerRegistry/registries/cacheRules",
+    "Microsoft.KeyVault/vaults",
     "Microsoft.Storage/storageAccounts", "Microsoft.DBforPostgreSQL/flexibleServers",
     "Microsoft.ManagedIdentity/userAssignedIdentities",
     "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials",
@@ -101,6 +102,12 @@ class TestPerProfile(unittest.TestCase):
         self.assertIn("output readerIdentityPrincipalId string", main)
         self.assertIn("output readerIdentityPrincipalId string", ids)
         self.assertEqual(missing_params(main, slurp(os.path.join(INFRA, "example.bicepparam"))), [])
+
+    def test_acr_cache_rules(self):
+        main = slurp(os.path.join(INFRA, "main.bicep"))
+        acr = slurp(os.path.join(INFRA, "modules/acr.bicep"))
+        self.assertIn("param acrCacheRules array", main)
+        self.assertIn("acrCacheRules", acr)
 
 
 class TestNoPrivate(unittest.TestCase):
