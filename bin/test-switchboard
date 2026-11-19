@@ -67100,6 +67100,7 @@ TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
 # The tests #924 added (moved out of this file, its line ceiling); the host module gives the classes their fixtures.
 _t924 = importlib.import_module("test_924")
 _t926 = importlib.import_module("test_926"); TestForeignPrefixParkedLabel = _t926.TestForeignPrefixParkedLabel
+_t34 = importlib.import_module("test_ownerless_other_owner"); TestOwnerlessOtherOwner = _t34.TestOwnerlessOtherOwner
 _t924.HOST = sys.modules[__name__]
 TestPR8Source924, TestImpactHold924 = _t924.load()
 TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
@@ -80321,7 +80322,7 @@ TestBriefPiecesPure, TestBriefPiecesFloor, TestBriefPiecesRecord = _ibp.TestBrie
 # A class in the first group that builds a World or a rig fails the test below: it must derive from Base.
 NOT_ISOLATED_BY_BASE = {
     "builds no World, rig or state path: it reads source text, parses strings or runs pure functions": (
-    "TestCaretaker2573", "TestForeignPrefixParkedLabel", "TestIntentToastOnce", "TestPublicNamesGuard", "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
+    "TestCaretaker2573", "TestForeignPrefixParkedLabel", "TestOwnerlessOtherOwner", "TestIntentToastOnce", "TestPublicNamesGuard", "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
     "Fixture", "HubFilesUnchanged", "JanitorIdentity", "Launcher", "OneWorkerAndCancel", "PendingJobs", "RelayLoopCadence", "RelayObeysTheTreeGuard",
     "ReviewCommentIsolationTests", "Rig", "TestReminderGridAndRecurring", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
     "TestAgentsVerify", "TestAges", "TestAlertConfig", "TestApprovalExemptionGuard", "TestApprovalReadsFresh", "TestArchTools",
