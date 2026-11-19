@@ -378,7 +378,9 @@ class TestHerdrClient(Base):
                 client.open_tab_running("w1", "c", "/w", ["/x"], {})
 
     def test_the_real_socket_call_speaks_one_json_line_each_way(self):
-        path = str(self.home / "s.sock")
+        short = tempfile.mkdtemp(prefix="sbs", dir="/tmp")   # an AF_UNIX path is limited to ~104 bytes: self.home can be longer
+        self.addCleanup(shutil.rmtree, short, True)
+        path = str(Path(short) / "s.sock")
         server = sb.socket.socket(sb.socket.AF_UNIX, sb.socket.SOCK_STREAM)
         server.bind(path)
         server.listen(1)
