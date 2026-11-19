@@ -361,6 +361,35 @@ def build():
             self.assertEqual(len(self.lines()), 1)
             self.assertEqual(len(self.audit("plan_wake.announced")), 1)
 
+        def truncated_world(self, full_reply):
+            record = self.post(3, self.plan())
+            full = record["body"]
+            record["body"], record["body_truncated"] = " ".join(full.split())[:400], True
+            reads = []
+
+            def read_one(repo, path, now, fresh=False):
+                reads.append(path)
+                if isinstance(full_reply, Exception):
+                    raise full_reply
+                return {"body": full} if full_reply else None
+            self.hub._read_one = read_one
+            with mock.patch.object(sb, "_audit_tail", lambda state_dir: []):
+                self.go()
+            return record, full, reads
+
+        def test_a_truncated_held_plan_is_reread_in_full_before_it_is_checked(self):
+            record, full, reads = self.truncated_world(True)
+            self.assertEqual(reads, ["issues/comments/%d" % record["id"]])
+            got = self.audit("plan_wake.announced")
+            self.assertEqual(len(got), 1)
+            self.assertNotEqual(got[0].get("detail", got[0]).get("check"), "FAIL")
+            self.assertIn(sb.load_plan_check().plan_hash(full), json.dumps(self.snapshot(), default=str))
+
+        def test_a_truncated_held_plan_whose_reread_fails_is_skipped(self):
+            record, full, reads = self.truncated_world(RuntimeError("boom"))
+            self.assertTrue(reads)
+            self.assertEqual(self.audit("plan_wake.announced"), [])
+
         def test_s5_a_work_item_with_its_own_done_when_is_checked_against_it_not_its_asks(self):
             self.add(3, parent=2, body="## Intent\nx\nDone when: " + "an entirely different own outcome that the plan does not state")
             self.post(3, self.plan())

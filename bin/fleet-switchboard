@@ -11692,7 +11692,7 @@ class GitHubHub:
         if have is None and mark is not None:
             have = store.load_held(self.state_dir, name, parse)   # the comments held at the last stop, so a restart reads incrementally
             if have is not None:
-                have = dict(i for i in have.items() if i[1]["created_at"] >= since)   # the window's start drops the older
+                have = {k: dict(v, body_truncated=True) for k, v in have.items() if v["created_at"] >= since}   # the window's start drops the older; a held body is clipped to 400 chars, so it is marked
         if have is None or mark is None:
             why = "no held comments" if have is None and mark is not None else {"absent": "no cursor file", "unreadable": "cursor file unreadable"}.get(self._comment_state, "no cursor")
             told = self.__dict__.setdefault("_comment_fallback", set())

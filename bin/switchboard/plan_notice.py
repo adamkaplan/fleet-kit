@@ -96,6 +96,20 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
             if posted is None or now - posted > module.ANNOUNCE_SECONDS:
                 continue
             body = plan["body"]
+            if plan.get("body_truncated") or ("\n" not in body and len(body) >= 390):   # a held body is clipped: never hash or check it
+                hub = getattr(engine, "hub", None)
+                if hub is None or (budget is not None and budget[0] < 1):
+                    continue
+                if budget is not None:
+                    budget[0] -= 1
+                try:
+                    full = hub._read_one(repo, "issues/comments/%d" % plan["id"], now, fresh=True)
+                except Exception:
+                    continue
+                if not isinstance(full, dict) or not isinstance(full.get("body"), str) or "\n" not in full["body"]:
+                    continue
+                plan["body"] = body = full["body"]
+                plan.pop("body_truncated", None)
             plan_hash = check_module.plan_hash(body)
             wake.newest[(repo, number)] = plan_hash   # #1542: the present hash, for the delivery re-check
             wake.current[(repo, number)] = plan_hash   # #1784: recorded before the approved and cited skips
