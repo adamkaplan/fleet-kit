@@ -404,7 +404,7 @@ class TestHerdrClient(Base):
                                                "params": {"a": 1}})
         self.assertTrue(seen[0].endswith(b"\n"))
         with self.assertRaises(sb.HerdrError) as caught:
-            sb.unix_socket_call(str(self.home / "nobody.sock"), "layout.apply", {}, 1)
+            sb.unix_socket_call(str(Path(short) / "nobody.sock"), "layout.apply", {}, 1)
         self.assertEqual(caught.exception.reason, "unavailable")
 
     def test_the_socket_path_follows_herdr(self):
