@@ -216,11 +216,16 @@ def run_cloud(function, *arguments):
 
 def relay_cli(command, payload):
     """Best-effort mirror of a CLI action to the in-cluster switchboard (when CW_SWITCHBOARD_URL is set); the answer, or None."""
-    if not os.environ.get("CW_SWITCHBOARD_URL"):
-        return None
+    cluster = False
     try:
-        return run_cloud("relay_cli_if_configured", command, payload)
+        cluster = os.environ.get("CW_SWITCHBOARD_AUTHORITY") == "cluster" or run_cloud("switchboard_authority") == "cluster"
+        ans = run_cloud("relay_cli_if_configured", command, payload)
+        if cluster and not isinstance(ans, dict):
+            raise ValueError("no answer")
+        return ans
     except Exception as err:
+        if cluster:
+            raise LaunchError("the cluster switchboard relay of %s failed; nothing was written locally" % command) from None
         sys.stderr.write("%s: warning: the cluster relay of %s failed (%s)\n" % (PROG, command, type(err).__name__))
         return None
 
@@ -228,13 +233,13 @@ def relay_cli(command, payload):
 def relay_cli_done(command, payload):
     """True when the cluster is the authority and took the action."""
     ans = relay_cli(command, payload)
-    return os.environ.get("CW_SWITCHBOARD_AUTHORITY") == "cluster" and isinstance(ans, dict)
+    return (os.environ.get("CW_SWITCHBOARD_AUTHORITY") == "cluster" or run_cloud("switchboard_authority") == "cluster") and isinstance(ans, dict)
 
 
 def relay_cli_show(command, payload):
     """Like relay_cli_done, and prints the cluster's answer rows so the command is not silent."""
     ans = relay_cli(command, payload)
-    if os.environ.get("CW_SWITCHBOARD_AUTHORITY") != "cluster" or not isinstance(ans, dict):
+    if not ((os.environ.get("CW_SWITCHBOARD_AUTHORITY") == "cluster" or run_cloud("switchboard_authority") == "cluster") and isinstance(ans, dict)):
         return False
     for key in ("intents", "decisions"):
         for row in ans.get(key) or []:

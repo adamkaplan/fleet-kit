@@ -859,12 +859,25 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"recorded": True}
     if route == ("POST", "/v1/remind"):
         when = body.get("when")
-        if not isinstance(when, (str, int, float)) or not text:
+        action = body.get("action")
+        manage = action in ("list", "cancel", "cancel_key")
+        if not manage and (not isinstance(when, (str, int, float)) or not text):
             return 400, {"error": "when and text are required"}
-        to = body.get("to") or auth["agent"]
+        to = body.get("to") or body.get("name") or auth["agent"]
         if not isinstance(to, str) or not CALLER_RE.fullmatch(to):
             return 400, {"error": "bad recipient"}
-        state["reminders"].append({"to": to, "from": auth["agent"], "when": when, "text": text, "key": body.get("key")})
+        if action == "list":
+            return 200, {"recorded": False, "reminders": [r for r in state["reminders"] if r.get("to") == to or r.get("from") == auth["agent"]]}
+        if manage:
+            target, field = (body.get("cancel"), "id") if action == "cancel" else (body.get("cancel_key"), "key")
+            keep = [r for r in state["reminders"] if not (target is not None and r.get(field) == target and r.get("from") == auth["agent"])]
+            removed = len(state["reminders"]) - len(keep)
+            state["reminders"][:] = keep
+            return 200, {"recorded": True, "cancelled": removed}
+        keys = ("issue", "repo", "key", "ttl", "every", "until_closed", "until_merged", "keep_if_closed", "action", "cancel", "cancel_key")
+        entry = {"to": to, "from": auth["agent"], "when": when, "text": text}
+        entry.update({k: body.get(k) for k in keys})
+        state["reminders"].append(entry)
         return 200, {"recorded": True}
     if route == ("POST", "/v1/artifact"):
         name = body.get("name")
@@ -933,14 +946,39 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
     return 404, {"error": "no such route"}
 
 
+def switchboard_relay_config(env=None):
+    """url, auth_file and authority from the environment, else from the state file switchboard-relay.json (never raises)."""
+    env = os.environ if env is None else env
+    got = {"url": (env.get("CW_SWITCHBOARD_URL") or "").strip(), "auth_file": (env.get("CW_SWITCHBOARD_AUTH_FILE") or "").strip(),
+           "authority": (env.get("CW_SWITCHBOARD_AUTHORITY") or "").strip()}
+    if all(got.values()):
+        return got
+    try:
+        with open(os.path.join(str(D["H"]["state_dir_path"]()), "switchboard-relay.json"), encoding="utf-8") as handle:
+            data = D["parse_bounded"](handle.read(65536))
+    except Exception:
+        return got
+    if not isinstance(data, dict):
+        return got
+    for key, names in (("url", ("url", "switchboard_url")), ("auth_file", ("auth_file", "switchboard_auth_file")), ("authority", ("authority", "switchboard_authority"))):
+        for name in names:
+            if not got[key] and isinstance(data.get(name), str):
+                got[key] = data[name].strip()
+    return got
+
+
+def switchboard_authority(env=None):
+    return switchboard_relay_config(env)["authority"]
+
+
 def call_switchboard_v1(path, payload, env=None):
     """POST `payload` to the in-cluster switchboard (CW_SWITCHBOARD_URL, header from the 0600 file CW_SWITCHBOARD_AUTH_FILE); None when no URL is set."""
-    env = os.environ if env is None else env
-    base = (env.get("CW_SWITCHBOARD_URL") or "").strip()
+    config = switchboard_relay_config(env)
+    base = config["url"]
     if not base:
         return None
     header = None
-    auth_file = (env.get("CW_SWITCHBOARD_AUTH_FILE") or "").strip()
+    auth_file = config["auth_file"]
     if not auth_file:
         raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not set")
     try:
@@ -958,8 +996,7 @@ def call_switchboard_v1(path, payload, env=None):
 
 def relay_cli_if_configured(command, payload, env=None):
     """Forward a Mac CLI action to the in-cluster switchboard; None when CW_SWITCHBOARD_URL is not set."""
-    env = os.environ if env is None else env
-    if not (env.get("CW_SWITCHBOARD_URL") or "").strip():
+    if not switchboard_relay_config(env)["url"]:
         return None
     return call_switchboard_v1("/v1/" + command, payload, env=env)
 

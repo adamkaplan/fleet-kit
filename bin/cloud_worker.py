@@ -1439,7 +1439,7 @@ def _final_message(engine, state, record, name, reason, body=None):
         block, why = _retired().last_message(where, state, name) if isinstance(where, str) and where else (None, "no run record")
         _retired().post_end(engine, state, record, name, reason, body, H["post_ask_comment"], lambda why_: _audit(engine, "cloud.end_post_failed", name, {"why": why_}), lambda why_: _audit(engine, "cloud.end_names_unchecked", name, {"why": why_}))   # ask #2393: once, on the pod's ask
         text = "cloud worker %s retired (%s)\n%s" % (name, _one(_scrub_lib()(reason, (), 200), 120), block or "last text not read: %s" % _one((why or "unknown").replace(" ", "_"), 120))
-        boss and engine.send("switchboard", boss, text)
+        boss and not ("relay_cli_done" in H and H["relay_cli_done"]("send", {"to": boss, "text": text, "issue": record.get("issue")})) and engine.send("switchboard", boss, text)
     except Exception as err:
         _audit(engine, "cloud.final_message_failed", name, {"why": _one(type(err).__name__, 60)})
 

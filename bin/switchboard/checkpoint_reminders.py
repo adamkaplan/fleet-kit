@@ -206,7 +206,7 @@ def remind_manage(args, engine, state, sender, moment):
 
 
 def cmd_remind(args, runner, now):
-    if relay_cli_done("remind", {"args": [str(a) for a in vars(args).get("text", None) or []], "name": getattr(args, "name", None)}):
+    if relay_cli_done("remind", {"to": getattr(args, "name", None), "name": getattr(args, "name", None), "when": getattr(args, "when", None), "text": " ".join(getattr(args, "text", None) or []).strip(), "args": [str(a) for a in vars(args).get("text", None) or []], "issue": getattr(args, "issue", None), "key": getattr(args, "key", None), "ttl": getattr(args, "ttl", None), "every": getattr(args, "every", None), "until_closed": getattr(args, "until_closed", None), "until_merged": getattr(args, "until_merged", None), "keep_if_closed": bool(getattr(args, "keep_if_closed", False)), "action": "list" if getattr(args, "list_mine", False) else ("cancel" if getattr(args, "cancel", None) else ("cancel_key" if getattr(args, "cancel_key", None) else "add")), "cancel": getattr(args, "cancel", None), "cancel_key": getattr(args, "cancel_key", None)}):
         return EXIT_OK
     engine, state, config = build_engine(runner, now, "cli")
     if args.sender is not None:

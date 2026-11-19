@@ -1117,6 +1117,38 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(seen["url"], "https://sw.example/v1/orders")
         self.assertIn("agent=cos", seen["headers"]["X-Switchboard-Auth"])
 
+    def test_relay_config_from_state_file(self):
+        (self.home / "switchboard-relay.json").write_text('{"url": "https://sw.example", "auth_file": "/x/auth", "authority": "cluster"}')
+        worker = sb.load_module("cloud_worker").bind(vars(sb))
+        with mock.patch.dict(worker.H, {"state_dir_path": lambda: self.home}), mock.patch.object(self.floor, "D", worker._Stayed()):
+            got = self.floor.switchboard_relay_config(env={})
+            self.assertEqual((got["url"], got["authority"]), ("https://sw.example", "cluster"))
+            self.assertEqual(self.floor.switchboard_authority(env={"CW_SWITCHBOARD_AUTHORITY": "local"}), "local")
+
+    def test_cluster_authority_relay_failure_is_loud(self):
+        def boom(*a, **k):
+            raise RuntimeError("down")
+        with mock.patch.dict(os.environ, {"CW_SWITCHBOARD_AUTHORITY": "cluster"}), \
+                mock.patch.object(sb, "run_cloud", boom):
+            with self.assertRaises(sb.LaunchError):
+                sb.relay_cli("remind", {})
+
+
+class TestFinalMessageRelay(Base):
+    def test_final_message_relays_over_send(self):
+        worker = sb.load_module("cloud_worker").bind(vars(sb))
+        calls = []
+        engine = mock.Mock()
+        done = lambda command, payload: calls.append((command, payload)) or True
+        retired = mock.Mock()
+        retired.last_message.return_value = ("last text", None)
+        with mock.patch.dict(worker.H, {"relay_cli_done": done, "post_ask_comment": None, "_one_line": lambda t, n=300: str(t)[:n]}), mock.patch.object(worker, "_retired", lambda: retired), \
+                mock.patch.object(worker, "_scrub_lib", lambda: (lambda t, *a: t)):
+            with mock.patch.object(worker, "_audit", lambda e, what, name, body=None: calls.append(("audit", body))):
+                worker._final_message(engine, {}, {"reports_to": "cos"}, "widget-api", "done")
+        self.assertEqual(calls[:1] and calls[0][0], "send", calls)
+        engine.send.assert_not_called()
+
 
 class TestCloudFloorMutants(Base):
     """Each mutant is a change of bin/cloud_floor.py made in memory; the test that should catch it runs under it and must fail, and runs first without it."""

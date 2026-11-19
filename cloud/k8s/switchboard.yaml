@@ -50,6 +50,10 @@
                 "value": "cw"
               },
               {
+                "name": "CW_FLOOR_URL",
+                "value": "http://floor-controller.cw.svc.cluster.local:8080"
+              },
+              {
                 "name": "HOME",
                 "value": "/run/home"
               }
