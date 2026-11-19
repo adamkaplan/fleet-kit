@@ -49285,10 +49285,8 @@ class TestCosOrdersFact(OrdersDeliveryCase):
         put_cos_orders(self, "x" * 18000)
         self.assertEqual(self.facts(), [])
         loud = [f for f in self.world.engine.collect_facts()[0] if f.key.startswith("orders.unreadable:cos:")]
-        self.assertEqual(len(loud), 1)
-        self.assertIn("18000 bytes", loud[0].summary)
-        notices = [d for d in sb.derive_decisions(self.world.engine, self.world.clock.now())[0] if d["id"] == "order:cos-unreadable"]
-        self.assertEqual(len(notices), 1)
+        self.assertTrue(len(loud) == 1 and "18000 bytes" in loud[0].summary)
+        self.assertEqual([d["id"] for d in sb.derive_decisions(self.world.engine, self.world.clock.now())[0] if d["id"] == "order:cos-unreadable"], ["order:cos-unreadable"])
         self.run_pass()
         self.assertEqual(self.messages(), [])
         self.assertTrue([e for e in self.world.audit() if e["event"] == "orders.unreadable" and e["detail"].get("cos")])
