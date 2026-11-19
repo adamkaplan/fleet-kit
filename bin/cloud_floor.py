@@ -847,7 +847,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         to = body.get("to")
         if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text:
             return 400, {"error": "to and text are required"}
-        message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue")}
+        message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo")}
         target = (state.get("floor_sessions") or {}).get(to)
         if target:
             seq = int(target.get("seq", 1)) + 1
@@ -860,7 +860,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         status = body.get("state") or body.get("status")
         if status not in REPORT_STATES:
             return 400, {"error": "status must be one of " + ", ".join(REPORT_STATES)}
-        state["reports"].append({"from": auth["agent"], "session": auth["session"], "status": status, "text": text})
+        state["reports"].append({"from": auth["agent"], "session": auth["session"], "status": status, "text": text, "repo": body.get("repo")})
         return 200, {"recorded": True}
     if route == ("POST", "/v1/remind"):
         when = body.get("when")
@@ -988,7 +988,13 @@ def call_switchboard_v1(path, payload, env=None):
     base = config["url"]
     if not base:
         return None
+    caller_agent = None
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        caller_agent = payload.pop("_caller_agent", None)
     header = _auth_header(config)
+    if isinstance(caller_agent, str) and CALLER_RE.fullmatch(caller_agent):
+        header = re.sub(r"(^|;)agent=[^;]+", lambda m: m.group(1) + "agent=" + caller_agent, header)
     data = json.dumps(payload, sort_keys=True).encode()
     headers = [("Accept", "application/json"), ("Content-Type", "application/json"), ("X-Switchboard-Auth", header)]
     return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
@@ -1225,7 +1231,28 @@ def relay_cli_if_configured(command, payload, env=None):
     """Forward a Mac CLI action to the in-cluster switchboard; None when CW_SWITCHBOARD_URL is not set."""
     if not switchboard_relay_config(env)["url"]:
         return None
+    if command in ("send", "report", "remind", "retire", "orders") and isinstance(payload, dict):
+        payload = _resolve_local_caller_and_repo(payload, env=env)
     return call_switchboard_v1("/v1/" + command, payload, env=env)
+
+
+def _resolve_local_caller_and_repo(payload, env=None):
+    """Best effort: name the calling lane (`_caller_agent`) and fill `repo` + numeric `issue` from its default repo."""
+    try:
+        H = D["H"]
+        if "build_engine" not in H:
+            return payload
+        engine, _, config = H["build_engine"](subprocess.run, time.time, "cli")
+        caller = payload.get("sender") or payload.get("from") or H["identify_caller"](engine.herdr, engine.v2, env or os.environ)
+        if isinstance(caller, str) and CALLER_RE.fullmatch(caller):
+            payload = dict(payload, _caller_agent=caller)
+        if payload.get("issue") is not None and not payload.get("repo") and "resolve_for_sender" in H:
+            repo, number = H["resolve_for_sender"](engine, config, payload["issue"], caller)
+            if repo and number is not None:
+                payload = dict(payload, repo=repo, issue=int(number))
+    except Exception:
+        pass
+    return payload
 
 
 def push_pane_state(observations, env=None, now=None):

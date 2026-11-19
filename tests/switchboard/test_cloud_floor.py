@@ -1143,6 +1143,26 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(seen["url"], "https://sw.example/v1/orders")
         self.assertIn("agent=cos", seen["headers"]["X-Switchboard-Auth"])
 
+    def test_relay_cli_preserves_caller_agent_and_repo(self):
+        auth = self.home / "auth"
+        auth.write_text("agent=pane-relay;session=ses_example;secret=x")
+        auth.chmod(0o600)
+        seen = {}
+
+        def fake(method, url, data, headers, **k):
+            seen.update(url=url, headers=dict(headers), body=json.loads(data))
+            return 200, b'{"ok": true}'
+        H = {"build_engine": lambda *a: (mock.Mock(), None, {}), "identify_caller": lambda *a: "fleetkit",
+             "resolve_for_sender": lambda engine, config, issue, caller: ("acme-org/widget-service", 34)}
+        env = {"CW_SWITCHBOARD_URL": "https://sw.example", "CW_SWITCHBOARD_AUTH_FILE": str(auth)}
+        with mock.patch.object(self.floor, "D", {"H": H, "parse_bounded": json.loads}), mock.patch.object(self.floor, "_request", fake):
+            self.floor.relay_cli_if_configured("send", {"to": "cos", "text": "hi", "issue": 34}, env=env)
+        self.assertEqual(seen["url"], "https://sw.example/v1/send")
+        self.assertIn("agent=fleetkit", seen["headers"]["X-Switchboard-Auth"])
+        self.assertEqual(seen["body"]["repo"], "acme-org/widget-service")
+        self.assertEqual(seen["body"]["issue"], 34)
+        self.assertNotIn("_caller_agent", seen["body"])
+
     def test_relay_config_from_state_file(self):
         (self.home / "switchboard-relay.json").write_text('{"url": "https://sw.example", "auth_file": "/x/auth", "authority": "cluster"}')
         worker = sb.load_module("cloud_worker").bind(vars(sb))
