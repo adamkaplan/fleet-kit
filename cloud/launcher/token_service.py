@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """token-service: a small HTTP service that mints the GitHub App installation token for the operator account (ask #2002).
 
-POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"|"lander"|"reader"} or, for orchestrator and reader, {"repos": ["OWNER/NAME", ...up to 20, one owner, each allowed], "role": ...} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
-The caller is REVIEWED (the cluster's TokenReview API): system:serviceaccount:<namespace>:cw-operator is served for worker, orchestrator and reader; floor-controller / CW_FLOOR_CONTROLLER_SA only for orchestrator and reader (any other role is refused); floor-heavy-executor / CW_HEAVY_EXECUTOR_SA only for lander.
+POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"|"lander"|"reader"|"switchboard"} or, for orchestrator, reader and switchboard, {"repos": ["OWNER/NAME", ...up to 20, one owner, each allowed], "role": ...} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
+The caller is REVIEWED (the cluster's TokenReview API): system:serviceaccount:<namespace>:cw-operator is served for worker, orchestrator, reader and switchboard; floor-controller / CW_FLOOR_CONTROLLER_SA only for orchestrator, reader and switchboard (any other role is refused); floor-heavy-executor / CW_HEAVY_EXECUTOR_SA only for lander.
 The repository must be on CW_ALLOWED_REPOS (the launcher's own check), the role in PERMISSIONS_BY_ROLE, the body at most 4096 bytes,
 and the body carries no other key. The answer is GitHub's own: the token, the repositories, the permissions and the expiry.
 The App id and key are read by the commands CW_APP_ID_CMD and CW_APP_KEY_CMD (default: cat of the files mounted from the cluster Secret).
@@ -25,7 +25,7 @@ import cloud_worker  # noqa: E402  (check_repo_allowed: the launcher's one allow
 MAX_BODY = 4096
 KEYS = {"repo", "role"}
 KEYS_MULTI = {"repos", "role"}
-MULTI_ROLES = ("orchestrator", "reader")
+MULTI_ROLES = ("orchestrator", "reader", "switchboard")
 MAX_REPOS = 20
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 REVIEW_URL = "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews"
@@ -120,9 +120,9 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
     if not isinstance(role, str) or role not in app_token.PERMISSIONS_BY_ROLE:
         return 400, None, "unknown role"
     if multi and role not in MULTI_ROLES:
-        return 400, None, "repos is only for the orchestrator and reader roles"
+        return 400, None, "repos is only for the %s roles" % ", ".join(MULTI_ROLES)
     if user == controller_sa and role not in MULTI_ROLES:
-        return 403, None, "the controller account may mint only the orchestrator and reader roles"
+        return 403, None, "the controller account may mint only the %s roles" % ", ".join(MULTI_ROLES)
     if user is not None and user != controller_sa:
         executor_sa = env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))
         if (role == "lander") != (user == executor_sa):

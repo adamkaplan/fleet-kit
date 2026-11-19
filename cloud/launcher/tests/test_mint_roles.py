@@ -38,8 +38,10 @@ ORCH_TEXT = "issues: write, pull_requests: read, checks: read, metadata: read"
 READER_SET = {"contents": "read", "issues": "read", "metadata": "read"}
 READER_TEXT = "contents: read, issues: read, metadata: read"
 STEP = "the owner adds %s to the App's permissions and accepts them on each installation"
-SETS = {"worker": WORKER_SET, "orchestrator": ORCH_SET, "reader": READER_SET}
-TEXTS = {"worker": WORKER_TEXT, "orchestrator": ORCH_TEXT, "reader": READER_TEXT}
+SWITCHBOARD_SET = {"issues": "write", "contents": "read", "pull_requests": "read", "checks": "read", "statuses": "read", "metadata": "read"}
+SWITCHBOARD_TEXT = "issues: write, contents: read, pull_requests: read, checks: read, statuses: read, metadata: read"
+SETS = {"worker": WORKER_SET, "orchestrator": ORCH_SET, "reader": READER_SET, "switchboard": SWITCHBOARD_SET}
+TEXTS = {"worker": WORKER_TEXT, "orchestrator": ORCH_TEXT, "reader": READER_TEXT, "switchboard": SWITCHBOARD_TEXT}
 
 
 def read(rel):
@@ -128,7 +130,7 @@ class RequestBodies(Fx):
         self.assertEqual(perms, ORCH_SET)
         self.assertEqual(sorted(perms), ["checks", "issues", "metadata", "pull_requests"])
         self.assertNotIn("contents", perms)
-        self.assertEqual(list(app_token.PERMISSIONS_BY_ROLE), ["worker", "orchestrator", "lander", "reader"])
+        self.assertEqual(list(app_token.PERMISSIONS_BY_ROLE), ["worker", "orchestrator", "lander", "reader", "switchboard"])
 
     def test_s2_the_texts_of_each_kind_equal_the_table(self):
         for role in SETS:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """app-token: mint a one-hour GitHub App installation token for ONE repository and write it to the route the caller names, and nowhere else.
 
-usage: app_token.py OWNER/REPO [--role worker|orchestrator|lander|reader] --fd N       (programs: a pipe descriptor the caller opened and passed down; N is 3 or more, open, writable, not a terminal)
+usage: app_token.py OWNER/REPO [--role worker|orchestrator|lander|reader|switchboard] --fd N       (programs: a pipe descriptor the caller opened and passed down; N is 3 or more, open, writable, not a terminal)
        app_token.py OWNER/REPO --out PATH   (a person: a new file, mode 0600, in a private directory you own; refused when PATH exists)
        app_token.py OWNER/REPO              (no route: the token is minted, never shown, revoked, and only its byte count is said on stderr)
 
@@ -52,6 +52,7 @@ PERMISSIONS_BY_ROLE = {
     "orchestrator": {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"},
     "lander": {"contents": "write", "statuses": "write", "metadata": "read"},
     "reader": {"contents": "read", "issues": "read", "metadata": "read"},
+    "switchboard": {"issues": "write", "contents": "read", "pull_requests": "read", "checks": "read", "statuses": "read", "metadata": "read"},
 }
 EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE["worker"]  # the worker's set: the name every existing importer uses
 
@@ -498,7 +499,7 @@ def mint_from_service(target, role, keep=False):
     return token
 
 
-USAGE = "usage: app_token.py OWNER/REPO [--role worker|orchestrator|lander|reader] [--fd N | --out PATH]"
+USAGE = "usage: app_token.py OWNER/REPO [--role worker|orchestrator|lander|reader|switchboard] [--fd N | --out PATH]"
 
 
 def parse_route(rest):

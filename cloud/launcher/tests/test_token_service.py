@@ -262,6 +262,9 @@ class MultiRepo(unittest.TestCase):
             self.assertEqual((status, minted), (200, [(body["repos"], body["role"])]))
         status, minted = self.call({"repos": both[:1], "role": "reader"}, "system:serviceaccount:cw:floor-controller")
         self.assertEqual(status, 200)
+        for user in (OPERATOR_USER, "system:serviceaccount:cw:floor-controller"):
+            body = {"repos": both, "role": "switchboard"}
+            self.assertEqual(self.call(body, user), (200, [(both, "switchboard")]))
         ctl = "system:serviceaccount:cw:floor-controller"
         for role in ("worker", "lander"):
             self.assertEqual(self.call({"repo": "acme-org/widget-service", "role": role}, ctl)[0], 403)

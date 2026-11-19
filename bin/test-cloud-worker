@@ -37,6 +37,7 @@ sys.modules["cw_fleet_switchboard"] = sb   # what the removed load_module() did 
 loader.exec_module(sb)
 sys.path.insert(0, str(BIN.parent / "cloud" / "worker" / "tests"))
 import stub_support  # noqa: E402  (starts a child with a cleanup that always runs: #956)
+import path_walk  # noqa: E402
 
 PASSWORD = "pw-" + "x" * 20
 
@@ -307,7 +308,12 @@ class Base(unittest.TestCase):
     _shared_remote = None
 
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()   # the platform's temporary directory, never the repository root: an entry that judges the root runs beside the entries that load this fixture
+        base_tmp = None
+        if path_walk.parents_problem(str(Path(tempfile.gettempdir()) / "x")) is not None:
+            base_tmp = Path.home() / "tmp"
+            base_tmp.mkdir(mode=0o700, exist_ok=True)
+            base_tmp.chmod(0o700)
+        tmp = tempfile.TemporaryDirectory(dir=str(base_tmp) if base_tmp else None)   # the platform's temporary directory, never the repository root: an entry that judges the root runs beside the entries that load this fixture
         self.home = Path(tmp.name).resolve()
         _START_MARKS[str(self.home)] = stub_support.STARTED[0]
         self.addCleanup(end_children_and_remove, tmp, self.home)
