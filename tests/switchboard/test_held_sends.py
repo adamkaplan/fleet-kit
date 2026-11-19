@@ -460,11 +460,11 @@ class TestHeldSends(Base):
         self.status("platform", "blocked")
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ[sb.LAB_ENV] = "1"
-        with captured() as (out, err):
+        with captured() as (out, err), mock.patch.object(sb, "check_issue_exists", return_value=None):
             code = sb.main(["report", "done", "--from", "coder", "landed  on main"], runner=self.world.route, now=self.world.clock.now)
-        self.assertEqual(code, 0, err)
-        self.assertIn("held for platform", err)
-        self.assertIn("warning: consecutive spaces in report text", err)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("held for platform", err.getvalue())
+        self.assertIn("warning: consecutive spaces in report text", err.getvalue())
         self.assertEqual(len(self.held()), 1)
         code2, _, err2 = self.cli("platform", "landed  at head")
         self.assertEqual(code2, 0, err2)

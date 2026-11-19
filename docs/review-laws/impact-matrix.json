@@ -379,11 +379,14 @@
         "bin/switchboard/labels_ensure.py",
         "bin/switchboard/land.py",
         "bin/switchboard/land_gate.py",
-        "bin/switchboard/caretaker.py"
+        "bin/switchboard/caretaker.py",
+        "bin/caretaker_config.py",
+        "bin/switchboard_names.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
         "bin/caretaker_config.py": ["validate"],
+        "bin/switchboard_names.py": [],
         "bin/agent_presence.py": [
           "*"
         ],

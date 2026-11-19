@@ -13699,7 +13699,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
         self.assertIn("<b>", err)
         self.assertIn("<b>", json.dumps([e["detail"] for e in self.audit_lines()]))
         self.registry.upsert(self.world.state, "orch-b", {"session": "s-x", "pane": self.world.panes["orch-b"], "role": "orchestrator", "charter": None, "repo": "acme<b>"})
-        with mock.patch.object(sb, "charter_safe", lambda text: str(text)):
+        with mock.patch.object(sb, "charter_safe", lambda text: str(text)), mock.patch.object(sb, "charter_repo_safe", lambda text: str(text)):
             code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertIn("<b>", out)
 

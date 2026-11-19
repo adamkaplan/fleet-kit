@@ -11643,7 +11643,7 @@ class GitHubHub:
             self._comment_gap_edges.pop(key, None)
         self._keep_comment_gap(key, since, have, gaps, kept, parse, store)
         newest = max((v["created_at"] for v in have.values()), default=None)
-        kept_held = store.save_held(self.state_dir, name, {k: dict(v, body=scrub_signed_links(v["body"])) if isinstance(v, dict) and isinstance(v.get("body"), str) else v for k, v in have.items()})   # a signed link token never reaches the file;  the cursor never runs ahead of the held file: a restart would skip the comments between
+        kept_held = store.save_held(self.state_dir, name, {k: dict(v, body=_one_line(scrub_signed_links(v["body"]), 400)) if isinstance(v, dict) and isinstance(v.get("body"), str) else v for k, v in have.items()})   # a signed link token never reaches the file;  the cursor never runs ahead of the held file: a restart would skip the comments between
         if not kept_held and self.audit is not None and name not in self.__dict__.setdefault("_held_unwritten", set()):
             self._held_unwritten.add(name)
             self.audit.append(self.actor, "comment_cursor.held_unwritten", repo, {"repo": repo, "consumer": consumer})
