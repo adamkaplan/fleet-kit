@@ -48,7 +48,7 @@ resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2
   }
 }]
 
-resource queueSvc 'Microsoft.Storage/storageAccounts/queueServices@2026-06-01' = {
+resource queueSvc 'Microsoft.Storage/storageAccounts/queueServices@2026-06-01' existing = {
   parent: sa
   name: 'default'
 }

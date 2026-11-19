@@ -35,7 +35,7 @@ resource dbs 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2026-04-01-pre
 }]
 
 @batchSize(1)
-resource rules 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2026-04-01-preview' = [for r in postgresFirewallRules: {
+resource rules 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = [for r in postgresFirewallRules: {
   parent: pg
   name: r.name
   properties: {
