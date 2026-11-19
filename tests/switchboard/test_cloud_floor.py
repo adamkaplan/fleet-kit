@@ -1201,6 +1201,8 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(data["EnvironmentVariables"]["PATH"], "/usr/bin:/a&b")
         self.assertEqual(data["StandardOutPath"], "/home/user/state/pane-relay-stdout.log")
         self.assertEqual(data["StandardErrorPath"], "/home/user/state/pane-relay-stderr.log")
+        odd = plistlib.loads(self.floor.render_pane_relay_plist("/usr/bin/python3", "/k", "/Users/a%sb", "/Users/a%sb/state", "/usr/bin").encode())
+        self.assertEqual(odd["StandardOutPath"], "/Users/a%sb/state/pane-relay-stdout.log")
 
 
     def test_pane_relay_pass_reports_a_failed_push_and_still_drains(self):

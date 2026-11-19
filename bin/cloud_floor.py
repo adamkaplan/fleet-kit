@@ -1087,8 +1087,8 @@ def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
     """Rehearsed rollback from cluster authority to the Mac daemon."""
     try:
         call_switchboard_v1("/v1/mode", {"mode": "shadow"}, env=env)
-    except Exception:
-        pass
+    except Exception as err:
+        _warn("cluster mode switch to shadow (the cluster may still hold authority)", err)
     relay_path = os.path.join(str(state_dir), "switchboard-relay.json")
     if os.path.exists(relay_path):
         with open(relay_path, encoding="utf-8") as handle:
@@ -1138,20 +1138,20 @@ def render_pane_relay_plist(python_bin, kit_root, home_dir, state_dir, path_env)
         "  <key>RunAtLoad</key>\n  <true/>\n"
         "  <key>KeepAlive</key>\n  <true/>\n"
         "  <key>ThrottleInterval</key>\n  <integer>10</integer>\n"
-        "  <key>StandardOutPath</key>\n  <string>%s</string>\n"
-        "  <key>StandardErrorPath</key>\n  <string>%s</string>\n"
+        "  <key>StandardOutPath</key>\n  <string>" + e(os.path.join(str(state_dir), "pane-relay-stdout.log")) + "</string>\n"
+        "  <key>StandardErrorPath</key>\n  <string>" + e(os.path.join(str(state_dir), "pane-relay-stderr.log")) + "</string>\n"
         "</dict>\n</plist>\n"
-    ) % (e(os.path.join(str(state_dir), "pane-relay-stdout.log")), e(os.path.join(str(state_dir), "pane-relay-stderr.log")))
-
-
+    )
 def sync_cloud_records_to_cluster(state_dir, env=None):
     """Push the Mac's cloud records (and, while not cluster authority, reminders) to the cluster."""
     def read(path):
         try:
             with open(path, encoding="utf-8") as handle:
                 return json.load(handle)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return None
+        except (OSError, ValueError) as err:
+            raise FloorError("%s cannot be read (%s); the sync is skipped so the cluster keeps its copy" % (os.path.basename(path), type(err).__name__)) from None
     records, reminders = {}, None
     cloud = os.path.join(str(state_dir), "cloud")
     if os.path.isdir(cloud):
