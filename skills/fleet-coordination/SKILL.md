@@ -43,7 +43,7 @@ A brief for a change that adds a file under `bin/` carries the output of `tools/
 
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
 
-A brief says `run the guard set` (`tools/guard-set` prints the commands, from `docs/guard-set.json`): the builder runs `tools/guard-set --run` before its final message (one class at a time, each with its timeout, one RESULT line).
+A brief says `run the guard set` (`tools/guard-set` prints the commands, from `docs/guard-set.json`): the builder runs `tools/guard-set --run` before its final message (classes run in parallel, each with its timeout, summaries in list order, one RESULT line).
 
 ## Builder checklist
 

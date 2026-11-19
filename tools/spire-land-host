@@ -110,6 +110,11 @@ def _origin_repo(root):
 _KEEPALIVE_STOP = {}
 
 
+# One owner of the SQL string-literal quoting, shipped in the python the pod runs (floor_controller has no helper).
+_POD_SQL_PRELUDE = ("import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
+                    "q = lambda v: \"'\" + str(v).replace(\"'\", \"''\") + \"'\"; ")
+
+
 def _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid):
     stop_ev = _KEEPALIVE_STOP.pop(lease_sid, None)
     if stop_ev:
@@ -118,8 +123,8 @@ def _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid):
         return
     proof.kube_run(
         ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
-         "import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
-         "fc._pg_run(\"DELETE FROM floor_live_sessions WHERE session_id=%s;\" % (\"'\" + str(sys.argv[1]).replace(\"'\", \"''\") + \"'\"))",
+         _POD_SQL_PRELUDE +
+         "fc._pg_run(\"DELETE FROM floor_live_sessions WHERE session_id=%s;\" % q(sys.argv[1]))",
          lease_sid],
         env, config=cfg,
     )
@@ -136,11 +141,11 @@ def _find_floor_heavy_pod(proof, env, cfg, ns, repo):
     def _pulse():
         return proof.kube_run(
             ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
-             "import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
+             _POD_SQL_PRELUDE +
              "fc._pg_run(\"INSERT INTO floor_live_sessions(session_id, caller, repo, ref, mode, state, round_num, updated_at) "
              "VALUES (%s, 'fleet', %s, 'main', 'author', 'running', 1, NOW()) "
              "ON CONFLICT (session_id) DO UPDATE SET state='running', updated_at=NOW();\" "
-             "% tuple(\"'\" + str(a).replace(\"'\", \"''\") + \"'\" for a in sys.argv[1:3])); fc.reconcile_heavy_pool_scale()",
+             "% (q(sys.argv[1]), q(sys.argv[2]))); fc.reconcile_heavy_pool_scale()",
              lease_sid, repo],
             env, config=cfg,
         )

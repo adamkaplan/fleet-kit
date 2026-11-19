@@ -200,7 +200,8 @@ class TestGuardSetRun(unittest.TestCase):
         ok = "time.sleep(0.5)\nprint('Ran 1 test in 0.5s')\n"
         with tempfile.TemporaryDirectory() as d:
             es = [self._fx(d, n, ok) for n in ("FxA", "FxB", "FxC")]
-            r = run("--run", "--workers", "3", "--list", str(self._list(d, es)))
+            with mock.patch.dict(os.environ, {"GUARD_SET_WORKERS": "3"}):
+                r = run("--run", "--list", str(self._list(d, es)))
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             pos = [r.stdout.index(n + ": tests run") for n in ("FxA", "FxB", "FxC")]
             self.assertEqual(pos, sorted(pos))
