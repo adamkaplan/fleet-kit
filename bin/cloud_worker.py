@@ -539,9 +539,6 @@ class _Stayed:
     def __getitem__(self, name):
         return globals()[name]
 
-    def __contains__(self, name):
-        return name in globals()
-
 
 def _load_part(name):
     """Load bin/<name>.py (beside this file; a part of it) with `D` set, register it in sys.modules under `name`, and bind its names here when it has `bind` (a name patched here does not reach it: patch it there)."""

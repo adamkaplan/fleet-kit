@@ -923,6 +923,14 @@ def push_pane_state(observations, env=None, now=None):
     return (ans.get("commands") or []) if isinstance(ans, dict) else []
 
 
+def _stayed_name(name):
+    """D[name], or an unmatchable class when the name is not there (`D` has no `get` and no membership test)."""
+    try:
+        return D[name]
+    except KeyError:
+        return ()
+
+
 def _one_line_text(err):
     return " ".join(str(err).split())[:160]
 
@@ -937,7 +945,7 @@ def floor_watch_sync(state_dir, records, engine=None):
             return records
         sessions = {k: v for k, v in sessions.items() if isinstance(v, dict)}
     except Exception as err:
-        if "Refusal" in D and isinstance(err, D["Refusal"]):
+        if isinstance(err, _stayed_name("Refusal")):
             env = env_of()
             if not any((env.get(k) or "").strip() for k in ("CW_FLOOR_URL", "CW_FLOOR_QUEUE_URL", "CW_FLOOR_BLOB_URL", "CW_FLOOR_TRANSPORT")):
                 return records   # no Floor is configured: nothing to read, and nothing to say

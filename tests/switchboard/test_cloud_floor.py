@@ -274,9 +274,9 @@ class TestCloudFloor(FloorCase):
         with mock.patch.object(self.floor, "call_switchboard_v1", return_value=None):
             self.assertEqual(self.floor.push_pane_state({}, env={}, now=1), [])
 
-    def test_the_stayed_namespace_answers_membership(self):
-        self.assertIn("Refusal", self.floor.D)
-        self.assertNotIn("NoSuchName", self.floor.D)
+    def test_a_stayed_name_that_is_missing_matches_nothing(self):
+        self.assertIs(self.floor._stayed_name("Refusal"), self.floor.D["Refusal"])
+        self.assertEqual(self.floor._stayed_name("NoSuchName"), ())
 
     def test_a_launch_makes_one_work_and_a_repeat_returns_it(self):
         code, out, err = self.launch()
