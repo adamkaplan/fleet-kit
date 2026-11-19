@@ -13530,8 +13530,6 @@ def _send_by_registry(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     raw_text = " ".join(args.text)
-    if "  " in raw_text.strip() and not getattr(args, "file", None):
-        sys.stderr.write("%s: warning: consecutive spaces in message text (did shell backticks swallow a value? use single quotes or --file)\n" % PROG)
     text = raw_text.strip()
     if not text:
         sys.stderr.write("%s: nothing to send\n" % PROG)
@@ -13581,6 +13579,8 @@ def send_plan(args):
 
 
 def _cmd_send(args, runner, now):
+    if "  " in " ".join(args.text or []).strip() and not getattr(args, "file", None):
+        sys.stderr.write("%s: warning: consecutive spaces in message text (did shell backticks swallow a value? use single quotes or --file)\n" % PROG)
     parts, problem = send_plan(args)
     if problem:
         sys.stderr.write("%s: %s\n" % (PROG, problem))

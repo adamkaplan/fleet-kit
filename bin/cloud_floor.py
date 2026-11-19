@@ -916,6 +916,8 @@ def floor_watch_sync(state_dir, records, engine=None):
             return records
         sessions = {k: v for k, v in sessions.items() if isinstance(v, dict)}
     except Exception as err:
+        if D.get("Refusal") and isinstance(err, D["Refusal"]):
+            return records
         print("floor_watch_sync: the Floor state could not be read (%s)" % type(err).__name__, file=sys.stderr)
         return records
     known = set()

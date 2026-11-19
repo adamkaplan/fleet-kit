@@ -458,10 +458,11 @@ class TestHeldSends(Base):
 
     def test_report_to_blocked_boss_is_held_and_delivered_on_unblock_and_backtick_gap_warns(self):
         self.status("platform", "blocked")
+        self.world.add_agent("reporter", fleet={"reports_to": "platform"})
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ[sb.LAB_ENV] = "1"
-        with captured() as (out, err), mock.patch.object(sb, "check_issue_exists", return_value=None):
-            code = sb.main(["report", "done", "--from", "coder", "landed  on main"], runner=self.world.route, now=self.world.clock.now,
+        with captured() as (out, err), mock.patch.object(sb.Switchboard, "check_issue_exists", return_value=None):
+            code = sb.main(["report", "done", "--from", "reporter", "landed  on main"], runner=self.world.route, now=self.world.clock.now,
                            wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         self.assertEqual(code, 0, err.getvalue())
         self.assertIn("held for platform", err.getvalue())
@@ -474,5 +475,5 @@ class TestHeldSends(Base):
         self.world.engine.run_pass()
         texts = [a["text"] for a in self.world.admissions("platform")]
         self.assertEqual(len(texts), 1)
-        self.assertIn("done: landed  on main", texts[0])
+        self.assertIn("done: landed on main", texts[0])
         self.assertIn("landed  at head", texts[0])
