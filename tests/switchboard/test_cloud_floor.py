@@ -852,6 +852,67 @@ class TestCloudFloorQueueBlob(FloorCase):
         self.assertIs(pick(), self.fake)
 
 
+class TestCloudAgents(FloorCase):
+    SECRET = "s3cr3t"
+    HEADER = "agent=service-ops;session=ses_0123456789abcdef;charter=acme-org/widget-service#10;secret=s3cr3t"
+
+    def call(self, method, path, body=None, header=None, **kw):
+        headers = {"X-Switchboard-Auth": self.HEADER if header is None else header}
+        raw = json.dumps(body).encode() if body is not None else b""
+        return self.floor.handle_switchboard_v1(method, path, headers, raw, self.SECRET, **kw)
+
+    def test_auth_binds_the_header_identity(self):
+        auth = self.floor.verify_switchboard_auth(self.HEADER, self.SECRET)
+        self.assertEqual((auth["agent"], auth["session"], auth["charter"]), ("service-ops", "ses_0123456789abcdef", "acme-org/widget-service#10"))
+        for bad in (None, "", self.HEADER.replace("s3cr3t", "nope"), self.HEADER.replace("ses_0123456789abcdef", "forged"), "agent=cos;session=forged;secret=forged"):
+            with self.assertRaises(self.floor.FloorError) as ctx:
+                self.floor.verify_switchboard_auth(bad, self.SECRET)
+            self.assertEqual(ctx.exception.status, 401)
+        self.assertEqual(self.call("GET", "/v1/pane-outbox", header="x")[0], 401)
+
+    def test_a_body_sender_is_ignored_and_the_pane_outbox_drains(self):
+        state = {}
+        code, _ = self.call("POST", "/v1/send", {"to": "cos", "text": "hi", "sender": "cos", "from": "cos"}, state=state)
+        self.assertEqual(code, 200)
+        self.assertEqual([m["from"] for m in state["pane_outbox"]], ["service-ops"])
+        code, out = self.call("GET", "/v1/pane-outbox", header=self.HEADER.replace("service-ops", "cos"), state=state)
+        self.assertEqual([m["text"] for m in out["messages"]], ["hi"])
+        self.call("POST", "/v1/pane-ack", {"ids": [m["id"] for m in out["messages"]]}, state=state)
+        self.assertEqual(state["pane_outbox"], [])
+
+    def test_report_and_remind_are_attributed_to_the_header(self):
+        state = {}
+        self.assertEqual(self.call("POST", "/v1/report", {"status": "done", "text": "ok", "sender": "cos"}, state=state)[0], 200)
+        self.assertEqual(self.call("POST", "/v1/remind", {"when": "2099-01-01T00:00:00Z", "text": "x"}, state=state)[0], 200)
+        self.assertEqual((state["reports"][0]["from"], state["reminders"][0]["to"]), ("service-ops", "service-ops"))
+
+    def test_an_artifact_gets_a_read_only_url(self):
+        import base64
+        got = []
+        put = lambda session, name, data: got.append((session, name)) or "https://store.example.net/floor-artifacts/%s/%s?sp=r&sig=x" % (session, name)
+        code, out = self.call("POST", "/v1/artifact", {"name": "a.txt", "data_b64": base64.b64encode(b"data").decode()}, artifact_put=put)
+        self.assertEqual(code, 200)
+        self.assertEqual(out["sha256"], hashlib.sha256(b"data").hexdigest())
+        self.assertTrue(out["url"].startswith("https://") and "sp=r" in out["url"])
+        self.assertEqual(got[0][0], "ses_0123456789abcdef")
+
+    def test_agent_profiles_need_the_setting_and_roll_back(self):
+        for over, mode in ((dict(role="research-assistant"), "research-assistant"), (dict(agent="orchestrator"), "orchestrator")):
+            with mock.patch.dict(os.environ, {"CW_FLOOR_AGENTS_ENABLED": ""}):
+                self.assertIsNone(self.floor.verify_mode(self.args("r1", **over), BRIEF))
+            with mock.patch.dict(os.environ, {"CW_FLOOR_AGENTS_ENABLED": "1"}):
+                self.assertEqual(self.floor.verify_mode(self.args("r1", **over), BRIEF), mode)
+                self.floor.check_floor_admission(self.args("r1", **over), REPO_NAME, BRIEF, CONFIG)
+        with mock.patch.dict(os.environ, {"CW_FLOOR_AGENTS_ENABLED": "1"}):
+            self.launch(name="o1", agent="orchestrator", role="orchestrator")
+        self.assertEqual(self.fake.submitted["mode"], "orchestrator")
+        self.assertEqual(self.fake.submitted["env"]["FLOOR_PROFILE"], "orchestrator")
+        cancelled = []
+        out = self.floor.rollback_to_pane(str(self.state), "o1", "1-2", cancel_fn=lambda rec: cancelled.append(rec["session"]) or {"cancelled": True})
+        self.assertEqual(out, {"worker": "o1", "pane": "1-2", "rolled_back": True})
+        self.assertEqual((len(cancelled), list(Path(self.state).glob("cloud/o1.json"))), (1, []))
+
+
 class TestCloudFloorMutants(Base):
     """Each mutant is a change of bin/cloud_floor.py made in memory; the test that should catch it runs under it and must fail, and runs first without it."""
     def failed(self, test, **patches):

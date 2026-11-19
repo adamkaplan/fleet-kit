@@ -1,0 +1,119 @@
+# The in-cluster switchboard (Cloud Agents, #34): one Deployment and a ClusterIP Service for the /v1 routes of bin/cloud_floor.py.
+# The sender is bound only from the X-Switchboard-Auth header the egress proxy sets outside the sandbox; a body sender is never trusted.
+# NO Secret value is here. Replace the image digest, then apply. Rollback: kubectl -n cw delete deployment,service -l app.kubernetes.io/part-of=fleet-switchboard
+# (JSON is valid YAML: the file is written as JSON documents so the offline test needs no YAML library.)
+---
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "fleet-switchboard",
+    "namespace": "cw",
+    "labels": {
+      "app": "fleet-switchboard",
+      "app.kubernetes.io/part-of": "fleet-switchboard"
+    }
+  },
+  "spec": {
+    "replicas": 1,
+    "strategy": {
+      "type": "Recreate"
+    },
+    "selector": {
+      "matchLabels": {
+        "app": "fleet-switchboard"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "fleet-switchboard",
+          "app.kubernetes.io/part-of": "fleet-switchboard"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 10001,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "containers": [
+          {
+            "name": "switchboard",
+            "image": "registry.invalid/cw-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "env": [
+              {
+                "name": "CW_CLOUD_NAMESPACE",
+                "value": "cw"
+              },
+              {
+                "name": "HOME",
+                "value": "/run/home"
+              }
+            ],
+            "ports": [
+              {
+                "name": "http",
+                "containerPort": 8080
+              }
+            ],
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "home",
+                "mountPath": "/run/home"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "home",
+            "emptyDir": {
+              "medium": "Memory",
+              "sizeLimit": "16Mi"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "fleet-switchboard",
+    "namespace": "cw",
+    "labels": {
+      "app": "fleet-switchboard",
+      "app.kubernetes.io/part-of": "fleet-switchboard"
+    }
+  },
+  "spec": {
+    "type": "ClusterIP",
+    "selector": {
+      "app": "fleet-switchboard"
+    },
+    "ports": [
+      {
+        "name": "http",
+        "port": 8080,
+        "targetPort": 8080,
+        "protocol": "TCP"
+      }
+    ]
+  }
+}

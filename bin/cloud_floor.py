@@ -23,6 +23,7 @@ after a crash names the same work and is never run twice.
 """
 import base64
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -381,8 +382,20 @@ def verify_enabled(env=None):
     return ((env_of() if env is None else env).get("CW_FLOOR_VERIFY_ENABLED") or "").strip().lower() in ("1", "true", "yes")
 
 
+def agents_enabled(env=None):
+    """True when the Cloud Agents profiles are on (CW_FLOOR_AGENTS_ENABLED is `1`, `true` or `yes`)."""
+    return ((env_of() if env is None else env).get("CW_FLOOR_AGENTS_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+
+
+AGENT_MODES = ("research-assistant", "orchestrator")
+
+
 def verify_mode(args, brief):
-    """`verify-only` for a tester, `rehearse` for --no-commit or a rehearsal brief, else None (an author launch)."""
+    """`research-assistant` or `orchestrator` for those profiles (agents enabled), `verify-only` for a tester, `rehearse` for --no-commit or a rehearsal brief, else None (an author launch)."""
+    if agents_enabled():
+        for profile in AGENT_MODES:
+            if getattr(args, "role", None) == profile or getattr(args, "agent", None) == profile:
+                return profile
     if getattr(args, "role", None) == "tester":
         return "verify-only"
     if getattr(args, "no_commit", False) or str(brief or "").lstrip().startswith("REHEARSAL BRIEF"):
@@ -400,6 +413,9 @@ def check_floor_admission(args, repo, brief, config):
         raise Refusal("refused: %s lands through pull requests and gates (not in land_repos): Floor only supports spire land repositories until a "
                       "PR-and-gates workflow exists; nothing was created" % repo)
     agent, text = getattr(args, "agent", None), str(brief or "")
+    profile = verify_mode(args, brief) if agents_enabled() else None
+    if profile in AGENT_MODES:
+        return
     if agent in NOT_AUTHORS or getattr(args, "persistent", False):
         raise Refusal("refused: %s routes to Floor: --agent orchestrator and --persistent are not Floor authors; nothing was created" % repo)
     if getattr(args, "role", None) == "reviewer" or str(agent or "").startswith("reviewer"):
@@ -523,7 +539,11 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     session_id = session_id if isinstance(session_id, str) and session_id else session_key(who, name, repo)
     base = getattr(args, "base", None) or "main"
     mode = verify_mode(args, brief)
-    extra = {"mode": mode, "env": {"FLOOR_WORKFLOW": mode}} if mode else {}   # a verify launch: Floor runs it on the heavy executor, nothing is translated to author commits
+    extra = {"mode": mode, "env": {"FLOOR_WORKFLOW": mode}} if mode else {}
+    if mode in AGENT_MODES:
+        extra["env"]["FLOOR_PROFILE"] = mode
+        if mode == "orchestrator" and getattr(args, "charter", None):
+            extra["env"]["FLOOR_CHARTER"] = str(args.charter)   # a verify launch: Floor runs it on the heavy executor, nothing is translated to author commits
     preview = bool(getattr(args, "preview", False))
     extra.update(**({"priority_class": pclass} if pclass != "production" else {}), **({"preview": True} if preview else {}))
     answer = submit_work(who, launch_key(who, session_id), session_id=session_id, repo=repo, ref=base, branch=branch, title=name,
@@ -693,6 +713,125 @@ def _retire_floor(args, runner, now, record):
     D["remove_record"](state, args.name)
     print("%s is retired (Floor session %s cancelled)" % (args.name, record.get("session")))
     return H["EXIT_OK"]
+
+
+def rollback_to_pane(state, name, pane_id, cancel_fn=None):
+    """Rollback of a cloud orchestrator to a local pane: cancel its Floor session, remove the record once retired, name the pane."""
+    record = D["load_record"](state, name)
+    if record is not None and is_floor(record):
+        cancel = cancel_fn or (lambda rec: _call(transport().cancel, floor_who(), rec["work_id"], cancel_key(rec["session"], int(rec.get("seq", 1)) + 1),
+                                                 int(rec.get("seq", 1)) + 1))
+        answer = cancel(record)
+        if isinstance(answer, dict) and answer.get("reserved"):
+            return {"worker": name, "pane": pane_id, "rolled_back": False}
+        D["remove_record"](state, name)
+    return {"worker": name, "pane": pane_id, "rolled_back": True}
+
+
+# ---------------------------------------------------------------- the in-cluster switchboard (Cloud Agents)
+
+SESSION_RE = re.compile(r"ses_[0-9a-f]{16}")
+CHARTER_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+")
+REPORT_STATES = ("done", "failed", "blocked", "question", "working")
+
+
+def verify_switchboard_auth(header_value, expected_secret):
+    """The sender identity from the egress proxy's X-Switchboard-Auth header; anything else raises FloorError 401."""
+    bad = FloorError("unauthenticated switchboard request", 401)
+    if not isinstance(header_value, str) or not header_value or not expected_secret or len(header_value) > 512:
+        raise bad
+    fields = {}
+    for part in header_value.split(";"):
+        key, sep, value = part.partition("=")
+        if not sep or key in fields:
+            raise bad
+        fields[key.strip()] = value
+    agent, session, charter, secret = fields.get("agent"), fields.get("session"), fields.get("charter"), fields.get("secret")
+    if set(fields) - {"agent", "session", "charter", "secret"} or secret is None:
+        raise bad
+    if not (agent and CALLER_RE.fullmatch(agent) and session and SESSION_RE.fullmatch(session)):
+        raise bad
+    if charter is not None and not CHARTER_RE.fullmatch(charter):
+        raise bad
+    if not hmac.compare_digest(secret.encode("utf-8"), str(expected_secret).encode("utf-8")):
+        raise bad
+    return {"agent": agent, "session": session, "charter": charter}
+
+
+def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, state=None, artifact_put=None):
+    """One request to the in-cluster switchboard: returns (status, body). The sender is the proxy-injected header's agent, never a body field."""
+    try:
+        auth = verify_switchboard_auth((headers or {}).get("X-Switchboard-Auth"), expected_secret)
+    except FloorError as err:
+        return err.status, {"error": str(err)}
+    state = state if state is not None else {}
+    for key in ("pane_outbox", "reports", "reminders", "audit"):
+        state.setdefault(key, [])
+    route = (method.upper(), path.split("?", 1)[0])
+    if route == ("GET", "/v1/pane-outbox"):
+        return 200, {"messages": [m for m in state["pane_outbox"] if m.get("to") == auth["agent"] or auth["agent"] in ("cos", "pane-relay")]}
+    body = {}
+    if route[0] == "POST":
+        try:
+            body = D["parse_bounded"](body_bytes.decode("utf-8")) if body_bytes else {}
+        except Exception:
+            return 400, {"error": "bad request body"}
+        if not isinstance(body, dict):
+            return 400, {"error": "bad request body"}
+    for spoof in ("sender", "from"):
+        if spoof in body and body[spoof] != auth["agent"]:
+            state["audit"].append({"event": "spoofed_sender", "agent": auth["agent"], "session": auth["session"], "claimed": scrub(body[spoof], 40)})
+    text = scrub(body.get("text", ""), 4000) if isinstance(body.get("text", ""), str) else ""
+    if route == ("POST", "/v1/send"):
+        to = body.get("to")
+        if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text:
+            return 400, {"error": "to and text are required"}
+        message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue")}
+        target = (state.get("floor_sessions") or {}).get(to)
+        if target:
+            seq = int(target.get("seq", 1)) + 1
+            _call(transport().message, floor_who(), target["work_id"], send_key(target.get("session", to), seq, text), seq, text)
+            target["seq"] = seq
+            return 200, {"queued": "floor"}
+        state["pane_outbox"].append(dict(message, id=len(state["pane_outbox"]) + 1 + len(state.get("acked", []))))
+        return 200, {"queued": "pane"}
+    if route == ("POST", "/v1/report"):
+        status = body.get("status")
+        if status not in REPORT_STATES:
+            return 400, {"error": "status must be one of " + ", ".join(REPORT_STATES)}
+        state["reports"].append({"from": auth["agent"], "session": auth["session"], "status": status, "text": text})
+        return 200, {"recorded": True}
+    if route == ("POST", "/v1/remind"):
+        when = body.get("when")
+        if not isinstance(when, (str, int, float)) or not text:
+            return 400, {"error": "when and text are required"}
+        to = body.get("to") or auth["agent"]
+        if not isinstance(to, str) or not CALLER_RE.fullmatch(to):
+            return 400, {"error": "bad recipient"}
+        state["reminders"].append({"to": to, "from": auth["agent"], "when": when, "text": text, "key": body.get("key")})
+        return 200, {"recorded": True}
+    if route == ("POST", "/v1/artifact"):
+        name = body.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", name) or artifact_put is None:
+            return 400, {"error": "a plain name is required"}
+        try:
+            data = base64.b64decode(body.get("data_b64") or "", validate=True)
+        except ValueError:
+            return 400, {"error": "data_b64 is not base64"}
+        digest = hashlib.sha256(data).hexdigest()
+        url = artifact_put(auth["session"], "%s-%s" % (digest, name), data)
+        if not isinstance(url, str) or not url.startswith("https://"):
+            return 502, {"error": "artifact store refused"}
+        return 200, {"url": url, "sha256": digest, "sp": "r"}
+    if route == ("POST", "/v1/pane-ack"):
+        ids = body.get("ids")
+        if not isinstance(ids, list):
+            return 400, {"error": "ids is required"}
+        keep = [m for m in state["pane_outbox"] if m.get("id") not in ids]
+        state.setdefault("acked", []).extend(m for m in state["pane_outbox"] if m.get("id") in ids)
+        state["pane_outbox"][:] = keep
+        return 200, {"acked": len(state["acked"])}
+    return 404, {"error": "no such route"}
 
 
 # ---------------------------------------------------------------- the cutover, the drain and the pod launcher's retirement
