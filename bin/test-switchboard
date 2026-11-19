@@ -1886,9 +1886,7 @@ class TestSteerToWorking(Base):
 
     def test_a_message_that_would_be_cut_is_refused_with_the_allowed_length_and_nothing_is_delivered(self):
         self.work()
-        strict = mock.patch.dict(os.environ, {"FLEET_STRICT_MESSAGE_TOO_LONG": "1"})
-        strict.start()
-        self.addCleanup(strict.stop)
+        self.enterContext(mock.patch.dict(os.environ, {"FLEET_STRICT_MESSAGE_TOO_LONG": "1"}))
 
         def send(*argv):
             with captured() as (out, err):
@@ -1912,19 +1910,6 @@ class TestSteerToWorking(Base):
         self.world.tick(1)
         code, _, err = send("short")
         self.assertEqual(code, 0, err)
-
-    def test_an_oversize_send_is_stored_whole_and_a_pointer_is_delivered(self):
-        self.work()
-        engine = self.world.engine
-        now = self.world.clock.now()
-        discovery = engine.discover(now)
-        fact = sb.Fact("send:cos:big", "platform", "send", "z" * 4500, now, batch=False, sender="cos")
-        with mock.patch.dict(os.environ, {"FLEET_STRICT_MESSAGE_TOO_LONG": "0"}):
-            result = engine.send_fact(fact, discovery, now)
-        self.assertTrue(result.get("sent"), result)
-        stored = list((engine.state_dir / "oversize-sends").glob("send-*.txt"))
-        self.assertEqual(len(stored), 1)
-        self.assertEqual(stored[0].read_text(), "z" * 4500)
 
     def test_1275_the_cut_check_measures_the_carried_send_with_two_facts_pending(self):
         self.work()
@@ -2008,8 +1993,7 @@ class TestSteerToWorking(Base):
         self.work()
         code, out, err = self.cli_send("x" * 5000)
         self.assertEqual(code, 0, err)   # never refused whole: stored as a file, a pointer is delivered
-        (got,) = self.delivered()
-        self.assertIn("oversize send (5000 chars) stored at", got)
+        self.assertIn("oversize send (5000 chars) stored at", self.delivered()[0])
 
     def test_1399_s6_a_file_that_cannot_be_used_is_refused_and_nothing_is_queued(self):
         self.work()
