@@ -2475,6 +2475,20 @@ class Switchboard:
             if len(pending) > 1:   # the carried send goes alone, with the line that says the others wait (compose's own rest line)
                 whole += "\n\u2026 and %d more: run fleet-switchboard pending %s" % (len(pending) - 1, plan.recipient)
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
+            if self.state_dir is not None and os.environ.get("FLEET_STRICT_MESSAGE_TOO_LONG") != "1":
+                # never refuse whole: store the full text as a file and deliver a pointer
+                store = self.state_dir / "oversize-sends"
+                target = store / ("send-%s.txt" % re.sub(r"[^A-Za-z0-9_.-]", "_", sent.key))
+                store.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as handle:
+                    handle.write(sent.summary)
+                head = "[oversize send (%d chars) stored at %s] " % (len(sent.summary), target)
+                sent.summary = head + sent.summary[:max(0, min(600, allowed - len(head)))]
+                text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
+                                        repos=repos, delivered=self.now(), resume=parts_done, in_turn=in_turn)
+                sent = next((fact for fact in carried if fact.kind == "send"), None)
+        if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:
             raise MessageTooLong("message is %d characters and would be cut at the delivery cap of %d once its header and "
                                  "ask sections are added; the allowed text for this message is %d characters: nothing was "
                                  "sent. Write it to a file in the opencode temp dir and send the path"
@@ -3094,7 +3108,7 @@ class Switchboard:
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, with_block_kind(self, plan.observation, {"reason": plan.reason, "keys": [fact.key]}))
-            if fact.kind in ("send", REPORT) and fact.key.startswith(("send:", "report:")) and self.state_dir is not None and held_send_applies(plan.observation):
+            if fact.kind in ("send", REPORT) and fact.key.startswith(("send:", "report:")) and self.state_dir is not None and (held_send_applies(plan.observation) or (plan.observation is not None and plan.observation.status == "blocked")):
                 return hold_send_fact(self, fact, now)   # #2051, #34: a send or attention report to an agent with any hold reason is held, never refused
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
@@ -13587,7 +13601,7 @@ def _send_by_registry(args, runner, now):
     if found[0] == "half":
         if not found[2]:
             return None   # the recipient is not known to be an endpoint row: the old path serves a pane agent, or finds nothing
-        sys.stderr.write("%s: not sent: %s\n" % (PROG, found[1]))
+        sys.stderr.write("%s: not sent: %s\n" % (PROG, found[1]))   # the recipient's state is unknown on a half read, so it is not stored as held
         return EXIT_HELD
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)
@@ -13615,6 +13629,10 @@ def _send_by_registry(args, runner, now):
         sys.stderr.write("%s: held for %s: %s is blocked; it will be delivered when it unblocks\n" % (PROG, args.name, args.name))
         return EXIT_OK
     ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
+    if not ok and (found[2] == "blocked" or es.blocked_reason(args.name, found[2], hold_reason)):
+        hold_send_endpoint(engine, args.name, sender, text, args.issue, engine.now())
+        sys.stderr.write("%s: held for %s: not delivered (%s); it will be delivered when it unblocks\n" % (PROG, args.name, line))
+        return EXIT_OK
     if not ok:
         sys.stderr.write("%s: not sent to %s: %s\n" % (PROG, args.name, line))
         return EXIT_HELD
@@ -13626,6 +13644,18 @@ def _send_by_registry(args, runner, now):
 
 def part_label(n, total):
     return "part %d of %d\n" % (n, total)
+
+
+def _store_oversize(text):
+    """Store an oversize send whole in a 0600 file under the state dir and return one pointer message that fits within MESSAGE_CAP."""
+    store = Path(state_dir_path()) / "oversize-sends"
+    store.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+    target = store / ("send-%s-%s.txt" % (time.strftime("%Y%m%dT%H%M%S"), digest))
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    return "[oversize send (%d chars) stored at %s]\n%s..." % (len(text), target, text[:600])
 
 
 def send_plan(args):
@@ -13643,13 +13673,12 @@ def send_plan(args):
             return [text], None
         chunks, refused = text_parts(text, SEND_PART_BUDGET - 40)   # room for the "part n of m" line
         if refused:
-            return None, "--file is too long to carry in %d parts: nothing sent" % FINDING_MAX_PARTS
+            return [_store_oversize(text)], None
         return [part_label(n + 1, len(chunks)) + chunk for n, chunk in enumerate(chunks)], None
     if not words:
         return None, "nothing to send"
     if len(words) > MESSAGE_CAP:
-        return None, ("the text is %d characters and a message holds %d: write it to a file and use --file F, which carries it in numbered "
-                      "parts: nothing sent" % (len(words), MESSAGE_CAP))
+        return [_store_oversize(words)], None
     return [words], None
 
 

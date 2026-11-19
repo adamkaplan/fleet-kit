@@ -1886,6 +1886,9 @@ class TestSteerToWorking(Base):
 
     def test_a_message_that_would_be_cut_is_refused_with_the_allowed_length_and_nothing_is_delivered(self):
         self.work()
+        strict = mock.patch.dict(os.environ, {"FLEET_STRICT_MESSAGE_TOO_LONG": "1"})
+        strict.start()
+        self.addCleanup(strict.stop)
 
         def send(*argv):
             with captured() as (out, err):
@@ -1910,6 +1913,19 @@ class TestSteerToWorking(Base):
         code, _, err = send("short")
         self.assertEqual(code, 0, err)
 
+    def test_an_oversize_send_is_stored_whole_and_a_pointer_is_delivered(self):
+        self.work()
+        engine = self.world.engine
+        now = self.world.clock.now()
+        discovery = engine.discover(now)
+        fact = sb.Fact("send:cos:big", "platform", "send", "z" * 4500, now, batch=False, sender="cos")
+        with mock.patch.dict(os.environ, {"FLEET_STRICT_MESSAGE_TOO_LONG": "0"}):
+            result = engine.send_fact(fact, discovery, now)
+        self.assertTrue(result.get("sent"), result)
+        stored = list((engine.state_dir / "oversize-sends").glob("send-*.txt"))
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].read_text(), "z" * 4500)
+
     def test_1275_the_cut_check_measures_the_carried_send_with_two_facts_pending(self):
         self.work()
         engine = self.world.engine
@@ -1920,7 +1936,7 @@ class TestSteerToWorking(Base):
             older = sb.Fact("send:cos:old", "platform", "send", "short", now - 1, batch=False, sender="cos")
             newer = sb.Fact("send:cos:new", "platform", "send", text, now, batch=False, sender="cos")
             return engine.send_fact(newer, discovery, now, carried=[older])
-        with self.assertRaises(sb.MessageTooLong) as cm:
+        with mock.patch.dict(os.environ, {"FLEET_STRICT_MESSAGE_TOO_LONG": "1"}), self.assertRaises(sb.MessageTooLong) as cm:
             deliver("x" * 4500)
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", str(cm.exception)).group(1))
         self.assertTrue(3000 < allowed < 4000, allowed)   # about 3,754, never the 8,444 of the short older fact
@@ -1988,13 +2004,12 @@ class TestSteerToWorking(Base):
         self.assertIn("a short message", got)
         self.assertNotIn("parts queued", err)
 
-    def test_1399_s5_command_line_text_over_the_cap_is_refused_with_the_file_hint_and_nothing_is_queued(self):
+    def test_1399_s5_command_line_text_over_the_cap_is_stored_and_a_pointer_is_delivered(self):
         self.work()
         code, out, err = self.cli_send("x" * 5000)
-        self.assertEqual(code, 2)
-        for needle in ("5000 characters", "4000", "--file"):
-            self.assertIn(needle, err)
-        self.assertEqual(self.delivered(), [])
+        self.assertEqual(code, 0, err)   # never refused whole: stored as a file, a pointer is delivered
+        (got,) = self.delivered()
+        self.assertIn("oversize send (5000 chars) stored at", got)
 
     def test_1399_s6_a_file_that_cannot_be_used_is_refused_and_nothing_is_queued(self):
         self.work()
