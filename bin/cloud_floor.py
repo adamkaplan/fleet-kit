@@ -837,7 +837,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         if not isinstance(name, str) or not CALLER_RE.fullmatch(name):
             return 400, {"error": "worker is required"}
         target = (state.get("floor_sessions") or {}).get(name)
-        if auth["agent"] != "cos" and auth["agent"] != (target or {}).get("reports_to"):   # the Chief of Staff or the worker's own boss, as `_may_retire` has it
+        if not D["_may_retire"](("agent", auth["agent"], "chief-of-staff" if auth["agent"] == "cos" else None), target or {}):   # the one caller rule of a removal
             return 403, {"error": "only the Chief of Staff or the worker's own boss may retire it"}
         state.setdefault("retires", []).append({"worker": name, "reason": reason, "from": auth["agent"]})
         if target:
