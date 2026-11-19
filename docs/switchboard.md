@@ -2261,7 +2261,7 @@ good place for them on GitHub yet:
 | What | Where |
 |---|---|
 | Path | `$XDG_CONFIG_HOME/fleet-switchboard/standing-orders.md`, beside `config.json`; config `cos_orders_file` (an absolute path) overrides |
-| Content | Free-form markdown, at most 8 KB. A larger file is refused, never cut: `orders --cos` and `status` say so, and nothing is fed to the judge or told to the Chief of Staff from it. HTML comments are not orders: the template's header is a comment |
+| Content | Free-form markdown, at most 16 KB (HTML comments not counted). A larger file is refused, never cut: `orders --cos` and `status` say so, and nothing is fed to the judge or told to the Chief of Staff from it. HTML comments are not orders: the template's header is a comment |
 | Who writes it | You, in an editor. No fleet command writes it, and the judge stops an agent that tries (below) |
 | `install` | Makes a template with a comment header explaining the file, if there is none; **never overwrites** one; `--uninstall` leaves it. It is not in the repo, and no test touches a real path |
 | `fleet-switchboard orders --cos` | Prints the file and its path (read-only). `status` shows its path, size and mtime, or `none` |

@@ -23911,6 +23911,12 @@ class OrdersFacts:
                 engine.reads.compaction_page(observation.session_id, COMPACTIONS_READ, engine.now()))
         except (CosOrdersError, V2Error) as err:  # nothing is guessed; a file too large is refused, not cut
             engine._note("orders.unreadable", observation.name, {"cos": True, "error": _one_line(str(err), 200)})
+            if isinstance(err, CosOrdersError):
+                msg = _one_line(str(err), 240)
+                digest = hashlib.sha256(msg.encode("utf-8")).hexdigest()[:8]
+                return Fact("orders.unreadable:cos:%s" % digest, observation.name, "alert",
+                            "standing-orders.md unreadable (not fed to cos or judge): %s" % msg, engine.now(),
+                            batch=False, sender="switchboard")
             return None
         if not found["text"]:
             return None
@@ -24225,12 +24231,12 @@ def add_orders_parsers(sub):
 #   launch_agent        FLEET_SWITCHBOARD_ROLE and FLEET_SWITCHBOARD_REPO in the pane's environment
 
 COS_ORDERS_NAME = "standing-orders.md"
-COS_ORDERS_MAX_BYTES = 8192
+COS_ORDERS_MAX_BYTES = 16384
 COS_ORDERS_TEMPLATE = """<!--
 The Chief of Staff's standing orders: what it may decide for you, in your own words.
 
 This ONE file is read by the switchboard. It is yours: edit it in an editor; no fleet command writes it (the
-policy judge stops an agent that tries). It is free-form markdown, at most 8 KB; this comment is not shown to
+policy judge stops an agent that tries). It is free-form markdown, at most 16 KB; this comment is not shown to
 anyone. Write short, plain rules, for example:
 
   - Answer permission prompts for read-only commands (ls, cat, git status, gh ... view) with allow.
@@ -24279,15 +24285,21 @@ def read_cos_orders(config=None, path=None):
     cached = _COS_ORDERS_CACHE.get(str(path))
     if cached is not None and cached[0] == signature:
         return cached[1]
-    if info.st_size > COS_ORDERS_MAX_BYTES:
-        raise CosOrdersError("%s is %d bytes: the limit is %d (8 KB). Trim it; nothing is fed to the judge or told "
+    if info.st_size > COS_ORDERS_MAX_BYTES * 4:
+        raise CosOrdersError("%s is %d bytes: the limit is %d (16 KB). Trim it; nothing is fed to the judge or told "
                              "to the Chief of Staff from a file this large" % (path, info.st_size, COS_ORDERS_MAX_BYTES))
     try:
         raw = path.read_text()
     except (OSError, UnicodeDecodeError) as err:
         raise CosOrdersError("cannot read %s: %s" % (path, getattr(err, "strerror", None) or err)) from None
-    result = {"path": str(path), "exists": True, "size": info.st_size, "mtime": info.st_mtime,
-              "text": cos_orders_text_of(raw), "raw": raw}
+    text = cos_orders_text_of(raw)
+    body_bytes = len((text or "").encode("utf-8"))
+    if body_bytes > COS_ORDERS_MAX_BYTES:
+        raise CosOrdersError("%s is %d bytes (without comments; %d bytes total): the limit is %d (16 KB). Trim it; "
+                             "nothing is fed to the judge or told to the Chief of Staff from a file this large"
+                             % (path, body_bytes, info.st_size, COS_ORDERS_MAX_BYTES))
+    result = {"path": str(path), "exists": True, "size": body_bytes if text else info.st_size, "mtime": info.st_mtime,
+              "text": text, "raw": raw}
     if len(_COS_ORDERS_CACHE) > 20:
         _COS_ORDERS_CACHE.clear()
     _COS_ORDERS_CACHE[str(path)] = (signature, result)

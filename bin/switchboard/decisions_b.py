@@ -176,6 +176,16 @@ def decisions_from_order_notices(engine, now):
     window = order_burst_seconds(getattr(engine, "config", None))
     live = [i for i in items if now - i["created"] < ORDER_NOTICE_TTL_SECONDS]
     entries = []
+    try:
+        read_cos_orders(getattr(engine, "config", None))
+    except CosOrdersError as err:
+        headline = decision_core.fit_lines("standing-orders.md unreadable: %s" % _one_line(str(err), 160))
+        repo = (getattr(engine, "config", None) or {}).get("intent_repo") or (decision_repos(engine)[0] if decision_repos(engine) else "fleet/orders")
+        entries.append({"id": "order:cos-unreadable", "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
+                        "headline": headline, "ask": None, "repo": repo, "agent": "cos", "kind": "notice", "tier": "human",
+                        "since": iso(now), "number": None, "url": None, "state": None, "additions": None,
+                        "deletions": None, "files": None, "ci": None, "review": None, "stale": False,
+                        "note": _one_line(str(err), 240), "merge_after": None})
     for group in order_groups(live, window):
         first = group[0]
         short, sign = first["repo"].split("/")[-1], "+" if first.get("action") == "add" else "-"

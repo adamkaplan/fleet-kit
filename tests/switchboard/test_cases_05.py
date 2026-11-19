@@ -1693,13 +1693,15 @@ class TestCosOrdersFile(Base):
         self.assertEqual(sb.read_cos_orders({})["text"], "- Approve read-only prompts.")
 
     def test_eight_kilobytes_is_the_limit_and_a_larger_file_is_refused_and_says_so(self):
-        put_cos_orders(self, "x" * 8192)
-        self.assertEqual(sb.read_cos_orders({})["size"], 8192)
-        put_cos_orders(self, "x" * 8193)
+        put_cos_orders(self, "x" * 16384)
+        self.assertEqual(sb.read_cos_orders({})["size"], 16384)
+        put_cos_orders(self, "<!-- " + "c" * 1024 + " -->\n" + "x" * 8192)
+        self.assertEqual(len(sb.read_cos_orders({})["text"]), 8192)
+        put_cos_orders(self, "x" * 16385)
         with self.assertRaises(sb.CosOrdersError) as caught:
             sb.read_cos_orders({})
-        self.assertIn("8193 bytes", str(caught.exception))
-        self.assertIn("8 KB", str(caught.exception))
+        self.assertIn("16385 bytes", str(caught.exception))
+        self.assertIn("16 KB", str(caught.exception))
 
     def test_it_is_read_again_only_when_the_mtime_or_size_changes(self):
         path = put_cos_orders(self, "- one", mtime=1000)
@@ -1721,8 +1723,8 @@ class TestCosOrdersFile(Base):
         report = sb.collect_status(FakeRunner(), time.time)
         self.assertEqual((report["cos_orders"]["size"], report["cos_orders"]["exists"]), (5, True))
         self.assertIn("(5 bytes, modified 2026-", sb.format_status(report))
-        put_cos_orders(self, "x" * 9000)
-        self.assertIn("is 9000 bytes", sb.format_status(sb.collect_status(FakeRunner(), time.time)))
+        put_cos_orders(self, "x" * 18000)
+        self.assertIn("is 18000 bytes", sb.format_status(sb.collect_status(FakeRunner(), time.time)))
 
 
 class TestOrdersCosCommand(Base):
@@ -1746,10 +1748,10 @@ class TestOrdersCosCommand(Base):
         self.assertIn("standing-orders.md", out)
 
     def test_a_file_that_is_too_large_is_refused_with_a_nonzero_exit(self):
-        put_cos_orders(self, "x" * 9000)
+        put_cos_orders(self, "x" * 18000)
         code, out, err = self.main("orders", "--cos")
         self.assertEqual((code, out), (1, ""))
-        self.assertIn("9000 bytes", err)
+        self.assertIn("18000 bytes", err)
 
     def test_there_is_no_command_that_writes_it(self):
         for argv in (("orders", "--cos", "add", "x"), ("orders", "--cos", "--write", "x")):
