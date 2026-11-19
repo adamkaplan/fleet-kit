@@ -1204,7 +1204,7 @@ class TestFloorAuthority(FloorCase):
 
 
     def test_pane_relay_pass_reports_a_failed_push_and_still_drains(self):
-        engine = mock.Mock()
+        engine = mock.Mock(sources=[])
         sb_mod = types.SimpleNamespace(cloud_push_pane_state=mock.Mock(side_effect=RuntimeError("down")))
         err = io.StringIO()
         with mock.patch.object(self.floor, "drain_pane_outbox", return_value={"delivered": 0, "acked": 0}) as drain, contextlib.redirect_stderr(err):
