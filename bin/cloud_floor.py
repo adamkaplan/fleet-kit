@@ -1079,7 +1079,7 @@ def pane_relay_pass(engine, sb_mod, env=None):
     for source in getattr(engine, "sources", ()):
         if facts is not None and isinstance(source, facts):
             try:
-                source()   # WorkerFacts is callable and reads engine.discovery
+                source()   # WorkerFacts is callable and reads engine.discovery, the one discover() just took
             except Exception as err:
                 _warn("worker fact collection", err)
     try:
@@ -1129,13 +1129,19 @@ def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
     return {"authority": "shadow", "resumed_pid": pid}
 
 
+def fleetkit_azure_dir(home_dir):
+    """The fleet-kit Azure config directory under a home, or None when it does not exist."""
+    path = os.path.join(str(home_dir), ".azure-fleetkit")
+    return path if os.path.isdir(path) else None
+
+
 def render_pane_relay_plist(python_bin, kit_root, home_dir, state_dir, path_env):
     """The LaunchAgent plist that keeps the pane-relay loop running."""
     e = lambda v: html.escape(str(v), quote=False)
     args = [python_bin, "-B", os.path.join(str(kit_root), "bin", "cloud_floor.py"), "pane-relay", "--kit-root", str(kit_root), "--state-dir", str(state_dir)]
     env = (("HOME", home_dir), ("PATH", path_env), ("CW_SWITCHBOARD_URL", "http://127.0.0.1:%d" % PANE_RELAY_PORT))
-    azure_dir = os.path.join(str(home_dir), ".azure-fleetkit")
-    if os.path.isdir(azure_dir):
+    azure_dir = fleetkit_azure_dir(home_dir)
+    if azure_dir:
         env += (("AZURE_CONFIG_DIR", azure_dir),)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1198,8 +1204,8 @@ def _start_port_forward(lib):
 
 def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
     H = D["H"]
-    azure_dir = os.path.expanduser("~/.azure-fleetkit")
-    if not os.environ.get("AZURE_CONFIG_DIR") and os.path.isdir(azure_dir):
+    azure_dir = fleetkit_azure_dir(os.path.expanduser("~"))
+    if not os.environ.get("AZURE_CONFIG_DIR") and azure_dir:
         os.environ["AZURE_CONFIG_DIR"] = azure_dir
     lib = D["_lib"]()
     D["use_settings"]()
