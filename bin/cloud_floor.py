@@ -1146,3 +1146,29 @@ def bind(namespace):
         wrapper.__name__, wrapper.__doc__ = inner.__name__, inner.__doc__
     namespace["_launch"], namespace["cmd_send"], namespace["cmd_read"] = _launch, cmd_send, cmd_read
     namespace["status_lines"], namespace["cmd_retire"] = status_lines, cmd_retire
+
+
+def apply_pane_state_to_discovery(pane_state, discovery):
+    for name, data in (pane_state or {}).items() if isinstance(pane_state, dict) else ():
+        if not isinstance(data, dict):
+            continue
+        obs = discovery.agents.get(name)
+        if obs is None and "Observation" in D.get("H", {}):
+            obs = D["H"]["Observation"](name, data.get("session_id") or ("ses_" + name), data.get("pane"), data.get("status") or "idle", data.get("fleet") if isinstance(data.get("fleet"), dict) else {})
+            discovery.agents[name] = obs
+        if obs is not None:
+            obs.status = data.get("status") or obs.status
+            obs.errored = bool(data.get("errored"))
+            obs.turn_error = data.get("turn_error") or ""
+            obs.turn_error_id = data.get("turn_error_id")
+            obs.idle_at = data.get("idle_at")
+            obs.permission_waiting = bool(data.get("permission_waiting"))
+            obs.form_waiting = bool(data.get("form_waiting"))
+    return discovery
+
+
+def queue_pane_resume_command(state, agent, reason):
+    cmd = {"action": "resume", "agent": agent, "reason": scrub(reason or "", 200), "from": "switchboard"}
+    state.setdefault("pane_commands", []).append(cmd)
+    state.setdefault("pane_outbox", []).append(cmd)
+    return cmd

@@ -47,6 +47,7 @@ import re
 import subprocess
 import sys
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -874,6 +875,26 @@ class TestCloudAgents(FloorCase):
 
     def sb_refusal(self):
         return self.m.D["Refusal"] if "D" in vars(self.m) else self.floor.D["Refusal"]
+
+    def test_pane_state_is_applied_to_discovery(self):
+        obs = types.SimpleNamespace(status="idle", errored=False, turn_error="", turn_error_id=None, idle_at=None, permission_waiting=False, form_waiting=False)
+        discovery = types.SimpleNamespace(agents={"widget-api": obs})
+        state = {"widget-api": {"status": "blocked", "errored": True, "turn_error": "stream error", "turn_error_id": "m1", "permission_waiting": True}, "bad": 3}
+        self.floor.apply_pane_state_to_discovery(state, discovery)
+        self.assertEqual((obs.status, obs.errored, obs.turn_error_id, obs.permission_waiting, obs.form_waiting), ("blocked", True, "m1", True, False))
+        self.assertIs(self.floor.apply_pane_state_to_discovery(None, discovery), discovery)
+
+    def test_pane_resume_command_is_queued(self):
+        state = {}
+        cmd = self.floor.queue_pane_resume_command(state, "widget-api", "turn ended")
+        self.assertEqual(cmd["action"], "resume")
+        self.assertEqual(state["pane_commands"], [cmd])
+        self.assertEqual(state["pane_outbox"], [cmd])
+
+    def test_blocked_kind_reads_a_relayed_permission(self):
+        engine = types.SimpleNamespace(sources=[], pane_command_sink=None)
+        obs = types.SimpleNamespace(name="widget-api", session_id="ses_example", permission_waiting=True, form_waiting=False, errored=False)
+        self.assertIn("permission request", sb.blocked_kind(engine, obs))
 
     def test_auth_binds_the_header_identity(self):
         auth = self.floor.verify_switchboard_auth(self.HEADER, self.SECRET)

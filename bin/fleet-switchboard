@@ -9065,6 +9065,8 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None, window=None)
     engine.reads.forget(seen.session_id)
     if engine.audit is not None:
         engine.audit.append(engine.actor, "resume", name, {"by": caller, "reason": reason, "session": seen.session_id, "message_id": message_id})
+    if callable(getattr(engine, "pane_command_sink", None)):
+        engine.pane_command_sink("resume", name, reason)
     return message_id
 def resume_first_recovery(engine, discovery, seen, reported):
     """The automatic first recovery of the blocked report: a stop whose turn error matches PROVIDER_ERROR is resumed once before it is reported."""
@@ -9121,6 +9123,8 @@ def stream_error_tick(engine, discovery):
             if row.get("outage"):
                 had_outage = True
             current_err, current_id = (last_turn_error_and_id(engine, seen.session_id) if isinstance(message, str) and message and row.get("last_id") != message else ("", None))
+            if current_id is None and isinstance(message, str) and message and row.get("last_id") != message and getattr(seen, "errored", False):
+                current_err, current_id = error, message
             if current_id != message or not PROVIDER_ERROR.search(current_err):
                 continue
             if TRANSPORT_ERROR.search(current_err):
@@ -9356,10 +9360,11 @@ def blocked_alert_section(config):
 
 def blocked_kind(engine, observation, resumed=False):
     """What a blocked agent waits on, in words, as the pass read it: an open permission request or question, or (nothing open) an ended turn."""
+    relayed = [k for k, f in (("permission", getattr(observation, "permission_waiting", False)), ("question", getattr(observation, "form_waiting", False))) if f]
     source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
-    if source is None:
+    if source is None and not relayed and not getattr(observation, "errored", False) and getattr(engine, "pane_command_sink", None) is None:
         return "a permission request or a question (not read)"
-    kinds = sorted({kind for who, kind, _ in source.requests if who.session_id == observation.session_id})
+    kinds = sorted(({kind for who, kind, _ in source.requests if who.session_id == observation.session_id} if source is not None else set()) | set(relayed))
     if kinds:
         return "an open %s; it goes to the owner" % " and an open ".join("%s request" % k if k == "permission" else k for k in kinds)
     return ended_turn_text(observation.name, resumed)
