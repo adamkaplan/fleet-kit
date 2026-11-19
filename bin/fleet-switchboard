@@ -1828,12 +1828,16 @@ class V2Reads:
         return page
 
 
+def _load_pass_timing():
+    return load_module("pass_timing")
+
+
 def _pass_timer_start(engine):
-    return load_module("pass_timing").Timer(getattr(engine, "pass_clock", time.monotonic))
+    return _load_pass_timing().Timer(getattr(engine, "pass_clock", time.monotonic))
 
 
 def _pass_timer_finish(timer, engine, now_iso):
-    load_module("pass_timing").finish(timer, engine.state_dir, engine.audit, engine.actor, now_iso)
+    _load_pass_timing().finish(timer, engine.state_dir, engine.audit, engine.actor, now_iso)
 
 
 class Switchboard:
