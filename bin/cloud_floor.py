@@ -867,7 +867,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         if not isinstance(to, str) or not CALLER_RE.fullmatch(to):
             return 400, {"error": "bad recipient"}
         if action == "list":
-            return 200, {"recorded": False, "reminders": [r for r in state["reminders"] if r.get("to") == to or r.get("from") == auth["agent"]]}
+            return 200, {"recorded": False, "reminders": [r for r in state["reminders"] if auth["agent"] in (r.get("to"), r.get("from"))]}
         if manage:
             target, field = (body.get("cancel"), "id") if action == "cancel" else (body.get("cancel_key"), "key")
             keep = [r for r in state["reminders"] if not (target is not None and r.get(field) == target and r.get("from") == auth["agent"])]
@@ -954,10 +954,16 @@ def switchboard_relay_config(env=None):
     if all(got.values()):
         return got
     try:
-        with open(os.path.join(str(D["H"]["state_dir_path"]()), "switchboard-relay.json"), encoding="utf-8") as handle:
-            data = D["parse_bounded"](handle.read(65536))
+        path = os.path.join(str(D["H"]["state_dir_path"]()), "switchboard-relay.json")
     except Exception:
+        return got   # no state directory bound: no file to read
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = D["parse_bounded"](handle.read(65536))
+    except FileNotFoundError:
         return got
+    except Exception as err:   # a present but unreadable or corrupt file must not silently turn into local writes
+        raise FloorError("switchboard-relay.json cannot be read (%s); fix or remove it" % type(err).__name__) from None
     if not isinstance(data, dict):
         return got
     for key, names in (("url", ("url", "switchboard_url")), ("auth_file", ("auth_file", "switchboard_auth_file")), ("authority", ("authority", "switchboard_authority"))):

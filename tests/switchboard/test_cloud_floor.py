@@ -1125,6 +1125,13 @@ class TestFloorAuthority(FloorCase):
             self.assertEqual((got["url"], got["authority"]), ("https://sw.example", "cluster"))
             self.assertEqual(self.floor.switchboard_authority(env={"CW_SWITCHBOARD_AUTHORITY": "local"}), "local")
 
+    def test_corrupt_relay_file_is_loud(self):
+        (self.home / "switchboard-relay.json").write_text("{not json")
+        worker = sb.load_module("cloud_worker").bind(vars(sb))
+        with mock.patch.dict(worker.H, {"state_dir_path": lambda: self.home}), mock.patch.object(self.floor, "D", worker._Stayed()):
+            with self.assertRaises(Exception):
+                self.floor.switchboard_relay_config(env={})
+
     def test_cluster_authority_relay_failure_is_loud(self):
         def boom(*a, **k):
             raise RuntimeError("down")
@@ -1146,7 +1153,8 @@ class TestFinalMessageRelay(Base):
                 mock.patch.object(worker, "_scrub_lib", lambda: (lambda t, *a: t)):
             with mock.patch.object(worker, "_audit", lambda e, what, name, body=None: calls.append(("audit", body))):
                 worker._final_message(engine, {}, {"reports_to": "cos"}, "widget-api", "done")
-        self.assertEqual(calls[:1] and calls[0][0], "send", calls)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0][0], calls[0][1]["to"]), ("send", "cos"))
         engine.send.assert_not_called()
 
 
