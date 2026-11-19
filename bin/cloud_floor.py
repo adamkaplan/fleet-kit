@@ -25,12 +25,17 @@ after a crash names the same work and is never run twice.
 import base64
 import hashlib
 import hmac
+import html
 import json
 import os
 import time
 import re
+import signal
 import stat
+import subprocess
 import sys
+import tempfile
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -998,6 +1003,224 @@ def call_switchboard_v1(path, payload, env=None):
     data = json.dumps(payload, sort_keys=True).encode()
     headers = [("Accept", "application/json"), ("Content-Type", "application/json"), ("X-Switchboard-Auth", header)]
     return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
+
+
+def _auth_header(config):
+    auth_file = config["auth_file"]
+    if not auth_file:
+        raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not set")
+    try:
+        info = os.stat(auth_file)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+            raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not a regular 0600 file of the user's own")
+        with open(auth_file, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        raise FloorError("CW_SWITCHBOARD_AUTH_FILE cannot be read") from None
+
+
+def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
+    """Fetch the cluster's pane outbox, deliver what the Mac owns (cluster authority only), and ack."""
+    config = switchboard_relay_config(env)
+    if not config["url"]:
+        return {"delivered": 0, "acked": 0}
+    header = _auth_header(config)
+    ans = _parse(_request("GET", config["url"].rstrip("/") + "/v1/pane-outbox", None, [("Accept", "application/json"), ("X-Switchboard-Auth", header)])[1])
+    messages = (ans.get("messages") if isinstance(ans, dict) else None) or []
+    if not messages:
+        return {"delivered": 0, "acked": 0}
+    authority = config.get("authority") or "shadow"
+    ack_ids, delivered = [], 0
+    for m in messages:
+        mid = m.get("id")
+        if mid is None:
+            continue
+        if authority != "cluster":
+            if m.get("from") != "switchboard":
+                ack_ids.append(mid)
+            continue
+        if m.get("from") == "switchboard":
+            recipient = m.get("to")
+            session_id = m.get("session")
+            text = m.get("text") or ""
+            keys = m.get("keys") or []
+            message_id = m.get("message_id") or ("msg_cluster_%s" % mid)
+            delivery = m.get("delivery") or "queue"
+            resume = bool(m.get("resume", True))
+            description = m.get("description") or ("cluster switchboard -> %s" % recipient)
+            if discovery is not None and recipient in getattr(discovery, "agents", {}):
+                session_id = discovery.agents[recipient].session_id
+            try:
+                engine.v2.synthetic(session_id, text, {"fleet": {"keys": keys, "from": "switchboard"}}, resume, delivery, message_id, description)
+            except Exception as err:
+                if "409" not in str(err):
+                    continue
+            ack_ids.append(mid)
+            delivered += 1
+        elif isinstance(m.get("command"), dict):
+            command = m["command"]
+            if command.get("action") == "resume" and sb_mod is not None and discovery is not None:
+                sb_mod.resume_ended_turn(engine, "switchboard", command["agent"], command.get("reason") or "cluster resume", discovery, window=0)
+            ack_ids.append(mid)
+        else:
+            ack_ids.append(mid)
+    if ack_ids:
+        call_switchboard_v1("/v1/pane-ack", {"ids": ack_ids}, env=env)
+    return {"delivered": delivered, "acked": len(ack_ids)}
+
+
+def pane_relay_pass(engine, sb_mod, env=None):
+    """One Mac pane-relay pass: discover, collect worker facts, push pane state, drain the outbox."""
+    discovery = engine.discover(engine.now())
+    facts = getattr(sb_mod, "WorkerFacts", None)
+    for source in getattr(engine, "sources", ()):
+        if facts is not None and isinstance(source, facts):
+            try:
+                source.collect(discovery, engine.now())
+            except Exception:
+                pass
+    try:
+        sb_mod.cloud_push_pane_state(engine, discovery)
+    except Exception:
+        pass
+    return drain_pane_outbox(engine, sb_mod=sb_mod, discovery=discovery, env=env)
+
+
+def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
+    """Rehearsed rollback from cluster authority to the Mac daemon."""
+    try:
+        call_switchboard_v1("/v1/mode", {"mode": "shadow"}, env=env)
+    except Exception:
+        pass
+    relay_path = os.path.join(str(state_dir), "switchboard-relay.json")
+    if os.path.exists(relay_path):
+        with open(relay_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            data["authority"] = "shadow"
+            fd, tmp = tempfile.mkstemp(dir=str(state_dir), prefix=".relay-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as out:
+                    json.dump(data, out, sort_keys=True)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, relay_path)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+    pid = None
+    for name in ("daemon.json", "run.lock"):
+        try:
+            with open(os.path.join(str(state_dir), name), encoding="utf-8") as handle:
+                got = json.load(handle)
+            pid = got.get("pid") if isinstance(got, dict) else None
+        except (OSError, ValueError):
+            continue
+        if pid is not None:
+            break
+    if isinstance(pid, int) and pid > 1:
+        try:
+            kill_fn(pid, signal.SIGCONT)
+        except (ProcessLookupError, OSError):
+            pass
+    return {"authority": "shadow", "resumed_pid": pid}
+
+
+def render_pane_relay_plist(python_bin, kit_root, home_dir, state_dir, path_env):
+    """The LaunchAgent plist that keeps the pane-relay loop running."""
+    e = lambda v: html.escape(str(v), quote=False)
+    args = [python_bin, "-B", os.path.join(str(kit_root), "bin", "cloud_floor.py"), "pane-relay", "--kit-root", str(kit_root), "--state-dir", str(state_dir)]
+    env = (("HOME", home_dir), ("PATH", path_env), ("CW_SWITCHBOARD_URL", "http://127.0.0.1:18080"))
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n<dict>\n'
+        "  <key>Label</key>\n  <string>com.fleet-kit.pane-relay</string>\n"
+        "  <key>ProgramArguments</key>\n  <array>\n" + "".join("    <string>%s</string>\n" % e(a) for a in args) + "  </array>\n"
+        "  <key>EnvironmentVariables</key>\n  <dict>\n" + "".join("    <key>%s</key>\n    <string>%s</string>\n" % (k, e(v)) for k, v in env) + "  </dict>\n"
+        "  <key>RunAtLoad</key>\n  <true/>\n"
+        "  <key>KeepAlive</key>\n  <true/>\n"
+        "  <key>ThrottleInterval</key>\n  <integer>10</integer>\n"
+        "  <key>StandardOutPath</key>\n  <string>%s</string>\n"
+        "  <key>StandardErrorPath</key>\n  <string>%s</string>\n"
+        "</dict>\n</plist>\n"
+    ) % (e(os.path.join(str(state_dir), "pane-relay-stdout.log")), e(os.path.join(str(state_dir), "pane-relay-stderr.log")))
+
+
+def sync_cloud_records_to_cluster(state_dir, env=None):
+    """Push the Mac's cloud records (and, while not cluster authority, reminders) to the cluster."""
+    def read(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            return None
+    records, reminders = {}, None
+    cloud = os.path.join(str(state_dir), "cloud")
+    if os.path.isdir(cloud):
+        for name in sorted(os.listdir(cloud)):
+            if name.endswith(".json"):
+                got = read(os.path.join(cloud, name))
+                if got is not None:
+                    records[name[:-5]] = got
+    if switchboard_authority(env) != "cluster":
+        reminders = read(os.path.join(str(state_dir), "reminders.json"))
+    call_switchboard_v1("/v1/cloud-sync", {"records": records, "reminders": reminders}, env=env)
+    return {"synced": len(records)}
+
+
+def _healthy(url="http://127.0.0.1:18080/healthz"):
+    try:
+        return urllib.request.urlopen(url, timeout=3).status == 200
+    except Exception:
+        return False
+
+
+def _start_port_forward(lib):
+    namespace = os.environ.get("CW_CLOUD_NAMESPACE") or "cw"
+    base = ["kubectl"]
+    for flag, name in (("--server", "CW_CLOUD_SERVER"), ("--certificate-authority", "CW_CLOUD_CA_FILE")):
+        if os.environ.get(name):
+            base += [flag, os.environ[name]]
+    base += ["--token", lib.cluster_token(os.environ, duration="30m"), "-n", namespace]
+    pods = json.loads(subprocess.run(base + ["get", "pods", "-o", "json"], capture_output=True, text=True, timeout=60, check=True).stdout)
+    for item in pods.get("items", []):
+        if item["metadata"]["name"].startswith("fleet-switchboard") and item.get("status", {}).get("phase") == "Running":
+            return subprocess.Popen(base + ["port-forward", "pod/" + item["metadata"]["name"], "18080:8080"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    raise FloorError("no running fleet-switchboard pod")
+
+
+def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
+    H = D["H"]
+    lib = D["_lib"]()
+    D["use_settings"]()
+    engine, state_dir, _ = H["build_engine"](subprocess.run, time.time, "pane-relay")
+    sb_mod = types.SimpleNamespace(**H)
+    child, started, passes = None, 0.0, 0
+    try:
+        while max_passes is None or passes < max_passes:
+            passes += 1
+            if max_passes is None and (child is None or child.poll() is not None or time.time() - started > 900 or not _healthy()):
+                if child is not None and child.poll() is None:
+                    child.terminate()
+                try:
+                    child, started = _start_port_forward(lib), time.time()
+                    time.sleep(2)
+                except Exception:
+                    child = None
+            try:
+                sync_cloud_records_to_cluster(state_dir, env=env)
+            except Exception:
+                pass
+            try:
+                pane_relay_pass(engine, sb_mod, env=env)
+            except Exception:
+                pass
+            if max_passes is None or passes < max_passes:
+                time.sleep(poll_seconds)
+    finally:
+        if child is not None and child.poll() is None:
+            child.terminate()
 
 
 def relay_cli_if_configured(command, payload, env=None):

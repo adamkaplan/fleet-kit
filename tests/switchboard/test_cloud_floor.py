@@ -43,7 +43,9 @@ import http.server
 import io
 import json
 import os
+import plistlib
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -1163,6 +1165,42 @@ class TestFloorAuthority(FloorCase):
                 mock.patch.object(sb, "run_cloud", boom):
             with self.assertRaises(sb.LaunchError):
                 sb.relay_cli("remind", {})
+
+
+    def test_drain_pane_outbox_delivers_switchboard_messages_and_acks(self):
+        auth = self.home / "auth"
+        auth.write_text("agent=cos;session=ses_example;secret=x")
+        auth.chmod(0o600)
+        msgs = [{"id": 1, "from": "switchboard", "to": "w", "session": "ses_a", "text": "hi"}, {"id": 2, "from": "mac"}]
+        for authority, delivered, acked in (("cluster", 1, [1, 2]), ("shadow", 0, [2])):
+            env = {"CW_SWITCHBOARD_URL": "https://sw.example", "CW_SWITCHBOARD_AUTH_FILE": str(auth), "CW_SWITCHBOARD_AUTHORITY": authority}
+            engine = mock.Mock()
+            with mock.patch.object(self.floor, "_request", return_value=(200, json.dumps({"messages": msgs}).encode())), \
+                    mock.patch.object(self.floor, "call_switchboard_v1") as post:
+                out = self.floor.drain_pane_outbox(engine, env=env)
+            self.assertEqual(out, {"delivered": delivered, "acked": len(acked)})
+            post.assert_called_once_with("/v1/pane-ack", {"ids": acked}, env=env)
+            self.assertEqual(engine.v2.synthetic.call_count, delivered)
+
+    def test_rollback_switchboard_authority_sets_shadow_and_resumes_pid(self):
+        (self.home / "switchboard-relay.json").write_text('{"url": "https://sw.example", "authority": "cluster"}')
+        (self.home / "daemon.json").write_text('{"pid": 4242}')
+        kills = []
+        with mock.patch.object(self.floor, "call_switchboard_v1") as post:
+            out = self.floor.rollback_switchboard_authority(self.home, env={}, kill_fn=lambda *a: kills.append(a))
+        post.assert_called_once_with("/v1/mode", {"mode": "shadow"}, env={})
+        self.assertEqual(json.loads((self.home / "switchboard-relay.json").read_text())["authority"], "shadow")
+        self.assertEqual(kills, [(4242, signal.SIGCONT)])
+        self.assertEqual(out, {"authority": "shadow", "resumed_pid": 4242})
+
+    def test_render_pane_relay_plist_is_valid_xml(self):
+        out = self.floor.render_pane_relay_plist("/usr/bin/python3", "/home/user/kit", "/home/user", "/home/user/state", "/usr/bin:/a&b")
+        data = plistlib.loads(out.encode())
+        self.assertEqual(data["Label"], "com.fleet-kit.pane-relay")
+        self.assertIs(data["KeepAlive"], True)
+        self.assertEqual(data["EnvironmentVariables"]["PATH"], "/usr/bin:/a&b")
+        self.assertEqual(data["StandardOutPath"], "/home/user/state/pane-relay-stdout.log")
+        self.assertEqual(data["StandardErrorPath"], "/home/user/state/pane-relay-stderr.log")
 
 
 class TestFinalMessageRelay(Base):
