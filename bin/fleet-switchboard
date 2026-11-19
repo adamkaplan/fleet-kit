@@ -13723,6 +13723,9 @@ def _cmd_send(args, runner, now):
 
 
 def _send_one(args, runner, now):
+    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
+    if remote is not None:
+        return run_cloud("cmd_send", args, runner, now, remote)
     if relay_cli_done("send", {"to": args.name, "text": " ".join(args.text).strip(), "issue": getattr(args, "issue", None)}):
         print("msg_cluster_" + uuid.uuid4().hex[:16])
         sys.stderr.write("%s: delivered to %s (cluster)\n" % (PROG, args.name))
@@ -13739,9 +13742,6 @@ def _send_one(args, runner, now):
     routed = _send_by_registry(args, runner, now)
     if routed is not None:
         return routed
-    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
-    if remote is not None:
-        return run_cloud("cmd_send", args, runner, now, remote)
     started = now()
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)

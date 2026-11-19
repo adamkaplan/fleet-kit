@@ -1079,7 +1079,7 @@ def pane_relay_pass(engine, sb_mod, env=None):
     for source in getattr(engine, "sources", ()):
         if facts is not None and isinstance(source, facts):
             try:
-                source.collect(discovery, engine.now())
+                source.poll(discovery, engine.now())
             except Exception as err:
                 _warn("worker fact collection", err)
     try:
@@ -1134,6 +1134,9 @@ def render_pane_relay_plist(python_bin, kit_root, home_dir, state_dir, path_env)
     e = lambda v: html.escape(str(v), quote=False)
     args = [python_bin, "-B", os.path.join(str(kit_root), "bin", "cloud_floor.py"), "pane-relay", "--kit-root", str(kit_root), "--state-dir", str(state_dir)]
     env = (("HOME", home_dir), ("PATH", path_env), ("CW_SWITCHBOARD_URL", "http://127.0.0.1:%d" % PANE_RELAY_PORT))
+    azure_dir = os.path.join(str(home_dir), ".azure-fleetkit")
+    if os.path.isdir(azure_dir):
+        env += (("AZURE_CONFIG_DIR", azure_dir),)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
@@ -1195,6 +1198,9 @@ def _start_port_forward(lib):
 
 def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
     H = D["H"]
+    azure_dir = os.path.expanduser("~/.azure-fleetkit")
+    if not os.environ.get("AZURE_CONFIG_DIR") and os.path.isdir(azure_dir):
+        os.environ["AZURE_CONFIG_DIR"] = azure_dir
     lib = D["_lib"]()
     D["use_settings"]()
     engine, state_dir, _ = H["build_engine"](subprocess.run, time.time, "pane-relay")
@@ -1466,3 +1472,18 @@ def queue_pane_resume_command(state, agent, reason):
     state.setdefault("pane_commands", []).append(cmd)
     state.setdefault("pane_outbox", []).append(cmd)
     return cmd
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _args = _sys.argv[1:]
+    if _args[:1] != ["pane-relay"]:
+        raise SystemExit("usage: cloud_floor.py pane-relay --kit-root DIR --state-dir DIR")
+    _kit = _args[_args.index("--kit-root") + 1] if "--kit-root" in _args else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if "--state-dir" in _args:
+        os.environ.setdefault("FLEET_STATE_DIR", _args[_args.index("--state-dir") + 1])
+    _path = os.path.join(_kit, "bin", "fleet-switchboard")
+    _mod = types.ModuleType("sb")
+    _mod.__file__ = _path
+    exec(compile(open(_path, encoding="utf-8").read(), _path, "exec"), _mod.__dict__)
+    _mod.__dict__["run_cloud"]("run_pane_relay_loop")
