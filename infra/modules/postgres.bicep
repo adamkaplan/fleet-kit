@@ -27,6 +27,7 @@ resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2026-04-01-preview' = {
   }
 }
 
+@batchSize(1)
 resource dbs 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2026-04-01-preview' = [for d in postgresDatabases: {
   parent: pg
   name: d
@@ -40,12 +41,13 @@ resource rules 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2026-04-
   properties: {
     startIpAddress: r.startIpAddress
     endIpAddress: r.endIpAddress
-    sourceAddressPrefixes: r.?sourceAddressPrefixes
   }
+  dependsOn: [ dbs ]
 }]
 
 resource atp 'Microsoft.DBforPostgreSQL/flexibleServers/advancedThreatProtectionSettings@2026-04-01-preview' = {
   parent: pg
   name: 'Default'
   properties: { state: 'Enabled' }
+  dependsOn: [ rules ]
 }

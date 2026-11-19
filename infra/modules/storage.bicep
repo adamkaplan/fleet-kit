@@ -51,9 +51,6 @@ resource containers 'Microsoft.Storage/storageAccounts/blobServices/containers@2
 resource queueSvc 'Microsoft.Storage/storageAccounts/queueServices@2026-06-01' = {
   parent: sa
   name: 'default'
-  properties: {
-    logging: { delete: false, read: false, retentionPolicy: { enabled: false }, version: '1.0', write: false }
-  }
 }
 
 resource queues 'Microsoft.Storage/storageAccounts/queueServices/queues@2026-06-01' = [for q in storageQueues: {
