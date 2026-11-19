@@ -34,7 +34,6 @@ CHECK_BLOCK = ('    if scheme != "Bearer" or not token:\n'
                '        return 502, None, "the caller review could not be asked"\n'
                '    if authenticated is not True:\n'
                '        return 401, None, "the caller token is not accepted"\n'
-               '    controller_sa = env.get("CW_FLOOR_CONTROLLER_SA") or ("system:serviceaccount:%s:floor-controller" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))\n'
                '    if user not in (controller_sa, "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):\n'
                '        return 403, None, "the caller is not the operator account"\n')
 
@@ -329,8 +328,8 @@ class Mutants(unittest.TestCase):
             ('    if scheme != "Bearer" or not token:\n', "    if not token:\n", check_scheme),
             ("    if not isinstance(role, str) or role not in app_token.PERMISSIONS_BY_ROLE:\n", "    if not isinstance(role, str):\n", check_role),
             ("    if body_length > MAX_BODY:\n", "    if False:\n", check_limit),
-            ('    if user not in ("system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):\n', "    if False:\n", check_account),
-            ("        cloud_worker.check_repo_allowed(repo, env)\n", "        pass\n", check_allowed),
+            ('    if user not in (controller_sa, "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):\n', "    if False:\n", check_account),
+            ("        for r in checks:\n            cloud_worker.check_repo_allowed(r, env)\n", "        for r in checks:\n            pass\n", check_allowed),
         ]
         texts = set()
         for old, new, check in cases:

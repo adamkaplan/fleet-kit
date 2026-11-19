@@ -89,6 +89,7 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
     """One request to /mint: (status, answer dict or None, reason line). `review(token)` returns (authenticated, username)."""
     env = os.environ if env is None else env
     mint_fn = mint_fn or mint_answer
+    controller_sa = env.get("CW_FLOOR_CONTROLLER_SA") or ("system:serviceaccount:%s:floor-controller" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))
     if body_length is None or body_length < 0:
         return 400, None, "the request has no usable length"
     if body_length > MAX_BODY:
@@ -106,7 +107,6 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
         return 502, None, "the caller review could not be asked"
     if authenticated is not True:
         return 401, None, "the caller token is not accepted"
-    controller_sa = env.get("CW_FLOOR_CONTROLLER_SA") or ("system:serviceaccount:%s:floor-controller" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))
     if user not in (controller_sa, "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):
         return 403, None, "the caller is not the operator account"
     try:
