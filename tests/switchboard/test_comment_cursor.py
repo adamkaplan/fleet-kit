@@ -146,8 +146,8 @@ class TestCommentCursor(PublishMixin, HubCase):
             hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
             hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES)
             windows += ("since=%s&" % self.since) in world.requests[0]
-            self.assertEqual(len(self.fallbacks()), 1, msg=kind)
-        self.assertEqual(windows, 3, msg="%d of 3 reads started at the window's start" % windows)
+            self.assertEqual(len(self.fallbacks()), 0 if kind == "restart" else 1, msg=kind)   # a restart keeps the held comments on disk and reads incrementally
+        self.assertEqual(windows, 2, msg="%d of 2 reads started at the window's start" % windows)
 
     def test_s4_a_window_not_read_to_its_start_is_said_once_a_day(self):
         cos = types.SimpleNamespace(fleet={"role": "chief-of-staff"})
@@ -228,6 +228,8 @@ class TestCommentCursor(PublishMixin, HubCase):
         self.assertEqual(got[0]["id"], old[0]["id"])   # the comment a check sees first is the same as before
         numeric = CommentWorld(NOW - 7 * DAY, 0)
         numeric.comments = [CommentWorld.make(100, when), CommentWorld.make(99, when)]   # ids compared as strings would put 99 first
+        for leftover in self.state_dir.glob("comment-*.json"):
+            leftover.unlink()   # a different world: nothing of the first one is held
         got, _ = self.hub(numeric).read_comments("sweep", REPO, self.since, cap=2)
         self.assertEqual([c["id"] for c in got], [100, 99])
 
@@ -598,6 +600,24 @@ class TestCommentWindowGapFill(HubCase):
         self.assertEqual({k: v for k, v in sb.take_comment_cuts().items() if k == ("sweep", REPO)}, {})
 
 
+
+    def test_a_restart_after_the_gap_closed_reads_one_request_and_cuts_nothing(self):
+        world = AscendingWorld(NOW - 7 * DAY, 6141)
+        hub, cut, rounds = self.hub(world), True, 0
+        while cut and rounds < 80:
+            rounds += 1
+            got, cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[4])
+        self.assertFalse(cut)
+        sb.take_comment_cuts()
+        self.audit.clear()
+        hub = self.restart(world)
+        world.requests.clear()
+        got, cut = hub.read_comments("sweep", REPO, self.since, cap=sb.COMMENT_WINDOW_PAGES, budget=[4])
+        self.assertFalse(cut)
+        self.assertEqual(len(got), len(world.comments))
+        self.assertEqual(len(world.requests), 1)
+        self.assertEqual([a for a in self.audit if "comment_cursor.fallback" in a], [])
+        self.assertEqual({k: v for k, v in sb.take_comment_cuts().items() if k == ("sweep", REPO)}, {})
 
 
 class TestSweepGapOnRealWiring(HubCase):

@@ -75,12 +75,14 @@ def load_gaps(state_dir, parse):
     for k, v in data.items():
         if isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("edge"), str) and isinstance(v.get("ids"), list):
             out[k] = {"edge": v["edge"], "ids": [i for i in v["ids"] if isinstance(i, (int, str))][-GAP_MAX_IDS:]}
+            if isinstance(v.get("gap"), str):
+                out[k]["gap"] = v["gap"]
     return dict(sorted(out.items(), key=lambda kv: kv[1]["edge"])[-GAP_MAX_KEYS:])
 
 
 def save_gaps(state_dir, gaps, parse):
     """Writes the open gaps atomically (mode 0600) when the content changes; bounded in keys, ids and bytes. False when it could not be written."""
-    new = {k: {"edge": v["edge"], "ids": list(v["ids"])[-GAP_MAX_IDS:]} for k, v in sorted(gaps.items(), key=lambda kv: kv[1]["edge"])[-GAP_MAX_KEYS:]}
+    new = {k: dict({"edge": v["edge"], "ids": list(v["ids"])[-GAP_MAX_IDS:]}, **({"gap": v["gap"]} if v.get("gap") else {})) for k, v in sorted(gaps.items(), key=lambda kv: kv[1]["edge"])[-GAP_MAX_KEYS:]}
     if load_gaps(state_dir, parse) == new:
         return True
     path = Path(state_dir) / GAP_FILE
@@ -88,6 +90,57 @@ def save_gaps(state_dir, gaps, parse):
     if len(text.encode("utf-8")) > GAP_MAX_BYTES:
         return False
     tmp = path.with_name(GAP_FILE + ".tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        os.replace(str(tmp), str(path))
+    except OSError:
+        return False
+    return True
+
+
+HELD_MAX_BYTES = 24 << 20
+
+
+def _held_path(state_dir, name):
+    import hashlib
+    return Path(state_dir) / ("comment-held-%s.json" % hashlib.sha1(name.encode("utf-8")).hexdigest()[:16])
+
+
+def load_held(state_dir, name, parse):
+    """The comments held for "<consumer>|<repository>" at the last stop ({id: record}), or None when absent, too large or malformed."""
+    try:
+        with open(str(_held_path(state_dir, name)), "rb") as handle:
+            raw = handle.read(HELD_MAX_BYTES + 1)
+        if len(raw) > HELD_MAX_BYTES:
+            return None
+        data = parse(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    out = {}
+    for r in data:
+        if isinstance(r, dict) and isinstance(r.get("created_at"), str) and r.get("id") is not None:
+            out[r["id"]] = r
+    return out
+
+
+def save_held(state_dir, name, have):
+    """Writes the held comments atomically (mode 0600), only when the content changes and fits HELD_MAX_BYTES. False when not written."""
+    records = [v for v in have.values() if isinstance(v, dict) and v.get("id") is not None]
+    text = json.dumps(sorted(records, key=lambda r: (r["created_at"], str(r["id"]))), sort_keys=True, default=str) + "\n"
+    if len(text.encode("utf-8")) > HELD_MAX_BYTES:
+        return False
+    path = _held_path(state_dir, name)
+    try:
+        with open(str(path), "r") as handle:
+            if handle.read() == text:
+                return True
+    except OSError:
+        pass
+    tmp = path.with_name(path.name + ".tmp")
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:

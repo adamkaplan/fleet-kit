@@ -11561,7 +11561,7 @@ class GitHubHub:
         if key in gaps and edge:
             ids = self.__dict__.setdefault("_comment_gap_ids", {}).setdefault(key, set())
             ids.update(i for i in have if isinstance(i, (int, str)))
-            entry = {"edge": edge, "ids": sorted(ids, key=str)[-store.GAP_MAX_IDS:]}
+            entry = {"edge": edge, "ids": sorted(ids, key=str)[-store.GAP_MAX_IDS:], "gap": gaps[key]}
             if kept.get(name) == entry:
                 return
             kept[name] = entry
@@ -11588,6 +11588,10 @@ class GitHubHub:
         base = "repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
         loose_held = self.__dict__.setdefault("_held_loose", {}).setdefault(key, {})   # records without a valid created_at, keyed by id or content so they never duplicate
         have, mark = held.get(key), cursors.get(name)
+        if have is None and mark is not None:
+            have = store.load_held(self.state_dir, name, parse)   # the comments held at the last stop, so a restart reads incrementally
+            if have is not None:
+                have = dict(i for i in have.items() if i[1]["created_at"] >= since)   # the window's start drops the older
         if have is None or mark is None:
             why = "no held comments" if have is None and mark is not None else {"absent": "no cursor file", "unreadable": "cursor file unreadable"}.get(self._comment_state, "no cursor")
             told = self.__dict__.setdefault("_comment_fallback", set())
@@ -11619,9 +11623,11 @@ class GitHubHub:
         kept = self.__dict__.get("_comment_gap_kept")
         if kept is None:
             kept = self._comment_gap_kept = store.load_gaps(self.state_dir, parse)   # #2238: the gaps open at the last stop
-        if key in gaps and key not in self.__dict__.setdefault("_comment_gap_edges", {}) and "%s|%s" % key in kept:
+        if key not in self.__dict__.setdefault("_comment_gap_edges", {}) and "%s|%s" % key in kept:
             old = kept["%s|%s" % key]
             if old["edge"] >= since:   # an edge before the window's start is dropped
+                if key not in gaps:   # a restart: the incremental read was not cut, but the gap kept at the last stop is still open
+                    gaps[key] = old.get("gap") or min((v["created_at"] for v in have.values()), default=old["edge"])
                 self._comment_gap_edges[key] = old["edge"]
                 self.__dict__.setdefault("_comment_gap_ids", {})[key] = set(old["ids"])
         if key in gaps:
@@ -11631,6 +11637,7 @@ class GitHubHub:
             self._comment_gap_edges.pop(key, None)
         self._keep_comment_gap(key, since, have, gaps, kept, parse, store)
         newest = max((v["created_at"] for v in have.values()), default=None)
+        store.save_held(self.state_dir, name, have)
         if newest is not None and cursors.get(name) != newest:   # an empty merge keeps the old cursor (harmless: the next read asks since it again)
             cursors[name] = newest
             store.save(self.state_dir, cursors, parse)
