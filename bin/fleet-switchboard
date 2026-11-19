@@ -24742,4 +24742,6 @@ globals().pop("_fleet_parts")
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--run-pane-relay-loop"]:   # the pane-relay LaunchAgent (cloud_floor.py pane-relay) hands over here
+        sys.exit(run_cloud("run_pane_relay_loop"))
     sys.exit(main())

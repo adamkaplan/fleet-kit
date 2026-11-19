@@ -1479,11 +1479,14 @@ if __name__ == "__main__":
     _args = _sys.argv[1:]
     if _args[:1] != ["pane-relay"]:
         raise SystemExit("usage: cloud_floor.py pane-relay --kit-root DIR --state-dir DIR")
-    _kit = _args[_args.index("--kit-root") + 1] if "--kit-root" in _args else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _kit = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for _flag in ("--kit-root", "--state-dir"):
+        if _flag in _args:
+            if _args.index(_flag) + 1 >= len(_args):
+                raise SystemExit("%s needs a value" % _flag)
+    if "--kit-root" in _args:
+        _kit = _args[_args.index("--kit-root") + 1]
     if "--state-dir" in _args:
         os.environ.setdefault("FLEET_STATE_DIR", _args[_args.index("--state-dir") + 1])
-    _path = os.path.join(_kit, "bin", "fleet-switchboard")
-    _mod = types.ModuleType("sb")
-    _mod.__file__ = _path
-    exec(compile(open(_path, encoding="utf-8").read(), _path, "exec"), _mod.__dict__)
-    _mod.__dict__["run_cloud"]("run_pane_relay_loop")
+    # The switchboard entry runs the loop itself: no code is loaded by name here.
+    os.execv(_sys.executable, [_sys.executable, "-B", os.path.join(_kit, "bin", "fleet-switchboard"), "--run-pane-relay-loop"])
