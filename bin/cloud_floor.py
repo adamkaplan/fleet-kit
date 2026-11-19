@@ -906,6 +906,10 @@ def call_switchboard_v1(path, payload, env=None):
     return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
 
 
+def _one_line_text(err):
+    return " ".join(str(err).split())[:160]
+
+
 def floor_watch_sync(state_dir, records, engine=None):
     """Read the Floor controller's sessions (the source of truth for backend=floor): audit `cloud.stopped` once for a finished session and add a
     virtual record for a session no local file holds. Never raises: an offline pass is not broken by it."""
@@ -917,6 +921,10 @@ def floor_watch_sync(state_dir, records, engine=None):
         sessions = {k: v for k, v in sessions.items() if isinstance(v, dict)}
     except Exception as err:
         if D.get("Refusal") and isinstance(err, D["Refusal"]):
+            env = env_of()
+            if not any((env.get(k) or "").strip() for k in ("CW_FLOOR_URL", "CW_FLOOR_QUEUE_URL", "CW_FLOOR_BLOB_URL", "CW_FLOOR_TRANSPORT")):
+                return records   # no Floor is configured: nothing to read, and nothing to say
+            print("floor_watch_sync: the Floor state could not be read (%s)" % _one_line_text(err), file=sys.stderr)
             return records
         print("floor_watch_sync: the Floor state could not be read (%s)" % type(err).__name__, file=sys.stderr)
         return records
