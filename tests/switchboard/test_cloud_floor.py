@@ -954,6 +954,12 @@ class TestCloudAgents(FloorCase):
         self.assertEqual(self.call("POST", "/v1/remind", {"when": "2099-01-01T00:00:00Z", "text": "x"}, state=state)[0], 200)
         self.assertEqual((state["reports"][0]["from"], state["reminders"][0]["to"]), ("service-ops", "service-ops"))
 
+    def test_report_accepts_state_and_rejects_an_unknown_one(self):
+        state = {}
+        self.assertEqual(self.call("POST", "/v1/report", {"state": "done", "text": "ok"}, state=state)[0], 200)
+        self.assertEqual(state["reports"][0]["status"], "done")
+        self.assertEqual(self.call("POST", "/v1/report", {"state": "bogus", "text": "ok"}, state=state)[0], 400)
+
     def test_an_artifact_gets_a_read_only_url(self):
         import base64
         got = []

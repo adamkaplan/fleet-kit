@@ -852,10 +852,10 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         state["pane_outbox"].append(dict(message, id=len(state["pane_outbox"]) + 1 + len(state.get("acked", []))))
         return 200, {"queued": "pane"}
     if route == ("POST", "/v1/report"):
-        status = body.get("status")
+        status = body.get("state") or body.get("status")
         if status not in REPORT_STATES:
             return 400, {"error": "status must be one of " + ", ".join(REPORT_STATES)}
-        state["reports"].append({"from": auth["agent"], "session": auth["session"], "status": status, "state": body.get("state") or status, "text": text})
+        state["reports"].append({"from": auth["agent"], "session": auth["session"], "status": status, "text": text})
         return 200, {"recorded": True}
     if route == ("POST", "/v1/remind"):
         when = body.get("when")
