@@ -378,9 +378,7 @@ class TestHerdrClient(Base):
                 client.open_tab_running("w1", "c", "/w", ["/x"], {})
 
     def test_the_real_socket_call_speaks_one_json_line_each_way(self):
-        short = tempfile.mkdtemp(prefix="sbs", dir="/tmp")   # an AF_UNIX path is limited to ~104 bytes: self.home can be longer
-        self.addCleanup(shutil.rmtree, short, True)
-        path = str(Path(short) / "s.sock")
+        self.home = Path(tempfile.mkdtemp(prefix="sbs", dir="/tmp")); self.addCleanup(shutil.rmtree, self.home, True); path = str(self.home / "s.sock")   # a short home: an AF_UNIX path caps near 104 bytes
         server = sb.socket.socket(sb.socket.AF_UNIX, sb.socket.SOCK_STREAM)
         server.bind(path)
         server.listen(1)
@@ -404,7 +402,7 @@ class TestHerdrClient(Base):
                                                "params": {"a": 1}})
         self.assertTrue(seen[0].endswith(b"\n"))
         with self.assertRaises(sb.HerdrError) as caught:
-            sb.unix_socket_call(str(Path(short) / "nobody.sock"), "layout.apply", {}, 1)
+            sb.unix_socket_call(str(self.home / "nobody.sock"), "layout.apply", {}, 1)
         self.assertEqual(caught.exception.reason, "unavailable")
 
     def test_the_socket_path_follows_herdr(self):
