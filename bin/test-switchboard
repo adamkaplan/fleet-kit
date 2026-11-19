@@ -67099,8 +67099,7 @@ _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
 # The tests #924 added (moved out of this file, its line ceiling); the host module gives the classes their fixtures.
 _t924 = importlib.import_module("test_924")
-_t926 = importlib.import_module("test_926"); TestForeignPrefixParkedLabel = _t926.TestForeignPrefixParkedLabel
-_t34 = importlib.import_module("test_ownerless_other_owner"); TestOwnerlessOtherOwner = _t34.TestOwnerlessOtherOwner
+_t926 = importlib.import_module("test_926"); TestForeignPrefixParkedLabel = _t926.TestForeignPrefixParkedLabel; TestOwnerlessOtherOwner = importlib.import_module("test_ownerless_other_owner").TestOwnerlessOtherOwner
 _t924.HOST = sys.modules[__name__]
 TestPR8Source924, TestImpactHold924 = _t924.load()
 TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
