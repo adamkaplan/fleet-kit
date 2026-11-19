@@ -13724,6 +13724,7 @@ def _cmd_send(args, runner, now):
 
 def _send_one(args, runner, now):
     if relay_cli_done("send", {"to": args.name, "text": " ".join(args.text).strip(), "issue": getattr(args, "issue", None)}):
+        sys.stderr.write("%s: delivered to %s (cluster)\n" % (PROG, args.name))
         return EXIT_OK
     system = load_module("system_sender")   # #2518: a registered system sender is proved by the calling process; the claim variable and --from only NAME one
     claim = os.environ.get(system.SYSTEM_SENDER_ENV) or None
@@ -13914,6 +13915,7 @@ def record_approval(engine, verdict, sender, recipient, repo, number):
 def cmd_report(args, runner, now):
     """PR 13: tell the one you report to what happened. Delivered like `send`; a progress report is a rider."""
     if relay_cli_done("report", {"state": getattr(args, "state", None), "text": " ".join(getattr(args, "text", None) or []).strip(), "issue": getattr(args, "issue", None)}):
+        sys.stderr.write("%s: report delivered to the one you report to (cluster)\n" % PROG)
         return EXIT_OK
     engine, _, _ = build_engine(runner, now, "cli")
     if args.sender is not None:

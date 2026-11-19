@@ -999,6 +999,23 @@ class TestFloorAuthority(FloorCase):
     def call(self, path, body, agent="cos", **kw):
         return self.floor.handle_switchboard_v1("POST", path, {"X-Switchboard-Auth": self.header(agent)}, json.dumps(body).encode(), self.SECRET, **kw)
 
+    def test_cmd_remind_reads_text_file_before_relay(self):
+        import tempfile
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "note.txt")
+            with open(path, "w") as fh:
+                fh.write("check the widget-api rollout")
+            args = argparse.Namespace(name="widget-api", when="10m", text=[], text_file=path, issue=None, key=None, ttl=None, every=None,
+                                      until_closed=None, until_merged=None, keep_if_closed=False, list_mine=False, cancel=None, cancel_key=None, sender=None)
+            done = lambda command, payload: calls.append((command, payload)) or True
+            with mock.patch.dict(os.environ, {"CW_SWITCHBOARD_AUTHORITY": "cluster"}), mock.patch.object(sb, "relay_cli_done", done), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = sb.cmd_remind(args, None, lambda: 0)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0][0], "remind")
+        self.assertEqual(calls[0][1]["text"], "check the widget-api rollout")
+
     def test_a_finished_session_retires_on_the_first_call(self):
         for finished in ("done", "failed", "retired"):
             transport = self.floor.QueueBlobTransport("https://q.example/q", "sig=1", "https://b.example/b", "sig=2")

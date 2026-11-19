@@ -206,7 +206,18 @@ def remind_manage(args, engine, state, sender, moment):
 
 
 def cmd_remind(args, runner, now):
-    if relay_cli_done("remind", {"to": getattr(args, "name", None), "name": getattr(args, "name", None), "when": getattr(args, "when", None), "text": " ".join(getattr(args, "text", None) or []).strip(), "args": [str(a) for a in vars(args).get("text", None) or []], "issue": getattr(args, "issue", None), "key": getattr(args, "key", None), "ttl": getattr(args, "ttl", None), "every": getattr(args, "every", None), "until_closed": getattr(args, "until_closed", None), "until_merged": getattr(args, "until_merged", None), "keep_if_closed": bool(getattr(args, "keep_if_closed", False)), "action": "list" if getattr(args, "list_mine", False) else ("cancel" if getattr(args, "cancel", None) else ("cancel_key" if getattr(args, "cancel_key", None) else "add")), "cancel": getattr(args, "cancel", None), "cancel_key": getattr(args, "cancel_key", None)}):
+    if not (getattr(args, "list_mine", False) or getattr(args, "cancel", None) or getattr(args, "cancel_key", None)) and getattr(args, "text_file", None):
+        if args.text:
+            sys.stderr.write("%s: remind takes the text as words or from --text-file, not both; nothing armed\n" % PROG)
+            return EXIT_USAGE
+        relayed_text, problem = read_text_file(args.text_file)
+        if problem:
+            sys.stderr.write("%s: %s\n" % (PROG, problem))
+            return EXIT_USAGE
+    else:
+        relayed_text = " ".join(getattr(args, "text", None) or []).strip()
+    if relay_cli_done("remind", {"to": getattr(args, "name", None), "name": getattr(args, "name", None), "when": getattr(args, "when", None), "text": relayed_text, "args": [str(a) for a in vars(args).get("text", None) or []], "issue": getattr(args, "issue", None), "key": getattr(args, "key", None), "ttl": getattr(args, "ttl", None), "every": getattr(args, "every", None), "until_closed": getattr(args, "until_closed", None), "until_merged": getattr(args, "until_merged", None), "keep_if_closed": bool(getattr(args, "keep_if_closed", False)), "action": "list" if getattr(args, "list_mine", False) else ("cancel" if getattr(args, "cancel", None) else ("cancel_key" if getattr(args, "cancel_key", None) else "add")), "cancel": getattr(args, "cancel", None), "cancel_key": getattr(args, "cancel_key", None)}):
+        sys.stderr.write("%s: reminder for %s relayed to cluster\n" % (PROG, getattr(args, "name", None) or "caller"))
         return EXIT_OK
     engine, state, config = build_engine(runner, now, "cli")
     if args.sender is not None:
