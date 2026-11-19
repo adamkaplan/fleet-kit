@@ -27,31 +27,34 @@ def _load_script(rel_path, mod_name):
 
 
 class TestSpireLandCutover2570(Base):
-    def test_s3_floor_heavy_pod_finder_acquires_and_releases_lease_on_timeout(self):
+    def test_s3_nightly_and_cloud_land_enqueue_floor_sessions_without_pod_or_db_access(self):
         host = _load_script("tools/spire-land-host", "spire_land_host_s3")
-        calls = []
+        text = (REPO / "tools" / "spire-land-host").read_text()
+        for word in ("kubectl", "fhex", "floor_live_sessions", "reconcile_heavy_pool_scale"):
+            self.assertNotIn(word, text)
 
-        class R:
-            def __init__(self, out=""):
-                self.returncode = 0
-                self.stdout = out
-                self.stderr = ""
+        class Tp:
+            def __init__(self, seen):
+                self.seen = seen
+                self.submits = []
+                self.observes = []
 
-        class Proof:
-            def kube_run(self, argv, env, **kw):
-                calls.append(argv)
-                if argv[3:5] == ["get", "pods"] and "jsonpath={.items[*].metadata.name}" in argv:
-                    return R("floor-controller-abc other-pod")
-                return R("")
+            def submit(self, who, cmd_id, **fields):
+                self.submits.append(fields)
 
-        with mock.patch.object(host.time, "sleep", lambda _s: None):
-            with self.assertRaisesRegex(RuntimeError, "no Running Ready Floor heavy-executor pod"):
-                host._find_floor_heavy_pod(Proof(), {}, None, "cw", "acme-org/widget-service")
-        flat = [" ".join(c) for c in calls]
-        self.assertTrue(any("INSERT INTO floor_live_sessions" in c for c in flat))
-        self.assertTrue(any("DELETE FROM floor_live_sessions" in c for c in flat))
-        self.assertFalse(any("_sql_str" in c for c in flat))
-        self.assertTrue(any("reconcile_heavy_pool_scale" in c for c in flat))
+            def observe(self, who, session_id):
+                self.observes.append(session_id)
+                return self.seen
+
+        host._origin_repo = lambda root: "acme-org/widget-service"
+        nightly = Tp({"state": "done", "manifest": {"exit_code": 0}})
+        self.assertEqual(host.run_floor_nightly(str(REPO), transport=nightly, poll_interval=0), 0)
+        self.assertEqual(nightly.submits[0]["mode"], "verify-only")
+        self.assertEqual(nightly.submits[0]["priority_class"], "background")
+        land = Tp({"state": "done", "landed_sha": "a" * 40})
+        self.assertEqual(host.submit_cloud_land(str(REPO), ["land"], "5404907", "key", transport=land, poll_interval=0), 0)
+        self.assertEqual(land.submits[0]["mode"], "land")
+        self.assertEqual(land.submits[0]["priority_class"], "production")
 
     def test_s1_pin_verify_and_land_json_areas(self):
         done = subprocess.run([REAL_NODE or "node", ".spire/tool/pin.mjs", "verify"], cwd=str(REPO), capture_output=True, text=True, timeout=30)

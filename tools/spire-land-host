@@ -107,133 +107,51 @@ def _origin_repo(root):
     return m.group(1)
 
 
-_KEEPALIVE_STOP = {}
+def _load_floor_transport(root):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cloud_floor", os.path.join(root, "bin", "cloud_floor.py"))
+    cf = importlib.util.module_from_spec(spec)
+    cf.D = {
+        "Refusal": ValueError,
+        "CloudError": RuntimeError,
+        "parse_bounded": json.loads,
+        "use_settings": lambda: None,
+        "endpoint_problem": lambda u: None,
+    }
+    spec.loader.exec_module(cf)
+    cf.env_of = lambda: dict(_cloud_env_map(), **os.environ)
+    return cf
 
 
-# One owner of the SQL string-literal quoting, shipped in the python the pod runs (floor_controller has no helper).
-_POD_SQL_PRELUDE = ("import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
-                    "q = lambda v: \"'\" + str(v).replace(\"'\", \"''\") + \"'\"; ")
+_TERMINAL = ("done", "failed", "held", "retired")
 
 
-def _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid):
-    stop_ev = _KEEPALIVE_STOP.pop(lease_sid, None)
-    if stop_ev:
-        stop_ev.set()
-    if not ctrl or not lease_sid:
-        return
-    proof.kube_run(
-        ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
-         _POD_SQL_PRELUDE +
-         "fc._pg_run(\"DELETE FROM floor_live_sessions WHERE session_id=%s;\" % q(sys.argv[1]))",
-         lease_sid],
-        env, config=cfg,
-    )
+def _wait_floor(tp, who, session_id, poll_interval, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        seen = tp.observe(who, session_id) or {}
+        if seen.get("state") in _TERMINAL:
+            return seen
+        if time.monotonic() >= deadline:
+            raise RuntimeError("timed out waiting for Floor session %s" % session_id)
+        time.sleep(poll_interval)
 
 
-def _find_floor_heavy_pod(proof, env, cfg, ns, repo):
-    pod = (env.get("CW_LAND_EXECUTOR_POD") or "").strip()
-    if pod:
-        return pod, "", ""
-    res = proof.kube_run(["kubectl", "-n", ns, "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"], env, config=cfg)
-    names = (res.stdout or "").split() if res.returncode == 0 else []
-    ctrl = next((n for n in names if n.startswith("floor-controller-")), "")
-    lease_sid = "ses_host_heavy_%d" % os.getpid() if ctrl else ""
-    def _pulse():
-        return proof.kube_run(
-            ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
-             _POD_SQL_PRELUDE +
-             "fc._pg_run(\"INSERT INTO floor_live_sessions(session_id, caller, repo, ref, mode, state, round_num, updated_at) "
-             "VALUES (%s, 'fleet', %s, 'main', 'author', 'running', 1, NOW()) "
-             "ON CONFLICT (session_id) DO UPDATE SET state='running', updated_at=NOW();\" "
-             "% (q(sys.argv[1]), q(sys.argv[2]))); fc.reconcile_heavy_pool_scale()",
-             lease_sid, repo],
-            env, config=cfg,
-        )
-
-    if ctrl:
-        ins = _pulse()
-        if ins.returncode != 0:
-            lease_sid = ""
-    try:
-        for i in range(90):
-            r = proof.kube_run(
-                ["kubectl", "-n", ns, "get", "pods", "-o",
-                 "jsonpath={range .items[*]}{.metadata.name}:{.status.phase}:{range .status.conditions[?(@.type=='Ready')]}{.status}{end}{\"\\n\"}{end}"],
-                env, config=cfg,
-            )
-            for line in (r.stdout or "").splitlines():
-                parts = line.strip().split(":")
-                if len(parts) >= 3 and parts[0].startswith("fhex-") and parts[1] == "Running" and parts[2] == "True":
-                    if ctrl and lease_sid:
-                        stop_ev = threading.Event()
-                        _KEEPALIVE_STOP[lease_sid] = stop_ev
-
-                        def _loop(ev=stop_ev):
-                            while not ev.wait(5):
-                                try:
-                                    _pulse()
-                                except Exception:
-                                    pass
-
-                        threading.Thread(target=_loop, daemon=True).start()
-                    return parts[0], ctrl, lease_sid
-            if ctrl and lease_sid and i % 3 == 2:
-                _pulse()
-            time.sleep(2)
-    except BaseException:
-        _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
-        raise
-    _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
-    raise RuntimeError("no Running Ready Floor heavy-executor pod (fhex-*) found in namespace %s" % ns)
-
-
-def submit_cloud_land(root, subcmd, app_id, app_key):
-    sys.path.insert(0, os.path.join(root, "bin"))
-    import cloud_image_proof as proof
-    cenv = _cloud_env_map()
-    env = dict(os.environ, CW_SECRET_DIR=secret_dir() or "", CW_PROOF_KUBECTL_TIMEOUT="900")
-    cfg = proof.mint_token(env)
-    ns = env.get("CW_CLOUD_NAMESPACE") or cenv.get("CW_CLOUD_NAMESPACE") or "cw"
-    council_url = env.get("CW_COUNCIL_URL") or cenv.get("CW_COUNCIL_URL") or "http://copilot-bridge.%s.svc:8080" % ns
+def submit_cloud_land(root, subcmd, app_id, app_key, transport=None, poll_interval=5, timeout=900):
+    cf = _load_floor_transport(root)
+    tp = transport or cf.transport()
     repo = _origin_repo(root)
     head_sha = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True, timeout=15).strip()
-    tmp_dir = tempfile.mkdtemp(prefix="spire-land-bundle-")
-    ctrl = lease_sid = ""
-    try:
-        pod, ctrl, lease_sid = _find_floor_heavy_pod(proof, env, cfg, ns, repo)
-        bundle_path = os.path.join(tmp_dir, "cand.bundle")
-        subprocess.run(["git", "-C", root, "bundle", "create", bundle_path, "HEAD"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        with open(bundle_path, "rb") as bf:
-            b64_bundle = base64.b64encode(bf.read()).decode("ascii")
-        prep = (
-            "base64 -d > /tmp/cand.bundle && rm -rf /home/worker/land-ws && "
-            "if [ -d /work/repo/.git ]; then git clone -q /work/repo /home/worker/land-ws; else git init -q /home/worker/land-ws; fi && "
-            "chmod 755 /home/worker/land-ws && "
-            "git -C /home/worker/land-ws remote set-url origin https://github.com/%s.git && "
-            "git -C /home/worker/land-ws fetch -q origin main && "
-            "git -C /home/worker/land-ws fetch -q /tmp/cand.bundle HEAD && "
-            "git -C /home/worker/land-ws checkout -q -B land-cand FETCH_HEAD && rm -f /tmp/cand.bundle" % repo
-        )
-        up = proof.kube_run(["kubectl", "-n", ns, "exec", "-i", pod, "--", "sh", "-c", prep], env, stdin=b64_bundle, config=cfg)
-        if up.returncode != 0:
-            sys.stderr.write((up.stdout or "") + (up.stderr or ""))
-            return up.returncode or 1
-        cmd_str = " ".join(shlex.quote(a) for a in ([".spire/tool/bin/spire"] + subcmd))
-        run_sh = (
-            "export PATH=\"/run/cw-tmp/bin:$PATH\" FLEET_APP_ID=%s FLEET_LAND_STATUSES=required "
-            "COUNCIL_MODEL_URL=%s COUNCIL_MODEL_KEY=copilot-bridge; "
-            "FLEET_APP_PRIVATE_KEY=\"$(cat)\" && export FLEET_APP_PRIVATE_KEY && "
-            "cd /home/worker/land-ws && %s" % (shlex.quote(app_id), shlex.quote(council_url), cmd_str)
-        )
-        done = proof.kube_run(["kubectl", "-n", ns, "exec", "-i", pod, "--", "bash", "-c", run_sh], env, stdin=app_key, config=cfg)
-        if done.stdout:
-            sys.stdout.write(done.stdout)
-        if done.stderr:
-            sys.stderr.write(done.stderr)
-        return int(done.returncode)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
+    who = cf.floor_who()
+    session_id = cf.session_key(who, "land-%s" % head_sha[:12], repo)
+    cmd_id = cf.launch_key(who, session_id)
+    tp.submit(who, cmd_id, session_id=session_id, repo=repo, ref=head_sha,
+              brief="Land commit %s via %s" % (head_sha, " ".join(subcmd)),
+              mode="land", priority_class="production")
+    seen = _wait_floor(tp, who, session_id, poll_interval, timeout)
+    if seen.get("log_tail"):
+        sys.stdout.write(seen["log_tail"] + "\n")
+    return 0 if seen.get("state") == "done" else 1
 
 
 NIGHTLY_SUITES = (
@@ -251,46 +169,20 @@ NIGHTLY_SUITES = (
 )
 
 
-def run_floor_nightly(root):
-    sys.path.insert(0, os.path.join(root, "bin"))
-    import cloud_image_proof as proof
-    cenv = _cloud_env_map()
-    env = dict(os.environ, CW_SECRET_DIR=secret_dir() or "", CW_PROOF_KUBECTL_TIMEOUT="1800")
-    cfg = proof.mint_token(env)
-    ns = env.get("CW_CLOUD_NAMESPACE") or cenv.get("CW_CLOUD_NAMESPACE") or "cw"
+def run_floor_nightly(root, transport=None, poll_interval=5, timeout=1800):
+    cf = _load_floor_transport(root)
+    tp = transport or cf.transport()
     repo = _origin_repo(root)
-    pod, ctrl, lease_sid = _find_floor_heavy_pod(proof, env, cfg, ns, repo)
-    try:
-        prep = (
-            "rm -rf /home/worker/nightly-ws && "
-            "if [ -d /work/repo/.git ]; then git clone -q /work/repo /home/worker/nightly-ws; "
-            "else git clone -q https://github.com/%s.git /home/worker/nightly-ws; fi && "
-            "git -C /home/worker/nightly-ws remote set-url origin https://github.com/%s.git && "
-            "git -C /home/worker/nightly-ws fetch -q origin main && "
-            "git -C /home/worker/nightly-ws checkout -q -f origin/main" % (repo, repo)
-        )
-        up = proof.kube_run(["kubectl", "-n", ns, "exec", pod, "--", "sh", "-c", prep], env, config=cfg)
-        if up.returncode != 0:
-            sys.stderr.write((up.stdout or "") + (up.stderr or ""))
-            return up.returncode or 1
-        results = []
-        failed = 0
-        for suite in NIGHTLY_SUITES:
-            t0 = time.monotonic()
-            cmd = "unset FLEET_REAL_GH; export FLEET_HEAVY=off PATH=\"/run/cw-tmp/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; cd /home/worker/nightly-ws && %s" % suite
-            r = proof.kube_run(["kubectl", "-n", ns, "exec", pod, "--", "bash", "-c", cmd], env, config=cfg)
-            elapsed = round(time.monotonic() - t0, 1)
-            ok = r.returncode == 0
-            if not ok:
-                failed += 1
-            entry = {"suite": suite, "rc": r.returncode, "seconds": elapsed, "ok": ok}
-            if not ok:
-                entry["tail"] = ((r.stdout or "") + "\n" + (r.stderr or ""))[-1500:].strip()
-            results.append(entry)
-        print(json.dumps({"pod": pod, "repo": repo, "failed": failed, "results": results}))
-        return 1 if failed else 0
-    finally:
-        _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid)
+    who = cf.floor_who()
+    session_id = cf.session_key(who, "nightly-%d" % int(time.time()), repo)
+    cmd_id = cf.launch_key(who, session_id)
+    tp.submit(who, cmd_id, session_id=session_id, repo=repo, ref="main",
+              brief="Nightly verification suite: " + ", ".join(NIGHTLY_SUITES),
+              mode="verify-only", env={"FLOOR_WORKFLOW": "verify-only"}, priority_class="background")
+    seen = _wait_floor(tp, who, session_id, poll_interval, timeout)
+    print(json.dumps({"session_id": session_id, "repo": repo, "state": seen.get("state"),
+                      "manifest": seen.get("manifest"), "error": seen.get("error")}))
+    return 0 if seen.get("state") == "done" else 1
 
 
 def main(argv=None, workdir=None, runner=subprocess.run, platform=None):
