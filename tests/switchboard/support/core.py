@@ -91,6 +91,8 @@ class Base(unittest.TestCase):
             # A test that forgets to inject a fake must fail, not reach the
             # machine's real herdr or OpenCode: neither lives in these.
             "PATH": SAFE_PATH,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
             # the installed chief-of-staff definition: one that allows the way out of a refusal (the gate preflight reads it)
             sb.COS_DEFINITION_ENV: str(self.home / "cos-definition.md"),
         })
