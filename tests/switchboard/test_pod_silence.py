@@ -193,7 +193,7 @@ class StubCluster:
 class TestSummaryCluster(unittest.TestCase):
     def summary(self, launcher):
         cloud = load_real("cloud_worker").bind(sb.__dict__)
-        fake = types.SimpleNamespace(run_launcher=launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster)
+        fake = types.SimpleNamespace(run_launcher=launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster, route=lambda n: None)
         fake.bind = lambda g: fake
         with unittest.mock.patch.object(sb, "load_module", lambda n: fake if n == "cloud_worker" else load_real(n)):
             return sb.pod_silence_summary("other-pod")
@@ -228,7 +228,7 @@ class TestDaemonSummary(unittest.TestCase):
         def fake_launcher(runner, command, worker, options=(), timeout=0, **kw):
             calls.append((command, worker, tuple(options)))
             return 0, dict(BODY), ""
-        fake = types.SimpleNamespace(run_launcher=fake_launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster)
+        fake = types.SimpleNamespace(run_launcher=fake_launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster, route=lambda n: None)
         fake.bind = lambda g: fake
         with unittest.mock.patch.object(sb, "load_module", lambda n: fake if n == "cloud_worker" else load_real(n)):
             line = sb.pod_silence_summary("other-pod")

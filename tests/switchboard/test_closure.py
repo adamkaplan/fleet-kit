@@ -102,6 +102,9 @@ def fixture():
     shutil.copytree(str(REPO / "bin" / "switchboard"), str(root / "bin" / "switchboard"))
     (root / MATRIX).parent.mkdir(parents=True)
     shutil.copy(str(REPO / MATRIX), str(root / MATRIX))
+    entries = REPO / "docs" / "review-laws" / "impact-entries"
+    if entries.is_dir():
+        shutil.copytree(str(entries), str(root / "docs" / "review-laws" / "impact-entries"))
     return root
 
 
