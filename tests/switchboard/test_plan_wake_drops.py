@@ -366,8 +366,11 @@ def build():
             full = record["body"]
             record["body"], record["body_truncated"] = " ".join(full.split())[:400], True
             reads = []
+            original = self.hub._read_one
 
             def read_one(repo, path, now, fresh=False):
+                if not path.startswith("issues/comments/"):
+                    return original(repo, path, now, fresh)
                 reads.append(path)
                 if isinstance(full_reply, Exception):
                     raise full_reply
