@@ -278,3 +278,65 @@ class github_write:
         except Exception:
             pass   # the write has been made: its result line failing changes nothing, the intent line is on disk
         return False
+
+
+# ----------------------------------------------------------------- the public-names guard of a GitHub write (#34)
+
+class PublicNamesRefused(IntentError):
+    """A GitHub write carried a private name (from the same list `bin/check-public-names` reads): nothing was written. The message names the line and the entry number, never the term."""
+
+    def __init__(self, repo, line, index):
+        super().__init__("public_names", "refused to write a private name (line %d: term #%d) to %s" % (line, index, repo))
+
+
+def private_name_terms():
+    """[(index, regex)] from $FLEET_PRIVATE_NAMES (the text), else $FLEET_PRIVATE_NAMES_FILE, else the default list file (never under a test run unless one of the two is set); [] when there is none or it is unreadable."""
+    text = os.environ.get("FLEET_PRIVATE_NAMES")
+    if text is None:
+        path = os.environ.get("FLEET_PRIVATE_NAMES_FILE")
+        if path is None and not os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
+            base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+            path = os.path.join(base, "fleet-switchboard", "private-names.txt")
+        try:
+            text = open(path, encoding="utf-8").read() if path else ""
+        except (OSError, ValueError):
+            return []
+    terms, index = [], 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("ignore:"):
+            continue
+        index += 1
+        flags = re.IGNORECASE
+        if line.startswith("case:"):
+            line, flags = line[5:], 0
+        try:
+            terms.append((index, re.compile(line, flags)))
+        except re.error:
+            continue
+    return terms
+
+
+def _strings_of(value, depth=0):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, bytes):
+        yield value.decode("utf-8", "replace")
+    elif isinstance(value, dict) and depth < 6:
+        for item in value.values():
+            yield from _strings_of(item, depth + 1)
+    elif isinstance(value, (list, tuple)) and depth < 6:
+        for item in value:
+            yield from _strings_of(item, depth + 1)
+
+
+def refuse_private_names(repo, values):
+    """Raise PublicNamesRefused when any string in `values` (bodies, titles, payloads) matches a private-name entry."""
+    terms = private_name_terms()
+    if not terms:
+        return
+    for text in _strings_of(list(values)):
+        for number, line in enumerate(text.splitlines(), 1):
+            for index, regex in terms:
+                if regex.search(line):
+                    raise PublicNamesRefused(repo, number, index)
