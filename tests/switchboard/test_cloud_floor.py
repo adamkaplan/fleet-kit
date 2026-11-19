@@ -896,6 +896,11 @@ class TestCloudAgents(FloorCase):
         obs = types.SimpleNamespace(name="widget-api", session_id="ses_example", permission_waiting=True, form_waiting=False, errored=False)
         self.assertIn("permission request", sb.blocked_kind(engine, obs))
 
+    def test_blocked_kind_with_a_sink_reads_the_ended_turn(self):
+        engine = types.SimpleNamespace(sources=[], pane_command_sink=lambda *a: None)
+        obs = types.SimpleNamespace(name="widget-api", session_id="ses_example", permission_waiting=False, form_waiting=False, errored=False)
+        self.assertNotIn("not read", sb.blocked_kind(engine, obs))
+
     def test_auth_binds_the_header_identity(self):
         auth = self.floor.verify_switchboard_auth(self.HEADER, self.SECRET)
         self.assertEqual((auth["agent"], auth["session"], auth["charter"]), ("service-ops", "ses_0123456789abcdef", "acme-org/widget-service#10"))
