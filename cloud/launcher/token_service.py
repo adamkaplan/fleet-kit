@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """token-service: a small HTTP service that mints the GitHub App installation token for the operator account (ask #2002).
 
-POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"|"lander"} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
+POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"|"lander"|"reader"} or, for orchestrator and reader, {"repos": ["OWNER/NAME", ...up to 20, one owner, each allowed], "role": ...} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
 The caller is REVIEWED (the cluster's TokenReview API): only system:serviceaccount:<namespace>:cw-operator (for worker and orchestrator) or system:serviceaccount:<namespace>:floor-heavy-executor / CW_HEAVY_EXECUTOR_SA (for lander) is served.
 The repository must be on CW_ALLOWED_REPOS (the launcher's own check), the role in PERMISSIONS_BY_ROLE, the body at most 4096 bytes,
 and the body carries no other key. The answer is GitHub's own: the token, the repositories, the permissions and the expiry.
@@ -24,6 +24,9 @@ import cloud_worker  # noqa: E402  (check_repo_allowed: the launcher's one allow
 
 MAX_BODY = 4096
 KEYS = {"repo", "role"}
+KEYS_MULTI = {"repos", "role"}
+MULTI_ROLES = ("orchestrator", "reader")
+MAX_REPOS = 20
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 REVIEW_URL = "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews"
 
@@ -59,7 +62,9 @@ def cluster_review(token, url=REVIEW_URL, sa_dir=SA_DIR):
 def mint_answer(target, role):
     """GitHub's own answer for ONE repository and the role's permissions (the steps of app_token.mint, which returns only the token).
     Exits through app_token.die() on any failure (SystemExit): the caller maps it to a 502."""
-    repo = target.split("/", 1)[1]
+    targets = list(target) if isinstance(target, list) else [target]
+    target = targets[0]
+    names = [t.split("/", 1)[1] for t in targets]
     app_id = app_token.vault("CW_APP_ID_CMD", "cw-app-id").strip()
     if not app_id.isdigit():
         app_token.die("the app id must be a number")
@@ -73,7 +78,7 @@ def mint_answer(target, role):
     del key
     inst, _owner_id = app_token.find_installation(target, jwt)
     ans = app_token.github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
-                                {"repositories": [repo], "permissions": dict(app_token.PERMISSIONS_BY_ROLE[role])}, role=role)
+                                {"repositories": names, "permissions": dict(app_token.PERMISSIONS_BY_ROLE[role])}, role=role)
     if not isinstance(ans, dict) or not isinstance(ans.get("token"), str) or not ans["token"]:
         app_token.die("the answer has no token")
     app_token.check_permissions(ans.get("permissions"), role)
@@ -101,25 +106,42 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
         return 502, None, "the caller review could not be asked"
     if authenticated is not True:
         return 401, None, "the caller token is not accepted"
-    if user not in ("system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):
+    controller_sa = env.get("CW_FLOOR_CONTROLLER_SA") or ("system:serviceaccount:%s:floor-controller" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))
+    if user not in (controller_sa, "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):
         return 403, None, "the caller is not the operator account"
     try:
         body = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         return 400, None, "the body is not JSON"
-    if not isinstance(body, dict) or set(body) != KEYS:
-        return 400, None, "the body must carry exactly repo and role"
-    repo, role = body["repo"], body["role"]
+    if not isinstance(body, dict) or set(body) not in (KEYS, KEYS_MULTI):
+        return 400, None, "the body must carry exactly repo and role, or repos and role"
+    multi = "repos" in body
+    repo, role = (body["repos"] if multi else body["repo"]), body["role"]
     if not isinstance(role, str) or role not in app_token.PERMISSIONS_BY_ROLE:
         return 400, None, "unknown role"
-    if user is not None:
+    if multi and role not in MULTI_ROLES:
+        return 400, None, "repos is only for the orchestrator and reader roles"
+    if user == controller_sa and role not in MULTI_ROLES:
+        return 403, None, "the controller account may mint only the orchestrator and reader roles"
+    if user is not None and user != controller_sa:
         executor_sa = env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))
         if (role == "lander") != (user == executor_sa):
             return 403, None, "only the heavy executor account may mint the lander role"
-    if not isinstance(repo, str) or not app_token.valid_target(repo):
-        return 400, None, "the repository is not OWNER/NAME"
+    if multi:
+        if not isinstance(repo, list) or not 0 < len(repo) <= MAX_REPOS:
+            return 400, None, "repos must be a list of 1 to %d repositories" % MAX_REPOS
+        if not all(isinstance(r, str) and app_token.valid_target(r) for r in repo):
+            return 400, None, "a repository is not OWNER/NAME"
+        if len({r.split("/")[0].lower() for r in repo}) != 1:
+            return 400, None, "the repositories must share one owner"
+        checks = repo
+    else:
+        if not isinstance(repo, str) or not app_token.valid_target(repo):
+            return 400, None, "the repository is not OWNER/NAME"
+        checks = [repo]
     try:
-        cloud_worker.check_repo_allowed(repo, env)
+        for r in checks:
+            cloud_worker.check_repo_allowed(r, env)
     except cloud_worker.CloudError:
         return 403, None, "the repository is not on the allowed list"
     try:

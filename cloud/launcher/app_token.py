@@ -51,6 +51,7 @@ PERMISSIONS_BY_ROLE = {
     "worker": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"},
     "orchestrator": {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"},
     "lander": {"contents": "write", "statuses": "write", "metadata": "read"},
+    "reader": {"contents": "read", "issues": "read", "metadata": "read"},
 }
 EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE["worker"]  # the worker's set: the name every existing importer uses
 

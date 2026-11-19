@@ -34,7 +34,8 @@ CHECK_BLOCK = ('    if scheme != "Bearer" or not token:\n'
                '        return 502, None, "the caller review could not be asked"\n'
                '    if authenticated is not True:\n'
                '        return 401, None, "the caller token is not accepted"\n'
-               '    if user not in ("system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):\n'
+               '    controller_sa = env.get("CW_FLOOR_CONTROLLER_SA") or ("system:serviceaccount:%s:floor-controller" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))\n'
+               '    if user not in (controller_sa, "system:serviceaccount:%s:cw-operator" % (env.get("CW_CLOUD_NAMESPACE") or "cw"), env.get("CW_HEAVY_EXECUTOR_SA") or ("system:serviceaccount:%s:floor-heavy-executor" % (env.get("CW_CLOUD_NAMESPACE") or "cw"))):\n'
                '        return 403, None, "the caller is not the operator account"\n')
 
 
@@ -242,6 +243,45 @@ class Served(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "the mutation was not applied"):
             apply_mutation(original, CHECK_BLOCK, CHECK_BLOCK)
         print("S2 mutant: control 1 of 1, the copy fails 1 of 1, the no-op mutation fails 1 of 1")
+
+
+class MultiRepo(unittest.TestCase):
+    """Issue #34: the reader role and the repos list."""
+    ENV = {"CW_ALLOWED_REPOS": ALLOWED, "CW_CLOUD_NAMESPACE": "cw"}
+
+    def call(self, body, user=OPERATOR_USER):
+        raw = json.dumps(body).encode()
+        minted = []
+        status = token_service.handle({"X-Caller-Token": "Bearer t"}, len(raw), lambda n: raw[:n], lambda t: (True, user),
+                                      dict(self.ENV), lambda target, role: minted.append((target, role)) or {"token": "x"})[0]
+        return status, minted
+
+    def test_repos_list_is_minted_for_orchestrator_and_reader(self):
+        both = ["acme-org/widget-service", "acme-org/other-repo"]
+        for body in ({"repos": both, "role": "orchestrator"}, {"repos": both[:1], "role": "reader"}):
+            status, minted = self.call(body)
+            self.assertEqual((status, minted), (200, [(body["repos"], body["role"])]))
+        status, minted = self.call({"repos": both[:1], "role": "reader"}, "system:serviceaccount:cw:floor-controller")
+        self.assertEqual(status, 200)
+
+    def test_bad_repos_mint_nothing(self):
+        for repos, want in ((["acme-org/widget-service", "evil-org/other"], 400), ([], 400), (["acme-org/not-allowed"], 403),
+                            ("acme-org/widget-service", 400), ([1], 400)):
+            status, minted = self.call({"repos": repos, "role": "orchestrator"})
+            self.assertEqual((status, minted), (want, []), repos)
+        self.assertEqual(self.call({"repos": ["acme-org/widget-service"], "role": "worker"}), (400, []))
+        self.assertEqual(self.call({"repo": "acme-org/widget-service", "role": "worker"}, "system:serviceaccount:cw:floor-controller"), (403, []))
+
+    def test_github_gets_the_repository_names(self):
+        seen = []
+        with mock.patch.object(token_service.app_token, "vault", lambda n, s: "1" if "ID" in n else "k"), \
+             mock.patch.object(token_service.app_token, "sign", lambda k, d: b"s"), \
+             mock.patch.object(token_service.app_token, "find_installation", lambda t, j: (7, 1)), \
+             mock.patch.object(token_service.app_token, "check_permissions", lambda p, r: None), \
+             mock.patch.object(token_service.app_token, "github_json",
+                               lambda m, path, jwt, body=None, **k: seen.append(body) or {"token": "x"}):
+            token_service.mint_answer(["acme-org/widget-service", "acme-org/other-repo"], "orchestrator")
+        self.assertEqual(seen[0]["repositories"], ["widget-service", "other-repo"])
 
 
 class Mutants(unittest.TestCase):

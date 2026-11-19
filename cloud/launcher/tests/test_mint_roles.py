@@ -126,7 +126,7 @@ class RequestBodies(Fx):
         self.assertEqual(perms, ORCH_SET)
         self.assertEqual(sorted(perms), ["checks", "issues", "metadata", "pull_requests"])
         self.assertNotIn("contents", perms)
-        self.assertEqual(list(app_token.PERMISSIONS_BY_ROLE), ["worker", "orchestrator", "lander"])
+        self.assertEqual(list(app_token.PERMISSIONS_BY_ROLE), ["worker", "orchestrator", "lander", "reader"])
 
     def test_s2_the_texts_of_each_kind_equal_the_table(self):
         for role in SETS:

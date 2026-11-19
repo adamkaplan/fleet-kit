@@ -42,13 +42,17 @@ param agentPools = [
 param sandboxGroupName = 'sbxg-fleetkit-example'
 param sandboxGroupTags = {}
 param connectorGatewayName = ''
+param extraSandboxGroups = [
+  { name: 'sbxg-fleetkit-research-example', tags: {}, identityId: '' }
+]
+param readerIdentityName = ''
 
 param acrName = 'acrflexample'
 param keyVaultName = 'kv-fleetkit-example'
 
 param storageAccountName = 'stfleetkitexample'
 param storageTags = {}
-param blobContainers = ['floor-bundles', 'floor-jobs-example']
+param blobContainers = ['floor-bundles', 'floor-jobs-example', 'floor-sessions', 'floor-artifacts']
 param storageQueues = ['cmd-jobs-example', 'cmd-jobs-poison-example']
 
 param postgresServerName = 'pg-fleetkit-example'

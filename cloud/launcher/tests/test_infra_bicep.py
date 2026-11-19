@@ -93,6 +93,16 @@ class TestFiles(unittest.TestCase):
         self.assertEqual(check_types(d), ["missing resource type: Microsoft.ContainerRegistry/registries"])
 
 
+class TestPerProfile(unittest.TestCase):
+    def test_extra_groups_and_reader_output(self):
+        main, sbx, ids = (slurp(os.path.join(INFRA, n)) for n in ("main.bicep", "modules/sandbox-group.bicep", "modules/identities.bicep"))
+        self.assertIn("param extraSandboxGroups array = []", main)
+        self.assertIn("extraSandboxGroups", sbx)
+        self.assertIn("output readerIdentityPrincipalId string", main)
+        self.assertIn("output readerIdentityPrincipalId string", ids)
+        self.assertEqual(missing_params(main, slurp(os.path.join(INFRA, "example.bicepparam"))), [])
+
+
 class TestNoPrivate(unittest.TestCase):
     def test_clean(self):
         self.assertEqual(check_private(INFRA), [])
