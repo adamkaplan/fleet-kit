@@ -764,6 +764,36 @@ def verify_switchboard_auth(header_value, expected_secret):
     return {"agent": agent, "session": session, "charter": charter}
 
 
+def ensure_switchboard_auth_file(env=None, fetch_secret=None):
+    """The relay credential file: the configured 0600 file when present, else fetched from Key Vault and written atomically (0600). Returns its path, or None."""
+    env = os.environ if env is None else env
+    auth_file = (env.get("CW_SWITCHBOARD_AUTH_FILE") or "").strip()
+    if auth_file and os.path.isfile(auth_file) and stat.S_IMODE(os.stat(auth_file).st_mode) == 0o600:
+        return auth_file
+    vault = (env.get("CW_SWITCHBOARD_KEYVAULT") or "").strip()
+    secret_name = (env.get("CW_SWITCHBOARD_SECRET_NAME") or "switchboard-relay-auth").strip()
+    if not vault:
+        return None
+    if fetch_secret is None:
+        def fetch_secret(vault_name, name):
+            import subprocess
+            done = subprocess.run(["az", "keyvault", "secret", "show", "--vault-name", vault_name, "--name", name, "--query", "value", "-o", "tsv"],
+                                  capture_output=True, text=True, timeout=15)
+            return done.stdout.strip() if done.returncode == 0 else ""
+    value = fetch_secret(vault, secret_name)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = auth_file or os.path.join(os.path.expanduser("~"), ".config", "fleet-switchboard", "switchboard-relay.auth")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = "%s.tmp%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(value.strip() + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
 def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, state=None, artifact_put=None):
     """One request to the in-cluster switchboard: returns (status, body). The sender is the proxy-injected header's agent, never a body field."""
     try:
@@ -784,13 +814,25 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
             return 400, {"error": "bad request body"}
         if not isinstance(body, dict):
             return 400, {"error": "bad request body"}
-    if route[0] == "POST" and route[1] in ("/v1/send", "/v1/report", "/v1/remind", "/v1/retire", "/v1/orders", "/v1/pane-state", "/v1/pane-command") \
+    if route[0] == "POST" and route[1] in ("/v1/send", "/v1/report", "/v1/remind", "/v1/retire", "/v1/orders", "/v1/intent", "/v1/decisions", "/v1/pane-state", "/v1/pane-command") \
             and callable(state.get("on_v1_action")):
         state["on_v1_action"](route[1], auth, body, state)
     for spoof in ("sender", "from"):
         if spoof in body and body[spoof] != auth["agent"]:
             state["audit"].append({"event": "spoofed_sender", "agent": auth["agent"], "session": auth["session"], "claimed": scrub(body[spoof], 40)})
     text = scrub(body.get("text", ""), 4000) if isinstance(body.get("text", ""), str) else ""
+    if route in (("POST", "/v1/intent"), ("GET", "/v1/intent")):
+        if route[0] == "GET" or body.get("action") == "list":
+            return 200, {"intents": state.get("intents") or []}
+        state.setdefault("intents", []).append({"action": body.get("action") or "set", "issue": body.get("issue"), "text": text, "from": auth["agent"]})
+        return 200, {"recorded": True, "intents": state["intents"]}
+    if route in (("POST", "/v1/decisions"), ("GET", "/v1/decisions")):
+        if route[0] == "GET" or body.get("action") == "list":
+            return 200, {"decisions": state.get("decisions") or []}
+        title = body.get("title", "")
+        state.setdefault("decisions", []).append({"action": body.get("action") or "batch", "title": scrub(title, 200) if isinstance(title, str) else "",
+                                                  "rows": body.get("rows") if isinstance(body.get("rows"), list) else [], "from": auth["agent"]})
+        return 200, {"recorded": True, "decisions": state["decisions"]}
     if route == ("POST", "/v1/send"):
         to = body.get("to")
         if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text:

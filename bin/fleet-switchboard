@@ -8354,6 +8354,8 @@ def held_merge_order_hints(decisions, runner, now):
 
 def cmd_decisions(args, runner, now):
     action = getattr(args, "decisions_action", None) or "list"
+    if relay_cli_done("decisions", {"action": action, "title": getattr(args, "title", None)}):
+        return EXIT_OK
     if action != "list":
         return cmd_decision_write(args, action, runner, now)
     if args.watch and args.fresh:
@@ -15258,6 +15260,8 @@ def soft_caller(runner, now):
 
 def cmd_intent(args, runner, now):
     """Print the ask's Intent and Done-when, and the work item's Intent line."""
+    if relay_cli_done("intent", {"action": "show", "issue": getattr(args, "issue", None)}):
+        return EXIT_OK
     reader = _intent_reader(runner, now)
     fleet, watched = soft_caller(runner, now)
     try:
@@ -15337,6 +15341,8 @@ def ask_row(owner, issue, repos=None):
 
 def cmd_intents(args, runner, now):
     """The caller's open asks, one line each with its Done-when."""
+    if relay_cli_done("intent", {"action": "list"}):
+        return EXIT_OK
     engine, _, config = build_engine(runner, now, "cli", writable=False)
     if engine.intents is None:
         raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())

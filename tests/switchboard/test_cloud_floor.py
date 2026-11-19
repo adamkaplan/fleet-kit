@@ -884,6 +884,32 @@ class TestCloudAgents(FloorCase):
             self.assertEqual(ctx.exception.status, 401)
         self.assertEqual(self.call("GET", "/v1/pane-outbox", header="x")[0], 401)
 
+    def test_intent_and_decisions_are_recorded_and_listed(self):
+        state = {}
+        code, out = self.call("POST", "/v1/intent", {"action": "set", "issue": "acme-org/widget-service#2", "text": "ship it", "from": "service-ops"}, state=state)
+        self.assertEqual(code, 200)
+        self.assertEqual(out["intents"][0]["from"], "service-ops")
+        self.assertEqual(self.call("GET", "/v1/intent", state=state)[1]["intents"], state["intents"])
+        code, out = self.call("POST", "/v1/decisions", {"title": "Pick one", "rows": [{"a": 1}]}, state=state)
+        self.assertEqual((code, out["recorded"]), (200, True))
+        self.assertEqual(self.call("POST", "/v1/decisions", {"action": "list"}, state=state)[1]["decisions"][0]["title"], "Pick one")
+        self.assertEqual(self.call("GET", "/v1/decisions", state={})[1], {"decisions": []})
+
+    def test_ensure_switchboard_auth_file_fetches_into_a_private_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "relay.auth")
+            env = {"CW_SWITCHBOARD_AUTH_FILE": path, "CW_SWITCHBOARD_KEYVAULT": "widget-vault"}
+            seen = []
+            def fetch(vault, name):
+                seen.append((vault, name))
+                return "agent=x;secret=y"
+            self.assertEqual(self.floor.ensure_switchboard_auth_file(env, fetch), path)
+            self.assertEqual(seen, [("widget-vault", "switchboard-relay-auth")])
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(self.floor.ensure_switchboard_auth_file(env, lambda *a: self.fail("refetched")), path)
+        self.assertIsNone(self.floor.ensure_switchboard_auth_file({}, lambda *a: "x"))
+
     def test_a_body_sender_is_ignored_and_the_pane_outbox_drains(self):
         state = {}
         code, _ = self.call("POST", "/v1/send", {"to": "cos", "text": "hi", "sender": "cos", "from": "cos"}, state=state)
