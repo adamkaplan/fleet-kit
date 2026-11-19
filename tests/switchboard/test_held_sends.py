@@ -461,7 +461,8 @@ class TestHeldSends(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ[sb.LAB_ENV] = "1"
         with captured() as (out, err), mock.patch.object(sb, "check_issue_exists", return_value=None):
-            code = sb.main(["report", "done", "--from", "coder", "landed  on main"], runner=self.world.route, now=self.world.clock.now)
+            code = sb.main(["report", "done", "--from", "coder", "landed  on main"], runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         self.assertEqual(code, 0, err.getvalue())
         self.assertIn("held for platform", err.getvalue())
         self.assertIn("warning: consecutive spaces in report text", err.getvalue())
