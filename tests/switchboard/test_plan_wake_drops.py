@@ -386,7 +386,7 @@ def build():
             got = self.audit("plan_wake.announced")
             self.assertEqual(len(got), 1)
             self.assertNotEqual(got[0].get("detail", got[0]).get("check"), "FAIL")
-            self.assertIn(sb.load_plan_check().plan_hash(full), json.dumps(self.snapshot(), default=str))
+            self.assertIn(sb.load_plan_check().plan_hash(full), str(self.snapshot()))
 
         def test_a_truncated_held_plan_whose_reread_fails_is_skipped(self):
             record, full, reads = self.truncated_world(RuntimeError("boom"))
