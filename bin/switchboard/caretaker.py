@@ -19,16 +19,18 @@ PROTECTED_SUFFIXES = (":charter", ":orchestrator", ":parked", ":awaiting-user", 
 OBSOLETE_RE = re.compile(r"\b(cw-worker|pod-launch|pod reaper|cloud_reaper|integration branch)\b", re.I)
 
 
-if "github_write" not in globals():   # imported standalone: the audit is the switchboard's own when it is assembled, a no-op here
-    class github_write:
-        def __init__(self, *args, **kwargs):
-            pass
+class _NoAudit:   # imported standalone (no assembled switchboard): the write guard is a no-op here
+    def __init__(self, *args, **kwargs):
+        pass
 
-        def __enter__(self):
-            return {}
+    def __enter__(self):
+        return {}
 
-        def __exit__(self, *exc):
-            return False
+    def __exit__(self, *exc):
+        return False
+
+
+globals().setdefault("github_write", _NoAudit)
 
 
 DEFAULT_OTHER_LABELS = ("agent:firstmate",)

@@ -80321,8 +80321,7 @@ TestBriefPiecesPure, TestBriefPiecesFloor, TestBriefPiecesRecord = _ibp.TestBrie
 # A class in the first group that builds a World or a rig fails the test below: it must derive from Base.
 NOT_ISOLATED_BY_BASE = {
     "builds no World, rig or state path: it reads source text, parses strings or runs pure functions": (
-    "TestCaretaker2573", "TestForeignPrefixParkedLabel", "TestIntentToastOnce", "TestPublicNamesGuard",
-    "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
+    "TestCaretaker2573", "TestForeignPrefixParkedLabel", "TestIntentToastOnce", "TestPublicNamesGuard", "AnswerBase", "BotDocumentation", "BotLines", "BotMutants", "BotSize", "BotVerdict", "BotWake", "Cases", "ClaimsNoteBase", "ExternalAdapterCase",
     "Fixture", "HubFilesUnchanged", "JanitorIdentity", "Launcher", "OneWorkerAndCancel", "PendingJobs", "RelayLoopCadence", "RelayObeysTheTreeGuard",
     "ReviewCommentIsolationTests", "Rig", "TestReminderGridAndRecurring", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
     "TestAgentsVerify", "TestAges", "TestAlertConfig", "TestApprovalExemptionGuard", "TestApprovalReadsFresh", "TestArchTools",
