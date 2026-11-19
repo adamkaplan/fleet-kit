@@ -108,6 +108,8 @@ class TestPerProfile(unittest.TestCase):
         acr = slurp(os.path.join(INFRA, "modules/acr.bicep"))
         self.assertIn("param acrCacheRules array", main)
         self.assertIn("acrCacheRules", acr)
+        self.assertIn("registries/cacheRules@", acr)
+        self.assertIn("for rule in acrCacheRules", acr)
 
 
 class TestNoPrivate(unittest.TestCase):
