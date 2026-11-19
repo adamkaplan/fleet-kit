@@ -1242,6 +1242,9 @@ def _resolve_local_caller_and_repo(payload, env=None):
         H = D["H"]
         if "build_engine" not in H:
             return payload
+    except Exception:   # no engine in this process (a bare unit-test load): nothing to resolve
+        return payload
+    try:
         engine, _, config = H["build_engine"](subprocess.run, time.time, "cli")
         caller = payload.get("sender") or payload.get("from") or H["identify_caller"](engine.herdr, engine.v2, env or os.environ)
         if isinstance(caller, str) and CALLER_RE.fullmatch(caller):
@@ -1250,8 +1253,8 @@ def _resolve_local_caller_and_repo(payload, env=None):
             repo, number = H["resolve_for_sender"](engine, config, payload["issue"], caller)
             if repo and number is not None:
                 payload = dict(payload, repo=repo, issue=int(number))
-    except Exception:
-        pass
+    except Exception as err:   # the action still goes, without the caller or repo: say so
+        _warn("resolving the caller and repo (sent without them)", err)
     return payload
 
 
