@@ -111,6 +111,8 @@ class TestPerProfile(unittest.TestCase):
         self.assertIn("registries/cacheRules@", acr)
         self.assertIn("for rule in acrCacheRules", acr)
         self.assertIn("public.ecr.aws/docker/library/*", main)
+        example = slurp(os.path.join(INFRA, "example.bicepparam"))
+        self.assertIn("public.ecr.aws/docker/library/*", example)
 
 
 class TestNoPrivate(unittest.TestCase):
