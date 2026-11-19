@@ -609,7 +609,7 @@ export function resolveSettings(env = process.env, deps = {}) {
 // ---- #1011: the Chief of Staff's standing orders in its system prompt, on every model call.
 // A message in the conversation is summarised by a compaction; the system prompt is not part of the conversation, so the orders
 // are put there, read from the file each call (an edit shows at once), word for word after the template's comment strip.
-// A file over 16 KB is refused with a visible note, never cut. Only the Chief of Staff's role gets them.
+// A file whose text, without HTML comments, is over 16 KB is refused with a visible note, never cut. Only the Chief of Staff's role gets them.
 export const COS_ORDERS_MAX = 16384;
 export const COS_ROLE = "chief-of-staff";
 
@@ -627,7 +627,7 @@ export function readCosOrders(file, fsm = fs) {
   } catch {
     return null;
   }
-  if (size > COS_ORDERS_MAX) return { refused: `${file} is ${size} bytes: the limit is ${COS_ORDERS_MAX} (16 KB). Trim it; none of it is given to you from a file this large` };
+  if (size > COS_ORDERS_MAX * 4) return { refused: `${file} is ${size} bytes: the limit is ${COS_ORDERS_MAX} (16 KB). Trim it; none of it is given to you from a file this large` };
   let raw;
   try {
     raw = fsm.readFileSync(file, "utf8");
@@ -635,6 +635,8 @@ export function readCosOrders(file, fsm = fs) {
     return { refused: `${file} cannot be read (${oneLine(err && (err.code || err.message) || "error")})` };
   }
   const text = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
+  const body = Buffer.byteLength(text, "utf8");
+  if (body > COS_ORDERS_MAX) return { refused: `${file} is ${body} bytes (without comments; ${size} bytes total): the limit is ${COS_ORDERS_MAX} (16 KB). Trim it; none of it is given to you from a file this large` };
   return text ? { text } : null;
 }
 

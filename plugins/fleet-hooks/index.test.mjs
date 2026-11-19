@@ -591,6 +591,11 @@ test("a file over the limit is refused visibly, never cut", () => {
   assert.ok(out.includes("refused") && !out.includes("xxxx"));
 });
 
+test("comments are not counted toward the limit", () => {
+  const file = ordersFile("<!-- " + "c".repeat(9000) + " -->\n" + "- keep it short\n");
+  assert.deepEqual(readCosOrders(file), { text: "- keep it short" });
+});
+
 test("setup registers the system hook, and not when turned off", async () => {
   const { home } = fakeHome();
   const hooks = [];
