@@ -43,7 +43,29 @@ def lane_named(item, lanes):
     return bool(name) and name.lower() in lanes
 
 
-def ownerless_split(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=(), parked_now=None):
+def is_other_owner(item, other_owners):
+    """True when the issue's author or any assignee is in `other_owners` (case-insensitive)."""
+    others = {str(x).strip().lower() for x in (other_owners or ()) if str(x).strip()}
+    if not others:
+        return False
+    author = str(item.get("author") or "").strip().lower()
+    if author and author in others:
+        return True
+    return any(str(a).strip().lower() in others for a in (item.get("assignees") or ()) if str(a).strip())
+
+
+def other_owner_count(items, other_owners, now, days=DEFAULT_DAYS):
+    """How many open non-PR issues in `items` belong to `other_owners` and have been quiet for `days` or more."""
+    if not other_owners:
+        return 0
+    count = 0
+    for item in items.values():
+        if not item.get("pr") and item.get("state") == "open" and (now - item["updated"]) / 86400.0 >= days and is_other_owner(item, other_owners):
+            count += 1
+    return count
+
+
+def ownerless_split(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=(), parked_now=None, other_owners=()):
     """([listed], [parked]) rows `(number, quiet_days)`, the oldest first, of the open ISSUES (not pull requests) that have no owner, no owner label, were not written by one of
     `ours_logins`, and were last touched `days` or more days ago. With a non-empty `label_owners` map for the repository, a label of the map owns the issue and an `Owner:` line owns it
     only when it names one of `lanes`; with none, the rule is the one before the map existed. `parked_now(item, now)` is the daemon's ONE reading of "parked until a future date"
@@ -52,6 +74,8 @@ def ownerless_split(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, l
     found, parked, strict = [], [], bool(label_owners)
     for number, item in items.items():
         if item.get("pr") or item.get("state") != "open":
+            continue
+        if is_other_owner(item, other_owners):   # another owner's issue is counted apart (other_owner_count), never ours to act on
             continue
         if strict and label_owned(item["labels"], label_owners):
             continue
@@ -64,12 +88,13 @@ def ownerless_split(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, l
     return order(found), order(parked)
 
 
-def summary_line(repo, rows, read, total, days=DEFAULT_DAYS, cut=False, parked=0):
+def summary_line(repo, rows, read, total, days=DEFAULT_DAYS, cut=False, parked=0, other_owner=0):
     """The ONE line about a repository: how many, how old the oldest is, the five oldest as links, and how much of the list was read. Counts, ages and links only: no title, no text.
     When the list was CUT the read took the least recently updated first, so the count is a lower bound (`at least N`) and the oldest are the true oldest."""
     links = ", ".join("https://github.com/%s/issues/%d" % (repo, number) for number, _ in rows[:OLDEST])
-    return "ownerless in %s: %s%d open issue(s) with no owner and no activity for %d day(s) or more; oldest quiet for %d day(s); oldest %d: %s; parked %d; read %s of %s open item(s)%s" % (
-        repo, "at least " if cut else "", len(rows), days, int(rows[0][1]), min(OLDEST, len(rows)), links, parked, read,
+    other_part = "; other-owner %d" % other_owner if other_owner else ""
+    return "ownerless in %s: %s%d open issue(s) with no owner and no activity for %d day(s) or more; oldest quiet for %d day(s); oldest %d: %s; parked %d%s; read %s of %s open item(s)%s" % (
+        repo, "at least " if cut else "", len(rows), days, int(rows[0][1]), min(OLDEST, len(rows)), links, parked, other_part, read,
         total if total is not None else "an unknown number", ", least recently updated first" if cut else "")
 
 

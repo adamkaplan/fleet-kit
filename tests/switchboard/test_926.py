@@ -22,3 +22,21 @@ class TestForeignPrefixParkedLabel(unittest.TestCase):
         fleet = sb.label_names({})["parked"]
         mutant = lambda body, labels: sb.parked_until(body, [l for l in labels if l == fleet])
         self.assertEqual(self.split(mutant, "x:parked"), ([(1, 10.0)], []))
+
+
+    def test_other_owner_issues_are_counted_apart_and_never_listed(self):
+        module = sb.load_module("triage_ownerless")
+        ctx = {"chain": set(), "owned": set(), "unresolved": set()}
+        make = lambda n, author: {"number": n, "pr": False, "state": "open", "labels": set(), "author": author, "assignees": [], "updated": 0.0, "owner_body": False}
+        items = {n: make(n, "DoThompson_Example") for n in range(1, 98)}
+        items.update({n: make(n, "alice") for n in range(98, 102)})
+        others = ["dothompson_example"]
+        rows, parked = module.ownerless_split(items, ctx, (), (), NOW, other_owners=others)
+        self.assertEqual([n for n, _ in rows], [98, 99, 100, 101])
+        self.assertEqual(parked, [])
+        count = module.other_owner_count(items, others, NOW)
+        self.assertEqual(count, 97)
+        self.assertEqual(module.other_owner_count(items, [], NOW), 0)
+        line = module.summary_line("acme-org/widget-service", rows, 101, 101, other_owner=count)
+        self.assertIn("; other-owner 97;", line)
+        self.assertNotIn("other-owner", module.summary_line("acme-org/widget-service", rows, 101, 101))

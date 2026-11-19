@@ -399,8 +399,9 @@ def triage_status_lines(triage):
         if text:
             lines.append("      triage     " + text)
     for repo_of, info in sorted((triage.get("ownerless") or {}).items()):
-        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; parked %d; read %s of %s open item(s)" % (
-            repo_of, info.get("count", 0), info.get("parked", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
+        other_part = "; other-owner %d" % info["other_owner"] if info.get("other_owner") else ""
+        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; parked %d%s; read %s of %s open item(s)" % (
+            repo_of, info.get("count", 0), info.get("parked", 0), other_part, info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
     cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time(), triage.get("digest_interval_minutes", 60))   # #406

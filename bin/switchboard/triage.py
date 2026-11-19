@@ -931,10 +931,13 @@ def triage_ownerless_pass(engine, state, cfg, now):
                     items[item["number"]] = item
             lanes = {name.lower() for name, agent in (discovery.agents.items() if discovery else [])   # a known lane: an orchestrator the daemon holds for the repository
                      if (agent.fleet or {}).get("role") == "orchestrator" and (_fleet_repo(agent.fleet or {}, engine.config) == repo or (agent.fleet or {}).get("repo") == repo)}
+            other_owners = list((engine.config or {}).get("caretaker_other_owners") or [])
             rows, parked = module.ownerless_split(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
-                                                  options["label_owners"].get(repo), lanes, triage_parked_now)   # #889: a future-parked issue is counted apart, never listed
+                                                  options["label_owners"].get(repo), lanes, triage_parked_now, other_owners=other_owners)   # #889: a future-parked issue is counted apart, never listed
             read, total = len(unit["data"]), unit.get("total")
-            shown[repo] = {"count": len(rows), "parked": len(parked), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
+            other_cnt = module.other_owner_count(items, other_owners, now, options["days"])
+            shown[repo] = {"count": len(rows), "parked": len(parked), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None,
+                           **({"other_owner": other_cnt} if other_cnt else {})}
             if not rows:
                 continue
             sent = _read_small(engine.state_dir, OWNERLESS_FILE)
@@ -942,7 +945,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                 continue
             sent[repo] = {"at": int(now)}
             _write_small(engine.state_dir, OWNERLESS_FILE, sent)   # before the send: at most one line a day, even when a send fails
-            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True, len(parked))
+            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True, len(parked), other_owner=other_cnt)
             dropped = sorted(name for name, agent in (discovery.agents.items() if discovery else [])   # #2545: tier 3: a digest never wakes an orchestrator on its own
                              if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
             names, told = ["chief-of-staff"], []
@@ -953,7 +956,8 @@ def triage_ownerless_pass(engine, state, cfg, now):
                         told.append(name)
                 except Exception as err:   # a failed send is audited, never retried into a second line
                     engine._note("triage.ownerless_send_failed", repo, {"to": name, "error": _one_line(str(err), 120)})
-            engine._note("triage.ownerless", repo, {"count": len(rows), "parked": len(parked), "read": read, "total": total, "told": told, "dropped": dropped})
+            engine._note("triage.ownerless", repo, {"count": len(rows), "parked": len(parked), "read": read, "total": total, "told": told, "dropped": dropped,
+                                                  **({"other_owner": other_cnt} if other_cnt else {})})
     except Exception as err:
         engine._note("triage.ownerless_error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return shown
