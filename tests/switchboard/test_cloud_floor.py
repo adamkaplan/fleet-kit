@@ -1007,13 +1007,13 @@ class TestFloorAuthority(FloorCase):
                 self.name, self.session_id, self.pane, self.status, self.fleet = name, session_id, pane, status, fleet
                 self.errored = False
 
-        disc = argparse.Namespace(agents={})
-        with mock.patch.dict(self.floor.D, {"H": {"Observation": Obs}}):
-            self.floor.apply_pane_state_to_discovery({
-                "widget-api": {"status": "idle", "idle_at": 1},
-                "widget-web": {"status": "idle", "outcome": "done"},
-                "widget-bad": {"status": "idle", "errored": True},
-            }, disc)
+        names = ("widget-api", "widget-web", "widget-bad")
+        disc = argparse.Namespace(agents={n: Obs(n, "ses_" + n, None, "working", {}) for n in names})
+        self.floor.apply_pane_state_to_discovery({
+            "widget-api": {"status": "idle", "idle_at": 1},
+            "widget-web": {"status": "idle", "outcome": "done"},
+            "widget-bad": {"status": "idle", "errored": True},
+        }, disc)
         self.assertEqual(disc.agents["widget-api"].outcome, "succeeded")
         self.assertEqual(disc.agents["widget-web"].outcome, "done")
         self.assertIsNone(disc.agents["widget-bad"].outcome)
