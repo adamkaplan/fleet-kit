@@ -31,7 +31,7 @@ param acrName string
 param acrCacheRules array = [
   {
     name: 'dockerhub-library'
-    sourceRepository: 'docker.io/library/*'
+    sourceRepository: 'public.ecr.aws/docker/library/*'
     targetRepository: 'dockerhub/library/*'
   }
 ]

@@ -110,6 +110,7 @@ class TestPerProfile(unittest.TestCase):
         self.assertIn("acrCacheRules", acr)
         self.assertIn("registries/cacheRules@", acr)
         self.assertIn("for rule in acrCacheRules", acr)
+        self.assertIn("public.ecr.aws/docker/library/*", main)
 
 
 class TestNoPrivate(unittest.TestCase):

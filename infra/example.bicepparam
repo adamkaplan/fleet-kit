@@ -48,7 +48,7 @@ param extraSandboxGroups = [
 param readerIdentityName = ''
 
 param acrName = 'acrflexample'
-param acrCacheRules = [{ name: 'dockerhub-library', sourceRepository: 'docker.io/library/*', targetRepository: 'dockerhub/library/*' }]
+param acrCacheRules = [{ name: 'dockerhub-library', sourceRepository: 'public.ecr.aws/docker/library/*', targetRepository: 'dockerhub/library/*' }]
 param keyVaultName = 'kv-fleetkit-example'
 
 param storageAccountName = 'stfleetkitexample'
