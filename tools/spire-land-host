@@ -119,7 +119,7 @@ def _release_floor_heavy_lease(proof, env, cfg, ns, ctrl, lease_sid):
     proof.kube_run(
         ["kubectl", "-n", ns, "exec", ctrl, "--", "python3", "-c",
          "import sys; sys.path.insert(0, '/opt/floor'); import floor_controller as fc; "
-         "fc._pg_run(\"DELETE FROM floor_live_sessions WHERE session_id=%s;\" % fc._sql_str(sys.argv[1]))",
+         "fc._pg_run(\"DELETE FROM floor_live_sessions WHERE session_id=%s;\" % (\"'\" + str(sys.argv[1]).replace(\"'\", \"''\") + \"'\"))",
          lease_sid],
         env, config=cfg,
     )
@@ -140,7 +140,7 @@ def _find_floor_heavy_pod(proof, env, cfg, ns, repo):
              "fc._pg_run(\"INSERT INTO floor_live_sessions(session_id, caller, repo, ref, mode, state, round_num, updated_at) "
              "VALUES (%s, 'fleet', %s, 'main', 'author', 'running', 1, NOW()) "
              "ON CONFLICT (session_id) DO UPDATE SET state='running', updated_at=NOW();\" "
-             "% (fc._sql_str(sys.argv[1]), fc._sql_str(sys.argv[2]))); fc.set_fhex_scale(max(1, fc.get_fhex_scale()[0]))",
+             "% tuple(\"'\" + str(a).replace(\"'\", \"''\") + \"'\" for a in sys.argv[1:3])); fc.reconcile_heavy_pool_scale()",
              lease_sid, repo],
             env, config=cfg,
         )

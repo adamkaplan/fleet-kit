@@ -50,6 +50,8 @@ class TestSpireLandCutover2570(Base):
         flat = [" ".join(c) for c in calls]
         self.assertTrue(any("INSERT INTO floor_live_sessions" in c for c in flat))
         self.assertTrue(any("DELETE FROM floor_live_sessions" in c for c in flat))
+        self.assertFalse(any("_sql_str" in c for c in flat))
+        self.assertTrue(any("reconcile_heavy_pool_scale" in c for c in flat))
 
     def test_s1_pin_verify_and_land_json_areas(self):
         done = subprocess.run([REAL_NODE or "node", ".spire/tool/pin.mjs", "verify"], cwd=str(REPO), capture_output=True, text=True, timeout=30)

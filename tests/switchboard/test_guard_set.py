@@ -177,7 +177,7 @@ class TestGuardSetRun(unittest.TestCase):
         bad = "time.sleep(0.2)\nprint('Ran 2 tests in 0.2s')\nprint('FAILED (failures=1)')\nopen(log, 'a').write('end FxBad %f\\n' % time.time())\nsys.exit(1)\n"
         with tempfile.TemporaryDirectory() as d:
             es = [self._fx(d, "FxA", ok), self._fx(d, "FxBad", bad), self._fx(d, "FxC", ok)]
-            r = run("--run", "--list", str(self._list(d, es)))
+            r = run("--run", "--workers", "1", "--list", str(self._list(d, es)))
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertRegex(r.stdout, r"FxA: tests run 3, failed 0, [0-9.]+ s")
             self.assertRegex(r.stdout, r"FxBad: tests run 2, failed 1, [0-9.]+ s")
@@ -195,6 +195,18 @@ class TestGuardSetRun(unittest.TestCase):
                 if e[0] == "end":
                     alive -= 1
             self.assertEqual(overlaps, 0)
+
+    def test_default_run_is_parallel_with_deterministic_output_order(self):
+        ok = "time.sleep(0.5)\nprint('Ran 1 test in 0.5s')\n"
+        with tempfile.TemporaryDirectory() as d:
+            es = [self._fx(d, n, ok) for n in ("FxA", "FxB", "FxC")]
+            r = run("--run", "--workers", "3", "--list", str(self._list(d, es)))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            pos = [r.stdout.index(n + ": tests run") for n in ("FxA", "FxB", "FxC")]
+            self.assertEqual(pos, sorted(pos))
+            events = [l.split() for l in (Path(d) / "log.txt").read_text().splitlines()]
+            first_end = min(i for i, e in enumerate(events) if e[0] == "end")
+            self.assertGreater(sum(1 for e in events[:first_end] if e[0] == "start"), 1)
 
     def test_all_pass_prints_result_pass(self):
         with tempfile.TemporaryDirectory() as d:

@@ -74,23 +74,31 @@ def run_one(argv, timeout):
         return -9, out or "", True
 
 
-def run_all(data):
+def _run_entry(item):
+    name, argv, timeout = item
+    t0 = time.time()
+    code, out, timed_out = run_one(argv, timeout)
+    return name, timeout, code, out, timed_out, time.time() - t0
+
+
+def run_all(data, workers=None):
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, int(workers or os.environ.get("GUARD_SET_WORKERS") or (os.cpu_count() or 1)))
     failed = []
-    for name, argv, timeout in entries(data):
-        t0 = time.time()
-        code, out, timed_out = run_one(argv, timeout)
-        secs = time.time() - t0
-        m = re.search(r"^Ran (\d+) tests?", out, re.M)
-        ran = int(m.group(1)) if m else 0
-        f = re.search(r"FAILED \((.*?)\)", out)
-        nfail = sum(int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", f.group(1))) if f else 0
-        if code != 0 and not nfail:
-            nfail = 1
-        reason = " TIMEOUT after %ds (killed)" % timeout if timed_out else ""
-        print("%s: tests run %d, failed %d, %.1f s%s" % (name, ran, nfail, secs, reason), flush=True)
-        if code != 0:
-            failed.append(name + (" (timed out)" if timed_out else ""))
-            print(out[-2000:], flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = pool.map(_run_entry, list(entries(data)))
+        for name, timeout, code, out, timed_out, secs in results:
+            m = re.search(r"^Ran (\d+) tests?", out, re.M)
+            ran = int(m.group(1)) if m else 0
+            f = re.search(r"FAILED \((.*?)\)", out)
+            nfail = sum(int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", f.group(1))) if f else 0
+            if code != 0 and not nfail:
+                nfail = 1
+            reason = " TIMEOUT after %ds (killed)" % timeout if timed_out else ""
+            print("%s: tests run %d, failed %d, %.1f s%s" % (name, ran, nfail, secs, reason), flush=True)
+            if code != 0:
+                failed.append(name + (" (timed out)" if timed_out else ""))
+                print(out[-2000:], flush=True)
     if failed:
         print("RESULT: FAIL, failed: %s" % ", ".join(failed))
         return 1
@@ -110,7 +118,8 @@ def main(argv):
             print("every class of the guard set exists: FAIL, no test file defines %s" % m)
         return 1 if missing else 0
     if "--run" in argv:
-        return run_all(data)
+        w = argv[argv.index("--workers") + 1] if "--workers" in argv else None
+        return run_all(data, w)
     print("\n".join(lines(data)))
     return 0
 
