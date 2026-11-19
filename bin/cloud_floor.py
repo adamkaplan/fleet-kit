@@ -988,21 +988,17 @@ def call_switchboard_v1(path, payload, env=None):
     base = config["url"]
     if not base:
         return None
-    header = None
-    auth_file = config["auth_file"]
-    if not auth_file:
-        raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not set")
-    try:
-        info = os.stat(auth_file)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
-            raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not a regular 0600 file of the user's own")
-        with open(auth_file, encoding="utf-8") as handle:
-            header = handle.read().strip()
-    except OSError:
-        raise FloorError("CW_SWITCHBOARD_AUTH_FILE cannot be read") from None
+    header = _auth_header(config)
     data = json.dumps(payload, sort_keys=True).encode()
     headers = [("Accept", "application/json"), ("Content-Type", "application/json"), ("X-Switchboard-Auth", header)]
     return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
+
+
+PANE_RELAY_PORT = 18080   # the local end of the port-forward to the in-cluster switchboard
+
+
+def _warn(what, err):
+    print("pane-relay: %s failed: %s" % (what, scrub(str(err))), file=sys.stderr)
 
 
 def _auth_header(config):
@@ -1054,6 +1050,7 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
                 engine.v2.synthetic(session_id, text, {"fleet": {"keys": keys, "from": "switchboard"}}, resume, delivery, message_id, description)
             except Exception as err:
                 if "409" not in str(err):
+                    _warn("delivery of outbox message %s" % mid, err)
                     continue
             ack_ids.append(mid)
             delivered += 1
@@ -1077,12 +1074,12 @@ def pane_relay_pass(engine, sb_mod, env=None):
         if facts is not None and isinstance(source, facts):
             try:
                 source.collect(discovery, engine.now())
-            except Exception:
-                pass
+            except Exception as err:
+                _warn("worker fact collection", err)
     try:
         sb_mod.cloud_push_pane_state(engine, discovery)
-    except Exception:
-        pass
+    except Exception as err:
+        _warn("pane state push", err)
     return drain_pane_outbox(engine, sb_mod=sb_mod, discovery=discovery, env=env)
 
 
@@ -1130,7 +1127,7 @@ def render_pane_relay_plist(python_bin, kit_root, home_dir, state_dir, path_env)
     """The LaunchAgent plist that keeps the pane-relay loop running."""
     e = lambda v: html.escape(str(v), quote=False)
     args = [python_bin, "-B", os.path.join(str(kit_root), "bin", "cloud_floor.py"), "pane-relay", "--kit-root", str(kit_root), "--state-dir", str(state_dir)]
-    env = (("HOME", home_dir), ("PATH", path_env), ("CW_SWITCHBOARD_URL", "http://127.0.0.1:18080"))
+    env = (("HOME", home_dir), ("PATH", path_env), ("CW_SWITCHBOARD_URL", "http://127.0.0.1:%d" % PANE_RELAY_PORT))
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
@@ -1169,7 +1166,7 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
     return {"synced": len(records)}
 
 
-def _healthy(url="http://127.0.0.1:18080/healthz"):
+def _healthy(url="http://127.0.0.1:%d/healthz" % PANE_RELAY_PORT):
     try:
         return urllib.request.urlopen(url, timeout=3).status == 200
     except Exception:
@@ -1186,7 +1183,7 @@ def _start_port_forward(lib):
     pods = json.loads(subprocess.run(base + ["get", "pods", "-o", "json"], capture_output=True, text=True, timeout=60, check=True).stdout)
     for item in pods.get("items", []):
         if item["metadata"]["name"].startswith("fleet-switchboard") and item.get("status", {}).get("phase") == "Running":
-            return subprocess.Popen(base + ["port-forward", "pod/" + item["metadata"]["name"], "18080:8080"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return subprocess.Popen(base + ["port-forward", "pod/" + item["metadata"]["name"], "%d:8080" % PANE_RELAY_PORT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     raise FloorError("no running fleet-switchboard pod")
 
 
@@ -1206,16 +1203,17 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
                 try:
                     child, started = _start_port_forward(lib), time.time()
                     time.sleep(2)
-                except Exception:
+                except Exception as err:
                     child = None
+                    _warn("port-forward start (check kubectl and the cluster settings)", err)
             try:
                 sync_cloud_records_to_cluster(state_dir, env=env)
-            except Exception:
-                pass
+            except Exception as err:
+                _warn("cloud record sync", err)
             try:
                 pane_relay_pass(engine, sb_mod, env=env)
-            except Exception:
-                pass
+            except Exception as err:
+                _warn("pane relay pass", err)
             if max_passes is None or passes < max_passes:
                 time.sleep(poll_seconds)
     finally:

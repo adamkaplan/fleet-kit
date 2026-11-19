@@ -1203,6 +1203,28 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(data["StandardErrorPath"], "/home/user/state/pane-relay-stderr.log")
 
 
+    def test_pane_relay_pass_reports_a_failed_push_and_still_drains(self):
+        engine = mock.Mock()
+        sb_mod = types.SimpleNamespace(cloud_push_pane_state=mock.Mock(side_effect=RuntimeError("down")))
+        err = io.StringIO()
+        with mock.patch.object(self.floor, "drain_pane_outbox", return_value={"delivered": 0, "acked": 0}) as drain, contextlib.redirect_stderr(err):
+            out = self.floor.pane_relay_pass(engine, sb_mod, env={})
+        self.assertEqual(out, {"delivered": 0, "acked": 0})
+        self.assertIn("pane state push failed", err.getvalue())
+        drain.assert_called_once()
+
+    def test_sync_cloud_records_sends_reminders_only_outside_cluster_authority(self):
+        (self.home / "cloud").mkdir()
+        (self.home / "cloud" / "w-1.json").write_text('{"a": 1}')
+        (self.home / "reminders.json").write_text('[1]')
+        for authority, reminders in (("shadow", [1]), ("cluster", None)):
+            with mock.patch.object(self.floor, "switchboard_authority", return_value=authority), \
+                    mock.patch.object(self.floor, "call_switchboard_v1") as post:
+                out = self.floor.sync_cloud_records_to_cluster(self.home, env={})
+            self.assertEqual(out, {"synced": 1})
+            post.assert_called_once_with("/v1/cloud-sync", {"records": {"w-1": {"a": 1}}, "reminders": reminders}, env={})
+
+
 class TestFinalMessageRelay(Base):
     def test_final_message_relays_over_send(self):
         worker = sb.load_module("cloud_worker").bind(vars(sb))
