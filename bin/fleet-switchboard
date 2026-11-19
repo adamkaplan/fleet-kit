@@ -13913,7 +13913,7 @@ def record_approval(engine, verdict, sender, recipient, repo, number):
 
 def cmd_report(args, runner, now):
     """PR 13: tell the one you report to what happened. Delivered like `send`; a progress report is a rider."""
-    if relay_cli_done("report", {"text": " ".join(getattr(args, "text", None) or []).strip(), "issue": getattr(args, "issue", None)}):
+    if relay_cli_done("report", {"state": getattr(args, "state", None), "text": " ".join(getattr(args, "text", None) or []).strip(), "issue": getattr(args, "issue", None)}):
         return EXIT_OK
     engine, _, _ = build_engine(runner, now, "cli")
     if args.sender is not None:
