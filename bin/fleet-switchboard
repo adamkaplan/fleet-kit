@@ -207,9 +207,27 @@ def run_cloud(function, *arguments):
     """`cloud_worker.<function>(*arguments)`; a CloudError reads as a LaunchError (a one-line failure, exit 1)."""
     module = load_module("cloud_worker").bind(globals())
     try:
+        if not hasattr(module, function) and hasattr(module, "cloud_floor"):
+            return getattr(module.cloud_floor, function)(*arguments)
         return getattr(module, function)(*arguments)
     except module.CloudError as err:
         raise LaunchError(str(err)) from None
+
+
+def relay_cli(command, payload):
+    """Best-effort mirror of a CLI action to the in-cluster switchboard (when CW_SWITCHBOARD_URL is set); the answer, or None."""
+    if not os.environ.get("CW_SWITCHBOARD_URL"):
+        return None
+    try:
+        return run_cloud("relay_cli_if_configured", command, payload)
+    except Exception:
+        return None
+
+
+def relay_cli_done(command, payload):
+    """True when the cluster is the authority and took the action."""
+    ans = relay_cli(command, payload)
+    return os.environ.get("CW_SWITCHBOARD_AUTHORITY") == "cluster" and isinstance(ans, dict)
 
 
 def refuse_cloud_name(name):
@@ -6197,6 +6215,8 @@ def cmd_retire(args, runner, now):
     --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
     `--close` is given: then the agent's terminal PANE is closed too (see `retire_close_problem`). The caller rule is `reattach`'s: the operator, the
     Chief of Staff or the agent's own boss; others are refused and audited."""
+    if relay_cli_done("retire", {"name": args.name, "reason": getattr(args, "reason", None), "undo": bool(getattr(args, "undo", False))}):
+        return EXIT_OK
     remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
     if remote is not None:
         return run_cloud("cmd_retire", args, runner, now, remote)
@@ -8723,6 +8743,27 @@ def push_watch_tick(engine, discovery):
     return module.run_pass(ns, engine, engine.now(), lambda path: hub.gh_api(path, paginate=False), (getattr(engine, "config", None) or {}).get("push_watch"))
 
 
+def cloud_push_pane_state(engine, discovery):
+    """Best-effort: push the pane observations to the cluster and apply the resume commands it answers with."""
+    blocked = {"permission": set(), "question": set()}
+    for source in engine.sources:
+        if type(source).__name__ == "WorkerFacts":
+            for observation, kind, _ in getattr(source, "requests", []):
+                blocked.setdefault(kind, set()).add(observation.session_id)
+    observations = {}
+    for name, o in discovery.agents.items():
+        observations[name] = {key: getattr(o, key, None) for key in ("status", "errored", "turn_error", "turn_error_id", "idle_at", "pane", "session_id", "fleet")}
+        observations[name]["permission_waiting"] = o.session_id in blocked["permission"]
+        observations[name]["form_waiting"] = o.session_id in blocked["question"]
+    cloud = load_module("cloud_worker").bind(globals())
+    for cmd in cloud.cloud_floor.push_pane_state(observations, now=engine.now()):
+        if isinstance(cmd, dict) and cmd.get("action") == "resume":
+            try:
+                resume_ended_turn(engine, "switchboard", cmd["agent"], cmd.get("reason") or "cluster resume", discovery, window=0)
+            except Exception:
+                pass
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -8746,6 +8787,11 @@ def finish_pass(engine, discovery, report):
         cloud_watch_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
+    if os.environ.get("CW_SWITCHBOARD_URL") and discovery is not None:
+        try:
+            cloud_push_pane_state(engine, discovery)
+        except Exception as err:
+            engine._failed("pane-state", "pane-state", err, report)
     try:
         cloud_end_tick(engine, discovery)
     except Exception as err:
@@ -13601,6 +13647,8 @@ def _cmd_send(args, runner, now):
 
 
 def _send_one(args, runner, now):
+    if relay_cli_done("send", {"to": args.name, "text": " ".join(args.text).strip(), "issue": getattr(args, "issue", None)}):
+        return EXIT_OK
     system = load_module("system_sender")   # #2518: a registered system sender is proved by the calling process; the claim variable and --from only NAME one
     claim = os.environ.get(system.SYSTEM_SENDER_ENV) or None
     args.system_proven = False
@@ -13789,6 +13837,8 @@ def record_approval(engine, verdict, sender, recipient, repo, number):
 
 def cmd_report(args, runner, now):
     """PR 13: tell the one you report to what happened. Delivered like `send`; a progress report is a rider."""
+    if relay_cli_done("report", {"text": " ".join(getattr(args, "text", None) or []).strip(), "issue": getattr(args, "issue", None)}):
+        return EXIT_OK
     engine, _, _ = build_engine(runner, now, "cli")
     if args.sender is not None:
         if os.environ.get(LAB_ENV) != "1":
@@ -24057,6 +24107,8 @@ def _orders_charter(config, charter, fleet, watched):
 
 
 def cmd_orders(args, runner, now):
+    if relay_cli_done("orders", {"action": getattr(args, "orders_action", None), "name": getattr(args, "name", None)}):
+        return EXIT_OK
     if getattr(args, "cos", False):
         return cmd_orders_cos(args)
     if args.orders_action is None:

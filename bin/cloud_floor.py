@@ -784,6 +784,9 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
             return 400, {"error": "bad request body"}
         if not isinstance(body, dict):
             return 400, {"error": "bad request body"}
+    if route[0] == "POST" and route[1] in ("/v1/send", "/v1/report", "/v1/remind", "/v1/retire", "/v1/orders", "/v1/pane-state", "/v1/pane-command") \
+            and callable(state.get("on_v1_action")):
+        state["on_v1_action"](route[1], auth, body, state)
     for spoof in ("sender", "from"):
         if spoof in body and body[spoof] != auth["agent"]:
             state["audit"].append({"event": "spoofed_sender", "agent": auth["agent"], "session": auth["session"], "claimed": scrub(body[spoof], 40)})
@@ -906,6 +909,20 @@ def call_switchboard_v1(path, payload, env=None):
     return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
 
 
+def relay_cli_if_configured(command, payload, env=None):
+    """Forward a Mac CLI action to the in-cluster switchboard; None when CW_SWITCHBOARD_URL is not set."""
+    env = os.environ if env is None else env
+    if not (env.get("CW_SWITCHBOARD_URL") or "").strip():
+        return None
+    return call_switchboard_v1("/v1/" + command, payload, env=env)
+
+
+def push_pane_state(observations, env=None, now=None):
+    """Push the Mac's pane observations; returns the commands the cluster answers with."""
+    ans = call_switchboard_v1("/v1/pane-state", {"agents": observations, "at": now}, env=env)
+    return (ans.get("commands") or []) if isinstance(ans, dict) else []
+
+
 def _one_line_text(err):
     return " ".join(str(err).split())[:160]
 
@@ -920,7 +937,7 @@ def floor_watch_sync(state_dir, records, engine=None):
             return records
         sessions = {k: v for k, v in sessions.items() if isinstance(v, dict)}
     except Exception as err:
-        if D.get("Refusal") and isinstance(err, D["Refusal"]):
+        if "Refusal" in D and isinstance(err, D["Refusal"]):
             env = env_of()
             if not any((env.get(k) or "").strip() for k in ("CW_FLOOR_URL", "CW_FLOOR_QUEUE_URL", "CW_FLOOR_BLOB_URL", "CW_FLOOR_TRANSPORT")):
                 return records   # no Floor is configured: nothing to read, and nothing to say

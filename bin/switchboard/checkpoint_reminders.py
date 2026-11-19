@@ -206,6 +206,8 @@ def remind_manage(args, engine, state, sender, moment):
 
 
 def cmd_remind(args, runner, now):
+    if relay_cli_done("remind", {"args": [str(a) for a in vars(args).get("text", None) or []], "name": getattr(args, "name", None)}):
+        return EXIT_OK
     engine, state, config = build_engine(runner, now, "cli")
     if args.sender is not None:
         if os.environ.get(LAB_ENV) != "1":
