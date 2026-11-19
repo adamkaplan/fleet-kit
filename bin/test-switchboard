@@ -67517,8 +67517,7 @@ def main(argv):
                     keep.addTest(case)
         suite = keep
 
-    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
-    result = runner.run(suite)
+    result = importlib.import_module("support.discovery").run_suite_parallel(suite, SCENARIO_REPORTS)
 
     passed = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
     if SCENARIO_REPORTS:

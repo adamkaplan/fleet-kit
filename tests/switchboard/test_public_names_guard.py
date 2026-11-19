@@ -27,6 +27,14 @@ class TestPublicNamesGuard(unittest.TestCase):
             self.assertEqual(self.calls, [])
             self.audit.append.assert_not_called()
 
+    def test_public_words_pass_and_builtin_private_shapes_refuse(self):
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "\\bfleetkit\\b\nacme-secret\n"}):
+            for ok in ("FleetKit", "fleetkit", "fleet-cloud", "spire-floor", "<!-- fleet-switchboard:from=coder -->"):
+                self.assertEqual(self.write("acme/api", ok), "ok")
+            for bad in ("12345678-1234-1234-1234-123456789abc", "x.vault.azure.net", "fkcwdemo", "acme-secret"):
+                with self.assertRaises(self.sb.IntentError):
+                    self.write("acme/api", bad)
+
     def test_case_sensitive_entry_and_clean_text_pass(self):
         with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "case:Bar\n"}):
             self.assertEqual(self.write("acme/api", "a bar is fine"), "ok")

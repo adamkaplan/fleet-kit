@@ -345,13 +345,31 @@ def _strings_of(value, depth=0):
             yield from _strings_of(item, depth + 1)
 
 
+BUILTIN_PRIVATE_TERMS = (
+    re.compile(r"\b(?![0]{8}-[0]{4}-[0]{4}-[0]{4}-[0]{11}[0-9]\b)[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),
+    re.compile(r"\b[a-z0-9-]+\.(?:azurecr\.io|vault\.azure\.net|postgres\.database\.azure\.com|blob\.core\.windows\.net|queue\.core\.windows\.net|table\.core\.windows\.net|file\.core\.windows\.net|hcp\.[a-z0-9-]+\.azmk8s\.io)\b", re.IGNORECASE),
+    re.compile(r"\b(?:fkcw[a-z0-9-]+|spire-floor-(?:pg|monthly)[a-z0-9-]*)\b", re.IGNORECASE),
+)
+_FROM_MARKER = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
+_PUBLIC_WORDS = re.compile(r"fleet-cloud|spire-floor|spire-land|fleetkit|fleet-kit|spire", re.IGNORECASE)
+
+
 def refuse_private_names(repo, values):
-    """Raise PublicNamesRefused when any string in `values` (bodies, titles, payloads) matches a private-name entry."""
+    """Raise PublicNamesRefused when any string in `values` (bodies, titles, payloads) matches a configured private-name entry or a built-in private infrastructure pattern.
+    Public fleet-kit and spire words never count against the configured entries."""
     terms = private_name_terms()
-    if not terms:
+    builtin = []
+    if os.environ.get("FLEET_PRIVATE_NAMES", "").strip() or not os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
+        builtin = [(1000 + n, rx) for n, rx in enumerate(BUILTIN_PRIVATE_TERMS, 1)]
+    if not terms and not builtin:
         return
     for text in _strings_of(list(values)):
+        text = _FROM_MARKER.sub("", text)
         for number, line in enumerate(text.splitlines(), 1):
-            for index, regex in terms:
+            for index, regex in builtin:
                 if regex.search(line):
+                    raise PublicNamesRefused(repo, number, index)
+            cleaned = _PUBLIC_WORDS.sub(" ", line)
+            for index, regex in terms:
+                if regex.search(cleaned):
                     raise PublicNamesRefused(repo, number, index)
