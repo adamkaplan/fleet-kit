@@ -54,6 +54,9 @@ class TestSpireLandCutover2570(Base):
         self.assertEqual(nightly.submits[0]["priority_class"], "background")
         self.assertEqual(nightly.submits[0]["brief"], " && ".join(host.NIGHTLY_SUITES))
         self.assertFalse(nightly.submits[0]["brief"].startswith("Nightly"))
+        for suite in host.NIGHTLY_SUITES:
+            self.assertIn(suite, nightly.submits[0]["brief"])
+        self.assertGreater(len(host.NIGHTLY_SUITES), 0)
         failed = Tp({"state": "failed", "log_tail": "x"})
         self.assertEqual(host.run_floor_nightly(str(REPO), transport=failed, poll_interval=0), 1)
         with mock.patch.dict(os.environ, {"CW_FLOOR_TRANSPORT": "http", "CW_FLOOR_URL": "http://attacker.example"}):
