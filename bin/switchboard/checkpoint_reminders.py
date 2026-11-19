@@ -232,14 +232,11 @@ def cmd_remind(args, runner, now):
     if args.list_mine or args.cancel or getattr(args, "cancel_key", None):
         return remind_manage(args, engine, state, sender, moment)
     text_file = getattr(args, "text_file", None)   # a caller that builds its own namespace has none
-    if text_file and args.text:
-        sys.stderr.write("%s: remind takes the text as words or from --text-file, not both; nothing armed\n" % PROG)
-        return EXIT_USAGE
     if not args.name or not args.when or not (args.text or text_file):
         sys.stderr.write("%s: remind needs <name> <when> <text> (or --text-file F, or --list, or --cancel <id>)\n" % PROG)
         return EXIT_USAGE
     if text_file:
-        text, problem = read_text_file(text_file)
+        text, problem = relayed_text, None   # already read and checked before the relay
     else:
         text, problem = " ".join(args.text).strip(), None
         if len(text) > TEXT_CAP:   # #1355: never armed to be cut on delivery

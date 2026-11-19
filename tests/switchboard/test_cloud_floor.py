@@ -1010,9 +1010,10 @@ class TestFloorAuthority(FloorCase):
                                       until_closed=None, until_merged=None, keep_if_closed=False, list_mine=False, cancel=None, cancel_key=None, sender=None)
             done = lambda command, payload: calls.append((command, payload)) or True
             with mock.patch.dict(os.environ, {"CW_SWITCHBOARD_AUTHORITY": "cluster"}), mock.patch.object(sb, "relay_cli_done", done), \
-                    contextlib.redirect_stderr(io.StringIO()):
+                    contextlib.redirect_stderr(io.StringIO()) as err:
                 code = sb.cmd_remind(args, None, lambda: 0)
         self.assertEqual(code, 0)
+        self.assertIn("relayed to cluster", err.getvalue())
         self.assertEqual(calls[0][0], "remind")
         self.assertEqual(calls[0][1]["text"], "check the widget-api rollout")
 
