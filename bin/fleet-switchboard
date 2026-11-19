@@ -8508,6 +8508,8 @@ def cloud_watch_tick(engine, discovery):
     result = cloud.read_records_bounded(state_dir_path(), cursor=getattr(engine, "_cloud_cursor", None))
     engine._cloud_cursor = result["cursor"]
     engine.cloud_watch = result
+    if hasattr(cloud, "cloud_floor"):
+        cloud.cloud_floor.floor_watch_sync(state_dir_path(), result["records"], engine)
     if result["capped"] and not getattr(engine, "_cloud_cap_audited", False):
         engine._cloud_cap_audited = True
         if engine.audit is not None:
@@ -8695,7 +8697,8 @@ def lost_worker_tick(engine, discovery):
         boss = boss_name(discovery, obs)
         if boss and obs.status != "unknown":
             alive[name] = {"lane": boss, "ask": (obs.fleet or {}).get("issue") or (obs.fleet or {}).get("repo")}
-    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, retired=retired, parse_bounded=load_module("record_json").parse_bounded)
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, retired=retired, parse_bounded=load_module("record_json").parse_bounded,
+                             floor_session_finished=lambda name, record: (record or {}).get("floor_state") in ("done", "failed", "retired"))
     return module.run_pass(ns, engine, engine.now(), alive)
 
 

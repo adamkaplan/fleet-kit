@@ -921,6 +921,76 @@ class TestCloudAgents(FloorCase):
         self.assertEqual((len(cancelled), list(Path(self.state).glob("cloud/o1.json"))), (1, []))
 
 
+class TestFloorAuthority(FloorCase):
+    SECRET = "s3cr3t"
+
+    def header(self, agent):
+        return "agent=%s;session=ses_0123456789abcdef;secret=s3cr3t" % agent
+
+    def call(self, path, body, agent="cos", **kw):
+        return self.floor.handle_switchboard_v1("POST", path, {"X-Switchboard-Auth": self.header(agent)}, json.dumps(body).encode(), self.SECRET, **kw)
+
+    def test_a_finished_session_retires_on_the_first_call(self):
+        for finished in ("done", "failed", "retired"):
+            transport = self.floor.QueueBlobTransport("https://q.example/q", "sig=1", "https://b.example/b", "sig=2")
+            transport._enqueue = lambda *a, **k: None
+            transport._state = lambda: {"sessions": {"w-1": {"state": finished}}, "acks": {}}
+            self.assertEqual(transport.cancel("fleet", "w-1", "c1", 2), {"cancelled": True, "reserved": False})
+
+    def test_watch_sync_audits_stop_once_and_adds_virtual_records(self):
+        class T:
+            works = {"w-1": {"state": "done"}, "w-2": {"state": "failed"}, "w-3": {"state": "working", "worker": "widget-api", "repo": "acme-org/widget-service"}}
+        self.floor.TRANSPORT = T()
+        audit = mock.Mock()
+        engine = mock.Mock(audit=audit, actor="sw")
+        records = [{"worker": "a", "backend": "floor", "work_id": "w-1"}, {"worker": "b", "backend": "floor", "work_id": "w-2"}]
+        with mock.patch.object(self.m, "save_record", lambda *a: None):
+            self.floor.floor_watch_sync(self.state, records, engine)
+            self.floor.floor_watch_sync(self.state, records, engine)
+        reasons = sorted((c.args[3]["reason"], c.args[3]["exit"]) for c in audit.append.call_args_list)
+        self.assertEqual(reasons, [("done", 0), ("failed", 1)])
+        self.assertIn("widget-api", [r["worker"] for r in records])
+
+    def test_lost_worker_skips_a_finished_floor_session(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("lost_worker", str(REPO / "bin" / "lost_worker.py"))
+        lw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lw)
+        created = {"w": {"at": 1000, "deadline": 2000, "line": "l"}}
+        for record, expect in (({"backend": "floor", "floor_state": "done"}, 0), ({"backend": "floor"}, 1)):
+            state = {"created": dict(created)}
+            out = lw._losses(state, mock.Mock(spec=[]), mock.Mock(), {}, 10 ** 7, {"w": record})
+            self.assertEqual(len(out), expect)
+
+    def test_retire_orders_and_pane_commands(self):
+        state = {}
+        self.assertEqual(self.call("/v1/retire", {"worker": "widget-api", "reason": "done"}, state=state), (200, {"retired": True, "worker": "widget-api"}))
+        self.assertEqual(state["retires"][0]["worker"], "widget-api")
+        code, out = self.call("/v1/orders", {"action": "add", "charter": "acme-org/widget-service#10", "text": "ship"}, state=state)
+        self.assertEqual((code, out["recorded"], len(out["orders"])), (200, True, 1))
+        self.assertEqual(self.call("/v1/pane-command", {"action": "resume", "agent": "widget-api", "reason": "x"}, state=state)[0], 200)
+        self.assertEqual(self.call("/v1/pane-state", {"agents": {"widget-api": {"status": "idle", "junk": 1}}}, agent="service-ops", state=state)[0], 403)
+        code, out = self.call("/v1/pane-state", {"agents": {"widget-api": {"status": "idle", "junk": 1}}, "at": 5}, agent="pane-relay", state=state)
+        self.assertEqual((code, out["updated"], [c["action"] for c in out["commands"]]), (200, 1, ["resume"]))
+        self.assertEqual(state["pane_state"], {"widget-api": {"status": "idle"}})
+
+    def test_call_switchboard_v1(self):
+        self.assertIsNone(self.floor.call_switchboard_v1("/v1/orders", {}, env={}))
+        auth = self.home / "auth"
+        auth.write_text("agent=cos;session=ses_example;secret=x")
+        auth.chmod(0o600)
+        seen = {}
+
+        def fake(method, url, data, headers, **k):
+            seen.update(url=url, headers=dict(headers))
+            return 200, b'{"ok": true}'
+        with mock.patch.object(self.floor, "_request", fake):
+            out = self.floor.call_switchboard_v1("/v1/orders", {"action": "list"}, env={"CW_SWITCHBOARD_URL": "https://sw.example", "CW_SWITCHBOARD_AUTH_FILE": str(auth)})
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(seen["url"], "https://sw.example/v1/orders")
+        self.assertIn("agent=cos", seen["headers"]["X-Switchboard-Auth"])
+
+
 class TestCloudFloorMutants(Base):
     """Each mutant is a change of bin/cloud_floor.py made in memory; the test that should catch it runs under it and must fail, and runs first without it."""
     def failed(self, test, **patches):

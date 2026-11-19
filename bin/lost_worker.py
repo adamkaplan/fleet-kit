@@ -371,6 +371,10 @@ def _losses(state, sb, engine, alive, now, records):
         if now - newest <= GRACE and newest > c["at"]:
             continue   # a launcher action or a push within the grace: the pod still answers
         record = records.get(name, {})
+        if record.get("backend") == "floor" and (record.get("stopped_audited") or record.get("floor_state") in ("done", "failed", "retired")
+                                                 or getattr(sb, "floor_session_finished", lambda *a: False)(name, record)):
+            state.setdefault("stop", {})[name] = now   # Floor says the session ended: it is no lost pod
+            continue
         loss = {"key": "pod_no_stop:%s:%s" % (name, c["at"]), "kind": "pod_no_stop", "name": name, "ask": _ask_of(name, record),
                 "at": newest, "lane": record.get("reports_to"), "line": c["line"]}
         if now - deadline < longest:

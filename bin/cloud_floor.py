@@ -191,6 +191,9 @@ def _parse(raw):
     return parsed
 
 
+FINISHED_STATES = ("retired", "done", "failed")
+
+
 class HttpTransport:
     """The five calls of the Floor caller API over HTTP: a JSON body in, a bounded JSON answer out. Paths are under /v1/callers/<caller>/."""
     def __init__(self, base, token=None):
@@ -285,8 +288,8 @@ class QueueBlobTransport:
         ack = state["acks"].get(cmd_id)
         if isinstance(ack, str) and ack.startswith("rejected"):
             raise FloorError("Floor rejected the retire (%s)" % scrub(ack, 80))
-        retired = (state["sessions"].get(work_id) or {}).get("state") == "retired"
-        return {"cancelled": True, "reserved": not retired}
+        finished = (state["sessions"].get(work_id) or {}).get("state") in FINISHED_STATES
+        return {"cancelled": True, "reserved": not finished}
 
     def observe(self, caller, work_id):
         state = self._state()
@@ -826,6 +829,46 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         if not isinstance(url, str) or not url.startswith("https://"):
             return 502, {"error": "artifact store refused"}
         return 200, {"url": url, "sha256": digest, "sp": "r"}
+    if route == ("POST", "/v1/retire"):
+        name, reason = body.get("worker"), scrub(body.get("reason", ""), 200) if isinstance(body.get("reason", ""), str) else ""
+        if not isinstance(name, str) or not CALLER_RE.fullmatch(name):
+            return 400, {"error": "worker is required"}
+        state.setdefault("retires", []).append({"worker": name, "reason": reason, "from": auth["agent"]})
+        target = (state.get("floor_sessions") or {}).get(name)
+        if target:
+            seq = int(target.get("seq", 1)) + 1
+            _call(transport().cancel, floor_who(), target["work_id"], cancel_key(target.get("session", name), seq), seq)
+            target["seq"] = seq
+        return 200, {"retired": True, "worker": name}
+    if route == ("POST", "/v1/orders"):
+        action = body.get("action")
+        if action not in ("list", "add", "remove"):
+            return 400, {"error": "action must be list, add or remove"}
+        orders = state.setdefault("orders", [])
+        if action != "list":
+            orders.append({"action": action, "charter": body.get("charter"), "text": text, "number": body.get("number"), "from": auth["agent"]})
+        return 200, {"recorded": True, "orders": orders}
+    if route == ("POST", "/v1/pane-state"):
+        if auth["agent"] not in ("pane-relay", "cos"):
+            return 403, {"error": "pane-state is for the pane relay"}
+        agents = body.get("agents")
+        if not isinstance(agents, dict):
+            return 400, {"error": "agents is required"}
+        wanted = ("status", "errored", "turn_error", "turn_error_id", "idle_at", "permission_waiting", "form_waiting", "pane", "session_id", "fleet")
+        state["pane_state"] = {k: {f: v[f] for f in wanted if f in v} for k, v in agents.items() if isinstance(v, dict)}
+        state["pane_state_at"] = body.get("at")
+        commands = list(state.setdefault("pane_commands", []))
+        state["pane_commands"].clear()
+        return 200, {"updated": len(state["pane_state"]), "commands": commands}
+    if route == ("POST", "/v1/pane-command"):
+        agent, action = body.get("agent"), body.get("action")
+        if not isinstance(agent, str) or not CALLER_RE.fullmatch(agent) or action not in ("resume", "interrupt", "retire"):
+            return 400, {"error": "agent and a known action are required"}
+        command = {"action": action, "agent": agent, "reason": scrub(body.get("reason", ""), 200) if isinstance(body.get("reason", ""), str) else "", "from": auth["agent"]}
+        state.setdefault("pane_commands", []).append(command)
+        state["pane_outbox"].append({"from": auth["agent"], "session": auth["session"], "to": "pane-relay", "command": command, "text": "%s %s" % (action, agent),
+                                     "id": len(state["pane_outbox"]) + 1 + len(state.get("acked", []))})
+        return 200, {"queued": True}
     if route == ("POST", "/v1/pane-ack"):
         ids = body.get("ids")
         if not isinstance(ids, list):
@@ -836,6 +879,65 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         state["pane_outbox"][:] = keep
         return 200, {"acked": len(state["acked"])}
     return 404, {"error": "no such route"}
+
+
+def call_switchboard_v1(path, payload, env=None):
+    """POST `payload` to the in-cluster switchboard (CW_SWITCHBOARD_URL, header from the 0600 file CW_SWITCHBOARD_AUTH_FILE); None when no URL is set."""
+    env = os.environ if env is None else env
+    base = (env.get("CW_SWITCHBOARD_URL") or "").strip()
+    if not base:
+        return None
+    header = None
+    auth_file = (env.get("CW_SWITCHBOARD_AUTH_FILE") or "").strip()
+    if not auth_file:
+        raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not set")
+    try:
+        info = os.stat(auth_file)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+            raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not a regular 0600 file of the user's own")
+        with open(auth_file, encoding="utf-8") as handle:
+            header = handle.read().strip()
+    except OSError:
+        raise FloorError("CW_SWITCHBOARD_AUTH_FILE cannot be read") from None
+    data = json.dumps(payload, sort_keys=True).encode()
+    headers = [("Accept", "application/json"), ("Content-Type", "application/json"), ("X-Switchboard-Auth", header)]
+    return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
+
+
+def floor_watch_sync(state_dir, records, engine=None):
+    """Read the Floor controller's sessions (the source of truth for backend=floor): audit `cloud.stopped` once for a finished session and add a
+    virtual record for a session no local file holds. Never raises: an offline pass is not broken by it."""
+    try:
+        held = transport()
+        sessions = held._state()["sessions"] if hasattr(held, "_state") else getattr(held, "works", None)
+        if not isinstance(sessions, dict):
+            return records
+        sessions = {k: v for k, v in sessions.items() if isinstance(v, dict)}
+    except Exception:
+        return records
+    known = set()
+    for record in list(records):
+        if not isinstance(record, dict) or record.get("backend") != "floor":
+            continue
+        known.add(record.get("work_id") or record.get("session"))
+        found = sessions.get(record.get("work_id")) or sessions.get(record.get("session")) or {}
+        s_state = found.get("state")
+        if s_state not in FINISHED_STATES:
+            continue
+        record["floor_state"] = s_state
+        if getattr(engine, "audit", None) and not record.get("stopped_audited"):
+            try:
+                engine.audit.append(engine.actor, "cloud.stopped", record["worker"], {"exit": 0 if s_state != "failed" else 1, "reason": s_state, "runtime_id": record.get("runtime_id"), "backend": "floor"})
+                record["stopped_audited"] = True
+                D["save_record"](state_dir, record)
+            except Exception:
+                pass
+    for work_id, found in sessions.items():
+        name, repo = found.get("worker") or found.get("title"), found.get("repo")
+        if work_id in known or not name or not repo or any(isinstance(r, dict) and r.get("worker") == name for r in records):
+            continue
+        records.append({"worker": name, "backend": "floor", "work_id": work_id, "session": found.get("session", work_id), "repo": repo, "floor_state": found.get("state"), "virtual": True})
+    return records
 
 
 # ---------------------------------------------------------------- the cutover, the drain and the pod launcher's retirement
