@@ -462,6 +462,9 @@ cloud_cli.py:post
 cloud_cluster.py:run_launcher
 cloud_cost_report.py:read_lines
 cloud_lane_cap.py:_stopped_ids
+cloud_floor.py:_start_port_forward
+cloud_floor.py:read
+cloud_floor.py:rollback_switchboard_authority
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
