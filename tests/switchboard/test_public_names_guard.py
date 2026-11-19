@@ -45,3 +45,10 @@ class TestPublicNamesGuard(unittest.TestCase):
                     self.write("acme/api", "clean")
                 self.assertNotIn("Bar(", str(ctx.exception))
         self.assertEqual(self.calls, [])
+
+    def test_a_first_positional_payload_is_scanned(self):
+        write = self.sb.github_audited(lambda argv: (self.audit, "cli", "POST", "repos/acme/api/issues/1/comments", "acme/api", 1))(lambda argv: self.calls.append(argv))
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "foo"}):
+            with self.assertRaises(self.sb.IntentError):
+                write(["gh", "issue", "comment", "--body", "Foo"])
+        self.assertEqual(self.calls, [])

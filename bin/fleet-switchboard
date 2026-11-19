@@ -528,7 +528,7 @@ def github_audited(resolve, ok_of=None, refused=None):
             if known is None:
                 return fn(*args, **kwargs)
             try:
-                refuse_private_names(known[4], list(args[1:]) + list(kwargs.values()))
+                refuse_private_names(known[4], list(args) + list(kwargs.values()))
                 guard = github_write(*known)
                 outcome = guard.__enter__()
             except (GithubAuditRefused, PublicNamesRefused) as err:
