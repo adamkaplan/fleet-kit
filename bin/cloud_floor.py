@@ -833,8 +833,10 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         name, reason = body.get("worker"), scrub(body.get("reason", ""), 200) if isinstance(body.get("reason", ""), str) else ""
         if not isinstance(name, str) or not CALLER_RE.fullmatch(name):
             return 400, {"error": "worker is required"}
-        state.setdefault("retires", []).append({"worker": name, "reason": reason, "from": auth["agent"]})
         target = (state.get("floor_sessions") or {}).get(name)
+        if auth["agent"] != "cos" and auth["agent"] != (target or {}).get("reports_to"):   # the Chief of Staff or the worker's own boss, as `_may_retire` has it
+            return 403, {"error": "only the Chief of Staff or the worker's own boss may retire it"}
+        state.setdefault("retires", []).append({"worker": name, "reason": reason, "from": auth["agent"]})
         if target:
             seq = int(target.get("seq", 1)) + 1
             _call(transport().cancel, floor_who(), target["work_id"], cancel_key(target.get("session", name), seq), seq)
@@ -913,7 +915,8 @@ def floor_watch_sync(state_dir, records, engine=None):
         if not isinstance(sessions, dict):
             return records
         sessions = {k: v for k, v in sessions.items() if isinstance(v, dict)}
-    except Exception:
+    except Exception as err:
+        print("floor_watch_sync: the Floor state could not be read (%s)" % type(err).__name__, file=sys.stderr)
         return records
     known = set()
     for record in list(records):
@@ -930,8 +933,9 @@ def floor_watch_sync(state_dir, records, engine=None):
                 engine.audit.append(engine.actor, "cloud.stopped", record["worker"], {"exit": 0 if s_state != "failed" else 1, "reason": s_state, "runtime_id": record.get("runtime_id"), "backend": "floor"})
                 record["stopped_audited"] = True
                 D["save_record"](state_dir, record)
-            except Exception:
-                pass
+            except Exception as err:   # not marked audited: the next pass tries again, and says so
+                record.pop("stopped_audited", None)
+                print("floor_watch_sync: cloud.stopped for %s was not recorded (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
     for work_id, found in sessions.items():
         name, repo = found.get("worker") or found.get("title"), found.get("repo")
         if work_id in known or not name or not repo or any(isinstance(r, dict) and r.get("worker") == name for r in records):

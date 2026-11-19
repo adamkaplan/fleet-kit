@@ -8698,7 +8698,7 @@ def lost_worker_tick(engine, discovery):
         if boss and obs.status != "unknown":
             alive[name] = {"lane": boss, "ask": (obs.fleet or {}).get("issue") or (obs.fleet or {}).get("repo")}
     ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, retired=retired, parse_bounded=load_module("record_json").parse_bounded,
-                             floor_session_finished=lambda name, record: (record or {}).get("floor_state") in ("done", "failed", "retired"))
+                             floor_session_finished=lambda name, record: (record or {}).get("floor_state") in load_module("cloud_worker").bind(globals()).cloud_floor.FINISHED_STATES)
     return module.run_pass(ns, engine, engine.now(), alive)
 
 

@@ -959,7 +959,7 @@ class TestFloorAuthority(FloorCase):
         created = {"w": {"at": 1000, "deadline": 2000, "line": "l"}}
         for record, expect in (({"backend": "floor", "floor_state": "done"}, 0), ({"backend": "floor"}, 1)):
             state = {"created": dict(created)}
-            out = lw._losses(state, mock.Mock(spec=[]), mock.Mock(), {}, 10 ** 7, {"w": record})
+            out = lw._losses(state, mock.Mock(floor_session_finished=lambda n, r: r.get("floor_state") in self.floor.FINISHED_STATES), mock.Mock(), {}, 10 ** 7, {"w": record})
             self.assertEqual(len(out), expect)
 
     def test_retire_orders_and_pane_commands(self):
@@ -973,6 +973,31 @@ class TestFloorAuthority(FloorCase):
         code, out = self.call("/v1/pane-state", {"agents": {"widget-api": {"status": "idle", "junk": 1}}, "at": 5}, agent="pane-relay", state=state)
         self.assertEqual((code, out["updated"], [c["action"] for c in out["commands"]]), (200, 1, ["resume"]))
         self.assertEqual(state["pane_state"], {"widget-api": {"status": "idle"}})
+
+    def test_retire_is_for_the_chief_of_staff_or_the_boss_and_cancels_the_session(self):
+        class T:
+            calls = []
+            def cancel(self, who, work_id, key, seq):
+                self.calls.append((work_id, seq))
+                return {"cancelled": True, "reserved": False}
+        self.floor.TRANSPORT = T()
+        state = {"floor_sessions": {"widget-api": {"work_id": "w-1", "seq": 1, "reports_to": "service-ops"}}}
+        self.assertEqual(self.call("/v1/retire", {"worker": "widget-api"}, agent="stranger", state=state)[0], 403)
+        self.assertEqual(T.calls, [])
+        self.assertEqual(self.call("/v1/retire", {"worker": "widget-api"}, agent="service-ops", state=state)[0], 200)
+        self.assertEqual(T.calls, [("w-1", 2)])
+
+    def test_an_audit_failure_leaves_the_stop_unrecorded_and_says_so(self):
+        class T:
+            works = {"w-1": {"state": "done"}}
+        self.floor.TRANSPORT = T()
+        engine = mock.Mock(actor="sw")
+        engine.audit.append.side_effect = OSError("disk")
+        records = [{"worker": "a", "backend": "floor", "work_id": "w-1"}]
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.floor.floor_watch_sync(self.state, records, engine)
+        self.assertNotIn("stopped_audited", records[0])
+        self.assertIn("OSError", err.getvalue())
 
     def test_call_switchboard_v1(self):
         self.assertIsNone(self.floor.call_switchboard_v1("/v1/orders", {}, env={}))
