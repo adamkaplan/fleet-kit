@@ -1692,7 +1692,7 @@ class TestCosOrdersFile(Base):
         put_cos_orders(self, sb.COS_ORDERS_TEMPLATE + "\n- Approve read-only prompts.\n")
         self.assertEqual(sb.read_cos_orders({})["text"], "- Approve read-only prompts.")
 
-    def test_eight_kilobytes_is_the_limit_and_a_larger_file_is_refused_and_says_so(self):
+    def test_sixteen_kilobytes_without_comments_is_the_limit_and_a_larger_file_is_refused_and_says_so(self):
         put_cos_orders(self, "x" * 16384)
         self.assertEqual(sb.read_cos_orders({})["size"], 16384)
         put_cos_orders(self, "<!-- " + "c" * 1024 + " -->\n" + "x" * 8192)

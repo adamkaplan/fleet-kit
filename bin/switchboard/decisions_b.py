@@ -185,7 +185,7 @@ def decisions_from_order_notices(engine, now):
                         "headline": headline, "ask": None, "repo": repo, "agent": "cos", "kind": "notice", "tier": "human",
                         "since": iso(now), "number": None, "url": None, "state": None, "additions": None,
                         "deletions": None, "files": None, "ci": None, "review": None, "stale": False,
-                        "note": _one_line(str(err), 240), "merge_after": None})
+                        "note": "fix or trim standing-orders.md", "merge_after": None})
     for group in order_groups(live, window):
         first = group[0]
         short, sign = first["repo"].split("/")[-1], "+" if first.get("action") == "add" else "-"

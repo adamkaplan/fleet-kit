@@ -585,7 +585,7 @@ test("a worker role gets no orders", () => {
 });
 
 test("a file over the limit is refused visibly, never cut", () => {
-  const file = ordersFile("x".repeat(9000));
+  const file = ordersFile("x".repeat(18000));
   assert.ok(readCosOrders(file).refused);
   const out = sent(makeOrdersHook({ file }), "chief-of-staff");
   assert.ok(out.includes("refused") && !out.includes("xxxx"));

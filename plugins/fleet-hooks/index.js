@@ -609,8 +609,8 @@ export function resolveSettings(env = process.env, deps = {}) {
 // ---- #1011: the Chief of Staff's standing orders in its system prompt, on every model call.
 // A message in the conversation is summarised by a compaction; the system prompt is not part of the conversation, so the orders
 // are put there, read from the file each call (an edit shows at once), word for word after the template's comment strip.
-// A file over 8 KB is refused with a visible note, never cut. Only the Chief of Staff's role gets them.
-export const COS_ORDERS_MAX = 8192;
+// A file over 16 KB is refused with a visible note, never cut. Only the Chief of Staff's role gets them.
+export const COS_ORDERS_MAX = 16384;
 export const COS_ROLE = "chief-of-staff";
 
 export function cosOrdersPathOf(env = process.env, home = os.homedir()) {
@@ -627,7 +627,7 @@ export function readCosOrders(file, fsm = fs) {
   } catch {
     return null;
   }
-  if (size > COS_ORDERS_MAX) return { refused: `${file} is ${size} bytes: the limit is ${COS_ORDERS_MAX} (8 KB). Trim it; none of it is given to you from a file this large` };
+  if (size > COS_ORDERS_MAX) return { refused: `${file} is ${size} bytes: the limit is ${COS_ORDERS_MAX} (16 KB). Trim it; none of it is given to you from a file this large` };
   let raw;
   try {
     raw = fsm.readFileSync(file, "utf8");
