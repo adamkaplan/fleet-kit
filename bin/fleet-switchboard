@@ -5681,6 +5681,7 @@ BOSS_READ_SITES = {
     "bin/cloud_retired.py:read_ended": "a cloud worker's own endpoint record (not a discovered agent: `boss_name` needs a discovery and an observation, which a pod that could not be reached has none of): its reports_to is read from the record and handed to `read_run_record` as the fallback boss of the ended run, only for the caller rule of `read`",
     "bin/cloud_lane_cap.py:lane_m_workers": "the lane of a record, for the M cap: a cloud worker's own endpoint record (not a discovered agent), read as written",
     "bin/cloud_inspect.py:cmd_inspect": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record and compared with the caller, the same rule as `_may_retire` but the boss alone",
+    "bin/cloud_floor.py:handle_switchboard_v1": "a Floor session record in the in-cluster switchboard (not a discovered agent): its reports_to is compared with the authenticated caller in /v1/retire, the same rule as _may_retire",
 }
 
 
