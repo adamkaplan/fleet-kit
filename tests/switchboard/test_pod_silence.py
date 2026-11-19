@@ -190,10 +190,16 @@ class StubCluster:
         return False
 
 
+def fake_cloud(cloud, launcher, cluster):
+    """A stand-in cloud_worker for a legacy pod not on disk: no route record, so pod_silence_summary takes the Cluster + run_launcher path."""
+    return types.SimpleNamespace(run_launcher=launcher, _inspect_short=cloud._inspect_short, Cluster=cluster, route=lambda n: None,
+                                 cloud_floor=types.SimpleNamespace(is_floor=lambda r: False))
+
+
 class TestSummaryCluster(unittest.TestCase):
     def summary(self, launcher):
         cloud = load_real("cloud_worker").bind(sb.__dict__)
-        fake = types.SimpleNamespace(run_launcher=launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster, route=lambda n: None, cloud_floor=types.SimpleNamespace(is_floor=lambda r: False))
+        fake = fake_cloud(cloud, launcher, StubCluster)
         fake.bind = lambda g: fake
         with unittest.mock.patch.object(sb, "load_module", lambda n: fake if n == "cloud_worker" else load_real(n)):
             return sb.pod_silence_summary("other-pod")
@@ -228,7 +234,7 @@ class TestDaemonSummary(unittest.TestCase):
         def fake_launcher(runner, command, worker, options=(), timeout=0, **kw):
             calls.append((command, worker, tuple(options)))
             return 0, dict(BODY), ""
-        fake = types.SimpleNamespace(run_launcher=fake_launcher, _inspect_short=cloud._inspect_short, Cluster=StubCluster, route=lambda n: None, cloud_floor=types.SimpleNamespace(is_floor=lambda r: False))
+        fake = fake_cloud(cloud, fake_launcher, StubCluster)
         fake.bind = lambda g: fake
         with unittest.mock.patch.object(sb, "load_module", lambda n: fake if n == "cloud_worker" else load_real(n)):
             line = sb.pod_silence_summary("other-pod")
