@@ -2,7 +2,7 @@
 """token-service: a small HTTP service that mints the GitHub App installation token for the operator account (ask #2002).
 
 POST /mint with the JSON body {"repo": "OWNER/NAME", "role": "worker"|"orchestrator"|"lander"|"reader"} or, for orchestrator and reader, {"repos": ["OWNER/NAME", ...up to 20, one owner, each allowed], "role": ...} and the header X-Caller-Token: Bearer <cluster token> (the API server removes Authorization of a proxied request).
-The caller is REVIEWED (the cluster's TokenReview API): only system:serviceaccount:<namespace>:cw-operator (for worker and orchestrator) or system:serviceaccount:<namespace>:floor-heavy-executor / CW_HEAVY_EXECUTOR_SA (for lander) is served.
+The caller is REVIEWED (the cluster's TokenReview API): system:serviceaccount:<namespace>:cw-operator is served for worker, orchestrator and reader; floor-controller / CW_FLOOR_CONTROLLER_SA only for orchestrator and reader (any other role is refused); floor-heavy-executor / CW_HEAVY_EXECUTOR_SA only for lander.
 The repository must be on CW_ALLOWED_REPOS (the launcher's own check), the role in PERMISSIONS_BY_ROLE, the body at most 4096 bytes,
 and the body carries no other key. The answer is GitHub's own: the token, the repositories, the permissions and the expiry.
 The App id and key are read by the commands CW_APP_ID_CMD and CW_APP_KEY_CMD (default: cat of the files mounted from the cluster Secret).

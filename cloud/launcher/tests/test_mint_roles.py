@@ -35,9 +35,11 @@ WORKER_SET = {"contents": "write", "pull_requests": "write", "issues": "read", "
 ORCH_SET = {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"}
 WORKER_TEXT = "contents: write, pull_requests: write, issues: read, metadata: read"
 ORCH_TEXT = "issues: write, pull_requests: read, checks: read, metadata: read"
+READER_SET = {"contents": "read", "issues": "read", "metadata": "read"}
+READER_TEXT = "contents: read, issues: read, metadata: read"
 STEP = "the owner adds %s to the App's permissions and accepts them on each installation"
-SETS = {"worker": WORKER_SET, "orchestrator": ORCH_SET}
-TEXTS = {"worker": WORKER_TEXT, "orchestrator": ORCH_TEXT}
+SETS = {"worker": WORKER_SET, "orchestrator": ORCH_SET, "reader": READER_SET}
+TEXTS = {"worker": WORKER_TEXT, "orchestrator": ORCH_TEXT, "reader": READER_TEXT}
 
 
 def read(rel):

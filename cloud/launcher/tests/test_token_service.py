@@ -262,6 +262,9 @@ class MultiRepo(unittest.TestCase):
             self.assertEqual((status, minted), (200, [(body["repos"], body["role"])]))
         status, minted = self.call({"repos": both[:1], "role": "reader"}, "system:serviceaccount:cw:floor-controller")
         self.assertEqual(status, 200)
+        ctl = "system:serviceaccount:cw:floor-controller"
+        for role in ("worker", "lander"):
+            self.assertEqual(self.call({"repo": "acme-org/widget-service", "role": role}, ctl)[0], 403)
 
     def test_bad_repos_mint_nothing(self):
         for repos, want in ((["acme-org/widget-service", "evil-org/other"], 400), ([], 400), (["acme-org/not-allowed"], 403),
