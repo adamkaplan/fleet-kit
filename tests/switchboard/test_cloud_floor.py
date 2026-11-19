@@ -962,6 +962,33 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(reasons, [("done", 0), ("failed", 1)])
         self.assertIn("widget-api", [r["worker"] for r in records])
 
+    def test_watch_sync_sends_one_terminal_wake_to_the_boss(self):
+        class T:
+            works = {"w-1": {"state": "done", "landed_sha": "abc123"}, "w-2": {"state": "failed", "error": "build broke"}}
+        self.floor.TRANSPORT = T()
+        audit = mock.Mock()
+        engine = mock.Mock(audit=audit, actor="sw")
+        records = [{"worker": "a", "backend": "floor", "work_id": "w-1", "reports_to": "cos"},
+                   {"worker": "b", "backend": "floor", "work_id": "w-2", "reports_to": "cos"}]
+        with mock.patch.object(self.m, "save_record", lambda *a: None):
+            self.floor.floor_watch_sync(self.state, records, engine)
+            self.floor.floor_watch_sync(self.state, records, engine)
+        texts = sorted(c.args[2] for c in engine.send.call_args_list)
+        self.assertEqual(len(texts), 2)
+        self.assertIn("landed_sha=abc123", texts[0])
+        self.assertIn("build broke", texts[1])
+        self.assertEqual(audit.append.call_count, 2)
+
+    def test_pod_silence_summary_reads_a_floor_session_without_the_launcher(self):
+        cloud = mock.Mock()
+        cloud.route.return_value = {"worker": "a", "backend": "floor", "session": "ses_example"}
+        cloud.cloud_floor.is_floor.return_value = True
+        cloud.cloud_floor._observe.return_value = {"state": "working", "busy": True, "rounds": 2, "landed_sha": None}
+        with mock.patch.object(self.sb.load_module("cloud_worker") if hasattr(self, "sb") else sb.load_module("cloud_worker"), "bind", return_value=cloud):
+            line = sb.pod_silence_summary("a")
+        self.assertIn("state=working", line)
+        cloud.run_launcher.assert_not_called()
+
     def test_lost_worker_skips_a_finished_floor_session(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location("lost_worker", str(REPO / "bin" / "lost_worker.py"))

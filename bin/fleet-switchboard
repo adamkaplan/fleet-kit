@@ -1817,6 +1817,14 @@ class V2Reads:
         return page
 
 
+def _pass_timer_start(engine):
+    return load_module("pass_timing").Timer(getattr(engine, "pass_clock", time.monotonic))
+
+
+def _pass_timer_finish(timer, engine, now_iso):
+    load_module("pass_timing").finish(timer, engine.state_dir, engine.audit, engine.actor, now_iso)
+
+
 class Switchboard:
     """observe -> derive -> decide -> deliver, for every fleet agent.
 
@@ -2840,7 +2848,7 @@ class Switchboard:
         self.pass_toasts = {}
         self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
-        timer = load_module("pass_timing").Timer(getattr(self, "pass_clock", time.monotonic))   # #279
+        timer = _pass_timer_start(self)   # #279
         with timer.stage("discover"):
             discovery = self.discover(now)
         if self.state_dir is not None:   # the turn start is always recorded; steering stays gated by the setting
@@ -2933,7 +2941,7 @@ class Switchboard:
         feed_tick(self)   # #290: the event feed's bounded re-sync and reconciliation reads (never raises)
         record_v2_calls(self)
         record_github_calls(self)
-        load_module("pass_timing").finish(timer, self.state_dir, self.audit, self.actor, iso(now))
+        _pass_timer_finish(timer, self, iso(now))
         return report
 
     # -- render: the sidebar badge and the toast
@@ -5658,6 +5666,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 # resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
 BOSS_READ_SITES = {
     "bin/cloud_worker.py:_final_message": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record the retire already holds and validated as an agent name; only the address of the one final message",
+    "bin/cloud_floor.py:floor_watch_sync": "a Floor worker's own endpoint record (not a discovered agent): its reports_to is the address of the one terminal done/failed wake",
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
     "bin/push_watch.py:run_pass": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of a push item (the item is told to that lane and nobody else)",
@@ -8667,6 +8676,10 @@ def pod_silence_summary(worker):
     no flag and no caller argument: this function takes a pod name from the daemon's own live records and returns the line only to pod_silence.scan, which
     sends it to the recorded boss; a lane has no way to call it (not a command, not a request kind). Raises (a refusal text) when the pod cannot be read."""
     cloud = load_module("cloud_worker").bind(globals())
+    rec = cloud.route(worker)
+    if cloud.cloud_floor.is_floor(rec):
+        seen = cloud.cloud_floor._observe(rec)
+        return "Floor session %s: state=%s, busy=%s, rounds=%s, landed_sha=%s" % (rec.get("session"), seen.get("state"), seen.get("busy"), seen.get("rounds"), seen.get("landed_sha"))
     with cloud.Cluster() as cluster:   # the launcher's inspect needs a cluster login, like every other caller
         code, body, note = cloud.run_launcher(None, "inspect", worker, (), 60, cluster=cluster)
     if code != 0 or not isinstance(body, dict):
@@ -8689,6 +8702,8 @@ def pod_silence_tick(engine, discovery, summary=None):
     retired = registry_retired(state_dir)
     for rec in watch.get("records", []):
         name = rec.get("worker") if isinstance(rec, dict) else None
+        if isinstance(rec, dict) and (rec.get("floor_state") in ("done", "failed", "retired") or rec.get("stopped_audited")):
+            continue   # a finished Floor worker is not a quiet pod
         if not isinstance(name, str) or not cloud_record_live(rec, name, retired, reports, now):
             continue   # M1: a failed, retired or past-deadline record is not a live pod
         said = reports.get(name) if isinstance(reports.get(name), dict) else {}

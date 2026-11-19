@@ -958,11 +958,21 @@ def floor_watch_sync(state_dir, records, engine=None):
         if not isinstance(record, dict) or record.get("backend") != "floor":
             continue
         known.add(record.get("work_id") or record.get("session"))
-        found = sessions.get(record.get("work_id")) or sessions.get(record.get("session")) or {}
+        found = sessions.get(record.get("work_id")) or sessions.get(record.get("session"))
+        if found is None and not hasattr(held, "_state"):
+            try:
+                found = _observe(record)
+            except Exception:
+                found = None
+        found = found if isinstance(found, dict) else {}
         s_state = found.get("state")
-        if s_state not in FINISHED_STATES:
+        if s_state is None:
             continue
         record["floor_state"] = s_state
+        record["landed_sha"] = found.get("landed_sha")
+        record["floor_error"] = found.get("error")
+        if s_state not in FINISHED_STATES:
+            continue
         if getattr(engine, "audit", None) and not record.get("stopped_audited"):
             try:
                 engine.audit.append(engine.actor, "cloud.stopped", record["worker"], {"exit": 0 if s_state != "failed" else 1, "reason": s_state, "runtime_id": record.get("runtime_id"), "backend": "floor"})
@@ -971,6 +981,20 @@ def floor_watch_sync(state_dir, records, engine=None):
             except Exception as err:   # not marked audited: the next pass tries again, and says so
                 record.pop("stopped_audited", None)
                 print("floor_watch_sync: cloud.stopped for %s was not recorded (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
+        if s_state in ("done", "failed") and engine is not None and hasattr(engine, "send") and not record.get("terminal_woken"):
+            boss = record.get("reports_to")
+            if isinstance(boss, str) and boss.strip():
+                if s_state == "done":
+                    msg = "Floor worker %s finished (done): landed_sha=%s" % (record["worker"], scrub(found.get("landed_sha") or "none", 60))
+                else:
+                    msg = "Floor worker %s finished (failed): %s" % (record["worker"], scrub(found.get("error") or "unknown error", 200))
+                try:
+                    engine.send("switchboard", boss.strip(), msg, issue=record.get("issue"), repo=record.get("repo"))
+                    record["terminal_woken"] = True
+                    D["save_record"](state_dir, record)
+                except Exception as err:
+                    record.pop("terminal_woken", None)
+                    print("floor_watch_sync: terminal wake for %s failed (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
     for work_id, found in sessions.items():
         name, repo = found.get("worker") or found.get("title"), found.get("repo")
         if work_id in known or not name or not repo or any(isinstance(r, dict) and r.get("worker") == name for r in records):
