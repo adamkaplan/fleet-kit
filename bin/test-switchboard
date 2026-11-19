@@ -11649,6 +11649,7 @@ class TestIntentSend(IntentCase):
 
     def test_with_an_issue_the_ask_sections_count_toward_the_allowed_length(self):
         os.environ[sb.LAB_ENV] = "1"
+        self.enterContext(mock.patch.dict(os.environ, {"FLEET_STRICT_MESSAGE_TOO_LONG": "1"}))
         code, _, err = self.main("send", "platform", "--from", "coder", "--issue", "3", "x" * 3950)
         self.assertEqual(code, sb.EXIT_USAGE)
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", err).group(1))
