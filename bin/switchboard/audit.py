@@ -289,18 +289,33 @@ class PublicNamesRefused(IntentError):
         super().__init__("public_names", "refused to write a private name (line %d: term #%d) to %s" % (line, index, repo))
 
 
+class PublicNamesListBad(PublicNamesRefused):
+    """The private-names list is named but unusable (unreadable, or an entry that is no regular expression): the write is refused, as `check-public-names` exits 2 on a bad list."""
+
+    def __init__(self, why):
+        IntentError.__init__(self, "public_names", "refused to write: the private-names list is unusable (%s)" % why)
+
+
 def private_name_terms():
-    """[(index, regex)] from $FLEET_PRIVATE_NAMES (the text), else $FLEET_PRIVATE_NAMES_FILE, else the default list file (never under a test run unless one of the two is set); [] when there is none or it is unreadable."""
+    """[(index, regex)] from $FLEET_PRIVATE_NAMES (the text; blank falls through, as in check-public-names), else $FLEET_PRIVATE_NAMES_FILE, else the default list file (never under a test run unless one is set).
+    [] only when no list is configured (an absent default file); a named file that cannot be read, or a bad entry, raises PublicNamesListBad."""
     text = os.environ.get("FLEET_PRIVATE_NAMES")
-    if text is None:
-        path = os.environ.get("FLEET_PRIVATE_NAMES_FILE")
+    if text is None or not text.strip():
+        named = os.environ.get("FLEET_PRIVATE_NAMES_FILE")
+        path = named
         if path is None and not os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
             base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
             path = os.path.join(base, "fleet-switchboard", "private-names.txt")
-        try:
-            text = open(path, encoding="utf-8").read() if path else ""
-        except (OSError, ValueError):
+        if not path:
             return []
+        try:
+            text = open(path, encoding="utf-8").read()
+        except FileNotFoundError:
+            if named:
+                raise PublicNamesListBad("the named file does not exist") from None
+            return []
+        except (OSError, ValueError) as err:
+            raise PublicNamesListBad("the file cannot be read: %s" % type(err).__name__) from None
     terms, index = [], 0
     for raw in text.splitlines():
         line = raw.strip()
@@ -313,7 +328,7 @@ def private_name_terms():
         try:
             terms.append((index, re.compile(line, flags)))
         except re.error:
-            continue
+            raise PublicNamesListBad("entry #%d is not a valid regular expression" % index) from None
     return terms
 
 

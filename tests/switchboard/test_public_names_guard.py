@@ -37,3 +37,11 @@ class TestPublicNamesGuard(unittest.TestCase):
         env["FLEET_SWITCHBOARD_UNDER_TEST"] = "1"
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(self.write("acme/api", "anything"), "ok")
+
+    def test_bad_entry_and_missing_named_file_refuse(self):
+        for env in ({"FLEET_PRIVATE_NAMES": "case:Bar("}, {"FLEET_PRIVATE_NAMES": "", "FLEET_PRIVATE_NAMES_FILE": "/nonexistent/names.txt"}):
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaises(self.sb.IntentError) as ctx:
+                    self.write("acme/api", "clean")
+                self.assertNotIn("Bar(", str(ctx.exception))
+        self.assertEqual(self.calls, [])
