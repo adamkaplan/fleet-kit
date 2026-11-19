@@ -28,10 +28,10 @@ class TestPublicNamesGuard(unittest.TestCase):
             self.audit.append.assert_not_called()
 
     def test_public_words_pass_and_builtin_private_shapes_refuse(self):
-        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "\\bfleetkit\\b\nacme-secret\n"}):
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "\\bfleetkit\\b\nacme-secret\nspire-floor-acme\n"}):
             for ok in ("FleetKit", "fleetkit", "fleet-cloud", "spire-floor", "<!-- fleet-switchboard:from=coder -->"):
                 self.assertEqual(self.write("acme/api", ok), "ok")
-            for bad in ("12345678-1234-1234-1234-123456789abc", "x.vault.azure.net", "fkcwdemo", "acme-secret"):
+            for bad in ("12345678-1234-1234-1234-123456789abc", "x.vault.azure.net", "fkcwdemo", "acme-secret", "spire-floor-acme"):
                 with self.assertRaises(self.sb.IntentError):
                     self.write("acme/api", bad)
 

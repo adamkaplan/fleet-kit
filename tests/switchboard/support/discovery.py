@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -85,8 +86,9 @@ def run_suite_parallel(suite, scenario_reports=None):
 
     def reap():
         pid, _ = os.wait()
-        index, rfd = running.pop(pid)
-        with os.fdopen(rfd, "rb") as fh:
+        index, fh = running.pop(pid)
+        with fh:
+            fh.seek(0)
             data = fh.read()
         try:
             payloads[index] = json.loads(data.decode("utf-8"))
@@ -97,10 +99,9 @@ def run_suite_parallel(suite, scenario_reports=None):
     for index, (cls, cls_suite) in enumerate(groups):
         while len(running) >= min(len(groups), workers):
             reap()
-        rfd, wfd = os.pipe()
+        fh = tempfile.TemporaryFile()   # a file, not a pipe: a large payload never blocks the child
         pid = os.fork()
         if pid == 0:
-            os.close(rfd)
             code = 0
             try:
                 buf = io.StringIO()
@@ -111,13 +112,12 @@ def run_suite_parallel(suite, scenario_reports=None):
                 out = json.dumps({"testsRun": res.testsRun, "failures": [(str(t), tb) for t, tb in res.failures],
                                   "errors": [(str(t), tb) for t, tb in res.errors], "skipped": len(res.skipped),
                                   "scenarios": list(scenario_reports or ()), "out": buf.getvalue()}, default=str)
-                with os.fdopen(wfd, "wb") as fh:
-                    fh.write(out.encode("utf-8"))
+                fh.write(out.encode("utf-8"))
+                fh.flush()
             except BaseException:
                 code = 1
             os._exit(code)
-        os.close(wfd)
-        running[pid] = (index, rfd)
+        running[pid] = (index, fh)
     while running:
         reap()
     result = _Combined()

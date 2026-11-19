@@ -369,7 +369,6 @@ def refuse_private_names(repo, values):
             for index, regex in builtin:
                 if regex.search(line):
                     raise PublicNamesRefused(repo, number, index)
-            cleaned = _PUBLIC_WORDS.sub(" ", line)
             for index, regex in terms:
-                if regex.search(cleaned):
+                if any(not _PUBLIC_WORDS.fullmatch(m.group(0)) for m in regex.finditer(line)):
                     raise PublicNamesRefused(repo, number, index)
