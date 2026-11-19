@@ -2478,8 +2478,7 @@ class Switchboard:
             if self.state_dir is not None and os.environ.get("FLEET_STRICT_MESSAGE_TOO_LONG") != "1":
                 # never refuse whole: store the full text as a file and deliver a pointer
                 target = store_oversize_text(self.state_dir, sent.summary)
-                head = "[oversize send (%d chars) stored at %s] " % (len(sent.summary), target)
-                sent.summary = head + sent.summary[:max(0, min(600, allowed - len(head)))]
+                sent.summary = oversize_pointer(sent.summary, target, allowed)
                 text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
                                         repos=repos, delivered=self.now(), resume=parts_done, in_turn=in_turn)
                 sent = next((fact for fact in carried if fact.kind == "send"), None)
@@ -13652,10 +13651,15 @@ def store_oversize_text(state_dir, text):
     return Path(name)
 
 
+def oversize_pointer(text, target, room=600):
+    """The one pointer message that stands for an oversize send stored at `target`: its length, the path and up to `room` characters of preview."""
+    head = "[oversize send (%d chars) stored at %s]\n" % (len(text), target)
+    return head + text[:max(0, min(600, room - len(head) - 3))] + "..."
+
+
 def _store_oversize(text):
     """Store an oversize send whole and return one pointer message that fits within MESSAGE_CAP."""
-    target = store_oversize_text(state_dir_path(), text)
-    return "[oversize send (%d chars) stored at %s]\n%s..." % (len(text), target, text[:600])
+    return oversize_pointer(text, store_oversize_text(state_dir_path(), text), MESSAGE_CAP // 2)
 
 
 def send_plan(args):
