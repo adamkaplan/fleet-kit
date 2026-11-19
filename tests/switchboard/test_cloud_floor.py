@@ -267,6 +267,17 @@ class FloorCase(Base):
 
 class TestCloudFloor(FloorCase):
 
+    def test_the_relay_is_off_without_a_url_and_push_pane_state_reads_commands(self):
+        self.assertIsNone(self.floor.relay_cli_if_configured("send", {"to": "a"}, env={}))
+        with mock.patch.object(self.floor, "call_switchboard_v1", return_value={"commands": [{"action": "resume", "agent": "w"}]}):
+            self.assertEqual(self.floor.push_pane_state({}, env={}, now=1), [{"action": "resume", "agent": "w"}])
+        with mock.patch.object(self.floor, "call_switchboard_v1", return_value=None):
+            self.assertEqual(self.floor.push_pane_state({}, env={}, now=1), [])
+
+    def test_the_stayed_namespace_answers_membership(self):
+        self.assertIn("Refusal", self.floor.D)
+        self.assertNotIn("NoSuchName", self.floor.D)
+
     def test_a_launch_makes_one_work_and_a_repeat_returns_it(self):
         code, out, err = self.launch()
         self.assertEqual(code, 0, err)

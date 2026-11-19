@@ -220,7 +220,8 @@ def relay_cli(command, payload):
         return None
     try:
         return run_cloud("relay_cli_if_configured", command, payload)
-    except Exception:
+    except Exception as err:
+        sys.stderr.write("%s: warning: the cluster relay of %s failed (%s)\n" % (PROG, command, type(err).__name__))
         return None
 
 
@@ -8760,8 +8761,8 @@ def cloud_push_pane_state(engine, discovery):
         if isinstance(cmd, dict) and cmd.get("action") == "resume":
             try:
                 resume_ended_turn(engine, "switchboard", cmd["agent"], cmd.get("reason") or "cluster resume", discovery, window=0)
-            except Exception:
-                pass
+            except Exception as err:
+                engine._failed("pane-state-resume", "pane-state-resume", err, {"errors": []})
 
 
 def finish_pass(engine, discovery, report):
