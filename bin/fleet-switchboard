@@ -61,6 +61,7 @@ def _fleet_parts(after=False):
         if path in paths[:k]:
             sys.exit("fleet-switchboard: part listed twice: %s" % names[k])
     cut = paths.index(here) if here in paths else len(paths)
+    _doc = globals().get("__doc__")
     for path in (paths[cut + 1:] if after else paths[:cut]):
         try:
             with open(path) as handle:
@@ -68,9 +69,10 @@ def _fleet_parts(after=False):
         except OSError:
             sys.exit("fleet-switchboard: part file not found: %s" % path)
         exec(code, globals())
+    if _doc is not None:
+        globals()["__doc__"] = _doc
 
 
-_ENTRY_DOC = __doc__
 _fleet_parts()
 import argparse
 import base64
@@ -9187,6 +9189,52 @@ def undelivered_wake_tick(engine, discovery):
 
 
 # ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported").
+def hold_kind_code(engine, observation):
+    """The kind of a block, read once for every reader (the blocked report, `pending`, the hold and recheck audit lines):
+    "permission", "question", "permission and question" (open requests), "ended turn" (nothing open) or "not read"."""
+    source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
+    if source is None:
+        return "not read"
+    kinds = sorted({kind for who, kind, _ in source.requests if who.session_id == observation.session_id})
+    return " and ".join(kinds) if kinds else "ended turn"
+
+
+def with_block_kind(engine, observation, detail):
+    """An audit detail for a hold or a recheck: for a blocked agent it carries `kind`, and an ended turn with nothing open is not
+    called a permission request or a question."""
+    if observation is None or getattr(observation, "status", None) != "blocked":
+        return detail
+    detail = dict(detail, kind=hold_kind_code(engine, observation))
+    if detail["kind"] == "ended turn":
+        for key in ("reason", "why"):
+            if isinstance(detail.get(key), str):
+                detail[key] = detail[key].replace("blocked on a permission request or a question", "blocked on an ended turn with nothing open")
+    return detail
+
+
+def held_line(engine, observation):
+    """The one `pending` line for a blocked agent: the hold, its kind, what releases it, and since when (None when not blocked)."""
+    if observation is None or observation.get("status") != "blocked":
+        return None
+    seen = types.SimpleNamespace(name=observation["name"], session_id=observation["session"])
+    kind = hold_kind_code(engine, seen)
+    if kind == "ended turn":
+        released = "`%s %s` by the Chief of Staff" % (RESUME_COMMAND, seen.name)
+        label = "an ended turn with nothing open"
+    else:
+        released = "the person's answer"
+        label = "an open %s request" % kind if kind != "not read" else "a permission request or a question (not read)"
+    entry = {}
+    if engine.state_dir is not None:
+        try:
+            entry = _read_small(engine.state_dir, BLOCKED_ALERT_STATE).get(seen.name) or {}
+        except Exception:
+            entry = {}
+    since = entry.get("since") if entry.get("session") == seen.session_id and _is_number(entry.get("since")) else None
+    when = "blocked since: not recorded" if since is None else "blocked since %s (%d minutes)" % (iso(since), int(max(0, engine.now() - since) // 60))
+    return "held: %s; released by %s; %s" % (label, released, when)
+
+
 BLOCKED_ALERT_DEFAULTS = {"minutes": 20, "repeat_minutes": 60}
 BLOCKED_ALERT_STATE = "blocked-alert.json"
 def validate_blocked_alert_config(config, source):
@@ -9214,52 +9262,6 @@ def blocked_alert_section(config):
     if raw is False:
         return None
     return dict(BLOCKED_ALERT_DEFAULTS, **(raw or {}))
-
-
-def blocked_kind_code(engine, observation):
-    """The kind of a block, read once for every reader (the blocked report, `pending`, the hold and recheck audit lines):
-    "permission", "question", "permission and question" (open requests), "ended turn" (nothing open) or "not read"."""
-    source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
-    if source is None:
-        return "not read"
-    kinds = sorted({kind for who, kind, _ in source.requests if who.session_id == observation.session_id})
-    return " and ".join(kinds) if kinds else "ended turn"
-
-
-def with_block_kind(engine, observation, detail):
-    """An audit detail for a hold or a recheck: for a blocked agent it carries `kind`, and an ended turn with nothing open is not
-    called a permission request or a question."""
-    if observation is None or getattr(observation, "status", None) != "blocked":
-        return detail
-    detail = dict(detail, kind=blocked_kind_code(engine, observation))
-    if detail["kind"] == "ended turn":
-        for key in ("reason", "why"):
-            if isinstance(detail.get(key), str):
-                detail[key] = detail[key].replace("blocked on a permission request or a question", "blocked on an ended turn with nothing open")
-    return detail
-
-
-def held_line(engine, observation):
-    """The one `pending` line for a blocked agent: the hold, its kind, what releases it, and since when (None when not blocked)."""
-    if observation is None or observation.get("status") != "blocked":
-        return None
-    seen = types.SimpleNamespace(name=observation["name"], session_id=observation["session"])
-    kind = blocked_kind_code(engine, seen)
-    if kind == "ended turn":
-        released = "`%s %s` by the Chief of Staff" % (RESUME_COMMAND, seen.name)
-        label = "an ended turn with nothing open"
-    else:
-        released = "the person's answer"
-        label = "an open %s request" % kind if kind != "not read" else "a permission request or a question (not read)"
-    entry = {}
-    if engine.state_dir is not None:
-        try:
-            entry = _read_small(engine.state_dir, BLOCKED_ALERT_STATE).get(seen.name) or {}
-        except Exception:
-            entry = {}
-    since = entry.get("since") if entry.get("session") == seen.session_id and _is_number(entry.get("since")) else None
-    when = "blocked since: not recorded" if since is None else "blocked since %s (%d minutes)" % (iso(since), int(max(0, engine.now() - since) // 60))
-    return "held: %s; released by %s; %s" % (label, released, when)
 
 
 def blocked_kind(engine, observation, resumed=False):
@@ -24584,7 +24586,6 @@ def derive_action_groups():
 
 
 _fleet_parts(after=True)
-__doc__ = _ENTRY_DOC; globals().pop("_ENTRY_DOC", None)   # the parts listed after the entry, before the command groups are read from them
 derive_action_groups()
 
 

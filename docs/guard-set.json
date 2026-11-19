@@ -8,7 +8,14 @@
     {"class": "TestImpactHold", "timeout": 900},
     {"class": "TestHygiene"},
     {"class": "TestOwnMarkerNotHonoured"},
-    {"class": "TestTheEntryGuard"}
+    {"class": "TestTheEntryGuard"},
+    {"class": "TestAuthorityModulesGuard"},
+    {"class": "TestImpactEntriesMissing"},
+    {"class": "TestRecordJsonReaders"},
+    {"class": "TestSelfRegisteringCli"},
+    {"class": "TestCiOutsideBin"},
+    {"class": "TestEveryTestClassIsolates"},
+    {"class": "TestBlockedMutants"}
   ],
   "extras": ["tools/derive-closure --check"]
 }

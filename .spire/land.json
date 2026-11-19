@@ -21,11 +21,7 @@
         "docs/guard-set.json"
       ],
       "exclude": [
-        "**/*.md",
-        "bin/cloud_*.py",
-        "bin/decisions_pull.py",
-        "bin/fleet_health.py",
-        "bin/health_records.py"
+        "**/*.md"
       ],
       "steps": [
         {
@@ -49,7 +45,7 @@
           "cmd": [
             "sh",
             "-c",
-            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSupportRebinding TestEveryTestFileIsWired TestArchitectureDocument TestTheBinSetClassesAreAllInTheTable TestV2LightGuards TestHygiene TestOwnMarkerNotHonoured TestTheEntryGuard && python3 tools/derive-closure --check"
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSupportRebinding TestEveryTestFileIsWired TestArchitectureDocument TestTheBinSetClassesAreAllInTheTable TestV2LightGuards TestHygiene TestOwnMarkerNotHonoured TestTheEntryGuard TestAuthorityModulesGuard TestImpactEntriesMissing TestRecordJsonReaders TestSelfRegisteringCli TestCiOutsideBin TestEveryTestClassIsolates TestBlockedMutants && python3 tools/derive-closure --check"
           ]
         },
         {
@@ -367,7 +363,7 @@
           "cmd": [
             "sh",
             "-c",
-            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSupportRebinding TestEveryTestFileIsWired TestArchitectureDocument TestTheBinSetClassesAreAllInTheTable TestV2LightGuards TestHygiene TestOwnMarkerNotHonoured TestTheEntryGuard && python3 tools/derive-closure --check"
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSupportRebinding TestEveryTestFileIsWired TestArchitectureDocument TestTheBinSetClassesAreAllInTheTable TestV2LightGuards TestHygiene TestOwnMarkerNotHonoured TestTheEntryGuard TestAuthorityModulesGuard TestImpactEntriesMissing TestRecordJsonReaders TestSelfRegisteringCli TestCiOutsideBin TestEveryTestClassIsolates TestBlockedMutants && python3 tools/derive-closure --check"
           ]
         },
         {
