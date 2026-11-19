@@ -1468,6 +1468,9 @@ def apply_pane_state_to_discovery(pane_state, discovery):
             obs.turn_error = data.get("turn_error") or ""
             obs.turn_error_id = data.get("turn_error_id")
             obs.idle_at = data.get("idle_at")
+            obs.outcome = data.get("outcome") if "outcome" in data else getattr(obs, "outcome", None)
+            if obs.outcome is None and obs.status == "idle" and not obs.errored:
+                obs.outcome = "succeeded"
             obs.permission_waiting = bool(data.get("permission_waiting"))
             obs.form_waiting = bool(data.get("form_waiting"))
     return discovery

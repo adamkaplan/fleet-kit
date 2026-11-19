@@ -1001,6 +1001,23 @@ class TestFloorAuthority(FloorCase):
     def call(self, path, body, agent="cos", **kw):
         return self.floor.handle_switchboard_v1("POST", path, {"X-Switchboard-Auth": self.header(agent)}, json.dumps(body).encode(), self.SECRET, **kw)
 
+    def test_pane_state_preserves_outcome_and_defaults_clean_idle(self):
+        class Obs:
+            def __init__(self, name, session_id, pane, status, fleet):
+                self.name, self.session_id, self.pane, self.status, self.fleet = name, session_id, pane, status, fleet
+                self.errored = False
+
+        disc = argparse.Namespace(agents={})
+        with mock.patch.dict(self.floor.D, {"H": {"Observation": Obs}}):
+            self.floor.apply_pane_state_to_discovery({
+                "widget-api": {"status": "idle", "idle_at": 1},
+                "widget-web": {"status": "idle", "outcome": "done"},
+                "widget-bad": {"status": "idle", "errored": True},
+            }, disc)
+        self.assertEqual(disc.agents["widget-api"].outcome, "succeeded")
+        self.assertEqual(disc.agents["widget-web"].outcome, "done")
+        self.assertIsNone(disc.agents["widget-bad"].outcome)
+
     def test_cmd_remind_reads_text_file_before_relay(self):
         import tempfile
         calls = []

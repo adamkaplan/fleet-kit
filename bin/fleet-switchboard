@@ -8798,7 +8798,7 @@ def cloud_push_pane_state(engine, discovery):
                 blocked.setdefault(kind, set()).add(observation.session_id)
     observations = {}
     for name, o in discovery.agents.items():
-        observations[name] = {key: getattr(o, key, None) for key in ("status", "errored", "turn_error", "turn_error_id", "idle_at", "pane", "session_id", "fleet")}
+        observations[name] = {key: getattr(o, key, None) for key in ("status", "outcome", "errored", "turn_error", "turn_error_id", "idle_at", "pane", "session_id", "fleet")}
         observations[name]["permission_waiting"] = o.session_id in blocked["permission"]
         observations[name]["form_waiting"] = o.session_id in blocked["question"]
     cloud = load_module("cloud_worker").bind(globals())
