@@ -861,6 +861,9 @@ class TestCloudAgents(FloorCase):
         raw = json.dumps(body).encode() if body is not None else b""
         return self.floor.handle_switchboard_v1(method, path, headers, raw, self.SECRET, **kw)
 
+    def sb_refusal(self):
+        return self.m.D["Refusal"] if "D" in vars(self.m) else self.floor.D["Refusal"]
+
     def test_auth_binds_the_header_identity(self):
         auth = self.floor.verify_switchboard_auth(self.HEADER, self.SECRET)
         self.assertEqual((auth["agent"], auth["session"], auth["charter"]), ("service-ops", "ses_0123456789abcdef", "acme-org/widget-service#10"))
@@ -877,7 +880,9 @@ class TestCloudAgents(FloorCase):
         self.assertEqual([m["from"] for m in state["pane_outbox"]], ["service-ops"])
         code, out = self.call("GET", "/v1/pane-outbox", header=self.HEADER.replace("service-ops", "cos"), state=state)
         self.assertEqual([m["text"] for m in out["messages"]], ["hi"])
-        self.call("POST", "/v1/pane-ack", {"ids": [m["id"] for m in out["messages"]]}, state=state)
+        self.call("POST", "/v1/pane-ack", {"ids": [m["id"] for m in out["messages"]]}, state=state, header=self.HEADER)
+        self.assertEqual(len(state["pane_outbox"]), 1)   # another agent cannot ack it
+        self.call("POST", "/v1/pane-ack", {"ids": [m["id"] for m in out["messages"]]}, state=state, header=self.HEADER.replace("service-ops", "cos"))
         self.assertEqual(state["pane_outbox"], [])
 
     def test_report_and_remind_are_attributed_to_the_header(self):
@@ -904,6 +909,9 @@ class TestCloudAgents(FloorCase):
                 self.assertEqual(self.floor.verify_mode(self.args("r1", **over), BRIEF), mode)
                 self.floor.check_floor_admission(self.args("r1", **over), REPO_NAME, BRIEF, CONFIG)
         with mock.patch.dict(os.environ, {"CW_FLOOR_AGENTS_ENABLED": "1"}):
+            for over in (dict(agent="orchestrator", stack=True), dict(role="research-assistant")):
+                with self.assertRaises(self.sb_refusal()):
+                    self.floor.check_floor_admission(self.args("r1", **over), REPO_NAME, "NEEDS: docker\n" if "role" in over else BRIEF, CONFIG)
             self.launch(name="o1", agent="orchestrator", role="orchestrator")
         self.assertEqual(self.fake.submitted["mode"], "orchestrator")
         self.assertEqual(self.fake.submitted["env"]["FLOOR_PROFILE"], "orchestrator")

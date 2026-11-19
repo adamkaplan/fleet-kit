@@ -14,6 +14,7 @@ Private settings (cloud.env or the environment, never in this file):
   CW_FLOOR_CALLER         the caller id of this fleet (default `fleet`)
   CW_FLOOR_TOKEN_FILE     optional path of a 0600 bearer-token file
   CW_FLOOR_VERIFY_ENABLED `1` or `true` (default off): a tester, --no-commit or rehearsal launch is routed to Floor as mode `verify-only` or `rehearse` (no author runs)
+  CW_FLOOR_AGENTS_ENABLED `1` or `true` (default off): a research-assistant or orchestrator launch is routed to Floor as that mode; the env FLOOR_PROFILE (and FLOOR_CHARTER for an orchestrator) is sent
   CW_POD_ROLLBACK_WINDOW  `open` (the default) or `closed`: the pod launcher may be retired only once it is `closed`
 
 The transport object has five calls (the caller API of Floor): submit, message, cancel, observe, result. A test sets `TRANSPORT`; otherwise an
@@ -415,7 +416,9 @@ def check_floor_admission(args, repo, brief, config):
     agent, text = getattr(args, "agent", None), str(brief or "")
     profile = verify_mode(args, brief) if agents_enabled() else None
     if profile in AGENT_MODES:
-        return
+        if getattr(args, "stack", False) or re.search(r"^\s*NEEDS:\s*docker\s*$", text, re.I | re.M):
+            raise Refusal("refused: %s routes to Floor: --stack and NEEDS: docker are not valid for an ACA sandbox; nothing was created" % repo)
+        return   # a persistent orchestrator is intended here
     if agent in NOT_AUTHORS or getattr(args, "persistent", False):
         raise Refusal("refused: %s routes to Floor: --agent orchestrator and --persistent are not Floor authors; nothing was created" % repo)
     if getattr(args, "role", None) == "reviewer" or str(agent or "").startswith("reviewer"):
@@ -774,7 +777,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
     if route[0] == "POST":
         try:
             body = D["parse_bounded"](body_bytes.decode("utf-8")) if body_bytes else {}
-        except Exception:
+        except ValueError:
             return 400, {"error": "bad request body"}
         if not isinstance(body, dict):
             return 400, {"error": "bad request body"}
@@ -827,8 +830,9 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         ids = body.get("ids")
         if not isinstance(ids, list):
             return 400, {"error": "ids is required"}
-        keep = [m for m in state["pane_outbox"] if m.get("id") not in ids]
-        state.setdefault("acked", []).extend(m for m in state["pane_outbox"] if m.get("id") in ids)
+        mine = lambda m: m.get("id") in ids and (m.get("to") == auth["agent"] or auth["agent"] == "pane-relay")   # an agent acks only its own messages
+        keep = [m for m in state["pane_outbox"] if not mine(m)]
+        state.setdefault("acked", []).extend(m for m in state["pane_outbox"] if mine(m))
         state["pane_outbox"][:] = keep
         return 200, {"acked": len(state["acked"])}
     return 404, {"error": "no such route"}
