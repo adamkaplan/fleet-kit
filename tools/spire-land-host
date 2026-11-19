@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 """Host-only submitter and observer for `.spire/tool/bin/spire land` (#2570, #34).
 
-Reads `CW_SECRET_DIR` (`cw-app-id`, `cw-app-key`, `cw-minter-kubeconfig`, and optional
-`cw-stack-model-key`) and `CW_COUNCIL_URL` from `~/.config/fleet-switchboard/cloud.env` via
+Reads `CW_SECRET_DIR` (`cw-app-id`, `cw-app-key`, and optional `cw-stack-model-key`) and `CW_COUNCIL_URL` from `~/.config/fleet-switchboard/cloud.env` via
 `pwd.getpwuid(os.getuid()).pw_dir` (never trusting `$HOME`). Refuses (exit 64) to run `check`
 locally on the Mac host (`sys.platform == "darwin"`), and for `land` on the Mac host submits
-and observes the landing on a cloud heavy-executor pod (`shape L`) so no test or check suite
-runs on the host. Fails closed (exit 70) before running anything if the App ID, private key,
+enqueues a Floor session on the caller queue and observes it, so no test or check suite
+runs on the host; `--nightly` does the same in verify-only mode. Fails closed (exit 70) before running anything if the App ID, private key,
 or present model key file is missing or unreadable.
 """
-import base64
-import datetime as dt
 import json
 import os
 import pwd
 import re
-import shlex
-import shutil
 import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 NOT_CONFIGURED = 70
@@ -111,12 +105,16 @@ def _load_floor_transport(root):
     import importlib.util
     spec = importlib.util.spec_from_file_location("cloud_floor", os.path.join(root, "bin", "cloud_floor.py"))
     cf = importlib.util.module_from_spec(spec)
+    wspec = importlib.util.spec_from_file_location("cloud_worker", os.path.join(root, "bin", "cloud_worker.py"))
+    cw = importlib.util.module_from_spec(wspec)
+    sys.modules.setdefault("cloud_worker", cw)
+    wspec.loader.exec_module(cw)
     cf.D = {
         "Refusal": ValueError,
         "CloudError": RuntimeError,
         "parse_bounded": json.loads,
         "use_settings": lambda: None,
-        "endpoint_problem": lambda u: None,
+        "endpoint_problem": cw.endpoint_problem,
     }
     spec.loader.exec_module(cf)
     cf.env_of = lambda: dict(_cloud_env_map(), **os.environ)
@@ -196,7 +194,11 @@ def main(argv=None, workdir=None, runner=subprocess.run, platform=None):
         return NOT_CONFIGURED
     root = workdir or os.getcwd()
     if "--nightly" in argv:
-        return run_floor_nightly(root)
+        try:
+            return run_floor_nightly(root)
+        except Exception as err:
+            sys.stderr.write("spire-land-host: nightly failed (%s)\n" % err)
+            return 1
     spire_bin = os.path.join(root, ".spire", "tool", "bin", "spire")
     if not os.access(spire_bin, os.X_OK):
         sys.stderr.write("spire-land-host: %s is not executable: nothing was checked or pushed\n" % spire_bin)

@@ -8,6 +8,7 @@ material, and that `tools/land-status-parity` verifies `land/checks` (with `tree
 import importlib.machinery
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -51,6 +52,15 @@ class TestSpireLandCutover2570(Base):
         self.assertEqual(host.run_floor_nightly(str(REPO), transport=nightly, poll_interval=0), 0)
         self.assertEqual(nightly.submits[0]["mode"], "verify-only")
         self.assertEqual(nightly.submits[0]["priority_class"], "background")
+        failed = Tp({"state": "failed", "log_tail": "x"})
+        self.assertEqual(host.run_floor_nightly(str(REPO), transport=failed, poll_interval=0), 1)
+        with mock.patch.dict(os.environ, {"CW_FLOOR_TRANSPORT": "http", "CW_FLOOR_URL": "http://attacker.example"}):
+            cf = host._load_floor_transport(str(REPO))
+            with self.assertRaises(ValueError):
+                cf.transport()
+        stuck = Tp({"state": "running"})
+        with self.assertRaises(RuntimeError):
+            host.run_floor_nightly(str(REPO), transport=stuck, poll_interval=0, timeout=0)
         land = Tp({"state": "done", "landed_sha": "a" * 40})
         self.assertEqual(host.submit_cloud_land(str(REPO), ["land"], "5404907", "key", transport=land, poll_interval=0), 0)
         self.assertEqual(land.submits[0]["mode"], "land")
