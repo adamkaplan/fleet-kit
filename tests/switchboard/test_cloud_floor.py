@@ -910,6 +910,9 @@ class TestCloudAgents(FloorCase):
         spec = importlib.util.spec_from_loader("ics_pin_test", loader)
         mod = importlib.util.module_from_spec(spec)
         loader.exec_module(mod)
+        import re as _re
+        pinned_val = _re.search(r'"name":\s*"SWITCHBOARD_PINNED_SHA",\s*"value":\s*"([^"]*)"', text).group(1)
+        self.assertEqual(mod.compute_code_tree_hash(REPO), pinned_val)
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / "CODE_SHA").write_text("a" * 40 + "\n")
             mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "a" * 40})

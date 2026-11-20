@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Sync a clean git archive of HEAD into the running fleet-switchboard pod, verify CODE_SHA, restart it."""
 import argparse
+import hashlib
+import json
+import pathlib
 import re
 import importlib.util
 import os
@@ -73,42 +76,123 @@ def check_shas(head, pod_sha, pinned=""):
     return ""
 
 
+CODE_TREE_PATHS = ("bin", "tools", "shims", "docs")
+
+
+def compute_code_tree_hash(root="."):
+    root_p = pathlib.Path(root)
+    h = hashlib.sha256()
+    for top in CODE_TREE_PATHS:
+        base = root_p / top
+        if not base.exists():
+            continue
+        for p in sorted(base.rglob("*")):
+            if p.is_file() and "__pycache__" not in p.parts:
+                h.update((p.relative_to(root_p).as_posix() + "\0").encode("utf-8"))
+                h.update(p.read_bytes())
+                h.update(b"\0")
+    return h.hexdigest()[:40]
+
+
+def _manifest_value(name, root="."):
+    try:
+        text = (pathlib.Path(root) / "cloud" / "k8s" / "switchboard.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = re.search(r'"name":\s*"%s",\s*"value":\s*"([^"]*)"' % name, text)
+    return m.group(1).strip() if m else ""
+
+
+def manifest_pinned_sha(root="."):
+    return _manifest_value("SWITCHBOARD_PINNED_SHA", root)
+
+
+def manifest_mode(root="."):
+    return _manifest_value("SWITCHBOARD_MODE", root) or "shadow"
+
+
 def pod_pinned(pod):
     script = (
         "import os, pathlib, re; "
-        "v = os.environ.get('SWITCHBOARD_PINNED_SHA', '').strip(); "
         "p = pathlib.Path('/run/home/app/cloud/k8s/switchboard.yaml'); "
         "m = re.search(r'\"SWITCHBOARD_PINNED_SHA\",\\s*\"value\":\\s*\"([^\"]*)\"', p.read_text()) if p.exists() else None; "
-        "print(v or (m.group(1) if m else ''), end='')"
+        "v = os.environ.get('SWITCHBOARD_PINNED_SHA', '').strip(); "
+        "print((m.group(1) if m else '') or v, end='')"
     )
     return kubectl_out(["exec", pod, "--", "python3", "-c", script])
+
+
+def pod_tree_hash(pod):
+    script = (
+        "import importlib.machinery, importlib.util; "
+        "l = importlib.machinery.SourceFileLoader('s', '/run/home/app/tools/in-cluster-switchboard-server'); "
+        "sp = importlib.util.spec_from_loader('s', l); m = importlib.util.module_from_spec(sp); l.exec_module(m); "
+        "print(m.compute_code_tree_hash('/run/home/app'), end='')"
+    )
+    return kubectl_out(["exec", pod, "--", "python3", "-c", script])
+
+
+MODE_FILE = "/run/home/.local/state/fleet-switchboard/switchboard-mode.json"
+
+
+def rollback(pod):
+    import signal
+    state = pathlib.Path.home() / ".local" / "state" / "fleet-switchboard"
+    relay = state / "switchboard-relay.json"
+    try:
+        data = json.loads(relay.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data["authority"] = "shadow"
+    state.mkdir(parents=True, exist_ok=True)
+    relay.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    for name in ("daemon.json", "run.lock"):
+        try:
+            raw = (state / name).read_text(encoding="utf-8").strip()
+            try:
+                pid = int(json.loads(raw).get("pid"))
+            except (ValueError, AttributeError, TypeError):
+                pid = int(raw.split()[0])
+            os.kill(pid, signal.SIGCONT)
+            break
+        except (OSError, ValueError, IndexError):
+            continue
+    pod_exec(pod, "mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"shadow\"}' > %s && "
+                  "sed -i '/\"SWITCHBOARD_MODE\"/{n;s/\"value\": \"[^\"]*\"/\"value\": \"shadow\"/}' "
+                  "%s/cloud/k8s/switchboard.yaml" % (MODE_FILE, MODE_FILE, APP))
+    run(kubectl_base() + ["delete", "pod", pod, "--wait=false"])
+    print("rolled back to Mac switchboard (cluster=shadow, mac=active)")
+    return 0
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pinned-sha", default="")
-    ap.add_argument("--verify-only", action="store_true", help="check pod CODE_SHA only; no sync or restart")
+    ap.add_argument("--verify-only", action="store_true", help="check live tree hash only; no sync or restart")
+    ap.add_argument("--cutover", action="store_true", help="sync the manifest mode (active) to the pod")
+    ap.add_argument("--rollback", action="store_true", help="return authority to the Mac switchboard (cluster=shadow)")
     a = ap.parse_args(argv)
+    if a.rollback:
+        return rollback(find_pod())
     head = head_sha()
+    tree = compute_code_tree_hash(".")
     pod = find_pod()
     if not a.verify_only:
         archive = subprocess.check_output(["git", "archive", "--format=tar", "HEAD"] + PATHS)
         pod_exec(pod, "mkdir -p %s && tar -xf - -C %s" % (APP, APP), archive)
-        pin_val = a.pinned_sha or head
-        if not re.fullmatch(r"[0-9a-f]{40}", pin_val):
-            print("error: pinned SHA must be 40 hex chars: %r" % pin_val, file=sys.stderr)
-            return 1
-        pod_exec(pod, "printf %%s %s > %s/CODE_SHA && sed -i '/\"SWITCHBOARD_PINNED_SHA\"/{n;s/\"value\": \"[^\"]*\"/\"value\": \"%s\"/}' "
-                      "%s/cloud/k8s/switchboard.yaml && cp %s/tools/in-cluster-switchboard-server "
-                      "/run/home/in_cluster_switchboard_server.py" % (head, APP, pin_val, APP, APP))
-    pod_sha = pod_exec(pod, "cat %s/CODE_SHA" % APP).decode().strip()
-    err = check_shas(head, pod_sha, a.pinned_sha or pod_pinned(pod))
+        mode = manifest_mode(".")
+        pod_exec(pod, "printf %%s %s > %s/CODE_SHA && mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"%s\"}' > %s && "
+                      "cp %s/tools/in-cluster-switchboard-server /run/home/in_cluster_switchboard_server.py"
+                 % (tree, APP, MODE_FILE, mode, MODE_FILE, APP))
+    live_tree = pod_tree_hash(pod)
+    pinned = a.pinned_sha or pod_pinned(pod)
+    err = check_shas(tree, live_tree, pinned)
     if err:
         print("error: " + err, file=sys.stderr)
         return 1
     if not a.verify_only:
         run(kubectl_base() + ["delete", "pod", pod, "--wait=false"])
-    print("ok %s" % head)
+    print("ok head=%s tree=%s" % (head, tree))
     return 0
 
 

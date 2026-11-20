@@ -11,6 +11,7 @@ Modes (SWITCHBOARD_MODE env var, or the persisted switchboard-mode.json):
   - active: deliveries for local panes are queued into `pane_outbox` for the pane-relay.
 """
 import datetime as dt
+import hashlib
 import http.server
 import importlib.machinery
 import importlib.util
@@ -120,8 +121,18 @@ V1_STATE = {
 }
 
 
+def _manifest_mode(app_root=APP_ROOT):
+    try:
+        import re
+        text = (Path(app_root) / "cloud" / "k8s" / "switchboard.yaml").read_text(encoding="utf-8")
+        m = re.search(r'"name":\s*"SWITCHBOARD_MODE",\s*"value":\s*"([^"]*)"', text)
+        return (m.group(1) if m else "").strip()
+    except OSError:
+        return ""
+
+
 def _initial_mode():
-    return (os.environ.get("SWITCHBOARD_MODE") or "shadow").strip() or "shadow"
+    return _manifest_mode() or (os.environ.get("SWITCHBOARD_MODE") or "shadow").strip() or "shadow"
 
 
 SHADOW_SUMMARY = {
@@ -677,18 +688,43 @@ def _manifest_pinned_sha(app_root=APP_ROOT):
         return ""
 
 
+CODE_TREE_PATHS = ("bin", "tools", "shims", "docs")
+
+
+def compute_code_tree_hash(app_root=APP_ROOT):
+    root = Path(app_root)
+    h = hashlib.sha256()
+    found = False
+    for top in CODE_TREE_PATHS:
+        base = root / top
+        if not base.exists():
+            continue
+        for p in sorted(base.rglob("*")):
+            if p.is_file() and "__pycache__" not in p.parts:
+                found = True
+                h.update((p.relative_to(root).as_posix() + "\0").encode("utf-8"))
+                h.update(p.read_bytes())
+                h.update(b"\0")
+    if found:
+        return h.hexdigest()[:40]
+    code_sha = root / "CODE_SHA"
+    return code_sha.read_text(encoding="utf-8").strip() if code_sha.exists() else ""
+
+
 def verify_pinned_code_sha(app_root=APP_ROOT, env=None):
     env_map = os.environ if env is None else env
     pinned = (env_map.get("SWITCHBOARD_PINNED_SHA") or "").strip() or _manifest_pinned_sha(app_root)
-    code_sha = Path(app_root) / "CODE_SHA"
-    actual = code_sha.read_text(encoding="utf-8").strip() if code_sha.exists() else ""
+    actual = compute_code_tree_hash(app_root)
     if len(pinned) != 40 or pinned == "UNPINNED" or actual != pinned:
         print("refused: switchboard code SHA mismatch (expected %s, got %s)" % (pinned or "missing", actual or "missing"), file=sys.stderr)
         raise SystemExit(2)
 
 
-def verify_mode_agreement(state_dir=STATE_DIR, env=None):
-    env_mode = ((env if env is not None else os.environ).get("SWITCHBOARD_MODE") or "").strip()
+def verify_mode_agreement(state_dir=STATE_DIR, env=None, app_root=APP_ROOT):
+    if env is None:
+        env_mode = _manifest_mode(app_root) or (os.environ.get("SWITCHBOARD_MODE") or "").strip()
+    else:
+        env_mode = (env.get("SWITCHBOARD_MODE") or "").strip()
     mode_file = Path(state_dir) / "switchboard-mode.json"
     file_mode = ""
     if mode_file.exists():
