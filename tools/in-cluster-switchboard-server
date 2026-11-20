@@ -31,6 +31,10 @@ HOME = Path(os.environ.get("HOME", "/run/home"))
 # Ensure secret files named in cloud.env have 0600 permissions inside the container.
 for _env_p in [Path("/run/home/.config/fleet-switchboard/cloud.env")]:
     if _env_p.exists():
+        try:
+            os.chmod(_env_p, 0o600)
+        except OSError:
+            pass
         _et = _env_p.read_text()
         for _ln in _et.splitlines():
             if "_FILE=" in _ln and not _ln.strip().startswith("#"):
@@ -762,6 +766,15 @@ def main():
                 return self._send(200, {"synced": len(data.get("records") or {})})
             with STATE_LOCK:
                 code, ans = cf_mod.handle_switchboard_v1("POST", self.path, dict(self.headers), body, expected_secret, state=V1_STATE)
+                if path in ("/v1/send", "/v1/pane-ack"):
+                    try:
+                        _b = json.loads(body.decode("utf-8") or "{}")
+                    except ValueError:
+                        _b = {}
+                    _b = _b if isinstance(_b, dict) else {}
+                    caller = _b.get("agent") or _b.get("from")
+                    V1_STATE.setdefault("audit", []).append({"ts": iso_now(), "route": path, "agent": caller})
+                    V1_STATE["audit"] = V1_STATE["audit"][-200:]
                 if path == "/v1/mode" and code == 200 and isinstance(ans, dict):
                     SHADOW_SUMMARY["mode"] = ans.get("mode", SHADOW_SUMMARY["mode"])
             if path == "/v1/mode" and code == 200:
