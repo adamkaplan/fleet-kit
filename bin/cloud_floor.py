@@ -881,7 +881,7 @@ def switchboard_relay_config(env=None):
 def switchboard_authority(env=None):
     return switchboard_relay_config(env)["authority"]
 
-def call_switchboard_v1(path, payload, env=None):
+def call_switchboard_v1(path, payload, env=None, sleep_fn=time.sleep):
     """POST `payload` to the in-cluster switchboard (CW_SWITCHBOARD_URL, header from the 0600 file CW_SWITCHBOARD_AUTH_FILE); None when no URL is set."""
     config = switchboard_relay_config(env)
     base = config["url"]
@@ -896,7 +896,14 @@ def call_switchboard_v1(path, payload, env=None):
         header = re.sub(r"(^|;)agent=[^;]+", lambda m: m.group(1) + "agent=" + caller_agent, header)
     data = json.dumps(payload, sort_keys=True).encode()
     headers = [("Accept", "application/json"), ("Content-Type", "application/json"), ("X-Switchboard-Auth", header)]
-    return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
+    url = base.rstrip("/") + path
+    for attempt in range(3):
+        try:
+            return _parse(_request("POST", url, data, headers)[1])
+        except FloorError as err:
+            if attempt == 2 or (err.status is not None and err.status < 500):
+                raise
+            sleep_fn(1.5 * (attempt + 1))
 PANE_RELAY_PORT = 18080   # the local end of the port-forward to the in-cluster switchboard
 
 def _warn(what, err):

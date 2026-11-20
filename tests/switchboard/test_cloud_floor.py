@@ -1316,6 +1316,28 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(out, {"ok": True})
         self.assertEqual(seen["url"], "https://sw.example/v1/orders")
         self.assertIn("agent=cos", seen["headers"]["X-Switchboard-Auth"])
+        env = {"CW_SWITCHBOARD_URL": "https://sw.example", "CW_SWITCHBOARD_AUTH_FILE": str(auth)}
+        attempts, sleeps = [], []
+
+        def flaky(method, url, data, headers, **k):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise self.floor.FloorError("Floor could not be reached (URLError)")
+            if len(attempts) == 2:
+                raise self.floor.FloorError("busy", status=503)
+            return 200, b'{"ok": true}'
+        with mock.patch.object(self.floor, "_request", flaky):
+            out = self.floor.call_switchboard_v1("/v1/remind", {"text": "x"}, env=env, sleep_fn=sleeps.append)
+        self.assertEqual((out, len(attempts), sleeps), ({"ok": True}, 3, [1.5, 3.0]))
+        attempts.clear()
+
+        def denied(method, url, data, headers, **k):
+            attempts.append(url)
+            raise self.floor.FloorError("no", status=401)
+        with mock.patch.object(self.floor, "_request", denied):
+            with self.assertRaises(self.floor.FloorError):
+                self.floor.call_switchboard_v1("/v1/remind", {"text": "x"}, env=env, sleep_fn=sleeps.append)
+        self.assertEqual(len(attempts), 1)
 
     def test_relay_cli_preserves_caller_agent_and_repo(self):
         auth = self.home / "auth"
