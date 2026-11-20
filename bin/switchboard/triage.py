@@ -531,8 +531,6 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
             if item.get("parked_two_lines"):
                 found["T3"]["reason"] = "two Parked until lines: keep one"
-            if item.get("parked_two_lines"):
-                found["T3"]["reason"] = "two Parked until lines: keep one"
         if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
             found["T8"] = {"quiet_days": round(age_updated, 2)}
         if ask and "T3" not in found and not triage_awaits_live(item) and age_updated >= sla["t9_days"]:
