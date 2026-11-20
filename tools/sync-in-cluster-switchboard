@@ -146,6 +146,7 @@ def rollback(pod):
     data["authority"] = "shadow"
     state.mkdir(parents=True, exist_ok=True)
     relay.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    resumed = False
     for name in ("daemon.json", "run.lock"):
         try:
             raw = (state / name).read_text(encoding="utf-8").strip()
@@ -154,9 +155,12 @@ def rollback(pod):
             except (ValueError, AttributeError, TypeError):
                 pid = int(raw.split()[0])
             os.kill(pid, signal.SIGCONT)
+            resumed = True
             break
         except (OSError, ValueError, IndexError):
             continue
+    if not resumed:
+        raise SystemExit("error: could not SIGCONT the Mac switchboard (no live pid in daemon.json or run.lock); pod unchanged")
     pod_exec(pod, "mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"shadow\"}' > %s && "
                   "sed -i '/\"SWITCHBOARD_MODE\"/{n;s/\"value\": \"[^\"]*\"/\"value\": \"shadow\"/}' "
                   "%s/cloud/k8s/switchboard.yaml" % (MODE_FILE, MODE_FILE, APP))
@@ -169,7 +173,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pinned-sha", default="")
     ap.add_argument("--verify-only", action="store_true", help="check live tree hash only; no sync or restart")
-    ap.add_argument("--cutover", action="store_true", help="sync the manifest mode (active) to the pod")
+    ap.add_argument("--cutover", action="store_true", help="required to sync a manifest whose SWITCHBOARD_MODE is active")
     ap.add_argument("--rollback", action="store_true", help="return authority to the Mac switchboard (cluster=shadow)")
     a = ap.parse_args(argv)
     if a.rollback:
@@ -179,8 +183,11 @@ def main(argv=None):
     pod = find_pod()
     if not a.verify_only:
         archive = subprocess.check_output(["git", "archive", "--format=tar", "HEAD"] + PATHS)
-        pod_exec(pod, "mkdir -p %s && tar -xf - -C %s" % (APP, APP), archive)
         mode = manifest_mode(".")
+        if mode == "active" and not a.cutover:
+            print("error: manifest mode is active; pass --cutover to sync it", file=sys.stderr)
+            return 1
+        pod_exec(pod, "mkdir -p %s && cd %s && rm -rf bin tools shims docs && tar -xf - -C %s" % (APP, APP, APP), archive)
         pod_exec(pod, "printf %%s %s > %s/CODE_SHA && mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"%s\"}' > %s && "
                       "cp %s/tools/in-cluster-switchboard-server /run/home/in_cluster_switchboard_server.py"
                  % (tree, APP, MODE_FILE, mode, MODE_FILE, APP))
