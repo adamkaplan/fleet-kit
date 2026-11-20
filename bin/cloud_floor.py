@@ -997,19 +997,16 @@ def is_canary(m):
 
 
 def cluster_switchboard_mode(state_dir, env=None):
-    env_map = os.environ if env is None else env
-    env_mode = (env_map.get("SWITCHBOARD_MODE") or "").strip()
-    file_mode = None
-    path = os.path.join(str(state_dir), "switchboard-mode.json")
+    env_mode = ((os.environ if env is None else env).get("SWITCHBOARD_MODE") or "").strip()
+    file_mode, path = None, os.path.join(str(state_dir), "switchboard-mode.json")
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as handle:
-                m = D["parse_bounded"](handle.read()).get("mode")
-            if m in ("active", "shadow"):
-                file_mode = m
+                file_mode = D["parse_bounded"](handle.read()).get("mode")
+            file_mode = file_mode if file_mode in ("active", "shadow") else None
         except (OSError, ValueError, AttributeError) as err:
             _warn("reading switchboard-mode.json (falling back to the environment)", err)
-    if env_mode in ("active", "shadow") and file_mode in ("active", "shadow") and env_mode != file_mode:
+    if file_mode and env_mode in ("active", "shadow") and env_mode != file_mode:
         raise FloorError("refused: switchboard mode mismatch (SWITCHBOARD_MODE=%s != switchboard-mode.json=%s)" % (env_mode, file_mode), 500)
     return file_mode or (env_mode if env_mode in ("active", "shadow") else "shadow")
 

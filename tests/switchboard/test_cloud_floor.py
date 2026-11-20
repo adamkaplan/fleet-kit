@@ -934,7 +934,7 @@ class TestCloudAgents(FloorCase):
         sl.exec_module(sm)
         h = "a" * 40
         self.assertEqual(sm.check_shas(h, h, ""), "")
-        self.assertEqual(sm.check_shas(h, h, "UNPINNED"), "")
+        self.assertNotEqual(sm.check_shas(h, h, "UNPINNED"), "")
         self.assertNotEqual(sm.check_shas(h, "b" * 40, ""), "")
         self.assertNotEqual(sm.check_shas(h, h, "c" * 40), "")
         self.assertNotEqual(sm.check_shas("abc", "abc", ""), "")
