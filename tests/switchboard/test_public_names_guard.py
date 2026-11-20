@@ -37,7 +37,9 @@ class TestPublicNamesGuard(unittest.TestCase):
 
     def test_private_repo_skips_public_names_guard(self):
         with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "private-org\\b\nsecret-word\n"}):
-            self.assertEqual(self.write("private-org/internal-repo", "body with secret-word and 12345678-1234-1234-1234-123456789abc"), "ok")
+            self.assertEqual(self.write("private-org/internal-repo", "body with secret-word"), "ok")
+            with self.assertRaises(self.sb.IntentError):
+                self.write("private-org/internal-repo", "12345678-1234-1234-1234-123456789abc")
             for bad in ("body with private-org", "body with secret-word"):
                 with self.assertRaises(self.sb.IntentError):
                     self.write("acme/api", bad)

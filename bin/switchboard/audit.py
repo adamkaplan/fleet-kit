@@ -359,7 +359,7 @@ def refuse_private_names(repo, values):
     Public fleet-kit and spire words never count against the configured entries."""
     terms = private_name_terms()
     if isinstance(repo, str) and repo and any(not _PUBLIC_WORDS.fullmatch(m.group(0)) for _, rx in terms for m in rx.finditer(repo)):
-        return
+        terms = []  # a private repository may carry its own names; built-in private shapes are still refused
     builtin = []
     if os.environ.get("FLEET_PRIVATE_NAMES", "").strip() or not os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
         builtin = [(1000 + n, rx) for n, rx in enumerate(BUILTIN_PRIVATE_TERMS, 1)]
