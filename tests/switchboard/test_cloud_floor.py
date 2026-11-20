@@ -1168,6 +1168,41 @@ class TestFloorAuthority(FloorCase):
             self.assertEqual(acked, [[m["id"] for m in msgs]])
             synthetic.assert_not_called()
 
+    def _single_owner_checks(self):
+        import tempfile, importlib.machinery, importlib.util
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"CW_SWITCHBOARD_URL": "http://x", "CW_SWITCHBOARD_AUTHORITY": "cluster"}
+            with mock.patch.object(self.floor, "call_switchboard_v1", lambda path, payload, env=None: sent.append((path, payload)) or {"decisions_file": {"decisions": []}}):
+                self.floor.sync_cloud_records_to_cluster(tmp, env=env)
+            self.assertEqual(sent, [("/v1/cloud-sync", {"mirror_only": True})])
+            self.assertEqual(sorted(os.listdir(tmp)), ["decisions.json"])
+            wakes = []
+            engine = types.SimpleNamespace(send=lambda *a, **k: wakes.append(a), audit=None, actor="x")
+            rec = {"worker": "widget-api", "backend": "floor", "work_id": "w1", "session": "ses_example", "reports_to": "cos", "repo": "acme-org/widget-service"}
+            held = types.SimpleNamespace(works={"w1": {"state": "done", "landed_sha": "abc"}})
+            with mock.patch.object(self.floor, "transport", lambda: held), \
+                    mock.patch.dict(self.floor.D, {"save_record": lambda *a: None}):
+                self.floor.floor_watch_sync(tmp, [dict(rec)], engine)
+                self.floor.floor_watch_sync(tmp, [dict(rec)], engine)
+            self.assertEqual(len(wakes), 1)
+            def boom(*a, **k):
+                raise OSError("pane unreachable")
+            with tempfile.TemporaryDirectory() as tmp2, mock.patch.object(self.floor, "transport", lambda: held), \
+                    mock.patch.dict(self.floor.D, {"save_record": lambda *a: None}):
+                self.floor.floor_watch_sync(tmp2, [dict(rec)], types.SimpleNamespace(send=boom, audit=None, actor="x"))
+                self.floor.floor_watch_sync(tmp2, [dict(rec)], engine)
+            self.assertEqual(len(wakes), 2)
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "floor-terminal-wakes.json")))
+            so = os.path.join(tmp, "so.md")
+            Path(so).write_bytes(b"orders\n")
+            loader = importlib.machinery.SourceFileLoader("sync_so_test", str(REPO / "tools/sync-in-cluster-switchboard"))
+            sm = importlib.util.module_from_spec(importlib.util.spec_from_loader("sync_so_test", loader))
+            loader.exec_module(sm)
+            self.assertEqual(sm.standing_orders_bytes(so), b"orders\n")
+            self.assertEqual(len(sm.compute_standing_orders_hash(so)), 40)
+            self.assertEqual(sm.compute_standing_orders_hash(os.path.join(tmp, "none.md")), "")
+
     def test_every_state_writing_cli_command_from_parser_works_under_cluster_authority(self):
         import tempfile
         parser = sb.build_parser()
@@ -1178,8 +1213,10 @@ class TestFloorAuthority(FloorCase):
         self.assertTrue({"add", "remove", "copy"} <= set(nested["orders"].choices))
         writers = {"send", "report", "remind", "retire", "orders", "decisions", "move", "reassign", "resume", "notice", "intent"}
         self.assertTrue(writers <= set(parser.commands))
-        for name in ("orders", "retire", "decisions", "intent"):
+        for name in ("orders", "decisions", "intent"):
             self.assertIn(name, self.floor.PASSTHROUGH_COMMANDS)
+        self.assertNotIn("retire", self.floor.PASSTHROUGH_COMMANDS)
+        self._single_owner_checks()
         pod_state = {"pane_outbox": [], "reports": [], "reminders": [], "acked": []}
         floor, case = self.floor, self
 

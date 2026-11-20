@@ -489,7 +489,9 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
         record["pr_labels"] = labels
     try:
         D["save_record"](state, record)
-    except (D["CloudError"], OSError) as err:
+        if switchboard_authority() == "cluster":
+            call_switchboard_v1("/v1/cloud-record", {"worker": record["worker"], "record": record})
+    except (D["CloudError"], FloorError, OSError) as err:
         raise LaunchError("Floor accepted the work %s but its record could not be stored (%s); launch again to finish: the same work is returned" % (work_id, scrub(err, 80))) from None
     D["_audit"](engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "backend": "floor", "idle_deadline": record["idle_deadline"], "hard_deadline": record["hard_deadline"]})
     D["_registry_note"](engine, "upsert", state, name, {"session": session_id, "repo": repo, "role": getattr(args, "role", None), "kind": "cloud", "run_id": work_id, "state": "working"}, address=ENDPOINT_URL)
@@ -618,6 +620,11 @@ def _retire_floor(args, runner, now, record):
     D["_registry_note"](engine, "retire", state, args.name, reason)
     D["_keep_boss"](state, record)
     D["remove_record"](state, args.name)
+    if switchboard_authority() == "cluster":
+        try:
+            call_switchboard_v1("/v1/cloud-record", {"worker": args.name, "delete": True, "reason": reason})
+        except FloorError as err:
+            _warn("cluster copy of the %s record was not deleted" % args.name, err)
     print("%s is retired (Floor session %s cancelled)" % (args.name, record.get("session")))
     return H["EXIT_OK"]
 
@@ -860,7 +867,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
 OVERSIZE_RE = re.compile(r"(\[oversize send \(\d+ chars\) stored at )([^\]]+?/(oversize-sends/(send-[A-Za-z0-9_.-]+\.txt)))(\])")
 SYNC_STATE_FILES = ("registry.json", "retired.json", "boss-overrides.json", "escalated-requests.json", "pr-notices.json", "order-notices.json")
 _PASSTHROUGH_AUTH = []
-PASSTHROUGH_COMMANDS = ("orders", "retire", "decisions", "intent")
+PASSTHROUGH_COMMANDS = ("orders", "decisions", "intent")
 
 def _write_private(path, content):
     tmp = "%s.tmp%d" % (path, os.getpid())
@@ -1231,6 +1238,14 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
             return None
         except (OSError, ValueError) as err:
             raise FloorError("%s cannot be read (%s); the sync is skipped so the cluster keeps its copy" % (os.path.basename(path), type(err).__name__)) from None
+    if switchboard_authority(env) == "cluster":
+        ans = call_switchboard_v1("/v1/cloud-sync", {"mirror_only": True}, env=env)
+        if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict):
+            try:
+                _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
+            except OSError as err:
+                _warn("decisions.json sync", err)
+        return {"synced": 0}
     records, reminders = {}, None
     cloud = os.path.join(str(state_dir), "cloud")
     if os.path.isdir(cloud):
@@ -1354,12 +1369,12 @@ def relay_cli_if_configured(command, payload, env=None):
             _write_private(os.path.join(str(D["H"]["state_dir_path"]()), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
         except Exception as err:
             _warn("decisions.json update", err)
-    if env is None and command in PASSTHROUGH_COMMANDS and isinstance(ans, dict):
+    if env is None and command in PASSTHROUGH_COMMANDS and isinstance(ans, dict) and (command == "orders" or (isinstance(payload, dict) and payload.get("action") in (None, "list", "show", "cos"))):
         _PASSTHROUGH_AUTH[:] = [os.environ.pop("CW_SWITCHBOARD_AUTHORITY", None)]
     if command == "remind" and isinstance(ans, dict):
         if isinstance(orig_payload, dict):
             orig_payload["_relay_ans"] = ans
-        if payload.get("action") in (None, "add") and ans.get("id") and ans.get("at") is not None:
+        if switchboard_authority(env) != "cluster" and payload.get("action") in (None, "add") and ans.get("id") and ans.get("at") is not None:
             try:
                 H = D["H"]
                 if "build_engine" in H:
@@ -1426,6 +1441,14 @@ def floor_watch_sync(state_dir, records, engine=None):
             return records
         print("floor_watch_sync: the Floor state could not be read (%s)" % type(err).__name__, file=sys.stderr)
         return records
+    wakes_path = os.path.join(str(state_dir), "floor-terminal-wakes.json")
+    woken = {}
+    try:
+        with open(wakes_path, encoding="utf-8") as handle:
+            got = D["parse_bounded"](handle.read())
+        woken = got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        woken = {}
     known = set()
     for record in list(records):
         if not isinstance(record, dict) or record.get("backend") != "floor":
@@ -1455,7 +1478,7 @@ def floor_watch_sync(state_dir, records, engine=None):
             except Exception as err:   # not marked audited: the next pass tries again, and says so
                 record.pop("stopped_audited", None)
                 print("floor_watch_sync: cloud.stopped for %s was not recorded (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
-        if s_state in ("done", "failed") and engine is not None and hasattr(engine, "send") and not record.get("terminal_woken"):
+        if s_state in ("done", "failed") and engine is not None and hasattr(engine, "send") and not record.get("terminal_woken") and not woken.get("%s:%s" % (record["worker"], s_state)):
             boss = record.get("reports_to")
             if isinstance(boss, str) and boss.strip():
                 if s_state == "done":
@@ -1463,11 +1486,19 @@ def floor_watch_sync(state_dir, records, engine=None):
                 else:
                     msg = "Floor worker %s finished (failed): %s" % (record["worker"], scrub(found.get("error") or "unknown error", 200))
                 try:
+                    wkey = "%s:%s" % (record["worker"], s_state)
+                    woken[wkey] = True
+                    _write_private(wakes_path, json.dumps(woken, sort_keys=True))
                     record["terminal_woken"] = True   # saved BEFORE the send: a failed save never leads to a second wake
                     D["save_record"](state_dir, record)
                     engine.send("switchboard", boss.strip(), msg, issue=record.get("issue"), repo=record.get("repo"))
                 except Exception as err:
                     record.pop("terminal_woken", None)
+                    woken.pop("%s:%s" % (record["worker"], s_state), None)
+                    try:
+                        _write_private(wakes_path, json.dumps(woken, sort_keys=True))
+                    except OSError:
+                        pass
                     print("floor_watch_sync: terminal wake for %s failed (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
     for work_id, found in sessions.items():
         name, repo = found.get("worker") or found.get("title"), found.get("repo")

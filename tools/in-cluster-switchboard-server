@@ -572,6 +572,23 @@ def refresh_decisions(eng, sb_mod):
         log_line("v1_decisions_refresh_error", error=str(derr)[:160])
 
 
+PRESERVED_RECORD_KEYS = ("stopped_audited", "terminal_woken", "floor_state", "landed_sha", "floor_error")
+
+
+def merge_preserved(path, rec):
+    """Copy the completion keys of the record already at `path` into `rec` when `rec` lacks them."""
+    if not isinstance(rec, dict) or not path.is_file():
+        return
+    try:
+        old = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(old, dict):
+        for k in PRESERVED_RECORD_KEYS:
+            if k in old and k not in rec:
+                rec[k] = old[k]
+
+
 def handle_on_v1_action(route_path, auth, body, state):
     """Bridge `/v1/{send,report,remind,retire,orders}` into the in-cluster Switchboard engine."""
     eng = ENGINE_REF.get("engine")
@@ -601,6 +618,10 @@ def handle_on_v1_action(route_path, auth, body, state):
             dfile = STATE_DIR / "decisions.json"
             if dfile.is_file():
                 state["decisions_file"] = json.loads(dfile.read_text(encoding="utf-8"))
+        elif route_path == "/v1/orders":
+            if body.get("action") in ("add", "remove") and body.get("charter"):
+                eng.audit.append(auth.get("agent") or "cos", "orders." + body["action"], str(body.get("name") or body.get("charter"))[:60], {"charter": str(body["charter"])[:200]})
+                refresh_decisions(eng, sb_mod)
         elif route_path == "/v1/send":
             if isinstance(body.get("oversize_files"), dict):
                 ov = STATE_DIR / "oversize-sends"
@@ -989,6 +1010,7 @@ def main():
                 for name, rec in (data.get("records") or {}).items():
                     if isinstance(name, str) and "/" not in name and ".." not in name:
                         p = cloud_dir / (name + ".json")
+                        merge_preserved(p, rec)
                         p.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
                         os.chmod(p, 0o600)
                 rem_in = data.get("reminders")
@@ -1012,6 +1034,29 @@ def main():
                 if dfile.is_file():
                     out["decisions_file"] = json.loads(dfile.read_text(encoding="utf-8"))
                 return self._send(200, out)
+            if path == "/v1/cloud-record":
+                if self._auth_error() is not None:
+                    return None
+                try:
+                    data = json.loads(body.decode("utf-8") or "{}")
+                except ValueError as err:
+                    return self._send(400, {"error": "invalid JSON: " + str(err)[:120]})
+                worker = data.get("worker")
+                if not isinstance(worker, str) or not worker or "/" in worker or ".." in worker:
+                    return self._send(400, {"error": "invalid worker"})
+                p = STATE_DIR / "cloud" / (worker + ".json")
+                if data.get("delete"):
+                    if p.is_file():
+                        p.unlink()
+                    return self._send(200, {"deleted": True})
+                if isinstance(data.get("record"), dict):
+                    rec = dict(data["record"])
+                    p.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                    merge_preserved(p, rec)
+                    p.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+                    os.chmod(p, 0o600)
+                    return self._send(200, {"recorded": True})
+                return self._send(400, {"error": "record or delete required"})
             with STATE_LOCK:
                 code, ans = cf_mod.handle_switchboard_v1("POST", self.path, dict(self.headers), body, expected_secret, state=V1_STATE)
                 if path in ("/v1/send", "/v1/pane-ack") and code == 200:

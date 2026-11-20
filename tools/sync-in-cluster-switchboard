@@ -159,6 +159,22 @@ def pod_config_hash(pod):
     return kubectl_out(["exec", pod, "--", "python3", "-c", script])
 
 
+def standing_orders_bytes(path=None):
+    p = pathlib.Path(path) if path else pathlib.Path.home() / ".config" / "fleet-switchboard" / "standing-orders.md"
+    return p.read_bytes() if p.exists() else b""
+
+
+def compute_standing_orders_hash(path=None):
+    data = standing_orders_bytes(path)
+    return hashlib.sha256(data).hexdigest()[:40] if data else ""
+
+
+def pod_standing_orders_hash(pod):
+    script = ("import hashlib, pathlib; p = pathlib.Path('/run/home/.config/fleet-switchboard/standing-orders.md'); "
+              "print(hashlib.sha256(p.read_bytes()).hexdigest()[:40] if p.exists() else '', end='')")
+    return kubectl_out(["exec", pod, "--", "python3", "-c", script])
+
+
 def watched_repos_from_snapshot(snap, cfg):
     """Sorted list of repos watched by live agents in `snap` that match a `gh_users` entry in `cfg`."""
     gh_users = (cfg or {}).get("gh_users") or {}
@@ -292,6 +308,13 @@ def main(argv=None):
         if pod_cfg != cfg_hash:
             print("error: pod config.json hash %s != Mac config.json hash %s" % (pod_cfg, cfg_hash), file=sys.stderr)
             return 1
+    so_bytes = standing_orders_bytes()
+    if not a.verify_only and so_bytes:
+        pod_exec(pod, "mkdir -p /run/home/.config/fleet-switchboard && cat > /run/home/.config/fleet-switchboard/standing-orders.md", so_bytes)
+    so_hash = compute_standing_orders_hash()
+    if so_hash and pod_standing_orders_hash(pod) != so_hash:
+        print("error: pod standing-orders.md hash != Mac standing-orders.md hash %s" % so_hash, file=sys.stderr)
+        return 1
     live_tree = pod_tree_hash(pod)
     pinned = a.pinned_sha or pod_pinned(pod)
     err = check_shas(tree, live_tree, pinned)
