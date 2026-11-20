@@ -1001,6 +1001,53 @@ class TestFloorAuthority(FloorCase):
     def call(self, path, body, agent="cos", **kw):
         return self.floor.handle_switchboard_v1("POST", path, {"X-Switchboard-Auth": self.header(agent)}, json.dumps(body).encode(), self.SECRET, **kw)
 
+    def test_cluster_mode_persists_across_restart_and_delivers_canary(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.call("/v1/mode", {"mode": "active"}, state={"state_dir": tmp}), (200, {"mode": "active"}))
+            state2 = {"state_dir": tmp}
+            got = self.floor.handle_switchboard_v1("GET", "/v1/mode", {"X-Switchboard-Auth": self.header("cos")}, b"", self.SECRET, state=state2)
+            self.assertEqual(got, (200, {"mode": "active"}))
+            self.assertEqual(self.call("/v1/send", {"to": "pane-relay", "text": "canary:t1", "canary": True}, agent="pane-relay", state=state2)[1], {"queued": "pane"})
+            self.assertEqual(len(state2["pane_outbox"]), 1)
+            state2["mode"] = "shadow"
+            self.assertEqual(self.call("/v1/send", {"to": "pane-relay", "text": "canary:t2", "canary": True}, agent="pane-relay", state=state2)[1], {"queued": "shadow"})
+            self.assertEqual(len(state2["pane_outbox"]), 1)
+            acked, synthetic = [], mock.Mock()
+            engine = types.SimpleNamespace(v2=types.SimpleNamespace(synthetic=synthetic))
+            msgs = list(state2["pane_outbox"])
+            def fake_request(method, url, *a, **k):
+                return 200, json.dumps({"messages": msgs}).encode()
+            with mock.patch.object(self.floor, "switchboard_relay_config", return_value={"url": "http://x", "authority": "cluster"}), \
+                    mock.patch.object(self.floor, "_auth_header", return_value="h"), mock.patch.object(self.floor, "_request", fake_request), \
+                    mock.patch.object(self.floor, "call_switchboard_v1", lambda path, payload, env=None: acked.append(payload["ids"])):
+                result = self.floor.drain_pane_outbox(engine)
+            self.assertEqual(result["canaries"], ["canary:t1"])
+            self.assertEqual(acked, [[msgs[0]["id"]]])
+            synthetic.assert_not_called()
+
+    def test_single_authority_and_tunnel_drop_fire_macos_notifications(self):
+        f = self.floor
+        self.assertIsNone(f.check_single_authority("active", "cluster", True))
+        self.assertIsNone(f.check_single_authority("shadow", "mac", False))
+        sent = []
+        monitor = f.PaneRelayMonitor(notify=lambda title, text: sent.append(title))
+        monitor.tick(0, True, "shadow", "cluster", True)
+        monitor.tick(1, True, "active", "mac", False)
+        self.assertEqual(sent, ["fleet-switchboard authority mismatch"])
+        sent.clear()
+        for now in (10, 60, 129):
+            monitor.tick(now, False)
+        self.assertEqual(sent, [])
+        self.assertTrue(monitor.tick(130, False)["restart"])
+        monitor.tick(200, False)
+        self.assertEqual(sent, ["fleet-switchboard relay down"])
+        monitor.tick(210, True)
+        self.assertIn("fleet-switchboard relay recovered", sent)
+        calls = []
+        f.notify_macos_alarm("t", "x", runner=lambda argv, **k: calls.append(argv))
+        self.assertEqual(calls[0][0], "/usr/bin/osascript")
+
     def test_pane_state_preserves_outcome_and_defaults_clean_idle(self):
         class Obs:
             def __init__(self, name, session_id, pane, status, fleet):

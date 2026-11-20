@@ -1,26 +1,8 @@
 """The Floor remote-worker transport (ask #2564): a repository that routes to Floor is worked by an ACA sandbox author, not by a pod.
 
-A part of bin/cloud_worker.py, loaded by bin/cloud_inspect.py (so that file takes no new line): its `bind` wraps `_launch`, `cmd_send`, `cmd_read`,
-`status_lines` and `cmd_retire` of that file. Every wrapper decides by the RECORD (`backend` is `floor` or, as every older record, a pod), never by the
-setting of the day, so a worker stays on the side that admitted it through a cutover and through a rollback. A pod record takes the old code unchanged.
-
-Private settings (cloud.env or the environment, never in this file):
-  CW_REMOTE_BACKEND       `pod` (the default and the rollback switch: it wins over everything) or `floor`
-  CW_FLOOR_REPOS          comma-separated `owner/repo`, `owner/*` or `*`: the repositories routed to Floor while the backend is not `floor` yet
-  CW_FLOOR_TRANSPORT      `queue` or `http` (default `queue` when CW_FLOOR_QUEUE_URL and CW_FLOOR_BLOB_URL are both set, else `http`)
-  CW_FLOOR_QUEUE_URL, CW_FLOOR_QUEUE_SAS   the command queue (queue transport): commands are POSTed to <url>/messages?<sas>
-  CW_FLOOR_BLOB_URL, CW_FLOOR_BLOB_SAS     the published state (state.json, msg/<session>.json) and the payload blobs (queue transport)
-  CW_FLOOR_URL            the base URL of the Floor caller API (https, or plain http to a loopback address)
-  CW_FLOOR_CALLER         the caller id of this fleet (default `fleet`)
-  CW_FLOOR_TOKEN_FILE     optional path of a 0600 bearer-token file
-  CW_FLOOR_VERIFY_ENABLED `1` or `true` (default off): a tester, --no-commit or rehearsal launch is routed to Floor as mode `verify-only` or `rehearse` (no author runs)
-  CW_FLOOR_AGENTS_ENABLED `1` or `true` (default off): a research-assistant or orchestrator launch is routed to Floor as that mode; the env FLOOR_PROFILE (and FLOOR_CHARTER for an orchestrator) is sent
-  CW_POD_ROLLBACK_WINDOW  `open` (the default) or `closed`: the pod launcher may be retired only once it is `closed`
-
-The transport object has five calls (the caller API of Floor): submit, message, cancel, observe, result. A test sets `TRANSPORT`; otherwise an
-HTTP client of CW_FLOOR_URL is made (no redirect followed, 30 s, 1 MiB, parsed bounded, every error scrubbed of the URL and the token).
-Commands are idempotent by key: the session id and every command id are a hash of the caller and the worker, so a launch or a send that is repeated
-after a crash names the same work and is never run twice.
+Loaded by bin/cloud_inspect.py: its `bind` wraps `_launch`, `cmd_send`, `cmd_read`, `status_lines` and `cmd_retire` of bin/cloud_worker.py. Every wrapper
+decides by the RECORD (`backend` is `floor` or a pod), never by the setting of the day. Settings (CW_REMOTE_BACKEND, CW_FLOOR_*, CW_POD_ROLLBACK_WINDOW)
+live in cloud.env or the environment. The transport has five calls (submit, message, cancel, observe, result); commands are idempotent by key.
 """
 import base64
 import hashlib
@@ -39,9 +21,7 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
-
 D: object   # set by the loader before this file runs
-
 TRANSPORT = None   # a test seam: an object with submit, message, cancel, observe and result
 ENDPOINT_URL = "https://floor.example.internal"   # the placeholder the record carries: the real URL stays in the private settings
 TIMEOUT_SECONDS = 30
@@ -51,7 +31,6 @@ TOKEN_MAX = 512
 CALLER_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 NOT_AUTHORS = ("orchestrator",)   # an agent that is not a sandbox author
 AUTHORS = ("coder", "worker")
-
 FLOOR_AUTHOR_PREAMBLE = """Floor Author Contract (brief in, commit out):
 - Work in the repository checkout on branch %(branch)s (created from %(base)s).
 - Use bounded local edits and git commit only: do NOT run git push, gh pr create, prove, verdict, or spire land in this sandbox.
@@ -64,26 +43,21 @@ DELIVERY_LINE = re.compile(
     r"/work/land\.log|\bspire\s+land\b", re.I)
 REMOVED_LINE = "(a delivery step stood here: Floor delivers the commit, so there is nothing to run for it)"
 
-
 class FloorError(Exception):
     """A call of Floor that did not finish; `status` is the HTTP status or None, the text is already scrubbed."""
     def __init__(self, text, status=None):
         super().__init__(text)
         self.status = status
 
-
 class UnavailableArtifactError(FloorError):
     """Floor answered, but an artifact it names (`art-...`) cannot be read now."""
     def __init__(self, artifact, status=503):
         super().__init__("the artifact %s is unavailable" % artifact, status)
         self.artifact = artifact
-
-
 # ---------------------------------------------------------------- settings, scrubbing, routing
 
 def env_of():
     return os.environ
-
 
 def scrub(text, limit=200):
     """One line of `text` with every URL, host, bearer token, signature and long opaque string of the settings taken out."""
@@ -120,7 +94,6 @@ def scrub(text, limit=200):
     text = re.sub(r"\b(?![0-9a-f]{40}\b|[0-9a-f]{64}\b)[A-Za-z0-9_+/=-]{40,}\b", "<hidden>", text)
     return " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text).split())[:limit]
 
-
 def _matches(entry, repo):
     entry, repo = entry.strip().lower(), repo.lower()
     if entry == "*":
@@ -129,10 +102,8 @@ def _matches(entry, repo):
     e_owner, _, e_name = entry.partition("/")
     return bool(e_name) and e_owner == owner and e_name in ("*", name)
 
-
 def route_repo(repo, config, env=None):
-    """`floor` or `pod` for a repository. `CW_REMOTE_BACKEND=pod` is the rollback switch and wins; else `floor` when the backend is `floor` or the
-    repository is in CW_FLOOR_REPOS; else `pod`. `config` is the switchboard's (it is not read here: the land gate is `check_floor_admission`)."""
+    """`floor` or `pod` for a repository. `CW_REMOTE_BACKEND=pod` is the rollback switch and wins; else `floor` when the backend is `floor` or the repository is in CW_FLOOR_REPOS; else `pod`. `config` is the switchboard's (it is not read here: the land gate is `check_floor_admission`)."""
     env = env_of() if env is None else env
     backend = (env.get("CW_REMOTE_BACKEND") or "").strip().lower()
     if backend == "pod":
@@ -142,29 +113,23 @@ def route_repo(repo, config, env=None):
     listed = [e for e in (env.get("CW_FLOOR_REPOS") or "").split(",") if e.strip()]
     return "floor" if isinstance(repo, str) and any(_matches(e, repo) for e in listed) else "pod"
 
-
 def is_floor(record):
     """A record belongs to Floor by its own `backend`, never by the setting of the day."""
     return isinstance(record, dict) and record.get("backend") == "floor"
-
 
 def floor_who():
     who = (env_of().get("CW_FLOOR_CALLER") or "fleet").strip()
     if not CALLER_RE.fullmatch(who):
         raise D["Refusal"]("CW_FLOOR_CALLER is not a caller id (a-z, 0-9, _ and -, up to 32); nothing was created")
     return who
-
-
 # ---------------------------------------------------------------- the HTTP transport
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
 
-
 def _request(method, url, data=None, headers=(), missing_ok=False):
-    """(status, body bytes) of one request: no redirect followed, 30 s, the answer cut at 1 MiB. An HTTP error is a FloorError (a 503 that names `art-...` is an
-    UnavailableArtifactError); a 404 is returned as (404, b"") when `missing_ok`. The text of an error holds no URL: callers scrub it again."""
+    """(status, body bytes) of one request: no redirect followed, 30 s, the answer cut at 1 MiB. An HTTP error is a FloorError (a 503 that names `art-...` is an UnavailableArtifactError); a 404 is returned as (404, b"") when `missing_ok`. The text of an error holds no URL: callers scrub it again."""
     request = urllib.request.Request(url, data=data, method=method)
     for key, value in headers:
         request.add_header(key, value)
@@ -185,7 +150,6 @@ def _request(method, url, data=None, headers=(), missing_ok=False):
         raise FloorError("Floor's answer is larger than %d bytes" % RESPONSE_MAX)
     return status, raw
 
-
 def _parse(raw):
     try:
         parsed = D["parse_bounded"](raw.decode("utf-8"))
@@ -194,57 +158,41 @@ def _parse(raw):
     if not isinstance(parsed, dict):
         raise FloorError("Floor's answer is not an object")
     return parsed
-
-
 FINISHED_STATES = ("retired", "done", "failed")
-
 
 class HttpTransport:
     """The five calls of the Floor caller API over HTTP: a JSON body in, a bounded JSON answer out. Paths are under /v1/callers/<caller>/."""
     def __init__(self, base, token=None):
         self.base, self.token = base.rstrip("/"), token
-
     def _call(self, method, path, body=None):
         data = None if body is None else json.dumps(body, sort_keys=True).encode()
         headers = [("Accept", "application/json")] + ([("Content-Type", "application/json")] if data is not None else [])
         if self.token:
             headers.append(("Authorization", "Bearer " + self.token))
         return _parse(_request(method, self.base + path, data, headers)[1])
-
     def _root(self, caller):
         return "/v1/callers/" + urllib.parse.quote(caller, safe="")
-
     def submit(self, caller, cmd_id, **fields):
         return self._call("POST", self._root(caller) + "/submissions", dict(fields, cmd_id=cmd_id))
-
     def message(self, caller, work_id, cmd_id, seq, text):
         return self._call("POST", "%s/works/%s/messages" % (self._root(caller), urllib.parse.quote(work_id, safe="")), {"cmd_id": cmd_id, "seq": seq, "text": text})
-
     def cancel(self, caller, work_id, cmd_id, seq):
         return self._call("POST", "%s/works/%s/cancel" % (self._root(caller), urllib.parse.quote(work_id, safe="")), {"cmd_id": cmd_id, "seq": seq})
-
     def observe(self, caller, work_id):
         return self._call("GET", "%s/works/%s" % (self._root(caller), urllib.parse.quote(work_id, safe="")))
-
     def result(self, caller, work_id):
         return self._call("GET", "%s/works/%s/result" % (self._root(caller), urllib.parse.quote(work_id, safe="")))
-
 
 def rfc3339(moment=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if moment is None else moment))
 
-
 class QueueBlobTransport:
-    """Floor's Queue + Blob v1 wire format. A command is JSON, base64 inside a <QueueMessage> POSTed to <queue>/messages; the state is published by Floor as
-    state.json and msg/<session>.json under the blob URL. The work id is the session id. A command is never acknowledged on the call: `cancel` reads the
-    published state and says `reserved` until the session is `retired`; a submit or a send is applied once by Floor (it acks a repeated cmd_id `duplicate`)."""
+    """Floor's Queue + Blob v1 wire format. A command is JSON, base64 inside a <QueueMessage> POSTed to <queue>/messages; the state is published by Floor as state.json and msg/<session>.json under the blob URL. The work id is the session id. A command is never acknowledged on the call: `cancel` reads the published state and says `reserved` until the session is `retired`; a submit or a send is applied once by Floor (it acks a repeated cmd_id `duplicate`)."""
     def __init__(self, queue_url, queue_sas, blob_url, blob_sas):
         self.queue, self.queue_sas, self.blob, self.blob_sas = queue_url.rstrip("/"), (queue_sas or "").lstrip("?"), blob_url.rstrip("/"), (blob_sas or "").lstrip("?")
-
     @staticmethod
     def _url(base, path, sas):
         return base + path + ("?" + sas if sas else "")
-
     def _enqueue(self, command, payload=None):
         """Send `command` (a dict); `payload` holds the large fields (brief or text), which go in the message or, when it would be over 60 KiB, in a blob."""
         full = dict(command, **(payload or {}))
@@ -256,10 +204,8 @@ class QueueBlobTransport:
             text = base64.b64encode(json.dumps(dict(command, payload=path), sort_keys=True).encode("utf-8")).decode("ascii")
         body = ("<QueueMessage><MessageText>%s</MessageText></QueueMessage>" % text).encode("ascii")
         _request("POST", self._url(self.queue, "/messages", self.queue_sas), body, [("Content-Type", "application/xml")])
-
     def _command(self, op, cmd_id, session_id, seq, **more):
         return dict({"v": 1, "cmd_id": cmd_id, "op": op, "session_id": session_id, "seq": int(seq), "at": rfc3339()}, **more)
-
     def _state(self):
         state = _parse(_request("GET", self._url(self.blob, "/state.json", self.blob_sas), None, [("Accept", "application/json")])[1])
         sessions, acks = state.get("sessions"), state.get("acks")
@@ -268,22 +214,18 @@ class QueueBlobTransport:
         state["floor_seq"] = state.get("seq", state.get("state_seq"))
         state["acks"] = acks if isinstance(acks, dict) else {}
         return state
-
     def _blob(self, session_id):
         status, raw = _request("GET", self._url(self.blob, "/msg/%s.json" % urllib.parse.quote(session_id, safe=""), self.blob_sas), None, [("Accept", "application/json")], missing_ok=True)
         return {} if status == 404 else _parse(raw)
-
     def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", mode=None, env=None, priority_class=None, preview=False, **ignored):
         pclass = priority_class or "production"
         extras = {"class": pclass, "priority_class": pclass} if pclass != "production" else {}
         command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main", **({"mode": mode} if mode else {}), **extras, **({"preview": True} if preview else {}))
         self._enqueue(command, dict({"brief": brief}, **({"env": env} if env else {})))
         return {"work_id": session_id, "session_id": session_id, "seq": 1}
-
     def message(self, caller, work_id, cmd_id, seq, text):
         self._enqueue(self._command("send", cmd_id, work_id, seq), {"text": text})
         return {"id": cmd_id, "seq": int(seq)}
-
     def cancel(self, caller, work_id, cmd_id, seq):
         self._enqueue(self._command("retire", cmd_id, work_id, seq))
         try:
@@ -295,7 +237,6 @@ class QueueBlobTransport:
             raise FloorError("Floor rejected the retire (%s)" % scrub(ack, 80))
         finished = (state["sessions"].get(work_id) or {}).get("state") in FINISHED_STATES
         return {"cancelled": True, "reserved": not finished}
-
     def observe(self, caller, work_id):
         state = self._state()
         found = state["sessions"].get(work_id)
@@ -304,11 +245,9 @@ class QueueBlobTransport:
         text = blob.get("text") if isinstance(blob.get("text"), str) else ""
         return {"manifest": blob.get("manifest"), "log_tail": blob.get("log_tail"), "state": found.get("state", "queued"), "busy": bool(found.get("busy")), "landed_sha": found.get("landed_sha"), "rounds": found.get("rounds", 0),
                 "error": found.get("error"), "last_update": found.get("last_update"), "messages": [{"role": "assistant", "text": text}] if text else []}
-
     def result(self, caller, work_id):
         seen = self.observe(caller, work_id)
         return {"state": seen["state"], "landed_sha": seen["landed_sha"], "error": seen["error"], "manifest": seen["manifest"], "log_tail": seen["log_tail"]}
-
 
 def _private_file(setting):
     path = (env_of().get(setting) or "").strip()
@@ -323,15 +262,12 @@ def _private_file(setting):
     except OSError:
         raise D["Refusal"]("%s cannot be read; nothing was called" % setting) from None
 
-
 def _token():
     return _private_file("CW_FLOOR_TOKEN_FILE")
-
 
 def _sas(val_key, file_key):
     val = (env_of().get(val_key) or "").strip()
     return val if val else _private_file(file_key)
-
 
 def _base_problem(value):
     """Why a queue or blob URL (it may carry a path, the queue name) is refused, or None: the host part is judged as an endpoint is, and no query, fragment or credentials."""
@@ -343,7 +279,6 @@ def _base_problem(value):
     if parts.query or parts.fragment:
         return "it must not carry a query or fragment (the SAS is a separate setting)"
     return D["endpoint_problem"]("%s://%s" % (parts.scheme, parts.netloc))
-
 
 def transport():
     """The transport: the test seam, else an HTTP client of CW_FLOOR_URL (read from the private settings)."""
@@ -371,7 +306,6 @@ def transport():
         raise D["Refusal"]("CW_FLOOR_URL is refused: %s; nothing was created" % problem)
     return HttpTransport(url, _token())
 
-
 def _call(function, *args, **kwargs):
     """One call of the transport; a failure is a CloudError whose text holds no URL, host or token."""
     try:
@@ -382,22 +316,16 @@ def _call(function, *args, **kwargs):
         raise D["CloudError"]("Floor: %s" % scrub(err)) from None
     except (OSError, ValueError, KeyError, TypeError) as err:
         raise D["CloudError"]("Floor: %s" % scrub("the call failed (%s)" % type(err).__name__)) from None
-
-
 # ---------------------------------------------------------------- admission and the brief
 
 def verify_enabled(env=None):
     """True when Floor's verify workflows are on (CW_FLOOR_VERIFY_ENABLED is `1` or `true`)."""
     return ((env_of() if env is None else env).get("CW_FLOOR_VERIFY_ENABLED") or "").strip().lower() in ("1", "true", "yes")
 
-
 def agents_enabled(env=None):
     """True when the Cloud Agents profiles are on (CW_FLOOR_AGENTS_ENABLED is `1`, `true` or `yes`)."""
     return ((env_of() if env is None else env).get("CW_FLOOR_AGENTS_ENABLED") or "").strip().lower() in ("1", "true", "yes")
-
-
 AGENT_MODES = ("research-assistant", "orchestrator")
-
 
 def verify_mode(args, brief):
     """`research-assistant` or `orchestrator` for those profiles (agents enabled), `verify-only` for a tester, `rehearse` for --no-commit or a rehearsal brief, else None (an author launch)."""
@@ -411,10 +339,8 @@ def verify_mode(args, brief):
         return "rehearse"
     return None
 
-
 def check_floor_admission(args, repo, brief, config):
-    """Refuse (exit 2, nothing created) what Floor cannot work: a repository outside `land_repos`, and every role that is not a coder or worker author.
-    With CW_FLOOR_VERIFY_ENABLED a tester, --no-commit or rehearsal launch is admitted as a verify mode (see `verify_mode`)."""
+    """Refuse (exit 2, nothing created) what Floor cannot work: a repository outside `land_repos`, and every role that is not a coder or worker author. With CW_FLOOR_VERIFY_ENABLED a tester, --no-commit or rehearsal launch is admitted as a verify mode (see `verify_mode`)."""
     if route_repo(repo, config) != "floor":
         return
     Refusal = D["Refusal"]
@@ -446,10 +372,8 @@ def check_floor_admission(args, repo, brief, config):
     if re.search(r"\bgh\s+pr\s+merge\b", text) and not re.search(r"\b(implement|write|fix|add|change|refactor|edit|commit|create)\b", text, re.I):
         raise Refusal("refused: %s routes to Floor: merger pods have no Floor equivalent (Floor delivers via spire land); nothing was created" % repo)
 
-
 def translate_brief(brief, repo, branch, base=None):
-    """The brief a pod was written for, as a Floor author reads it: the pod header, setup and landing line taken off, every line that runs a delivery
-    command (push, pull request, prove, verdict, heavy, land) replaced by a plain note, and the author contract put first."""
+    """The brief a pod was written for, as a Floor author reads it: the pod header, setup and landing line taken off, every line that runs a delivery command (push, pull request, prove, verdict, heavy, land) replaced by a plain note, and the author contract put first."""
     text = str(brief or "")
     held = D["H"]
     header = D["POD_HEADER"]
@@ -467,48 +391,37 @@ def translate_brief(brief, repo, branch, base=None):
     lines = [REMOVED_LINE if DELIVERY_LINE.search(line) else line for line in text.splitlines()]
     body = "\n".join(lines).strip("\n")
     return FLOOR_AUTHOR_PREAMBLE % {"branch": branch, "base": base or "the default branch"} + body + "\n"
-
-
 # ---------------------------------------------------------------- keys
 
 def _hash(*parts):
     return hashlib.sha256("\0".join(str(p) for p in parts).encode()).hexdigest()[:16]
 
-
 def session_key(who, name, repo):
     return "ses_" + hashlib.sha256(("%s\0%s\0%s" % (who, name, repo)).encode()).hexdigest()[:16]
-
 
 def launch_key(who, session_id):
     return "c-" + hashlib.sha256(("%s\0launch\0%s" % (who, session_id)).encode()).hexdigest()[:16]
 
-
 def send_key(session_id, seq, text):
     return "c-" + hashlib.sha256(("%s\0send\0%d\0%s" % (session_id, seq, text)).encode()).hexdigest()[:16]
-
 
 def cancel_key(session_id, seq):
     return "c-" + _hash(session_id, "cancel", seq)
 
-
 def submit_work(who, cmd_id, **fields):
     """The one submit of a launch; a failure raises before any record is written."""
     return _call(transport().submit, who, cmd_id, **fields)
-
-
 # ---------------------------------------------------------------- launch
 
 def _stamp(seconds, now):
     import time
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + seconds))
 
-
 def _seconds(value, default):
     try:
         return int(value) if value and int(value) > 0 else default
     except (TypeError, ValueError):
         return default
-
 
 def check_priority_tier(args, engine, runner, now, repo=None, config=None):
     """The class and preview of a Floor launch, checked before anything is sent."""
@@ -527,7 +440,6 @@ def check_priority_tier(args, engine, runner, now, repo=None, config=None):
             raise D["Refusal"]("priority class outage is reserved for cos or the owner's shell (caller: %s); raise the outage to cos; nothing was created" % by)
         D["_audit"](engine, "cloud.outage_allowed", getattr(args, "name", "?"), body)
     return pclass
-
 
 def launch_floor(args, runner, now, reserve, repo, branch, inner):
     """The Floor half of `launch --cloud`: everything is checked before the one submit, and the record is written only after Floor accepted it."""
@@ -589,10 +501,8 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     print(_json(D["cloud_launch_again"]._launch_line(record)))
     return D["H"]["EXIT_OK"]
 
-
 def _json(value):
     return json.dumps(value, sort_keys=True)
-
 
 def _launch_wrapper(inner):
     def _launch(args, runner, now, reserve):
@@ -608,8 +518,6 @@ def _launch_wrapper(inner):
             return inner(args, runner, now, reserve)
         return launch_floor(args, runner, now, reserve, repo, branch, inner)
     return _launch
-
-
 # ---------------------------------------------------------------- send, read, status, retire
 
 def _send_floor(args, runner, now, record):
@@ -641,21 +549,17 @@ def _send_floor(args, runner, now, record):
     sys.stderr.write("%s: delivered to %s (Floor seq %d)\n" % (H["PROG"], args.name, seq))
     return H["EXIT_OK"]
 
-
 def _name_artifact(err, name):
     return D["H"]["LaunchError"]("%s: %s: the record is unchanged" % (name, scrub(err)))
-
 
 def _observe(record):
     who = floor_who()
     return _call(transport().observe, who, record["work_id"])
 
-
 def _line(message):
     if not isinstance(message, dict):
         return scrub(message, 400)
     return scrub("%s: %s" % (str(message.get("role") or message.get("type") or "?")[:20], message.get("text") or ""), 400)
-
 
 def _read_floor(args, record):
     limit = max(1, min(int(args.limit), 200))
@@ -677,7 +581,6 @@ def _read_floor(args, record):
         print(scrub("log_tail: " + str(line), 400))
     return D["H"]["EXIT_OK"]
 
-
 def _status_floor(records):
     lines, rows = [], []
     for record in records:
@@ -696,7 +599,6 @@ def _status_floor(records):
             lines.append("      cloud %s: Floor session %s not read (%s)" % (record["worker"], record.get("session"), scrub(err, 100)))
         rows.append(row)
     return lines, rows
-
 
 def _retire_floor(args, runner, now, record):
     H = D["H"]
@@ -725,7 +627,6 @@ def _retire_floor(args, runner, now, record):
     print("%s is retired (Floor session %s cancelled)" % (args.name, record.get("session")))
     return H["EXIT_OK"]
 
-
 def rollback_to_pane(state, name, pane_id, cancel_fn=None):
     """Rollback of a cloud orchestrator to a local pane: cancel its Floor session, remove the record once retired, name the pane."""
     record = D["load_record"](state, name)
@@ -737,14 +638,10 @@ def rollback_to_pane(state, name, pane_id, cancel_fn=None):
             return {"worker": name, "pane": pane_id, "rolled_back": False}
         D["remove_record"](state, name)
     return {"worker": name, "pane": pane_id, "rolled_back": True}
-
-
 # ---------------------------------------------------------------- the in-cluster switchboard (Cloud Agents)
-
 SESSION_RE = re.compile(r"ses_[0-9a-f]{16}")
 CHARTER_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+")
 REPORT_STATES = ("done", "failed", "blocked", "question", "working")
-
 
 def verify_switchboard_auth(header_value, expected_secret):
     """The sender identity from the egress proxy's X-Switchboard-Auth header; anything else raises FloorError 401."""
@@ -767,7 +664,6 @@ def verify_switchboard_auth(header_value, expected_secret):
     if not hmac.compare_digest(secret.encode("utf-8"), str(expected_secret).encode("utf-8")):
         raise bad
     return {"agent": agent, "session": session, "charter": charter}
-
 
 def ensure_switchboard_auth_file(env=None, fetch_secret=None):
     """The relay credential file: the configured 0600 file when present, else fetched from Key Vault and written atomically (0600). Returns its path, or None."""
@@ -803,7 +699,6 @@ def ensure_switchboard_auth_file(env=None, fetch_secret=None):
     os.replace(tmp, path)
     return path
 
-
 def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, state=None, artifact_put=None):
     """One request to the in-cluster switchboard: returns (status, body). The sender is the proxy-injected header's agent, never a body field."""
     try:
@@ -814,6 +709,10 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
     for key in ("pane_outbox", "reports", "reminders", "audit"):
         state.setdefault(key, [])
     route = (method.upper(), path.split("?", 1)[0])
+    if route == ("GET", "/v1/mode"):
+        if "mode" not in state and state.get("state_dir"):
+            state["mode"] = cluster_switchboard_mode(state["state_dir"])
+        return 200, {"mode": state.get("mode") or "shadow"}
     if route == ("GET", "/v1/pane-outbox"):
         return 200, {"messages": [m for m in state["pane_outbox"] if m.get("to") == auth["agent"] or auth["agent"] in ("cos", "pane-relay")]}
     body = {}
@@ -843,11 +742,23 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         state.setdefault("decisions", []).append({"action": body.get("action") or "batch", "title": scrub(title, 200) if isinstance(title, str) else "",
                                                   "rows": body.get("rows") if isinstance(body.get("rows"), list) else [], "from": auth["agent"]})
         return 200, {"recorded": True, "decisions": state["decisions"]}
+    if route == ("POST", "/v1/mode"):
+        if body.get("mode") not in ("shadow", "active"):
+            return 400, {"error": "mode must be shadow or active"}
+        state["mode"] = body["mode"]
+        if state.get("state_dir"):
+            write_cluster_switchboard_mode(state["state_dir"], body["mode"])
+        return 200, {"mode": state["mode"]}
     if route == ("POST", "/v1/send"):
         to = body.get("to")
         if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text:
             return 400, {"error": "to and text are required"}
         message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo")}
+        if to == "pane-relay" and (body.get("canary") is True or text.startswith("canary:")):
+            if state.get("mode", "active") == "shadow":
+                return 200, {"queued": "shadow"}
+            state["pane_outbox"].append(dict(message, id=len(state["pane_outbox"]) + 1 + len(state.get("acked", []))))
+            return 200, {"queued": "pane"}
         target = (state.get("floor_sessions") or {}).get(to)
         if target:
             seq = int(target.get("seq", 1)) + 1
@@ -950,7 +861,6 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"acked": len(state["acked"])}
     return 404, {"error": "no such route"}
 
-
 def switchboard_relay_config(env=None):
     """url, auth_file and authority from the environment, else from the state file switchboard-relay.json (never raises)."""
     env = os.environ if env is None else env
@@ -977,10 +887,8 @@ def switchboard_relay_config(env=None):
                 got[key] = data[name].strip()
     return got
 
-
 def switchboard_authority(env=None):
     return switchboard_relay_config(env)["authority"]
-
 
 def call_switchboard_v1(path, payload, env=None):
     """POST `payload` to the in-cluster switchboard (CW_SWITCHBOARD_URL, header from the 0600 file CW_SWITCHBOARD_AUTH_FILE); None when no URL is set."""
@@ -998,14 +906,10 @@ def call_switchboard_v1(path, payload, env=None):
     data = json.dumps(payload, sort_keys=True).encode()
     headers = [("Accept", "application/json"), ("Content-Type", "application/json"), ("X-Switchboard-Auth", header)]
     return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
-
-
 PANE_RELAY_PORT = 18080   # the local end of the port-forward to the in-cluster switchboard
-
 
 def _warn(what, err):
     print("pane-relay: %s failed: %s" % (what, scrub(str(err))), file=sys.stderr)
-
 
 def _auth_header(config):
     auth_file = config["auth_file"]
@@ -1020,7 +924,6 @@ def _auth_header(config):
     except OSError:
         raise FloorError("CW_SWITCHBOARD_AUTH_FILE cannot be read") from None
 
-
 def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
     """Fetch the cluster's pane outbox, deliver what the Mac owns (cluster authority only), and ack."""
     config = switchboard_relay_config(env)
@@ -1032,10 +935,14 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
     if not messages:
         return {"delivered": 0, "acked": 0}
     authority = config.get("authority") or "shadow"
-    ack_ids, delivered = [], 0
+    ack_ids, delivered, canaries = [], 0, []
     for m in messages:
         mid = m.get("id")
         if mid is None:
+            continue
+        if m.get("to") == "pane-relay" or m.get("canary") is True or str(m.get("text") or "").startswith("canary:"):
+            canaries.append(m.get("text"))
+            ack_ids.append(mid)
             continue
         if authority != "cluster":
             if m.get("from") != "switchboard":
@@ -1069,8 +976,7 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
             ack_ids.append(mid)
     if ack_ids:
         call_switchboard_v1("/v1/pane-ack", {"ids": ack_ids}, env=env)
-    return {"delivered": delivered, "acked": len(ack_ids)}
-
+    return {"delivered": delivered, "acked": len(ack_ids), **({"canaries": canaries} if canaries else {})}
 
 def pane_relay_pass(engine, sb_mod, env=None):
     """One Mac pane-relay pass: discover, collect worker facts, push pane state, drain the outbox."""
@@ -1087,6 +993,116 @@ def pane_relay_pass(engine, sb_mod, env=None):
     except Exception as err:
         _warn("pane state push", err)
     return drain_pane_outbox(engine, sb_mod=sb_mod, discovery=discovery, env=env)
+
+def cluster_switchboard_mode(state_dir, env=None):
+    path = os.path.join(str(state_dir), "switchboard-mode.json")
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                mode = D["parse_bounded"](handle.read()).get("mode")
+            if mode in ("active", "shadow"):
+                return mode
+        except (OSError, ValueError, AttributeError):
+            pass
+    return (env or os.environ).get("SWITCHBOARD_MODE") or "shadow"
+
+
+def write_cluster_switchboard_mode(state_dir, mode):
+    if mode not in ("shadow", "active"):
+        raise FloorError("mode must be shadow or active")
+    path = os.path.join(str(state_dir), "switchboard-mode.json")
+    os.makedirs(str(state_dir), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(state_dir), prefix=".switchboard-mode.")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"mode": mode}))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return {"mode": mode}
+
+
+def notify_macos_alarm(title, text, runner=subprocess.run):
+    if sys.platform != "darwin" and runner is subprocess.run:
+        return None
+    script = 'display notification %s with title %s sound name "Sosumi"' % (json.dumps(str(text)[:240]), json.dumps(str(title)[:80]))
+    try:
+        return runner(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    except Exception as err:
+        _warn("macOS notification", err)
+
+
+def mac_daemon_paused(state_dir, runner=subprocess.run):
+    pid = None
+    for name in ("daemon.json", "run.lock"):
+        try:
+            with open(os.path.join(str(state_dir), name), encoding="utf-8") as handle:
+                pid = D["parse_bounded"](handle.read()).get("pid")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(pid, int) and pid > 0:
+            break
+        pid = None
+    if pid is None:
+        return True
+    done = runner(["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    return done.returncode != 0 or (done.stdout or "").strip().startswith("T")
+
+
+def check_single_authority(cluster_mode, mac_authority, mac_paused):
+    """None when exactly one side holds authority; else a description of the mismatch."""
+    if cluster_mode == "active" and mac_authority == "cluster" and mac_paused is True:
+        return None
+    if cluster_mode == "shadow" and mac_authority != "cluster" and mac_paused is False:
+        return None
+    if cluster_mode == "shadow" and mac_paused:
+        return "no active switchboard authority: cluster is shadow and Mac daemon is paused"
+    if cluster_mode == "active" and not mac_paused:
+        return "split-brain authority: cluster is active and Mac daemon is running"
+    return "authority mismatch: cluster=%s, mac_authority=%s, mac_paused=%s" % (cluster_mode, mac_authority, mac_paused)
+
+
+class PaneRelayMonitor:
+    """Alarm state of the Mac relay: tunnel reachability (2 min), single authority, and a 10-minute end-to-end canary."""
+    def __init__(self, notify=notify_macos_alarm, down_after=120, canary_every=600, canary_wait=60):
+        self.notify, self.down_after, self.canary_every, self.canary_wait = notify, down_after, canary_every, canary_wait
+        self.unreachable_since = None
+        self.reachability_alerted = self.authority_alerted = self.canary_alerted = False
+        self.canary_token = self.canary_sent_at = self.last_canary = None
+    def tick(self, now, reachable, cluster_mode=None, mac_authority=None, mac_paused=None, canaries=()):
+        """Returns {"restart": bool, "send_canary": token or None}."""
+        out = {"restart": False, "send_canary": None}
+        if not reachable:
+            self.unreachable_since = self.unreachable_since if self.unreachable_since is not None else now
+            if now - self.unreachable_since >= self.down_after and not self.reachability_alerted:
+                self.notify("fleet-switchboard relay down", "Cannot reach in-cluster switchboard for 2 minutes")
+                self.reachability_alerted = out["restart"] = True
+            return out
+        self.unreachable_since = None
+        if self.reachability_alerted:
+            self.notify("fleet-switchboard relay recovered", "In-cluster switchboard tunnel recovered")
+            self.reachability_alerted = False
+        if cluster_mode is not None:
+            problem = check_single_authority(cluster_mode, mac_authority, mac_paused)
+            if problem is None:
+                self.authority_alerted = False
+            elif not self.authority_alerted:
+                self.notify("fleet-switchboard authority mismatch", problem)
+                self.authority_alerted = True
+        if self.canary_token and self.canary_token in [str(c) for c in canaries]:
+            self.canary_token, self.canary_alerted = None, False
+        if self.canary_token and now - self.canary_sent_at >= self.canary_wait:
+            if not self.canary_alerted:
+                self.notify("fleet-switchboard canary failed", "End-to-end canary wake was not delivered and acked")
+            self.canary_alerted, self.canary_token = True, None
+        if mac_authority == "cluster" and self.canary_token is None and (self.last_canary is None or now - self.last_canary >= self.canary_every):
+            self.canary_token, self.canary_sent_at, self.last_canary = "canary:%d" % now, now, now
+            out["send_canary"] = self.canary_token
+        return out
+
+
+def fetch_cluster_mode(env=None):
+    config = switchboard_relay_config(env)
+    ans = _parse(_request("GET", config["url"].rstrip("/") + "/v1/mode", None, [("Accept", "application/json"), ("X-Switchboard-Auth", _auth_header(config))])[1])
+    return ans.get("mode") if isinstance(ans, dict) else None
 
 
 def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
@@ -1128,12 +1144,10 @@ def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
             pass
     return {"authority": "shadow", "resumed_pid": pid}
 
-
 def fleetkit_azure_dir(home_dir):
     """The fleet-kit Azure config directory under a home, or None when it does not exist."""
     path = os.path.join(str(home_dir), ".azure-fleetkit")
     return path if os.path.isdir(path) else None
-
 
 def render_pane_relay_plist(python_bin, kit_root, home_dir, state_dir, path_env):
     """The LaunchAgent plist that keeps the pane-relay loop running."""
@@ -1180,13 +1194,11 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
     call_switchboard_v1("/v1/cloud-sync", {"records": records, "reminders": reminders}, env=env)
     return {"synced": len(records)}
 
-
 def _healthy(url="http://127.0.0.1:%d/healthz" % PANE_RELAY_PORT):
     try:
         return urllib.request.urlopen(url, timeout=3).status == 200
     except Exception:
         return False
-
 
 def _start_port_forward(lib):
     namespace = os.environ.get("CW_CLOUD_NAMESPACE") or "cw"
@@ -1201,7 +1213,6 @@ def _start_port_forward(lib):
             return subprocess.Popen(base + ["port-forward", "pod/" + item["metadata"]["name"], "%d:8080" % PANE_RELAY_PORT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     raise FloorError("no running fleet-switchboard pod")
 
-
 def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
     H = D["H"]
     azure_dir = fleetkit_azure_dir(os.path.expanduser("~"))
@@ -1212,6 +1223,7 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
     engine, state_dir, _ = H["build_engine"](subprocess.run, time.time, "pane-relay")
     sb_mod = types.SimpleNamespace(**H)
     child, started, passes = None, 0.0, 0
+    monitor, canaries = PaneRelayMonitor(), []
     try:
         while max_passes is None or passes < max_passes:
             passes += 1
@@ -1229,15 +1241,25 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
             except Exception as err:
                 _warn("cloud record sync", err)
             try:
-                pane_relay_pass(engine, sb_mod, env=env)
+                canaries = (pane_relay_pass(engine, sb_mod, env=env) or {}).get("canaries") or []
             except Exception as err:
                 _warn("pane relay pass", err)
+            if max_passes is None:
+                try:
+                    reachable = _healthy()
+                    mode = fetch_cluster_mode(env) if reachable else None
+                    act = monitor.tick(time.time(), reachable, mode, switchboard_authority(env), mac_daemon_paused(state_dir), canaries)
+                    if act["send_canary"]:
+                        call_switchboard_v1("/v1/send", {"to": "pane-relay", "text": act["send_canary"], "canary": True}, env=env)
+                    if act["restart"]:
+                        started = 0.0
+                except Exception as err:
+                    _warn("relay monitor", err)
             if max_passes is None or passes < max_passes:
                 time.sleep(poll_seconds)
     finally:
         if child is not None and child.poll() is None:
             child.terminate()
-
 
 def relay_cli_if_configured(command, payload, env=None):
     """Forward a Mac CLI action to the in-cluster switchboard; None when CW_SWITCHBOARD_URL is not set."""
@@ -1246,7 +1268,6 @@ def relay_cli_if_configured(command, payload, env=None):
     if command in ("send", "report", "remind", "retire", "orders") and isinstance(payload, dict):
         payload = _resolve_local_caller_and_repo(payload, env=env)
     return call_switchboard_v1("/v1/" + command, payload, env=env)
-
 
 def _resolve_local_caller_and_repo(payload, env=None):
     """Best effort: name the calling lane (`_caller_agent`) and fill `repo` + numeric `issue` from its default repo."""
@@ -1269,12 +1290,10 @@ def _resolve_local_caller_and_repo(payload, env=None):
         _warn("resolving the caller and repo (sent without them)", err)
     return payload
 
-
 def push_pane_state(observations, env=None, now=None):
     """Push the Mac's pane observations; returns the commands the cluster answers with."""
     ans = call_switchboard_v1("/v1/pane-state", {"agents": observations, "at": now}, env=env)
     return (ans.get("commands") or []) if isinstance(ans, dict) else []
-
 
 def _stayed_name(name):
     """D[name], or an unmatchable class when the name is not there (`D` has no `get` and no membership test)."""
@@ -1283,14 +1302,11 @@ def _stayed_name(name):
     except KeyError:
         return ()
 
-
 def _one_line_text(err):
     return " ".join(str(err).split())[:160]
 
-
 def floor_watch_sync(state_dir, records, engine=None):
-    """Read the Floor controller's sessions (the source of truth for backend=floor): audit `cloud.stopped` once for a finished session and add a
-    virtual record for a session no local file holds. Never raises: an offline pass is not broken by it."""
+    """Read the Floor controller's sessions (the source of truth for backend=floor): audit `cloud.stopped` once for a finished session and add a virtual record for a session no local file holds. Never raises: an offline pass is not broken by it."""
     try:
         held = transport()
         sessions = held._state()["sessions"] if hasattr(held, "_state") else getattr(held, "works", None)
@@ -1357,13 +1373,10 @@ def floor_watch_sync(state_dir, records, engine=None):
             continue
         records.append({"worker": name, "backend": "floor", "work_id": work_id, "session": found.get("session", work_id), "repo": repo, "floor_state": found.get("state"), "virtual": True})
     return records
-
-
 # ---------------------------------------------------------------- the cutover, the drain and the pod launcher's retirement
 
 def drain_check(state, expected_workers):
-    """{"lost": N, "twice": M} over the records of `state`: lost is an expected worker with no usable record; twice is a work that two records
-    claim, or a Floor record that still carries what only a pod holds (its password file, its pod uid): two authorities for one worker."""
+    """{"lost": N, "twice": M} over the records of `state`: lost is an expected worker with no usable record; twice is a work that two records claim, or a Floor record that still carries what only a pod holds (its password file, its pod uid): two authorities for one worker."""
     records = D["list_records"](state)
     by_name = {r.get("worker"): r for r in records if "problem" not in r}
     lost = sum(1 for name in set(expected_workers) if name not in by_name)
@@ -1376,10 +1389,8 @@ def drain_check(state, expected_workers):
     twice += sum(len(names) - 1 for names in claims.values() if len(names) > 1)
     return {"lost": lost, "twice": twice}
 
-
 def retire_pod_launcher(state, env=None):
-    """Whether the pod launcher may be retired: only when the backend is `floor`, the rollback window is `closed`, no pod worker is live and no record
-    is unreadable. It decides and changes nothing: a refusal says why (exit 2 through the command that asks)."""
+    """Whether the pod launcher may be retired: only when the backend is `floor`, the rollback window is `closed`, no pod worker is live and no record is unreadable. It decides and changes nothing: a refusal says why (exit 2 through the command that asks)."""
     env = env_of() if env is None else env
     Refusal = D["Refusal"]
     if (env.get("CW_REMOTE_BACKEND") or "").strip().lower() != "floor":
@@ -1397,8 +1408,6 @@ def retire_pod_launcher(state, env=None):
     if drained["lost"] or drained["twice"]:
         raise Refusal("the pod launcher stays: the drain found %d lost and %d run twice; nothing was changed" % (drained["lost"], drained["twice"]))
     return dict(drained, ready=True)
-
-
 # ---------------------------------------------------------------- the binding
 
 def bind(namespace):
@@ -1407,22 +1416,18 @@ def bind(namespace):
     inner_launch, inner_send, inner_read = namespace["_launch"], namespace["cmd_send"], namespace["cmd_read"]
     inner_status, inner_retire = namespace["status_lines"], namespace["cmd_retire"]
     real_list = namespace["list_records"]
-
     _launch = _launch_wrapper(inner_launch)
-
     @refusals
     def cmd_send(args, runner, now, record):
         if not is_floor(record):
             return inner_send(args, runner, now, record)
         return _send_floor(args, runner, now, record)
-
     @refusals
     def cmd_read(args, runner, now):
         record = D["route"](args.name) if D["valid_name"](args.name) else None
         if not is_floor(record):
             return inner_read(args, runner, now)
         return _read_floor(args, record)
-
     def status_lines(runner, state, *args, **kwargs):
         records = D["list_records"](state)
         floors = [r for r in records if is_floor(r)]
@@ -1440,19 +1445,16 @@ def bind(namespace):
             lines = ["      cloud: %d Floor session(s), no pod worker" % len(floors)]
         more, extra = _status_floor(floors)
         return lines + more, rows + extra
-
     @refusals
     def cmd_retire(args, runner, now, record):
         if not is_floor(record):
             return inner_retire(args, runner, now, record)
         return _retire_floor(args, runner, now, record)
-
     for wrapper, inner in ((_launch, inner_launch), (cmd_send, inner_send), (cmd_read, inner_read), (status_lines, inner_status), (cmd_retire, inner_retire)):
         wrapper.__wrapped__ = inner
         wrapper.__name__, wrapper.__doc__ = inner.__name__, inner.__doc__
     namespace["_launch"], namespace["cmd_send"], namespace["cmd_read"] = _launch, cmd_send, cmd_read
     namespace["status_lines"], namespace["cmd_retire"] = status_lines, cmd_retire
-
 
 def apply_pane_state_to_discovery(pane_state, discovery):
     for name, data in (pane_state or {}).items() if isinstance(pane_state, dict) else ():
@@ -1474,14 +1476,11 @@ def apply_pane_state_to_discovery(pane_state, discovery):
             obs.form_waiting = bool(data.get("form_waiting"))
     return discovery
 
-
 def queue_pane_resume_command(state, agent, reason):
     cmd = {"action": "resume", "agent": agent, "reason": scrub(reason or "", 200), "from": "switchboard"}
     state.setdefault("pane_commands", []).append(cmd)
     state.setdefault("pane_outbox", []).append(cmd)
     return cmd
-
-
 if __name__ == "__main__":
     import sys as _sys
     _args = _sys.argv[1:]
