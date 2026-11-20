@@ -947,7 +947,10 @@ class TestCloudAgents(FloorCase):
             self.assertEqual(cfg_out["opencode"], "/bin/true")
             self.assertNotIn("external_decisions", cfg_out)
             self.assertEqual(cfg_out["k"], 1)
-            self.assertEqual(sm.compute_config_hash(cfgp), sm.compute_config_hash(cfgp))
+            import hashlib as _hl
+            self.assertEqual(sm.compute_config_hash(cfgp), _hl.sha256(sm.cluster_config_bytes(cfgp)).hexdigest()[:40])
+            cfgp.write_text(json.dumps({"k": 1, "opencode": "/x", "herdr": "/y"}))
+            self.assertEqual(sm.compute_config_hash(cfgp), _hl.sha256(sm.cluster_config_bytes(cfgp)).hexdigest()[:40])
             self.assertRegex(sm.compute_config_hash(cfgp), r"^[0-9a-f]{40}$")
         h = "a" * 40
         self.assertEqual(sm.check_shas(h, h, ""), "")
