@@ -50,6 +50,10 @@
             "image": "registry.invalid/cw-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "env": [
               {
+                "name": "SWITCHBOARD_PINNED_SHA",
+                "value": "UNPINNED"
+              },
+              {
                 "name": "SWITCHBOARD_MODE",
                 "value": "shadow"
               },

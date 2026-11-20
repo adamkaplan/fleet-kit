@@ -661,7 +661,17 @@ def run_pass_loop(sb_mod, cf_mod):
         time.sleep(sleep_for)
 
 
+def verify_pinned_code_sha(app_root=APP_ROOT, env=None):
+    pinned = ((env if env is not None else os.environ).get("SWITCHBOARD_PINNED_SHA") or "").strip()
+    code_sha = Path(app_root) / "CODE_SHA"
+    actual = code_sha.read_text(encoding="utf-8").strip() if code_sha.exists() else ""
+    if pinned and pinned != "UNPINNED" and actual != pinned:
+        print("refused: switchboard code SHA mismatch (expected %s, got %s)" % (pinned, actual or "missing"), file=sys.stderr)
+        raise SystemExit(2)
+
+
 def main():
+    verify_pinned_code_sha()
     if not mint_tokens():
         log_line("startup_token_mint_failed", hint="check the ServiceAccount token, token-mint service and config.json accounts")
     sb_mod = load_switchboard_module()

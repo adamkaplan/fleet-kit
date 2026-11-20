@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Sync a clean git archive of HEAD into the running fleet-switchboard pod, verify CODE_SHA, restart it."""
+import argparse
+import subprocess
+import sys
+
+NAMESPACE = "cw"
+APP = "/run/home/app"
+PATHS = ["bin", "tools", "shims", "cloud/k8s", "docs"]
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, **kw)
+
+
+def head_sha():
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+
+
+def kubectl_out(args):
+    return subprocess.check_output(["kubectl", "-n", NAMESPACE] + args, text=True).strip()
+
+
+def find_pod():
+    out = kubectl_out(["get", "pods", "-o", "name"])
+    pods = [l.split("/", 1)[-1] for l in out.splitlines() if "fleet-switchboard" in l]
+    if not pods:
+        raise SystemExit("no fleet-switchboard pod found in namespace %s" % NAMESPACE)
+    return pods[0]
+
+
+def pod_exec(pod, script, stdin=None):
+    return subprocess.run(["kubectl", "-n", NAMESPACE, "exec", "-i", pod, "--", "sh", "-c", script],
+                          input=stdin, check=True, stdout=subprocess.PIPE).stdout
+
+
+def check_shas(head, pod_sha, pinned=""):
+    """Return an error string, or '' when consistent."""
+    if len(head) != 40:
+        return "HEAD is not a 40-char SHA: %r" % head
+    if pod_sha != head:
+        return "pod CODE_SHA %r != HEAD %s" % (pod_sha, head)
+    if pinned and pinned != "UNPINNED" and pinned != head:
+        return "SWITCHBOARD_PINNED_SHA %s != HEAD %s" % (pinned, head)
+    return ""
+
+
+def pod_pinned(pod):
+    try:
+        return kubectl_out(["exec", pod, "--", "sh", "-c", 'printf %s "$SWITCHBOARD_PINNED_SHA"'])
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--pinned-sha", default="")
+    ap.add_argument("--verify-only", action="store_true", help="check pod CODE_SHA only; no sync or restart")
+    a = ap.parse_args(argv)
+    head = head_sha()
+    pod = find_pod()
+    if not a.verify_only:
+        archive = subprocess.check_output(["git", "archive", "--format=tar", "HEAD"] + PATHS)
+        pod_exec(pod, "mkdir -p %s && tar -xf - -C %s" % (APP, APP), archive)
+        pod_exec(pod, "printf %%s %s > %s/CODE_SHA && cp %s/tools/in-cluster-switchboard-server "
+                      "/run/home/in_cluster_switchboard_server.py" % (head, APP, APP))
+    pod_sha = pod_exec(pod, "cat %s/CODE_SHA" % APP).decode().strip()
+    err = check_shas(head, pod_sha, a.pinned_sha or pod_pinned(pod))
+    if err:
+        print("error: " + err, file=sys.stderr)
+        return 1
+    if not a.verify_only:
+        run(["kubectl", "-n", NAMESPACE, "delete", "pod", pod, "--wait=false"])
+    print("ok %s" % head)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

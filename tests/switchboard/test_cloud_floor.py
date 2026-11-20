@@ -895,6 +895,21 @@ class TestCloudAgents(FloorCase):
         server = REPO / "tools/in-cluster-switchboard-server"
         self.assertTrue(server.is_file())
         ast.parse(server.read_text())
+        import importlib.machinery, importlib.util, tempfile
+        loader = importlib.machinery.SourceFileLoader("ics_pin_test", str(server))
+        spec = importlib.util.spec_from_loader("ics_pin_test", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "CODE_SHA").write_text("a" * 40 + "\n")
+            mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "a" * 40})
+            mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "UNPINNED"})
+            with self.assertRaises(SystemExit) as cm:
+                mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "b" * 40})
+            self.assertEqual(cm.exception.code, 2)
+        sync = REPO / "tools/sync-in-cluster-switchboard"
+        self.assertTrue(sync.is_file())
+        ast.parse(sync.read_text())
 
     def test_pane_state_is_applied_to_discovery(self):
         obs = types.SimpleNamespace(status="idle", errored=False, turn_error="", turn_error_id=None, idle_at=None, permission_waiting=False, form_waiting=False)
