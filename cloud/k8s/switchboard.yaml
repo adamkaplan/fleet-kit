@@ -55,7 +55,7 @@
               },
               {
                 "name": "SWITCHBOARD_MODE",
-                "value": "shadow"
+                "value": "active"
               },
               {
                 "name": "CW_CLOUD_NAMESPACE",
