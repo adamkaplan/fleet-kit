@@ -1311,8 +1311,7 @@ class TestTheReapersCommandPathIsWalked(InstallCase):
     """The service runs one file: the launcher's own walk (one copy, in cloud_worker.py) judges it and every parent above it."""
 
     def kit(self):
-        import stat
-        import tempfile
+        # A container emptyDir /tmp is group/world-writable without the sticky bit; the walk flags it, so use /var/tmp there.
         base = self.home
         parent_mode = os.lstat(str(base.parent)).st_mode
         if (parent_mode & 0o022) and not (parent_mode & stat.S_ISVTX) and os.path.isdir("/var/tmp"):
