@@ -1398,6 +1398,53 @@ class TestFloorAuthority(FloorCase):
             post.assert_called_once_with("/v1/pane-ack", {"ids": acked}, env=env)
             self.assertEqual(engine.v2.synthetic.call_count, delivered)
 
+    def test_relayed_remind_prints_the_stored_receipt(self):
+        state = {"on_v1_action": lambda route, auth, body, st: st.update(last_remind={"id": "rem_abc12345", "at": 1700000900.0, "at_iso": "2023-11-14T22:28:20Z"})}
+        status, got = self.call("/v1/remind", {"to": "widget-api", "when": "15m", "text": "check"}, state=state)
+        self.assertEqual(status, 200)
+        self.assertEqual((got["id"], got["at"], got["at_iso"]), ("rem_abc12345", 1700000900.0, "2023-11-14T22:28:20Z"))
+        self.assertNotIn("last_remind", state)
+        args = argparse.Namespace(name="widget-api", when="15m", text=["check"], text_file=None, issue=None, key=None, ttl=None, every=None,
+                                  until_closed=None, until_merged=None, keep_if_closed=False, list_mine=False, cancel=None, cancel_key=None, sender=None)
+        def done(command, payload):
+            payload["_relay_ans"] = got
+            return True
+        with mock.patch.object(sb, "relay_cli_done", done), contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()) as out:
+            code = sb.cmd_remind(args, None, lambda: 1700000000.0)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue().strip(), "rem_abc12345")
+        self.assertIn(sb._print_when(1700000900.0, 1700000000.0), err.getvalue())
+        self.assertIn("relayed to cluster", err.getvalue())
+
+    def test_drain_pane_outbox_audits_synthetic_and_lateness_sees_the_pair(self):
+        import tempfile
+        from datetime import datetime, timezone
+        auth = self.home / "auth"
+        auth.write_text("agent=cos;session=ses_example;secret=x")
+        auth.chmod(0o600)
+        env = {"CW_SWITCHBOARD_URL": "https://sw.example", "CW_SWITCHBOARD_AUTH_FILE": str(auth), "CW_SWITCHBOARD_AUTHORITY": "cluster"}
+        msgs = [{"id": 1, "from": "switchboard", "to": "w", "session": "ses_a", "text": "hi", "keys": ["reminder:rem_abc12345"]}]
+        engine = mock.Mock()
+        with mock.patch.object(self.floor, "_request", return_value=(200, json.dumps({"messages": msgs}).encode())), \
+                mock.patch.object(self.floor, "call_switchboard_v1"):
+            self.floor.drain_pane_outbox(engine, env=env)
+        calls = engine.audit.append.call_args_list
+        self.assertEqual(len(calls), 1)
+        who, event, subject, detail = calls[0].args
+        self.assertEqual((who, event), ("daemon", "v2.synthetic"))
+        self.assertEqual(set(detail), {"keys", "delivery", "resume"})
+        self.assertIn("reminder:rem_abc12345", detail["keys"])
+        def ts(t):
+            return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        base = 1700000000
+        lines = [{"ts": ts(base), "actor": "cli", "event": "reminder.add", "subject": "w", "detail": {"id": "rem_abc12345", "at": ts(base)}},
+                 {"ts": ts(base + 3600), "actor": who, "event": event, "subject": subject, "detail": detail}]
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "audit.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+            now = base + 3700
+            self.assertEqual(sb.late_reminder_counts(d, {}, now), {"w": 1})
+            self.assertEqual(sb.late_reminder_worst(d, now), {"w": 3600})
+
     def test_rollback_switchboard_authority_sets_shadow_and_resumes_pid(self):
         (self.home / "switchboard-relay.json").write_text('{"url": "https://sw.example", "authority": "cluster"}')
         pid = os.getpid()

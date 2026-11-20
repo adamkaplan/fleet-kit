@@ -577,6 +577,7 @@ def handle_on_v1_action(route_path, auth, body, state):
                         if body.get(k):
                             cond[k] = body[k]
                     item = sb_mod.add_reminder(STATE_DIR, to, at, moment, text, body.get("issue"), sender, body.get("repo"), condition=cond or None, key=body.get("key"), ttl=ttl, every=every)
+                    state["last_remind"] = {"id": item["id"], "at": item["at"], "at_iso": sb_mod.iso(item["at"])}
                     if getattr(eng, "audit", None) is not None:
                         eng.audit.append("cli", "reminder.add", to, {
                             "id": item["id"], "at": sb_mod.iso(item["at"]), "from": sender,

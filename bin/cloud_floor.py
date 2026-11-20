@@ -785,7 +785,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         entry = {"to": to, "from": auth["agent"], "when": when, "text": text}
         entry.update({k: body.get(k) for k in keys})
         state["reminders"].append(entry)
-        return 200, {"recorded": True}
+        return 200, {"recorded": True, **(state.pop("last_remind", None) or {})}
     if route == ("POST", "/v1/artifact"):
         name = body.get("name")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", name) or artifact_put is None:
@@ -958,6 +958,12 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
                 if "409" not in str(err):
                     _warn("delivery of outbox message %s" % mid, err)
                     continue
+            else:
+                try:
+                    if getattr(engine, "audit", None) is not None:
+                        engine.audit.append("daemon", "v2.synthetic", recipient, {"keys": list(keys), "delivery": delivery, "resume": bool(resume)})
+                except Exception:
+                    pass
             ack_ids.append(mid)
             delivered += 1
         elif isinstance(m.get("command"), dict):
@@ -1271,9 +1277,25 @@ def relay_cli_if_configured(command, payload, env=None):
     """Forward a Mac CLI action to the in-cluster switchboard; None when CW_SWITCHBOARD_URL is not set."""
     if not switchboard_relay_config(env)["url"]:
         return None
+    orig_payload = payload
     if command in ("send", "report", "remind", "retire", "orders") and isinstance(payload, dict):
         payload = _resolve_local_caller_and_repo(payload, env=env)
-    return call_switchboard_v1("/v1/" + command, payload, env=env)
+    ans = call_switchboard_v1("/v1/" + command, payload, env=env)
+    if command == "remind" and isinstance(ans, dict):
+        if isinstance(orig_payload, dict):
+            orig_payload["_relay_ans"] = ans
+        if payload.get("action") in (None, "add") and ans.get("id") and ans.get("at") is not None:
+            try:
+                H = D["H"]
+                if "build_engine" in H:
+                    engine = H["build_engine"](subprocess.run, time.time, "cli")[0]
+                    engine.audit.append("cli", "reminder.add", payload.get("to") or payload.get("name"), {
+                        "id": ans["id"], "at": ans.get("at_iso") or H["iso"](float(ans["at"])),
+                        "from": payload.get("_caller_agent"), "issue": payload.get("issue"), "repo": payload.get("repo"),
+                        **({"key": str(payload["key"])[:60]} if payload.get("key") else {})})
+            except Exception:
+                pass
+    return ans
 
 def _resolve_local_caller_and_repo(payload, env=None):
     """Best effort: name the calling lane (`_caller_agent`) and fill `repo` + numeric `issue` from its default repo."""
