@@ -12,7 +12,7 @@ import sys
 
 NAMESPACE = "cw"
 APP = "/run/home/app"
-PATHS = ["bin", "tools", "shims", "cloud/k8s", "docs"]
+PATHS = ["agents", "bin", "cloud/k8s", "docs", "plugins", "shims", "skills", "templates", "tools"]
 
 
 def run(cmd, **kw):
@@ -209,10 +209,13 @@ def main(argv=None):
         if mode == "active" and not a.cutover:
             print("error: manifest mode is active; pass --cutover to sync it", file=sys.stderr)
             return 1
-        pod_exec(pod, "mkdir -p %s && cd %s && rm -rf bin tools shims docs && tar -xf - -C %s" % (APP, APP, APP), archive)
+        stage = APP + ".stage"
+        old = APP + ".old"
+        pod_exec(pod, "rm -rf %s %s && mkdir -p %s && tar -xf - -C %s" % (stage, old, stage, stage), archive)
         pod_exec(pod, "printf %%s %s > %s/CODE_SHA && mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"%s\"}' > %s && "
-                      "cp %s/tools/in-cluster-switchboard-server /run/home/in_cluster_switchboard_server.py"
-                 % (tree, APP, MODE_FILE, mode, MODE_FILE, APP))
+                      "cp %s/tools/in-cluster-switchboard-server /run/home/in_cluster_switchboard_server.py && "
+                      "if [ -d %s ]; then mv %s %s; fi && mv %s %s && rm -rf %s"
+                 % (tree, stage, MODE_FILE, mode, MODE_FILE, stage, APP, APP, old, stage, APP, old))
     cfg_bytes = cluster_config_bytes()
     if not a.verify_only and cfg_bytes:
         pod_exec(pod, "mkdir -p /run/home/.config/fleet-switchboard && cat > /run/home/.config/fleet-switchboard/config.json", cfg_bytes)

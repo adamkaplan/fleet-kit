@@ -937,6 +937,11 @@ class TestCloudAgents(FloorCase):
         sl = importlib.machinery.SourceFileLoader("sync_pin_test", str(sync))
         sm = importlib.util.module_from_spec(importlib.util.spec_from_loader("sync_pin_test", sl))
         sl.exec_module(sm)
+        for path in ("docs", "agents", "plugins", "skills", "templates"):
+            self.assertIn(path, sm.PATHS)
+        sync_text = sync.read_text()
+        self.assertIn('APP + ".stage"', sync_text)
+        self.assertNotIn("rm -rf bin tools shims docs", sync_text)
         with tempfile.TemporaryDirectory() as cfgd:
             cfgp = Path(cfgd) / "config.json"
             self.assertEqual(sm.cluster_config_bytes(cfgp), b"")
