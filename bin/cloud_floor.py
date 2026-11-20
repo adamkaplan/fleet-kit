@@ -962,8 +962,8 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
                 try:
                     if getattr(engine, "audit", None) is not None:
                         engine.audit.append("daemon", "v2.synthetic", recipient, {"keys": list(keys), "delivery": delivery, "resume": bool(resume)})
-                except Exception:
-                    pass
+                except Exception as err:
+                    _warn("audit of outbox message %s" % mid, err)
             ack_ids.append(mid)
             delivered += 1
         elif isinstance(m.get("command"), dict):
@@ -1293,8 +1293,8 @@ def relay_cli_if_configured(command, payload, env=None):
                         "id": ans["id"], "at": ans.get("at_iso") or H["iso"](float(ans["at"])),
                         "from": payload.get("_caller_agent"), "issue": payload.get("issue"), "repo": payload.get("repo"),
                         **({"key": str(payload["key"])[:60]} if payload.get("key") else {})})
-            except Exception:
-                pass
+            except Exception as err:
+                _warn("local audit of reminder %s" % ans.get("id"), err)
     return ans
 
 def _resolve_local_caller_and_repo(payload, env=None):

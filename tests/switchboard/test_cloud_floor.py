@@ -1445,6 +1445,25 @@ class TestFloorAuthority(FloorCase):
             self.assertEqual(sb.late_reminder_counts(d, {}, now), {"w": 1})
             self.assertEqual(sb.late_reminder_worst(d, now), {"w": 3600})
 
+    def test_relay_remind_audits_locally_and_warns_when_the_audit_fails(self):
+        ans = {"recorded": True, "id": "rem_abc12345", "at": 1700000900.0, "at_iso": "2023-11-14T22:28:20Z"}
+        engine = mock.Mock()
+        H = {"build_engine": lambda *a: (engine, None, {}), "iso": lambda t: "x"}
+        payload = {"to": "widget-api", "when": "15m", "text": "t", "action": "add"}
+        with mock.patch.object(self.floor, "switchboard_relay_config", return_value={"url": "https://sw.example"}), \
+                mock.patch.object(self.floor, "call_switchboard_v1", return_value=ans), \
+                mock.patch.object(self.floor, "_resolve_local_caller_and_repo", side_effect=lambda p, env=None: p), \
+                mock.patch.object(self.floor, "D", {"H": H}):
+            self.floor.relay_cli_if_configured("remind", payload)
+            self.assertEqual(payload["_relay_ans"], ans)
+            args = engine.audit.append.call_args.args
+            self.assertEqual(args[:3], ("cli", "reminder.add", "widget-api"))
+            self.assertEqual(args[3]["id"], "rem_abc12345")
+            engine.audit.append.side_effect = RuntimeError("disk full")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.floor.relay_cli_if_configured("remind", dict(payload))
+        self.assertIn("disk full", err.getvalue())
+
     def test_rollback_switchboard_authority_sets_shadow_and_resumes_pid(self):
         (self.home / "switchboard-relay.json").write_text('{"url": "https://sw.example", "authority": "cluster"}')
         pid = os.getpid()
