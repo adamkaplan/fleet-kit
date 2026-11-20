@@ -23500,7 +23500,6 @@ class TestTriage(Base):
         self.add(73, labels=["kind", PARKED], body="Parked until: 2028-01-10", **quiet)          # 360 days ahead: parked
         self.go()
         self.assertEqual(self.only("T3"), ["acme/api#62", "acme/api#63", "acme/api#64", "acme/api#65", "acme/api#66", "acme/api#67", "acme/api#68", "acme/api#70", "acme/api#71"]); state = sb.triage_state(self.engine); self.assertEqual(state.reasons.get(("T3", "acme/api#67")), "two Parked until lines: keep one"); self.assertFalse({("T3", "acme/api#%d" % n) for n in (63, 64, 65)} & set(state.reasons)); self.assertIn("acme/api#67 T3 (two Parked until lines: keep one)", sb.triage_digest_text(state, 1, [("T3", "acme/api#67")], ["T3"], 0, []))
-        self.assertIn("acme/api#67 T3 (two Parked until lines: keep one)", sb.triage_digest_text(state, 1, [("T3", "acme/api#67")], ["T3"], 0, []))
 
     def test_parked_needs_its_own_label_and_is_read_to_the_end_of_the_day(self):
         self.assertIsNone(sb.parked_until("Parked until: 2027-01-20", ["osuser:merge-captain"]))
