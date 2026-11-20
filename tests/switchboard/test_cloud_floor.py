@@ -1029,8 +1029,8 @@ class TestFloorAuthority(FloorCase):
             self.assertEqual(self.call("/v1/send", {"to": "pane-relay", "text": "canary:t1", "canary": True}, agent="pane-relay", state=state2)[1], {"queued": "pane"})
             self.assertEqual(len(state2["pane_outbox"]), 1)
             state2["mode"] = "shadow"
-            self.assertEqual(self.call("/v1/send", {"to": "pane-relay", "text": "canary:t2", "canary": True}, agent="pane-relay", state=state2)[1], {"queued": "shadow"})
-            self.assertEqual(len(state2["pane_outbox"]), 1)
+            self.assertEqual(self.call("/v1/send", {"to": "pane-relay", "text": "canary:t2", "canary": True}, agent="pane-relay", state=state2)[1], {"queued": "pane"})
+            self.assertEqual(len(state2["pane_outbox"]), 2)  # shadow queues the canary too, so it can be acked
             acked, synthetic = [], mock.Mock()
             engine = types.SimpleNamespace(v2=types.SimpleNamespace(synthetic=synthetic))
             msgs = list(state2["pane_outbox"])
@@ -1040,8 +1040,8 @@ class TestFloorAuthority(FloorCase):
                     mock.patch.object(self.floor, "_auth_header", return_value="h"), mock.patch.object(self.floor, "_request", fake_request), \
                     mock.patch.object(self.floor, "call_switchboard_v1", lambda path, payload, env=None: acked.append(payload["ids"])):
                 result = self.floor.drain_pane_outbox(engine)
-            self.assertEqual(result["canaries"], ["canary:t1"])
-            self.assertEqual(acked, [[msgs[0]["id"]]])
+            self.assertEqual(result["canaries"], ["canary:t1", "canary:t2"])
+            self.assertEqual(acked, [[m["id"] for m in msgs]])
             synthetic.assert_not_called()
 
     def test_single_authority_and_tunnel_drop_fire_macos_notifications(self):

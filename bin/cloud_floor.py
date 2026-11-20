@@ -755,8 +755,6 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
             return 400, {"error": "to and text are required"}
         message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo")}
         if is_canary(dict(message, canary=body.get("canary"))):
-            if state.get("mode", "active") == "shadow":
-                return 200, {"queued": "shadow"}
             state["pane_outbox"].append(dict(message, id=len(state["pane_outbox"]) + 1 + len(state.get("acked", []))))
             return 200, {"queued": "pane"}
         target = (state.get("floor_sessions") or {}).get(to)

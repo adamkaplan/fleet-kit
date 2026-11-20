@@ -519,8 +519,9 @@ def handle_on_v1_action(route_path, auth, body, state):
             to = body.get("to")
             text = body.get("text") or ""
             issue = body.get("issue")
-            if body.get("canary") or (to == "pane-relay" and str(text).startswith("canary:")):
-                return  # canary already queued in pane_outbox; pane-relay is not an agent
+            if cf_mod is not None and cf_mod.is_canary(dict(body, to=to, text=text)):
+                log_line("v1_send_canary_skipped", sender=sender, to=to)
+                return  # handle_switchboard_v1 queued it in pane_outbox (any mode); pane-relay is not an agent
             if to and text:
                 outcome = eng.send(sender, to, text, issue=issue, repo=body.get("repo"))
                 if outcome.get("held") or outcome.get("action") == "hold":
