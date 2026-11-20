@@ -903,6 +903,7 @@ def call_switchboard_v1(path, payload, env=None, sleep_fn=time.sleep):
         except FloorError as err:
             if attempt == 2 or (err.status is not None and err.status < 500):
                 raise
+            _warn("switchboard relay attempt %d of 3" % (attempt + 1), err)
             sleep_fn(1.5 * (attempt + 1))
 PANE_RELAY_PORT = 18080   # the local end of the port-forward to the in-cluster switchboard
 
