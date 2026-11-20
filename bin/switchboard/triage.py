@@ -405,6 +405,10 @@ def triage_norm(issue):
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
             "standing": triage_body_standing(body, created),
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
+            "parked_two_lines": bool(isinstance(body, str) and any(
+                isinstance(l, str) and l.endswith(":parked") for l in
+                {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []})
+                and len(PARKED_UNTIL_RE.findall(SWEEP_QUOTED_RE.sub(" ", body))) > 1),
             "owner_body": triage_names_owner(body), "owner_name": triage_owner_name(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
             "pending_text": load_triage_plan_open().pending_text(body),   # #410: its own text says work is left
@@ -525,6 +529,10 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
                 and not item["open_sub"] and not any(c["next"] for c in comments) and not triage_standing_silent(item, comments, now, trusted=ours_logins) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
             found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
+            if item.get("parked_two_lines"):
+                found["T3"]["reason"] = "two Parked until lines: keep one"
+            if item.get("parked_two_lines"):
+                found["T3"]["reason"] = "two Parked until lines: keep one"
         if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
             found["T8"] = {"quiet_days": round(age_updated, 2)}
         if ask and "T3" not in found and not triage_awaits_live(item) and age_updated >= sla["t9_days"]:
