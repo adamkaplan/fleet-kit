@@ -73,7 +73,11 @@ def check_shas(head, pod_sha, pinned=""):
 
 
 def pod_pinned(pod):
-    return kubectl_out(["exec", pod, "--", "sh", "-c", 'printf %s "$SWITCHBOARD_PINNED_SHA"'])
+    return kubectl_out(["exec", pod, "--", "python3", "-c",
+                                'import os, pathlib, re; v = os.environ.get("SWITCHBOARD_PINNED_SHA", "").strip(); '
+                                'p = pathlib.Path("/run/home/app/cloud/k8s/switchboard.yaml"); '
+                                'm = re.search(r"\"SWITCHBOARD_PINNED_SHA\",\\s*\"value\":\\s*\"([^\"]*)\"", p.read_text()) if p.exists() else None; '
+                                'print(v or (m.group(1) if m else ""), end="")'])
 
 
 def main(argv=None):
@@ -86,15 +90,15 @@ def main(argv=None):
     if not a.verify_only:
         archive = subprocess.check_output(["git", "archive", "--format=tar", "HEAD"] + PATHS)
         pod_exec(pod, "mkdir -p %s && tar -xf - -C %s" % (APP, APP), archive)
-        pod_exec(pod, "printf %%s %s > %s/CODE_SHA && cp %s/tools/in-cluster-switchboard-server "
-                      "/run/home/in_cluster_switchboard_server.py" % (head, APP, APP))
+        pin_val = a.pinned_sha or head
+        pod_exec(pod, "printf %%s %s > %s/CODE_SHA && sed -i '/\"SWITCHBOARD_PINNED_SHA\"/{n;s/\"value\": \"[^\"]*\"/\"value\": \"%s\"/}' "
+                      "%s/cloud/k8s/switchboard.yaml && cp %s/tools/in-cluster-switchboard-server "
+                      "/run/home/in_cluster_switchboard_server.py" % (head, APP, pin_val, APP, APP))
     pod_sha = pod_exec(pod, "cat %s/CODE_SHA" % APP).decode().strip()
-    err = check_shas(head, pod_sha, a.pinned_sha or (pod_pinned(pod) if a.verify_only else ""))
+    err = check_shas(head, pod_sha, a.pinned_sha or pod_pinned(pod))
     if err:
         print("error: " + err, file=sys.stderr)
         return 1
-    if not a.verify_only:
-        run(kubectl_base() + ["set", "env", "deployment/fleet-switchboard", "SWITCHBOARD_PINNED_SHA=" + head])
     if not a.verify_only:
         run(kubectl_base() + ["delete", "pod", pod, "--wait=false"])
     print("ok %s" % head)

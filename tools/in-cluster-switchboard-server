@@ -37,6 +37,10 @@ for _env_p in [Path("/run/home/.config/fleet-switchboard/cloud.env")]:
             print("cloud.env chmod 0600 failed: %s" % _ce, file=sys.stderr)
         _et = _env_p.read_text()
         for _ln in _et.splitlines():
+            if "=" in _ln and not _ln.strip().startswith("#"):
+                _pk, _pv = _ln.split("=", 1)
+                if _pk.strip() in ("SWITCHBOARD_PINNED_SHA", "SWITCHBOARD_MODE") and not os.environ.get(_pk.strip()):
+                    os.environ[_pk.strip()] = _pv.strip().strip("\"'")
             if "_FILE=" in _ln and not _ln.strip().startswith("#"):
                 _k, _v = _ln.split("=", 1)
                 _v = _v.strip().strip("\"'")
@@ -663,8 +667,19 @@ def run_pass_loop(sb_mod, cf_mod):
         time.sleep(sleep_for)
 
 
+def _manifest_pinned_sha(app_root=APP_ROOT):
+    try:
+        import re
+        text = (Path(app_root) / "cloud" / "k8s" / "switchboard.yaml").read_text(encoding="utf-8")
+        m = re.search(r'"name":\s*"SWITCHBOARD_PINNED_SHA",\s*"value":\s*"([^"]*)"', text)
+        return (m.group(1) if m else "").strip()
+    except OSError:
+        return ""
+
+
 def verify_pinned_code_sha(app_root=APP_ROOT, env=None):
-    pinned = ((env if env is not None else os.environ).get("SWITCHBOARD_PINNED_SHA") or "").strip()
+    env_map = os.environ if env is None else env
+    pinned = (env_map.get("SWITCHBOARD_PINNED_SHA") or "").strip() or _manifest_pinned_sha(app_root)
     code_sha = Path(app_root) / "CODE_SHA"
     actual = code_sha.read_text(encoding="utf-8").strip() if code_sha.exists() else ""
     if len(pinned) != 40 or pinned == "UNPINNED" or actual != pinned:
