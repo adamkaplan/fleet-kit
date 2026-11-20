@@ -1313,8 +1313,7 @@ class TestTheReapersCommandPathIsWalked(InstallCase):
     def kit(self):
         # A container emptyDir /tmp is group/world-writable without the sticky bit; the walk flags it, so use /var/tmp there.
         base = self.home
-        parent_mode = os.lstat(str(base.parent)).st_mode
-        if (parent_mode & 0o022) and not (parent_mode & stat.S_ISVTX) and os.path.isdir("/var/tmp"):
+        if os.path.isdir("/var/tmp") and any((os.lstat(str(p)).st_mode & 0o022) and not (os.lstat(str(p)).st_mode & stat.S_ISVTX) for p in base.parents):
             base = Path(tempfile.mkdtemp(dir="/var/tmp"))
             self.addCleanup(shutil.rmtree, str(base), True)
         root = Path(os.path.realpath(str(base))) / "kit"
