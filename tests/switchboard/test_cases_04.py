@@ -1311,7 +1311,14 @@ class TestTheReapersCommandPathIsWalked(InstallCase):
     """The service runs one file: the launcher's own walk (one copy, in cloud_worker.py) judges it and every parent above it."""
 
     def kit(self):
-        root = Path(os.path.realpath(str(self.home))) / "kit"
+        import stat
+        import tempfile
+        base = self.home
+        parent_mode = os.lstat(str(base.parent)).st_mode
+        if (parent_mode & 0o022) and not (parent_mode & stat.S_ISVTX) and os.path.isdir("/var/tmp"):
+            base = Path(tempfile.mkdtemp(dir="/var/tmp"))
+            self.addCleanup(shutil.rmtree, str(base), True)
+        root = Path(os.path.realpath(str(base))) / "kit"
         shutil.copytree(REPO / "cloud" / "launcher", root / "cloud" / "launcher", ignore=shutil.ignore_patterns("tests", "__pycache__"), symlinks=True)
         shutil.copytree(REPO / "templates", root / "templates")
         for path in [root] + [p for p in root.rglob("*")]:
