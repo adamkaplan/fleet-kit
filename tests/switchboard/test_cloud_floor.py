@@ -1279,6 +1279,23 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(kills, [(4242, signal.SIGCONT)])
         self.assertEqual(out, {"authority": "shadow", "resumed_pid": 4242})
 
+    def test_fetch_cluster_mode_falls_back_to_healthz_on_404_only(self):
+        cfg = {"url": "https://sw.example/"}
+        def req(status, mode):
+            def fake(method, url, *a, **k):
+                if url.endswith("/v1/mode"):
+                    raise self.floor.FloorError("gone", status=status)
+                return 200, json.dumps({"mode": mode}).encode()
+            return fake
+        with mock.patch.object(self.floor, "switchboard_relay_config", return_value=cfg), \
+                mock.patch.object(self.floor, "_auth_header", return_value="x"), \
+                mock.patch.object(self.floor, "_parse", side_effect=lambda b: json.loads(b)):
+            with mock.patch.object(self.floor, "_request", req(404, "shadow")):
+                self.assertEqual(self.floor.fetch_cluster_mode({}), "shadow")
+            with mock.patch.object(self.floor, "_request", req(500, "shadow")):
+                with self.assertRaises(self.floor.FloorError):
+                    self.floor.fetch_cluster_mode({})
+
     def test_render_pane_relay_plist_is_valid_xml(self):
         out = self.floor.render_pane_relay_plist("/usr/bin/python3", "/home/user/kit", "/home/user", "/home/user/state", "/usr/bin:/a&b")
         data = plistlib.loads(out.encode())
