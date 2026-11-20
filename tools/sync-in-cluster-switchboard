@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Sync a clean git archive of HEAD into the running fleet-switchboard pod, verify CODE_SHA, restart it."""
 import argparse
+import importlib.util
+import os
 import subprocess
 import sys
 
@@ -17,8 +19,33 @@ def head_sha():
     return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 
 
+_KUBE_BASE = None
+
+
+def kubectl_base():
+    global _KUBE_BASE
+    if _KUBE_BASE is not None:
+        return list(_KUBE_BASE)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    azure_dir = os.path.expanduser("~/.azure-fleetkit")
+    if not os.environ.get("AZURE_CONFIG_DIR") and os.path.isdir(azure_dir):
+        os.environ["AZURE_CONFIG_DIR"] = azure_dir
+    spec = importlib.util.spec_from_file_location("cw_lib", os.path.join(root, "cloud", "launcher", "cloud_worker.py"))
+    lib = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lib)
+    lib.apply_settings()
+    base = ["kubectl"]
+    for flag, name in (("--server", "CW_CLOUD_SERVER"), ("--certificate-authority", "CW_CLOUD_CA_FILE")):
+        if os.environ.get(name):
+            base += [flag, os.environ[name]]
+    if os.environ.get("CW_CLOUD_SERVER"):
+        base += ["--token", lib.cluster_token(os.environ, duration="30m")]
+    _KUBE_BASE = base + ["-n", NAMESPACE]
+    return list(_KUBE_BASE)
+
+
 def kubectl_out(args):
-    return subprocess.check_output(["kubectl", "-n", NAMESPACE] + args, text=True).strip()
+    return subprocess.check_output(kubectl_base() + args, text=True).strip()
 
 
 def find_pod():
@@ -30,7 +57,7 @@ def find_pod():
 
 
 def pod_exec(pod, script, stdin=None):
-    return subprocess.run(["kubectl", "-n", NAMESPACE, "exec", "-i", pod, "--", "sh", "-c", script],
+    return subprocess.run(kubectl_base() + ["exec", "-i", pod, "--", "sh", "-c", script],
                           input=stdin, check=True, stdout=subprocess.PIPE).stdout
 
 
@@ -67,7 +94,7 @@ def main(argv=None):
         print("error: " + err, file=sys.stderr)
         return 1
     if not a.verify_only:
-        run(["kubectl", "-n", NAMESPACE, "delete", "pod", pod, "--wait=false"])
+        run(kubectl_base() + ["delete", "pod", pod, "--wait=false"])
     print("ok %s" % head)
     return 0
 
