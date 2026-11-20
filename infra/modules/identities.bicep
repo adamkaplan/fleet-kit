@@ -6,6 +6,9 @@ param federatedIdentityCredentials array
 @description('Name of the reader identity whose principal id is output; empty for none.')
 param readerIdentityName string = ''
 
+@description('Name of the role-less connector identity whose resource id is output; empty for none.')
+param connectorIdentityName string = ''
+
 resource ids 'Microsoft.ManagedIdentity/userAssignedIdentities@2025-05-31-preview' = [for i in userAssignedIdentities: {
   name: i.name
   location: i.location
@@ -22,3 +25,4 @@ resource creds 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdenti
 
 var identityNames = [for i in userAssignedIdentities: i.name]
 output readerIdentityPrincipalId string = empty(readerIdentityName) || !contains(identityNames, readerIdentityName) ? '' : ids[indexOf(identityNames, readerIdentityName)].properties.principalId
+output connectorIdentityId string = empty(connectorIdentityName) || !contains(identityNames, connectorIdentityName) ? '' : ids[indexOf(identityNames, connectorIdentityName)].id

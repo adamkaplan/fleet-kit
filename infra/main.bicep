@@ -23,6 +23,10 @@ param connectorGatewayName string = ''
 param connectorGatewayId string = ''
 @description('Per-profile sandbox groups. Each: name, tags, identityId (optional).')
 param extraSandboxGroups array = []
+@description('Optional user-assigned identity resource ids attached to the primary sandboxGroupName.')
+param sandboxGroupIdentityIds array = []
+@description('Name of the role-less connector user-assigned identity (in userAssignedIdentities); empty for none.')
+param connectorIdentityName string = ''
 @description('Name of the reader user-assigned identity (in userAssignedIdentities); empty for none.')
 param readerIdentityName string = ''
 
@@ -89,6 +93,7 @@ module sandbox 'modules/sandbox-group.bicep' = {
     location: location
     sandboxGroupName: sandboxGroupName
     sandboxGroupTags: sandboxGroupTags
+    sandboxGroupIdentityIds: sandboxGroupIdentityIds
     connectorGatewayName: connectorGatewayName
     connectorGatewayId: connectorGatewayId
     extraSandboxGroups: extraSandboxGroups
@@ -135,6 +140,7 @@ module identities 'modules/identities.bicep' = {
     userAssignedIdentities: userAssignedIdentities
     federatedIdentityCredentials: federatedIdentityCredentials
     readerIdentityName: readerIdentityName
+    connectorIdentityName: connectorIdentityName
   }
 }
 
@@ -172,3 +178,4 @@ module legacyVmMonitoring 'modules/legacy-vm-monitoring.bicep' = if (!empty(lega
 }
 
 output readerIdentityPrincipalId string = identities.outputs.readerIdentityPrincipalId
+output connectorIdentityId string = identities.outputs.connectorIdentityId

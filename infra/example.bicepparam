@@ -24,11 +24,12 @@ param agentPools = [
     tags: {}
   }
   {
-    name: 'floorheavyv7'
+    name: 'floorkatav7'
     mode: 'User'
     vmSize: 'Standard_D32ads_v7'
     osDiskSizeGB: 1760
     osDiskType: 'Ephemeral'
+    workloadRuntime: 'KataVmIsolation'
     count: 0
     minCount: 0
     maxCount: 2
@@ -46,6 +47,8 @@ param extraSandboxGroups = [
   { name: 'sbxg-fleetkit-research-example', tags: {}, identityId: '' }
 ]
 param readerIdentityName = ''
+param sandboxGroupIdentityIds = []
+param connectorIdentityName = 'id-fleetkit-connector-example'
 
 param acrName = 'acrflexample'
 param acrCacheRules = [{ name: 'dockerhub-library', sourceRepository: 'public.ecr.aws/docker/library/*', targetRepository: 'dockerhub/library/*' }]
@@ -66,6 +69,7 @@ param postgresFirewallRules = [
 
 param userAssignedIdentities = [
   { name: 'id-fleetkit-example', location: 'eastus2', tags: {} }
+  { name: 'id-fleetkit-connector-example', location: 'eastus2', tags: {} }
 ]
 param federatedIdentityCredentials = [
   {

@@ -103,6 +103,16 @@ class TestPerProfile(unittest.TestCase):
         self.assertIn("output readerIdentityPrincipalId string", ids)
         self.assertEqual(missing_params(main, slurp(os.path.join(INFRA, "example.bicepparam"))), [])
 
+    def test_connector_identity(self):
+        main, sbx, ids = (slurp(os.path.join(INFRA, n)) for n in ("main.bicep", "modules/sandbox-group.bicep", "modules/identities.bicep"))
+        self.assertIn("param sandboxGroupIdentityIds array", main)
+        self.assertIn("sandboxGroupIdentityIds", sbx)
+        self.assertIn("param connectorIdentityName string", main)
+        self.assertIn("output connectorIdentityId string", main)
+        self.assertIn("output connectorIdentityId string", ids)
+        self.assertIn("g.?identityIds", sbx)
+        self.assertIn("g.?identityId ", sbx)
+
     def test_acr_cache_rules(self):
         main = slurp(os.path.join(INFRA, "main.bicep"))
         acr = slurp(os.path.join(INFRA, "modules/acr.bicep"))
