@@ -83,10 +83,13 @@ class Base(unittest.TestCase):
     def setUp(self):
         td = Path(tempfile.gettempdir())
         tmp_dir = "/var/tmp" if os.path.isdir("/var/tmp") and any((os.lstat(str(p)).st_mode & 0o022) and not (os.lstat(str(p)).st_mode & 0o1000) for p in [td, *td.parents]) else None
+        if tmp_dir:
+            self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
+            tempfile.tempdir = tmp_dir
         tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(remove_tree_patiently, tmp)
         self.home = Path(tmp.name).resolve()
-        patcher = mock.patch.dict(os.environ, {
+        env_patch = {
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.home / "xdg-config"),
             "XDG_STATE_HOME": str(self.home / "xdg-state"),
@@ -97,7 +100,10 @@ class Base(unittest.TestCase):
             "GCM_INTERACTIVE": "never",
             # the installed chief-of-staff definition: one that allows the way out of a refusal (the gate preflight reads it)
             sb.COS_DEFINITION_ENV: str(self.home / "cos-definition.md"),
-        })
+        }
+        if tmp_dir:
+            env_patch["TMPDIR"] = tmp_dir
+        patcher = mock.patch.dict(os.environ, env_patch)
         patcher.start()
         self.addCleanup(patcher.stop)
         # The version of a program is asked for under a production bound (3 s) a loaded machine can overrun: tests get a bound that cannot
