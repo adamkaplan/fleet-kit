@@ -944,6 +944,7 @@ class TestCloudAgents(FloorCase):
         sl.exec_module(sm)
         for path in ("docs", "agents", "plugins", "skills", "templates"):
             self.assertIn(path, sm.PATHS)
+        self.assertIn("cloud/launcher", sm.PATHS)
         snap = {"agents": [{"agent_session": "ses_example"}, {"agent_session": {"value": "ses_live2", "kind": "id"}}],
                 "sessions": {"ses_live2": {"metadata": {"fleet": {"repo": "acme-org/live-service"}}},
                              "ses_example": {"metadata": {"fleet": {"repo": "acme-org/widget-service"}}},
@@ -1383,6 +1384,39 @@ class TestFloorAuthority(FloorCase):
             state = {"created": dict(created)}
             out = lw._losses(state, mock.Mock(floor_session_finished=lambda n, r: r.get("floor_state") in self.floor.FINISHED_STATES), mock.Mock(), {}, 10 ** 7, {"w": record})
             self.assertEqual(len(out), expect)
+
+    def test_lost_worker_never_flags_a_floor_worker_as_local(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("lost_worker", str(REPO / "bin" / "lost_worker.py"))
+        lw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lw)
+        sbm = mock.Mock(retired=lambda e, n: False)
+        records = {"widget-api": {"backend": "floor"}}
+        state = {"seen": {"widget-api": {"at": 5, "lane": None, "ask": "x"}}}
+        out = lw._losses(state, sbm, mock.Mock(), {}, 100, records)
+        self.assertEqual([x for x in out if x["kind"] == "local_worker"], [])
+        state = {}
+        lw._losses(state, sbm, mock.Mock(), {"widget-api": {"lane": None}}, 100, records)
+        self.assertNotIn("widget-api", state.get("seen", {}))
+        state = {"seen": {"other": {"at": 5, "lane": None, "ask": "x"}}}
+        out = lw._losses(state, sbm, mock.Mock(), {}, 100, records)
+        self.assertEqual([x["name"] for x in out if x["kind"] == "local_worker"], ["other"])
+
+    def test_pane_state_persists_across_restart(self):
+        import importlib.machinery, importlib.util
+        import tempfile
+        loader = importlib.machinery.SourceFileLoader("ics_server", str(REPO / "tools/in-cluster-switchboard-server"))
+        srv = importlib.util.module_from_spec(importlib.util.spec_from_loader("ics_server", loader))
+        loader.exec_module(srv)
+        with tempfile.TemporaryDirectory() as td:
+            srv.STATE_DIR = Path(td)
+            srv.PANE_STATE_FILE = Path(td) / "pane-state.json"
+            srv.save_pane_state({"widget-api": {"status": "idle"}})
+            self.assertEqual(srv.PANE_STATE_FILE.stat().st_mode & 0o777, 0o600)
+            srv.V1_STATE.pop("pane_state", None)
+            srv.load_pane_state()
+            self.assertEqual(srv.V1_STATE["pane_state"], {"widget-api": {"status": "idle"}})
+            srv.V1_STATE.pop("pane_state", None)
 
     def test_retire_orders_and_pane_commands(self):
         state = {}

@@ -70,6 +70,7 @@ pwd.getpwuid = _safe_getpwuid
 
 CONFIG_DIR = HOME / ".config" / "fleet-switchboard"
 STATE_DIR = HOME / ".local" / "state" / "fleet-switchboard"
+PANE_STATE_FILE = STATE_DIR / "pane-state.json"
 TOKENS_DIR = HOME / "tokens"
 APP_ROOT = HOME / "app"
 SNAPSHOT_FILE = HOME / "fleet_agents_snapshot.json"
@@ -542,6 +543,8 @@ def handle_on_v1_action(route_path, auth, body, state):
     if eng is None or sb_mod is None:
         return
     try:
+        if route_path == "/v1/pane-state" and isinstance(body.get("agents"), dict):
+            save_pane_state(body["agents"])
         if route_path == "/v1/pane-state" and cf_mod is not None:
             if getattr(eng, "discovery", None) is not None and isinstance(body.get("agents"), dict):
                 cf_mod.apply_pane_state_to_discovery(body["agents"], eng.discovery)
@@ -634,7 +637,32 @@ def _next_pass_sleep(sb_mod, state_dir, poll_sec, elapsed, now_ts):
     return wait
 
 
+def save_pane_state(agents):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PANE_STATE_FILE.with_name(PANE_STATE_FILE.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(agents, fh)
+        os.replace(str(tmp), str(PANE_STATE_FILE))
+    except OSError as err:
+        log_line("pane_state_not_saved", error=str(err)[:160])
+
+
+def load_pane_state():
+    if not PANE_STATE_FILE.is_file() or V1_STATE.get("pane_state"):
+        return
+    try:
+        loaded = json.loads(PANE_STATE_FILE.read_text())
+    except (OSError, ValueError) as err:
+        log_line("pane_state_not_loaded", error=str(err)[:160])
+        return
+    if isinstance(loaded, dict):
+        V1_STATE["pane_state"] = loaded
+
+
 def run_pass_loop(sb_mod, cf_mod):
+    load_pane_state()
     real_gh = "/usr/bin/gh" if os.path.exists("/usr/bin/gh") else "gh"
     runner = make_runner(real_gh)
     now = time.time

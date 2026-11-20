@@ -399,10 +399,15 @@ def _losses(state, sb, engine, alive, now, records):
     seen = state.setdefault("seen", {})
     if alive is not None:
         for name, info in alive.items():
+            if name in records:
+                continue
             state.get("gone", {}).pop(name, None)
             seen[name] = {"at": now, "lane": info.get("lane"), "ask": _clean(info.get("ask") or name, 80)}
         for name, s in sorted(seen.items()):
             if name in alive or name in state.get("gone", {}):
+                continue
+            if name in records:
+                state.setdefault("gone", {})[name] = now
                 continue
             if engine_retired(engine, sb, name):
                 state.setdefault("gone", {})[name] = now

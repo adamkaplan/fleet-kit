@@ -12,7 +12,7 @@ import sys
 
 NAMESPACE = "cw"
 APP = "/run/home/app"
-PATHS = ["agents", "bin", "cloud/k8s", "docs", "plugins", "shims", "skills", "templates", "tools"]
+PATHS = ["agents", "bin", "cloud/k8s", "cloud/launcher", "docs", "plugins", "shims", "skills", "templates", "tools"]
 
 
 def run(cmd, **kw):

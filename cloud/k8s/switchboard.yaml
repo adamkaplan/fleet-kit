@@ -51,7 +51,7 @@
             "env": [
               {
                 "name": "SWITCHBOARD_PINNED_SHA",
-                "value": "b576a00f28c868e3e45db967f4663da7bb1a36b8"
+                "value": "4698ee7dc2bcb20eaf132ea3b3419773d91a11d8"
               },
               {
                 "name": "SWITCHBOARD_MODE",
