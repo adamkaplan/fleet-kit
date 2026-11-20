@@ -35,6 +35,13 @@ class TestPublicNamesGuard(unittest.TestCase):
                 with self.assertRaises(self.sb.IntentError):
                     self.write("acme/api", bad)
 
+    def test_private_repo_skips_public_names_guard(self):
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "private-org\\b\nsecret-word\n"}):
+            self.assertEqual(self.write("private-org/internal-repo", "body with secret-word and 12345678-1234-1234-1234-123456789abc"), "ok")
+            for bad in ("body with private-org", "body with secret-word"):
+                with self.assertRaises(self.sb.IntentError):
+                    self.write("acme/api", bad)
+
     def test_case_sensitive_entry_and_clean_text_pass(self):
         with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "case:Bar\n"}):
             self.assertEqual(self.write("acme/api", "a bar is fine"), "ok")

@@ -358,6 +358,8 @@ def refuse_private_names(repo, values):
     """Raise PublicNamesRefused when any string in `values` (bodies, titles, payloads) matches a configured private-name entry or a built-in private infrastructure pattern.
     Public fleet-kit and spire words never count against the configured entries."""
     terms = private_name_terms()
+    if isinstance(repo, str) and repo and any(not _PUBLIC_WORDS.fullmatch(m.group(0)) for _, rx in terms for m in rx.finditer(repo)):
+        return
     builtin = []
     if os.environ.get("FLEET_PRIVATE_NAMES", "").strip() or not os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
         builtin = [(1000 + n, rx) for n, rx in enumerate(BUILTIN_PRIVATE_TERMS, 1)]
