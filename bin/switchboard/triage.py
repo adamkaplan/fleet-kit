@@ -51,6 +51,13 @@ PARKED_UNTIL_RE = re.compile(r"^[ \t]*Parked until:[ \t]*([0-9]{4}-[0-9]{2}-[0-9
 PARKED_MAX_DAYS = 366   # a park reaches at most this far ahead of the moment it is judged: `9999-12-31` does not park forever
 
 
+def parked_line_count(body, labels):
+    """How many `Parked until:` lines an item states (outside quotes and code); 0 without the `<user>:parked` label."""
+    if not any(isinstance(l, str) and l.endswith(":parked") for l in labels or ()) or not isinstance(body, str):
+        return 0
+    return len(PARKED_UNTIL_RE.findall(SWEEP_QUOTED_RE.sub(" ", body)))
+
+
 def parked_until(body, labels):
     """The epoch second a `<user>:parked` item is parked until, or None. It counts ONLY with the label AND one line
     `Parked until: YYYY-MM-DD` in the body (outside quotes and code); a missing, malformed or impossible date is None, and the day
@@ -405,10 +412,7 @@ def triage_norm(issue):
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
             "standing": triage_body_standing(body, created),
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
-            "parked_two_lines": bool(isinstance(body, str) and any(
-                isinstance(l, str) and l.endswith(":parked") for l in
-                {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []})
-                and len(PARKED_UNTIL_RE.findall(SWEEP_QUOTED_RE.sub(" ", body))) > 1),
+            "parked_two_lines": parked_line_count(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}) > 1,
             "owner_body": triage_names_owner(body), "owner_name": triage_owner_name(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
             "pending_text": load_triage_plan_open().pending_text(body),   # #410: its own text says work is left
