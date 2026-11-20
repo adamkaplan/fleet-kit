@@ -74,11 +74,14 @@ def check_shas(head, pod_sha, pinned=""):
 
 
 def pod_pinned(pod):
-    return kubectl_out(["exec", pod, "--", "python3", "-c",
-                                'import os, pathlib, re; v = os.environ.get("SWITCHBOARD_PINNED_SHA", "").strip(); '
-                                'p = pathlib.Path("/run/home/app/cloud/k8s/switchboard.yaml"); '
-                                'm = re.search(r"\"SWITCHBOARD_PINNED_SHA\",\\s*\"value\":\\s*\"([^\"]*)\"", p.read_text()) if p.exists() else None; '
-                                'print(v or (m.group(1) if m else ""), end="")'])
+    script = (
+        "import os, pathlib, re; "
+        "v = os.environ.get('SWITCHBOARD_PINNED_SHA', '').strip(); "
+        "p = pathlib.Path('/run/home/app/cloud/k8s/switchboard.yaml'); "
+        "m = re.search(r'\"SWITCHBOARD_PINNED_SHA\",\\s*\"value\":\\s*\"([^\"]*)\"', p.read_text()) if p.exists() else None; "
+        "print(v or (m.group(1) if m else ''), end='')"
+    )
+    return kubectl_out(["exec", pod, "--", "python3", "-c", script])
 
 
 def main(argv=None):
