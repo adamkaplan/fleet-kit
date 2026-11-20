@@ -878,6 +878,24 @@ class TestCloudAgents(FloorCase):
     def sb_refusal(self):
         return self.m.D["Refusal"] if "D" in vars(self.m) else self.floor.D["Refusal"]
 
+    def test_switchboard_manifest_and_pane_rollback(self):
+        import ast
+        text = (REPO / "cloud/k8s/switchboard.yaml").read_text()
+        body = "\n".join(l for l in text.splitlines() if not l.startswith("#"))
+        decoder, pos, docs = json.JSONDecoder(), 0, []
+        while pos < len(body):
+            if body[pos].isspace() or body[pos:pos + 3] == "---":
+                pos += 3 if body[pos:pos + 3] == "---" else 1
+                continue
+            obj, pos = decoder.raw_decode(body, pos)
+            docs.append(obj)
+        deployment = next(d for d in docs if d.get("kind") == "Deployment")
+        container = next(c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "switchboard")
+        self.assertEqual(container.get("command"), ["python3", "/run/home/app/tools/in-cluster-switchboard-server"])
+        server = REPO / "tools/in-cluster-switchboard-server"
+        self.assertTrue(server.is_file())
+        ast.parse(server.read_text())
+
     def test_pane_state_is_applied_to_discovery(self):
         obs = types.SimpleNamespace(status="idle", errored=False, turn_error="", turn_error_id=None, idle_at=None, permission_waiting=False, form_waiting=False)
         discovery = types.SimpleNamespace(agents={"widget-api": obs})

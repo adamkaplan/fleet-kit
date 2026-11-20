@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""In-cluster switchboard daemon + /v1 HTTP API server (Cloud Agents #43 / #34).
+
+Modes (SWITCHBOARD_MODE env var, or the persisted switchboard-mode.json):
+  - shadow (default): serves the /v1 routes of bin/cloud_floor.py (`handle_switchboard_v1`) plus
+    /v1/mode, /v1/shadow-status and /v1/cloud-sync on port 8080, verifying X-Switchboard-Auth.
+    Mints GitHub App tokens from the token-mint service every 25 minutes, applies relayed pane
+    state, executes relayed actions against the cluster Switchboard engine and runs
+    `engine.run_pass()` every `poll_seconds`, recording planned deliveries.
+  - active: deliveries for local panes are queued into `pane_outbox` for the pane-relay.
+"""
+import datetime as dt
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import pwd
+from pathlib import Path
+
+_real_getpwuid = pwd.getpwuid
+
+HOME = Path(os.environ.get("HOME", "/run/home"))
+# Ensure secret files named in cloud.env have 0600 permissions inside the container.
+for _env_p in [Path("/run/home/.config/fleet-switchboard/cloud.env")]:
+    if _env_p.exists():
+        _et = _env_p.read_text()
+        for _ln in _et.splitlines():
+            if "_FILE=" in _ln and not _ln.strip().startswith("#"):
+                _k, _v = _ln.split("=", 1)
+                _v = _v.strip().strip("\"'")
+                _sp = Path(_v)
+                if _sp.exists():
+                    _dp = Path("/run/home/secrets_0600") / _sp.name
+                    _dp.parent.mkdir(parents=True, exist_ok=True)
+                    _dp.write_bytes(_sp.read_bytes())
+                    os.chmod(_dp, 0o600)
+                    _et = _et.replace(_v, str(_dp))
+                    os.environ[_k.strip()] = str(_dp)
+        _env_p.write_text(_et)
+
+os.environ.setdefault("CW_FLOOR_URL", "http://floor-controller.cw.svc.cluster.local:8080")
+
+
+def _safe_getpwuid(uid):
+    try:
+        return _real_getpwuid(uid)
+    except KeyError:
+        return pwd.struct_passwd(("worker", "x", uid, uid, "", str(HOME), "/bin/sh"))
+
+
+pwd.getpwuid = _safe_getpwuid
+
+CONFIG_DIR = HOME / ".config" / "fleet-switchboard"
+STATE_DIR = HOME / ".local" / "state" / "fleet-switchboard"
+TOKENS_DIR = HOME / "tokens"
+APP_ROOT = HOME / "app"
+SNAPSHOT_FILE = HOME / "fleet_agents_snapshot.json"
+SA_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+TOKEN_MINT_URL = os.environ.get("TOKEN_MINT_URL", "http://token-mint.cw.svc.cluster.local:8080/mint")
+
+
+def _load_account_repos():
+    """Map each GitHub account to its repos, from config.json plus SWITCHBOARD_EXTRA_REPOS."""
+    out = {}
+    try:
+        cfg_path = CONFIG_DIR / "config.json"
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        gh_users = cfg.get("gh_users") or {}
+        repos = list(cfg.get("github_repos") or [])
+        extra = [r.strip() for r in (os.environ.get("SWITCHBOARD_EXTRA_REPOS") or "").split(",") if r.strip()]
+        for r in repos + extra:
+            acct = gh_users.get(r) or gh_users.get(r.split("/")[0] + "/*")
+            if acct and r not in out.setdefault(acct, []):
+                out[acct].append(r)
+    except Exception:
+        pass
+    return out
+
+
+ACCOUNT_REPOS = _load_account_repos()
+
+STATE_LOCK = threading.RLock()
+ENGINE_REF = {"engine": None, "sb_mod": None, "cf_mod": None}
+V1_STATE = {
+    "pane_outbox": [],
+    "pane_commands": [],
+    "pane_state": {},
+    "pane_state_at": None,
+    "reports": [],
+    "reminders": [],
+    "orders": [],
+    "intents": [],
+    "decisions": [],
+    "audit": [],
+    "acked": [],
+    "floor_sessions": {},
+    "state_dir": STATE_DIR,
+    "relayed_actions": [],
+}
+
+
+def _initial_mode():
+    try:
+        return json.loads((STATE_DIR / "switchboard-mode.json").read_text()).get("mode") or "shadow"
+    except Exception:
+        return os.environ.get("SWITCHBOARD_MODE", "shadow")
+
+
+SHADOW_SUMMARY = {
+    "started_at": time.time(),
+    "started_iso": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "mode": _initial_mode(),
+    "passes": 0,
+    "planned_deliveries": [],
+    "held_sends_events": [],
+    "blocked_alerts": [],
+    "reminders_released": [],
+    "triage_runs": 0,
+    "self_echoes": 0,
+    "token_mint_ok": 0,
+    "token_mint_errors": 0,
+    "last_token_mint_at": None,
+    "github_calls_total": 0,
+    "github_304_total": 0,
+    "last_pass_at": None,
+    "last_pass_report": None,
+    "last_pass_error": None,
+}
+
+
+def iso_now():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log_line(event, **fields):
+    entry = dict({"ts": iso_now(), "event": event}, **fields)
+    line = json.dumps(entry, sort_keys=True)
+    print(line, flush=True)
+    try:
+        STATE_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+        with open(STATE_DIR / "shadow-passes.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def mint_tokens():
+    if not SA_TOKEN_PATH.exists():
+        with STATE_LOCK:
+            SHADOW_SUMMARY["token_mint_errors"] += 1
+        return False
+    sa_tok = SA_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    TOKENS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    ok_all = True
+    for account, repos in ACCOUNT_REPOS.items():
+        try:
+            body = json.dumps({"repos": repos, "role": "switchboard"}).encode("utf-8")
+            req = urllib.request.Request(
+                TOKEN_MINT_URL,
+                data=body,
+                headers={"X-Caller-Token": "Bearer " + sa_tok, "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                ans = json.loads(resp.read(65536).decode("utf-8"))
+            tok = ans.get("token", "").strip()
+            if not tok:
+                raise ValueError("empty token")
+            tmp = TOKENS_DIR / (account + ".tmp")
+            target = TOKENS_DIR / account
+            tmp.write_text(tok, encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+            with STATE_LOCK:
+                SHADOW_SUMMARY["token_mint_ok"] += 1
+                SHADOW_SUMMARY["last_token_mint_at"] = iso_now()
+        except Exception as err:
+            ok_all = False
+            with STATE_LOCK:
+                SHADOW_SUMMARY["token_mint_errors"] += 1
+            log_line("token_mint_error", account=account, error=str(err)[:160])
+    if ok_all:
+        log_line("token_mint_ok", accounts=sorted(ACCOUNT_REPOS.keys()))
+    return ok_all
+
+
+def load_switchboard_module():
+    sb_path = APP_ROOT / "bin" / "fleet-switchboard"
+    sys.path.insert(0, str(APP_ROOT / "bin"))
+    loader = importlib.machinery.SourceFileLoader("fleet_switchboard_daemon", str(sb_path))
+    spec = importlib.util.spec_from_loader("fleet_switchboard_daemon", loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["fleet_switchboard_daemon"] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def load_cloud_floor_module(sb_mod):
+    cw_mod = sb_mod.load_module("cloud_worker").bind(vars(sb_mod))
+    return cw_mod.cloud_floor
+
+
+def _cp(cmd, code, out, err, want_bytes):
+    if want_bytes:
+        out = out if isinstance(out, bytes) else out.encode()
+        err = err if isinstance(err, bytes) else err.encode()
+    return subprocess.CompletedProcess(cmd, code, stdout=out, stderr=err)
+
+
+def inprocess_gh_api(cmd, env, timeout=20, want_bytes=False):
+    token = (env or {}).get("GH_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    if cmd[1] != "api":
+        return None
+    include_headers = False
+    extra_headers = {}
+    path = None
+    i = 2
+    while i < len(cmd):
+        a = cmd[i]
+        if a == "-i":
+            include_headers = True
+            i += 1
+        elif a == "--paginate":
+            i += 1
+        elif a in ("-H", "--header") and i + 1 < len(cmd):
+            k, _, v = cmd[i + 1].partition(":")
+            if k.strip():
+                extra_headers[k.strip()] = v.strip()
+            i += 2
+        elif a in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "--jq", "-q") and i + 1 < len(cmd):
+            if a in ("-X", "--method") and cmd[i + 1].upper() not in ("GET", "HEAD"):
+                if SHADOW_SUMMARY["mode"] != "active":
+                    return _cp(cmd, 0, "{}\n", "", want_bytes)
+                return None
+            i += 2
+        elif not a.startswith("-") and path is None:
+            path = a
+            i += 1
+        else:
+            i += 1
+    if not path:
+        return _cp(cmd, 1, "", "no path", want_bytes)
+    if path.startswith("repos/") and path.endswith("/hooks?per_page=100"):
+        out = "HTTP/2.0 200 OK\r\n\r\n[]\n" if include_headers else "[]\n"
+        return _cp(cmd, 0, out, "", want_bytes)
+    url = "https://api.github.com/" + path.lstrip("/")
+    req_headers = {
+        "Accept": extra_headers.pop("Accept", "application/vnd.github+json"),
+        "User-Agent": "fleet-switchboard-incluster/0.2",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        req_headers["Authorization"] = "Bearer " + token
+    req_headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=req_headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or 20) as resp:
+            raw = resp.read(20 * 1024 * 1024)
+            status = resp.status
+            resp_headers = resp.headers
+    except urllib.error.HTTPError as err:
+        status = err.code
+        resp_headers = err.headers or {}
+        raw = err.read(65536) if err.fp else b""
+        if status == 304:
+            out = "HTTP/2.0 304 Not Modified\r\n\r\n" if include_headers else ""
+            return _cp(cmd, 0, out, "", want_bytes)
+        msg = raw.decode("utf-8", "replace")
+        if include_headers:
+            hdr_lines = ["HTTP/2.0 %d Error" % status]
+            for hk, hv in resp_headers.items():
+                hdr_lines.append("%s: %s" % (hk, hv))
+            out = "\r\n".join(hdr_lines) + "\r\n\r\n" + msg
+            return _cp(cmd, 1, out, "HTTP %d" % status, want_bytes)
+        return _cp(cmd, 1, raw if want_bytes else msg, "HTTP %d: %s" % (status, msg[:200]), want_bytes)
+    except Exception as err:
+        return _cp(cmd, 1, "", str(err), want_bytes)
+    if want_bytes and not include_headers:
+        return subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=b"")
+    text = raw.decode("utf-8", "replace")
+    if include_headers:
+        hdr_lines = ["HTTP/2.0 %d OK" % status]
+        for hk, hv in resp_headers.items():
+            hdr_lines.append("%s: %s" % (hk, hv))
+        text = "\r\n".join(hdr_lines) + "\r\n\r\n" + text
+    return _cp(cmd, 0, text, "", want_bytes)
+
+
+def make_runner(real_gh):
+    def runner(argv, **kwargs):
+        cmd = [str(x) for x in argv]
+        if len(cmd) >= 4 and cmd[1:4] == ["auth", "token", "--user"]:
+            user = cmd[4] if len(cmd) > 4 else "default"
+            tok_file = TOKENS_DIR / user
+            if not tok_file.exists():
+                mint_tokens()
+            if tok_file.exists():
+                return subprocess.CompletedProcess(cmd, 0, stdout=tok_file.read_text(encoding="utf-8").strip() + "\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no token for " + user)
+        if len(cmd) >= 3 and cmd[1:3] == ["webhook", "forward"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 403: Resource not accessible by integration (in-cluster polling mode)")
+        if cmd and (cmd[0] == "gh" or cmd[0].endswith("/gh") or cmd[0].endswith("/cw-gh")):
+            if len(cmd) >= 2 and cmd[1] == "api":
+                ans = inprocess_gh_api(cmd, kwargs.get("env"), timeout=kwargs.get("timeout", 20), want_bytes=(kwargs.get("text") is False))
+                if ans is not None:
+                    return ans
+            cmd = ["python3", "/usr/local/bin/cw-gh"] + cmd[1:]
+        return subprocess.run(cmd, **kwargs)
+    return runner
+
+
+class ShadowHerdr:
+    def __init__(self, snap_path):
+        self.snap_path = Path(snap_path)
+        self.binary = "/bin/true"
+
+    def _snap(self):
+        try:
+            return json.loads(self.snap_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"agents": [], "sessions": {}, "processes": {}}
+
+    def agent_list(self):
+        snap_agents = {a.get("pane_id"): dict(a) for a in self._snap().get("agents", []) if isinstance(a, dict)}
+        with STATE_LOCK:
+            ps = dict(V1_STATE.get("pane_state") or {})
+        for name, data in ps.items():
+            pane = data.get("pane") or ("pane_" + name)
+            entry = snap_agents.get(pane, {"pane_id": pane})
+            entry["agent_session"] = data.get("session_id") or entry.get("agent_session") or ("ses_" + name)
+            entry["agent_status"] = data.get("status") or entry.get("agent_status") or "idle"
+            snap_agents[pane] = entry
+        return list(snap_agents.values())
+
+    def agent_get(self, pane):
+        for a in self.agent_list():
+            if a.get("pane_id") == pane:
+                return a
+        return {}
+
+    def pane_process_info(self, pane):
+        procs = self._snap().get("processes", {}).get(pane)
+        if not procs:
+            for a in self.agent_list():
+                if a.get("pane_id") == pane and a.get("agent_session"):
+                    return [{"cmdline": "/opt/homebrew/bin/opencode -s " + str(a["agent_session"]), "name": "opencode"}]
+            procs = [{"cmdline": "/opt/homebrew/bin/opencode", "name": "opencode"}]
+        out = []
+        for p in procs:
+            c = str(p.get("cmdline") or "")
+            if c.startswith("opencode "):
+                c = "/opt/homebrew/bin/" + c
+            out.append(dict(p, cmdline=c))
+        return out
+
+    def pane_report_metadata_token(self, pane, name, value, ttl_ms=None):
+        return None
+
+    def pane_clear_token(self, pane, name):
+        return None
+
+    def notification_show(self, title, body=None):
+        return {"shown": True, "reason": None}
+
+    def tab_list(self):
+        return []
+
+    def pane_list(self):
+        return [{"pane_id": a.get("pane_id"), "cwd": "/run/home"} for a in self.agent_list()]
+
+
+class ShadowV2:
+    def __init__(self, snap_path, sb_mod):
+        self.snap_path = Path(snap_path)
+        self.sb_mod = sb_mod
+        self.http = None
+        self.state_dir = None
+
+    def _snap(self):
+        try:
+            return json.loads(self.snap_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"agents": [], "sessions": {}, "processes": {}}
+
+    def service_identity(self):
+        return 1
+
+    def service_url(self):
+        return "http://127.0.0.1:4096"
+
+    def server_info(self):
+        return {"version": "2.3.2-incluster"}
+
+    def _relayed_for_session(self, session_id):
+        with STATE_LOCK:
+            ps = dict(V1_STATE.get("pane_state") or {})
+        for name, data in ps.items():
+            if data.get("session_id") == session_id:
+                return name, data
+        return None, None
+
+    def session_get(self, session_id):
+        name, relayed = self._relayed_for_session(session_id)
+        info = dict(self._snap().get("sessions", {}).get(session_id) or {})
+        if relayed:
+            fleet = dict(relayed.get("fleet") or info.get("metadata", {}).get("fleet") or {"name": name})
+            fleet.setdefault("name", name)
+            idle_ms = int(float(relayed["idle_at"]) * 1000) if isinstance(relayed.get("idle_at"), (int, float)) else int(time.time() * 1000)
+            return {
+                "id": session_id, "outcome": relayed.get("outcome") or info.get("outcome") or ("succeeded" if (relayed.get("status") or "idle") == "idle" and not relayed.get("errored") else None),
+                "time": {"created": info.get("time", {}).get("created") or int(time.time() * 1000), "idle": idle_ms},
+                "metadata": {"fleet": fleet},
+            }
+        if info:
+            return info
+        return {"id": session_id, "time": {"created": int(time.time() * 1000)}, "metadata": {}}
+
+    def permission_list(self, session_id):
+        _, relayed = self._relayed_for_session(session_id)
+        if relayed and relayed.get("permission_waiting"):
+            return [{"id": "perm_relayed_" + str(session_id), "created": int(time.time() * 1000)}]
+        return []
+
+    def form_list(self, session_id):
+        _, relayed = self._relayed_for_session(session_id)
+        if relayed and relayed.get("form_waiting"):
+            return [{"id": "form_relayed_" + str(session_id), "created": int(time.time() * 1000)}]
+        return []
+
+    def session_active(self):
+        return {}
+
+    def session_list_page(self, directory=None, cursor=None, limit=100):
+        return list(self._snap().get("sessions", {}).values()), None
+
+    def inbox_list(self, session_id):
+        return []
+
+    def message_list(self, session_id, limit=10, type=None, order="desc"):
+        return []
+
+    def inbox_update(self, session_id, inbox_id, delivery):
+        return {"id": inbox_id, "delivery": delivery}
+
+    def inbox_cancel(self, session_id, inbox_id):
+        return {"id": inbox_id}
+
+    def calls_by_operation(self, window=60.0, now=None):
+        return {}
+
+    def calls_by_transport(self, window=60.0, now=None):
+        return {}
+
+    def synthetic(self, session_id, text, metadata, resume, delivery, message_id, description):
+        info = self.session_get(session_id)
+        recipient = ((info.get("metadata") or {}).get("fleet") or {}).get("name") or session_id
+        keys = ((metadata or {}).get("fleet") or {}).get("keys") or []
+        entry = {
+            "ts": iso_now(),
+            "mode": SHADOW_SUMMARY["mode"],
+            "recipient": recipient,
+            "session_id": session_id,
+            "message_id": message_id,
+            "delivery": delivery,
+            "resume": bool(resume),
+            "keys": keys,
+            "description": description,
+            "text_preview": (text or "")[:240],
+        }
+        with STATE_LOCK:
+            SHADOW_SUMMARY["planned_deliveries"].append(entry)
+            SHADOW_SUMMARY["planned_deliveries"] = SHADOW_SUMMARY["planned_deliveries"][-400:]
+            if any("blocked-alert:" in k for k in keys) or "[blocked]" in (text or "") or "blocked for " in (text or ""):
+                SHADOW_SUMMARY["blocked_alerts"].append(entry)
+            if SHADOW_SUMMARY["mode"] == "active":
+                V1_STATE["pane_outbox"].append({
+                    "id": len(V1_STATE["pane_outbox"]) + 1 + len(V1_STATE.get("acked", [])),
+                    "from": "switchboard",
+                    "session": session_id,
+                    "to": recipient,
+                    "text": text,
+                    "keys": keys,
+                    "message_id": message_id,
+                    "delivery": delivery,
+                    "resume": bool(resume),
+                })
+        log_line("planned_delivery", **entry)
+        return {"id": message_id}
+
+
+def handle_on_v1_action(route_path, auth, body, state):
+    """Bridge `/v1/{send,report,remind,retire,orders}` into the in-cluster Switchboard engine."""
+    eng = ENGINE_REF.get("engine")
+    sb_mod = ENGINE_REF.get("sb_mod")
+    cf_mod = ENGINE_REF.get("cf_mod")
+    state.setdefault("relayed_actions", []).append({"ts": iso_now(), "route": route_path, "agent": auth.get("agent"), "body": body})
+    state["relayed_actions"] = state["relayed_actions"][-200:]
+    if eng is None or sb_mod is None:
+        return
+    try:
+        if route_path == "/v1/pane-state" and cf_mod is not None:
+            if getattr(eng, "discovery", None) is not None and isinstance(body.get("agents"), dict):
+                cf_mod.apply_pane_state_to_discovery(body["agents"], eng.discovery)
+        elif route_path == "/v1/send":
+            sender = body.get("sender") or body.get("from") or auth.get("agent") or "cos"
+            to = body.get("to")
+            text = body.get("text") or ""
+            issue = body.get("issue")
+            if to and text:
+                outcome = eng.send(sender, to, text, issue=issue, repo=body.get("repo"))
+                if outcome.get("held") or outcome.get("action") == "hold":
+                    SHADOW_SUMMARY["held_sends_events"].append({"ts": iso_now(), "from": sender, "to": to, "outcome": outcome})
+                log_line("v1_send_executed", sender=sender, to=to, outcome=outcome)
+        elif route_path == "/v1/report":
+            sender = body.get("sender") or body.get("from") or auth.get("agent")
+            st = body.get("state") or body.get("status")
+            text = body.get("text") or ""
+            issue = body.get("issue")
+            if sender and st and text:
+                outcome = eng.report(sender, st, text, issue=issue)
+                log_line("v1_report_executed", sender=sender, state=st, outcome=outcome)
+        elif route_path == "/v1/remind":
+            sender = body.get("sender") or body.get("from") or auth.get("agent")
+            action = body.get("action")
+            if action == "cancel" and body.get("cancel"):
+                sb_mod.remove_reminders(STATE_DIR, {body["cancel"]})
+                log_line("v1_remind_cancelled", sender=sender, id=body["cancel"])
+            elif action == "cancel_key" and body.get("cancel_key"):
+                sb_mod.cancel_chain(STATE_DIR, sender, body["cancel_key"])
+                log_line("v1_remind_cancel_key", sender=sender, key=body["cancel_key"])
+            elif action != "list":
+                to = body.get("to") or body.get("name") or sender
+                when = body.get("when")
+                text = body.get("text") or (" ".join(str(x) for x in (body.get("args") or [])).strip())
+                if to and when and text:
+                    moment = time.time()
+                    every = sb_mod.parse_every(body["every"]) if body.get("every") else None
+                    at = sb_mod.grid_when(str(when), moment) if (body.get("key") or every) else (float(when) if isinstance(when, (int, float)) else sb_mod.parse_when(str(when), moment))
+                    ttl = sb_mod.parse_ttl(body["ttl"]) if body.get("ttl") else None
+                    cond = {}
+                    for k in ("until_closed", "until_merged"):
+                        if body.get(k):
+                            cond[k] = body[k]
+                    item = sb_mod.add_reminder(STATE_DIR, to, at, moment, text, body.get("issue"), sender, body.get("repo"), condition=cond or None, key=body.get("key"), ttl=ttl, every=every)
+                    log_line("v1_remind_added", sender=sender, to=to, id=item["id"], at=item["at"])
+    except Exception as err:
+        log_line("v1_action_error", route=route_path, error=str(err)[:200])
+
+
+def run_pass_loop(sb_mod, cf_mod):
+    real_gh = "/usr/bin/gh" if os.path.exists("/usr/bin/gh") else "gh"
+    runner = make_runner(real_gh)
+    now = time.time
+    config = sb_mod.load_config(CONFIG_DIR / "config.json")
+    config["gh"] = real_gh
+    state = sb_mod.ensure_state_dir(STATE_DIR)
+    v2 = ShadowV2(SNAPSHOT_FILE, sb_mod)
+    herdr = ShadowHerdr(SNAPSHOT_FILE)
+    audit = sb_mod.AuditLog(state / "audit.jsonl")
+    engine = sb_mod.Switchboard(
+        config, v2, herdr, audit, sb_mod.fact_sources(state), now, "daemon",
+        intents=sb_mod.intent_reader_for(config, runner, now), state_dir=state,
+    )
+    engine.accounts = sb_mod.GhAccounts(config, runner, now)
+    engine.accounts.audit, engine.accounts.actor = audit, "daemon"
+    sb_mod.enable_conditional_reads(engine)
+    if engine.intents is not None:
+        engine.intents.accounts = engine.accounts
+    engine.gh_runner = runner
+    engine.pane_command_sink = lambda action, agent, reason: cf_mod.queue_pane_resume_command(V1_STATE, agent, reason)
+
+    real_discover = engine.discover
+
+    def wrapped_discover(moment, entries=None):
+        disc = real_discover(moment, entries)
+        with STATE_LOCK:
+            ps = dict(V1_STATE.get("pane_state") or {})
+        if ps:
+            cf_mod.apply_pane_state_to_discovery(ps, disc)
+        return disc
+    engine.discover = wrapped_discover
+
+    ENGINE_REF["engine"] = engine
+    ENGINE_REF["sb_mod"] = sb_mod
+    ENGINE_REF["cf_mod"] = cf_mod
+    with STATE_LOCK:
+        V1_STATE["on_v1_action"] = handle_on_v1_action
+
+    def dummy_spawn(argv, log_path, **kwargs):
+        with open(str(log_path), "w", encoding="utf-8") as fh:
+            fh.write("HTTP 403: Resource not accessible by integration (polling mode)\n")
+        return subprocess.Popen(["/bin/false"])
+
+    hub = sb_mod.GitHubHub(config, state, engine.audit, runner, dummy_spawn, now, "daemon")
+    hub.attach(engine)
+    hub.start()
+
+    last_mint = time.time()
+    poll_sec = float(config.get("poll_seconds") or 30.0)
+    while True:
+        if time.time() - last_mint >= 1500:
+            mint_tokens()
+            last_mint = time.time()
+        t0 = time.time()
+        try:
+            with STATE_LOCK:
+                SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+            report = engine.run_pass()
+            elapsed_ms = int((time.time() - t0) * 1000)
+            calls = list(engine.accounts.calls)
+            total_calls = len(calls)
+            total_304 = sum(1 for c in calls if len(c) >= 4 and c[3])
+            sent_items = report.get("sent") or []
+            held_items = report.get("held") or []
+            summary = {
+                "at": report.get("at"),
+                "elapsed_ms": elapsed_ms,
+                "sent_count": len(sent_items),
+                "sent_keys": [k for item in sent_items for k in (item.get("keys") or [])],
+                "held_count": len(held_items),
+                "held_items": held_items,
+                "waiting": report.get("waiting") or [],
+                "errors": report.get("errors") or [],
+                "gh_calls_window": total_calls,
+                "gh_304_window": total_304,
+            }
+            with STATE_LOCK:
+                SHADOW_SUMMARY["passes"] += 1
+                SHADOW_SUMMARY["last_pass_at"] = report.get("at")
+                SHADOW_SUMMARY["last_pass_report"] = summary
+                SHADOW_SUMMARY["github_calls_total"] = total_calls
+                SHADOW_SUMMARY["github_304_total"] = total_304
+                if held_items:
+                    SHADOW_SUMMARY["held_sends_events"].append({"ts": iso_now(), "pass_held": held_items})
+            log_line("shadow_pass", **summary)
+        except Exception as err:
+            with STATE_LOCK:
+                SHADOW_SUMMARY["last_pass_error"] = str(err)[:240]
+            log_line("shadow_pass_error", error=str(err)[:240])
+        sleep_for = max(5.0, poll_sec - (time.time() - t0))
+        time.sleep(sleep_for)
+
+
+def main():
+    mint_tokens()
+    sb_mod = load_switchboard_module()
+    cf_mod = load_cloud_floor_module(sb_mod)
+    expected_secret = os.environ.get("SWITCHBOARD_AUTH_SECRET", "").strip()
+    if not expected_secret:
+        secret_file = Path("/etc/switchboard-auth/secret")
+        if secret_file.exists():
+            expected_secret = secret_file.read_text(encoding="utf-8").strip()
+    V1_STATE["state_dir"] = STATE_DIR
+    with STATE_LOCK:
+        SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+
+    pass_thread = threading.Thread(target=run_pass_loop, args=(sb_mod, cf_mod), daemon=True)
+    pass_thread.start()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, payload):
+            raw = json.dumps(payload, sort_keys=True).encode("utf-8") + b"\n"
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _auth_error(self):
+            try:
+                cf_mod.verify_switchboard_auth(self.headers.get("X-Switchboard-Auth"), expected_secret)
+            except Exception as err:
+                return self._send(getattr(err, "status", 401) or 401, {"error": str(err)})
+            return None
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/healthz":
+                with STATE_LOCK:
+                    SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+                    return self._send(200, {"ok": True, "mode": SHADOW_SUMMARY["mode"], "passes": SHADOW_SUMMARY["passes"]})
+            if path == "/v1/mode":
+                if self._auth_error() is not None:
+                    return None
+                with STATE_LOCK:
+                    SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+                    return self._send(200, {"mode": SHADOW_SUMMARY["mode"]})
+            if path == "/v1/shadow-status":
+                if self._auth_error() is not None:
+                    return None
+                held_file = STATE_DIR / "held-sends.json"
+                blocked_file = STATE_DIR / "blocked-alert.json"
+                held_disk = json.loads(held_file.read_text()) if held_file.exists() else {}
+                blocked_disk = json.loads(blocked_file.read_text()) if blocked_file.exists() else {}
+                with STATE_LOCK:
+                    return self._send(200, dict(SHADOW_SUMMARY, held_sends_disk=held_disk, blocked_alert_disk=blocked_disk, v1_state={
+                        "pane_state_agents": sorted((V1_STATE.get("pane_state") or {}).keys()),
+                        "pane_state_at": V1_STATE.get("pane_state_at"),
+                        "pane_outbox_len": len(V1_STATE["pane_outbox"]),
+                        "pane_commands_len": len(V1_STATE.get("pane_commands") or []),
+                        "acked_len": len(V1_STATE["acked"]),
+                        "reports_len": len(V1_STATE["reports"]),
+                        "reminders_len": len(V1_STATE["reminders"]),
+                        "orders_len": len(V1_STATE.get("orders") or []),
+                        "intents_len": len(V1_STATE.get("intents") or []),
+                        "decisions_len": len(V1_STATE.get("decisions") or []),
+                        "relayed_actions": (V1_STATE.get("relayed_actions") or [])[-30:],
+                        "pane_outbox": V1_STATE["pane_outbox"][-20:],
+                        "reports": V1_STATE["reports"][-20:],
+                        "reminders": V1_STATE["reminders"][-20:],
+                        "audit": V1_STATE["audit"][-20:],
+                    }))
+            with STATE_LOCK:
+                code, ans = cf_mod.handle_switchboard_v1("GET", self.path, dict(self.headers), b"", expected_secret, state=V1_STATE)
+            return self._send(code, ans)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(min(length, 1 << 20)) if length > 0 else b""
+            path = self.path.split("?", 1)[0]
+            if path == "/v1/cloud-sync":
+                if self._auth_error() is not None:
+                    return None
+                data = json.loads(body.decode("utf-8") or "{}")
+                cloud_dir = STATE_DIR / "cloud"
+                cloud_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+                for name, rec in (data.get("records") or {}).items():
+                    if isinstance(name, str) and "/" not in name and ".." not in name:
+                        p = cloud_dir / (name + ".json")
+                        p.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+                        os.chmod(p, 0o600)
+                rem_in = data.get("reminders")
+                rem_list = rem_in.get("reminders") if isinstance(rem_in, dict) else (rem_in if isinstance(rem_in, list) else None)
+                if isinstance(rem_list, list):
+                    with sb_mod.reminders_lock(STATE_DIR):
+                        existing = sb_mod.read_reminders(STATE_DIR)
+                        by_id = {r["id"]: r for r in existing if isinstance(r, dict) and "id" in r}
+                        for r in rem_list:
+                            if isinstance(r, dict) and "id" in r:
+                                by_id[r["id"]] = r
+                        sb_mod.write_reminders(STATE_DIR, sorted(by_id.values(), key=lambda x: x.get("at", 0)))
+                return self._send(200, {"synced": len(data.get("records") or {})})
+            with STATE_LOCK:
+                code, ans = cf_mod.handle_switchboard_v1("POST", self.path, dict(self.headers), body, expected_secret, state=V1_STATE)
+                if path == "/v1/mode" and code == 200 and isinstance(ans, dict):
+                    SHADOW_SUMMARY["mode"] = ans.get("mode", SHADOW_SUMMARY["mode"])
+            if path == "/v1/mode" and code == 200:
+                log_line("mode_changed", mode=SHADOW_SUMMARY["mode"])
+            log_line("v1_request", method="POST", path=path, status=code)
+            return self._send(code, ans)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+    log_line("server_started", port=8080, mode=SHADOW_SUMMARY["mode"])
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

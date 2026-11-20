@@ -43,6 +43,10 @@
         "containers": [
           {
             "name": "switchboard",
+            "command": [
+              "python3",
+              "/run/home/app/tools/in-cluster-switchboard-server"
+            ],
             "image": "registry.invalid/cw-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "env": [
               {
