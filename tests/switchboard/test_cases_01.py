@@ -583,7 +583,7 @@ class TestGitShim(Base):
                "XDG_CONFIG_HOME": str(self.home / "xdg-none"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": str(self.helper_path)}
         env.update(extra_env or {})   # (the sentinel test points the home variables at its scratch home)
         started = time.time()
-        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], stdin=subprocess.DEVNULL, start_new_session=True, capture_output=True, text=True, env=env, timeout=30)
+        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], cwd=str(self.home), stdin=subprocess.DEVNULL, start_new_session=True, capture_output=True, text=True, env=env, timeout=30)
         took = time.time() - started
         server.close()
         thread.join(5)
