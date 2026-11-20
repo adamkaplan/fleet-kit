@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 import pwd
+import re
 from pathlib import Path
 
 _real_getpwuid = pwd.getpwuid
@@ -502,7 +503,15 @@ class ShadowV2:
             if any("blocked-alert:" in k for k in keys) or "[blocked]" in (text or "") or "blocked for " in (text or ""):
                 SHADOW_SUMMARY["blocked_alerts"].append(entry)
             if SHADOW_SUMMARY["mode"] == "active":
+                oversize = {}
+                cf = ENGINE_REF.get("cf_mod")
+                if cf is not None:
+                    for match in cf.OVERSIZE_RE.finditer(text or ""):
+                        fp = STATE_DIR / "oversize-sends" / match.group(4)
+                        if fp.is_file():
+                            oversize[match.group(4)] = fp.read_text(encoding="utf-8", errors="replace")
                 V1_STATE["pane_outbox"].append({
+                    **({"oversize_files": oversize} if oversize else {}),
                     "id": len(V1_STATE["pane_outbox"]) + 1 + len(V1_STATE.get("acked", [])),
                     "from": "switchboard",
                     "session": session_id,
@@ -533,7 +542,27 @@ def handle_on_v1_action(route_path, auth, body, state):
         if route_path == "/v1/pane-state" and cf_mod is not None:
             if getattr(eng, "discovery", None) is not None and isinstance(body.get("agents"), dict):
                 cf_mod.apply_pane_state_to_discovery(body["agents"], eng.discovery)
+        elif route_path == "/v1/retire":
+            name = body.get("worker") or body.get("name")
+            if name:
+                reg = sb_mod.load_module("registry")
+                if body.get("undo"):
+                    reg.unretire(STATE_DIR, name)
+                else:
+                    reg.retire(STATE_DIR, name, auth.get("agent") or "cos", body.get("reason") or "finished")
+        elif route_path == "/v1/decisions":
+            dfile = STATE_DIR / "decisions.json"
+            if dfile.is_file():
+                state["decisions_file"] = json.loads(dfile.read_text(encoding="utf-8"))
         elif route_path == "/v1/send":
+            if isinstance(body.get("oversize_files"), dict):
+                ov = STATE_DIR / "oversize-sends"
+                ov.mkdir(parents=True, mode=0o700, exist_ok=True)
+                for fname, content in body["oversize_files"].items():
+                    if isinstance(fname, str) and re.fullmatch(r"send-[A-Za-z0-9_.-]+\.txt", fname):
+                        fp = ov / fname
+                        fp.write_text(str(content), encoding="utf-8")
+                        os.chmod(fp, 0o600)
             sender = body.get("sender") or body.get("from") or auth.get("agent") or "cos"
             to = body.get("to")
             text = body.get("text") or ""
@@ -872,7 +901,17 @@ def main():
                             if isinstance(r, dict) and "id" in r:
                                 by_id[r["id"]] = r
                         sb_mod.write_reminders(STATE_DIR, sorted(by_id.values(), key=lambda x: x.get("at", 0)))
-                return self._send(200, {"synced": len(data.get("records") or {})})
+                for fname, content in (data.get("state_files") or {}).items():
+                    if fname in cf_mod.SYNC_STATE_FILES and isinstance(content, str):
+                        tmp = STATE_DIR / (fname + ".tmp")
+                        tmp.write_text(content, encoding="utf-8")
+                        os.chmod(tmp, 0o600)
+                        os.replace(tmp, STATE_DIR / fname)
+                out = {"synced": len(data.get("records") or {})}
+                dfile = STATE_DIR / "decisions.json"
+                if dfile.is_file():
+                    out["decisions_file"] = json.loads(dfile.read_text(encoding="utf-8"))
+                return self._send(200, out)
             with STATE_LOCK:
                 code, ans = cf_mod.handle_switchboard_v1("POST", self.path, dict(self.headers), body, expected_secret, state=V1_STATE)
                 if path in ("/v1/send", "/v1/pane-ack") and code == 200:

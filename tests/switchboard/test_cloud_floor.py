@@ -1125,6 +1125,84 @@ class TestFloorAuthority(FloorCase):
             self.assertEqual(acked, [[m["id"] for m in msgs]])
             synthetic.assert_not_called()
 
+    def test_every_state_writing_cli_command_from_parser_works_under_cluster_authority(self):
+        import tempfile
+        parser = sb.build_parser()
+        subs = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices
+        nested = {n: next((a for a in subs[n]._actions if isinstance(a, argparse._SubParsersAction)), None) for n in ("decisions", "orders")}
+        self.assertTrue(all(nested.values()))
+        self.assertTrue({"escalate", "resolve", "answer", "supersede", "batch"} <= set(nested["decisions"].choices))
+        self.assertTrue({"add", "remove", "copy"} <= set(nested["orders"].choices))
+        writers = {"send", "report", "remind", "retire", "orders", "decisions", "move", "reassign", "resume", "notice", "intent"}
+        self.assertTrue(writers <= set(parser.commands))
+        for name in ("orders", "retire", "decisions", "intent"):
+            self.assertIn(name, self.floor.PASSTHROUGH_COMMANDS)
+        pod_state = {"pane_outbox": [], "reports": [], "reminders": [], "acked": []}
+        floor, case = self.floor, self
+
+        class Pod(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                code, ans = floor.handle_switchboard_v1("POST", self.path, dict(self.headers), raw, case.SECRET, state=pod_state)
+                data = json.dumps(ans).encode()
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        server = http.server.HTTPServer(("127.0.0.1", 0), Pod)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = os.path.join(tmp, "auth")
+            with open(auth, "w") as handle:
+                handle.write(self.header("cos"))
+            os.chmod(auth, 0o600)
+            env = {"CW_SWITCHBOARD_URL": "http://127.0.0.1:%d" % server.server_port, "CW_SWITCHBOARD_AUTH_FILE": auth, "CW_SWITCHBOARD_AUTHORITY": "cluster"}
+            ov_dir = os.path.join(tmp, "oversize-sends")
+            os.makedirs(ov_dir)
+            with open(os.path.join(ov_dir, "send-abc.txt"), "w") as handle:
+                handle.write("long body")
+            text = "[oversize send (9 chars) stored at %s/oversize-sends/send-abc.txt]" % tmp
+            relay = lambda cmd, payload: self.floor.relay_cli_if_configured(cmd, payload, env=env)
+            self.assertEqual(relay("send", {"sender": "cos", "to": "widget-api", "text": text})["queued"], "pane")
+            self.assertEqual(pod_state["pane_outbox"][-1]["oversize_files"], {"send-abc.txt": "long body"})
+            self.assertEqual(relay("report", {"sender": "cos", "state": "working", "text": "x"}), {"recorded": True})
+            self.assertTrue(relay("remind", {"to": "cos", "when": 60, "text": "x"})["recorded"])
+            self.assertTrue(relay("retire", {"name": "local-pane", "worker": "local-pane", "reason": "done", "undo": False})["retired"])
+            self.assertEqual(pod_state["retires"][-1]["worker"], "local-pane")
+            for action in ("add", "remove", "copy", None):
+                self.assertTrue(relay("orders", {"action": action, "name": "widget-api"})["recorded"])
+            self.assertEqual(len(pod_state["orders"]), 4)
+            self.assertTrue(relay("decisions", {"action": "escalate", "id": "d1", "title": "t"})["recorded"])
+            self.assertEqual(relay("decisions", {"action": "list"})["decisions"][0]["id"], "d1")
+            # the one-shot passthrough lets the CLI's own local writer run once, then cluster authority returns
+            saved = dict(os.environ)
+            try:
+                os.environ.update(env)
+                self.floor._PASSTHROUGH_AUTH[:] = []
+                self.assertTrue(isinstance(self.floor.relay_cli_if_configured("orders", {"action": "list"}), dict))
+                self.assertEqual(self.floor.switchboard_authority(), "local")
+                self.assertEqual(self.floor.switchboard_authority(), "cluster")
+            finally:
+                os.environ.clear()
+                os.environ.update(saved)
+            # the oversize file lands where the recipient's drain wrote it, with the path rewritten
+            home = os.path.join(tmp, "mac")
+            sent = []
+            engine = types.SimpleNamespace(state_dir=home, v2=types.SimpleNamespace(synthetic=lambda sid, t, *a: sent.append(t)))
+            msg = {"id": 1, "from": "switchboard", "to": "widget-api", "session": "ses_example", "text": text.replace(tmp, "/pod"),
+                   "oversize_files": {"send-abc.txt": "long body"}}
+            with mock.patch.object(self.floor, "switchboard_relay_config", return_value={"url": "http://x", "authority": "cluster"}), \
+                    mock.patch.object(self.floor, "_auth_header", return_value="h"), \
+                    mock.patch.object(self.floor, "_request", lambda *a, **k: (200, json.dumps({"messages": [msg]}).encode())), \
+                    mock.patch.object(self.floor, "call_switchboard_v1", lambda *a, **k: None):
+                self.assertEqual(self.floor.drain_pane_outbox(engine)["delivered"], 1)
+            self.assertIn(os.path.join(home, "oversize-sends", "send-abc.txt"), sent[0])
+            self.assertEqual(Path(home, "oversize-sends", "send-abc.txt").read_text(), "long body")
+
     def test_single_authority_and_tunnel_drop_fire_macos_notifications(self):
         f = self.floor
         self.assertIsNone(f.check_single_authority("active", "cluster", True))

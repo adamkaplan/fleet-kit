@@ -730,9 +730,12 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"recorded": True, "intents": state["intents"]}
     if route in (("POST", "/v1/decisions"), ("GET", "/v1/decisions")):
         if route[0] == "GET" or body.get("action") in ("list", "show"):
-            return 200, {"decisions": state.get("decisions") or []}
+            out = {"decisions": state.get("decisions") or []}
+            if isinstance(state.get("decisions_file"), dict):
+                out["decisions_file"] = state["decisions_file"]
+            return 200, out
         title = body.get("title", "")
-        state.setdefault("decisions", []).append({"action": body.get("action") or "batch", "title": scrub(title, 200) if isinstance(title, str) else "",
+        state.setdefault("decisions", []).append({"action": body.get("action") or "batch", "id": body.get("id"), "title": scrub(title, 200) if isinstance(title, str) else "",
                                                   "rows": body.get("rows") if isinstance(body.get("rows"), list) else [], "from": auth["agent"]})
         return 200, {"recorded": True, "decisions": state["decisions"]}
     if route == ("POST", "/v1/mode"):
@@ -747,6 +750,8 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text:
             return 400, {"error": "to and text are required"}
         message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo")}
+        if isinstance(body.get("oversize_files"), dict):
+            message["oversize_files"] = {k: str(v) for k, v in body["oversize_files"].items() if isinstance(k, str) and re.fullmatch(r"send-[A-Za-z0-9_.-]+\.txt", k)}
         if is_canary(dict(message, canary=body.get("canary"))):
             state["pane_outbox"].append(dict(message, id=len(state["pane_outbox"]) + 1 + len(state.get("acked", []))))
             return 200, {"queued": "pane"}
@@ -800,13 +805,15 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
             return 502, {"error": "artifact store refused"}
         return 200, {"url": url, "sha256": digest, "sp": "r"}
     if route == ("POST", "/v1/retire"):
-        name, reason = body.get("worker"), scrub(body.get("reason", ""), 200) if isinstance(body.get("reason", ""), str) else ""
+        name, reason = body.get("worker") or body.get("name"), scrub(body.get("reason", ""), 200) if isinstance(body.get("reason", ""), str) else ""
         if not isinstance(name, str) or not CALLER_RE.fullmatch(name):
             return 400, {"error": "worker is required"}
         target = (state.get("floor_sessions") or {}).get(name)
-        if not D["_may_retire"](("agent", auth["agent"], "chief-of-staff" if auth["agent"] == "cos" else None), target or {}):   # the one caller rule of a removal
+        if target is None and auth["agent"] not in ("cos", name):   # a name with no Floor session: only the Chief of Staff or the worker itself
             return 403, {"error": "only the Chief of Staff or the worker's own boss may retire it"}
-        state.setdefault("retires", []).append({"worker": name, "reason": reason, "from": auth["agent"]})
+        if target is not None and not D["_may_retire"](("agent", auth["agent"], "chief-of-staff" if auth["agent"] == "cos" else None), target):   # the one caller rule of a removal
+            return 403, {"error": "only the Chief of Staff or the worker's own boss may retire it"}
+        state.setdefault("retires", []).append({"worker": name, "reason": reason, "undo": bool(body.get("undo")), "from": auth["agent"]})
         if target:
             seq = int(target.get("seq", 1)) + 1
             _call(transport().cancel, floor_who(), target["work_id"], cancel_key(target.get("session", name), seq), seq)
@@ -814,11 +821,11 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"retired": True, "worker": name}
     if route == ("POST", "/v1/orders"):
         action = body.get("action")
-        if action not in ("list", "add", "remove"):
-            return 400, {"error": "action must be list, add or remove"}
+        if action not in ("list", "add", "remove", "copy", "cos", None):
+            return 400, {"error": "action must be list, add, remove or copy"}
         orders = state.setdefault("orders", [])
         if action != "list":
-            orders.append({"action": action, "charter": body.get("charter"), "text": text, "number": body.get("number"), "from": auth["agent"]})
+            orders.append({"action": action or "cos", "charter": body.get("charter"), "source": body.get("source"), "text": text, "number": body.get("number"), "from": auth["agent"]})
         return 200, {"recorded": True, "orders": orders}
     if route == ("POST", "/v1/pane-state"):
         if auth["agent"] not in ("pane-relay", "cos"):
@@ -852,8 +859,24 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"acked": len(state["acked"])}
     return 404, {"error": "no such route"}
 
+OVERSIZE_RE = re.compile(r"(\[oversize send \(\d+ chars\) stored at )([^\]]+?/(oversize-sends/(send-[A-Za-z0-9_.-]+\.txt)))(\])")
+SYNC_STATE_FILES = ("registry.json", "retired.json", "boss-overrides.json", "escalated-requests.json", "pr-notices.json", "order-notices.json")
+_PASSTHROUGH_AUTH = []
+PASSTHROUGH_COMMANDS = ("orders", "retire", "decisions", "intent")
+
+def _write_private(path, content):
+    tmp = "%s.tmp%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.replace(tmp, path)
+
 def switchboard_relay_config(env=None):
     """url, auth_file and authority from the environment, else from the state file switchboard-relay.json (never raises)."""
+    if env is None and _PASSTHROUGH_AUTH:
+        prev = _PASSTHROUGH_AUTH.pop()
+        if prev is not None:
+            os.environ["CW_SWITCHBOARD_AUTHORITY"] = prev
     env = os.environ if env is None else env
     got = {"url": (env.get("CW_SWITCHBOARD_URL") or "").strip(), "auth_file": (env.get("CW_SWITCHBOARD_AUTH_FILE") or "").strip(),
            "authority": (env.get("CW_SWITCHBOARD_AUTHORITY") or "").strip()}
@@ -879,6 +902,11 @@ def switchboard_relay_config(env=None):
     return got
 
 def switchboard_authority(env=None):
+    if env is None and _PASSTHROUGH_AUTH:
+        prev = _PASSTHROUGH_AUTH.pop()
+        if prev is not None:
+            os.environ["CW_SWITCHBOARD_AUTHORITY"] = prev
+        return "local"
     return switchboard_relay_config(env)["authority"]
 
 def call_switchboard_v1(path, payload, env=None, sleep_fn=time.sleep):
@@ -950,6 +978,23 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
             delivery = m.get("delivery") or "queue"
             resume = bool(m.get("resume", True))
             description = m.get("description") or ("cluster switchboard -> %s" % recipient)
+            if isinstance(m.get("oversize_files"), dict) and m["oversize_files"]:
+                sdir = getattr(engine, "state_dir", None)
+                if not isinstance(sdir, (str, os.PathLike)):
+                    try:
+                        sdir = D["H"]["state_dir_path"]()
+                    except Exception:
+                        sdir = None
+                if sdir:
+                    try:
+                        ov_dir = os.path.join(str(sdir), "oversize-sends")
+                        os.makedirs(ov_dir, exist_ok=True)
+                        for fname, content in m["oversize_files"].items():
+                            if isinstance(fname, str) and re.fullmatch(r"send-[A-Za-z0-9_.-]+\.txt", fname) and isinstance(content, str):
+                                _write_private(os.path.join(ov_dir, fname), content)
+                        text = OVERSIZE_RE.sub(lambda match: match.group(1) + os.path.join(str(sdir), match.group(3)) + match.group(5), text)
+                    except OSError as err:
+                        _warn("oversize files of outbox message %s" % mid, err)
             if discovery is not None and recipient in getattr(discovery, "agents", {}):
                 session_id = discovery.agents[recipient].session_id
             try:
@@ -1198,7 +1243,20 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
                     records[name[:-5]] = got
     if switchboard_authority(env) != "cluster":
         reminders = read(os.path.join(str(state_dir), "reminders.json"))
-    call_switchboard_v1("/v1/cloud-sync", {"records": records, "reminders": reminders}, env=env)
+    payload = {"records": records, "reminders": reminders}
+    state_files = {}
+    for fname in SYNC_STATE_FILES:
+        got = read(os.path.join(str(state_dir), fname))
+        if got is not None:
+            state_files[fname] = json.dumps(got)
+    if state_files:
+        payload["state_files"] = state_files
+    ans = call_switchboard_v1("/v1/cloud-sync", payload, env=env)
+    if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict) and switchboard_authority(env) == "cluster":
+        try:
+            _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
+        except OSError as err:
+            _warn("decisions.json sync", err)
     return {"synced": len(records)}
 
 def _healthy(url="http://127.0.0.1:%d/healthz" % PANE_RELAY_PORT):
@@ -1278,9 +1336,28 @@ def relay_cli_if_configured(command, payload, env=None):
     if not switchboard_relay_config(env)["url"]:
         return None
     orig_payload = payload
-    if command in ("send", "report", "remind", "retire", "orders") and isinstance(payload, dict):
+    if command in ("send", "report", "remind", "retire", "orders", "decisions", "intent") and isinstance(payload, dict):
         payload = _resolve_local_caller_and_repo(payload, env=env)
+    if command == "send" and isinstance(payload, dict) and isinstance(payload.get("text"), str):
+        found = {}
+        for match in OVERSIZE_RE.finditer(payload["text"]):
+            full = match.group(2)
+            try:
+                if os.path.isfile(full):
+                    with open(full, encoding="utf-8", errors="replace") as handle:
+                        found[match.group(4)] = handle.read()
+            except OSError:
+                pass
+        if found:
+            payload = dict(payload, oversize_files=found)
     ans = call_switchboard_v1("/v1/" + command, payload, env=env)
+    if command == "decisions" and isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict):
+        try:
+            _write_private(os.path.join(str(D["H"]["state_dir_path"]()), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
+        except Exception as err:
+            _warn("decisions.json update", err)
+    if env is None and command in PASSTHROUGH_COMMANDS and isinstance(ans, dict):
+        _PASSTHROUGH_AUTH[:] = [os.environ.pop("CW_SWITCHBOARD_AUTHORITY", None)]
     if command == "remind" and isinstance(ans, dict):
         if isinstance(orig_payload, dict):
             orig_payload["_relay_ans"] = ans

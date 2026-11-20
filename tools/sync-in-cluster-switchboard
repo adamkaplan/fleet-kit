@@ -140,6 +140,11 @@ def cluster_config_bytes(path=None):
     cfg["herdr"] = "/bin/true"
     cfg["opencode"] = "/bin/true"
     cfg.pop("external_decisions", None)
+    if path is None:
+        import getpass
+        user = getpass.getuser()
+        cfg.setdefault("awaiting_label", "%s:awaiting-user" % user)
+        cfg.setdefault("awaiting_cos_label", "%s:awaiting-cos" % user)
     return (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 

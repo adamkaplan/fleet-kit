@@ -111,6 +111,7 @@ class TestPerProfile(unittest.TestCase):
         self.assertIn("output connectorIdentityId string", main)
         self.assertIn("output connectorIdentityId string", ids)
         self.assertIn("g.?identityIds", sbx)
+        self.assertRegex(main, r"module sandbox 'modules/sandbox-group\.bicep' = \{[\s\S]*?dependsOn:\s*\[\s*identities\s*\]")
         self.assertIn("g.?identityId ", sbx)
 
     def test_acr_cache_rules(self):

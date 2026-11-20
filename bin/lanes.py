@@ -14,6 +14,7 @@ The logic is here; `bin/fleet-switchboard` only registers the command and hands 
 switchboard's own helpers (`NEEDS`) and its `engine`, so this module imports nothing from it.
 """
 
+import sys
 import re
 
 OPERATOR = "operator"
@@ -24,7 +25,7 @@ WAIT_LABEL = re.compile(r"await|hold|parked|block|wait", re.IGNORECASE)
 # what the command hands in, by name (the switchboard's helpers, classes and constants this module uses)
 NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "IntentError", "MessageTooLong", "InterruptRefused", "ReminderError",
          "_CHARTER_BLOCK", "NO_INTENT", "_fleet_repo", "_is_issue_number", "_one_line", "boss_name", "issue_tag", "iso",
-         "read_reminders", "write_reminders", "reminders_lock", "_gh_write", "orchestrator_label", "load_module", "repoint_workers")
+         "read_reminders", "write_reminders", "reminders_lock", "_gh_write", "orchestrator_label", "load_module", "repoint_workers", "run_cloud", "relay_cli_done")
 
 
 class MoveRefused(Exception):
@@ -227,6 +228,11 @@ def move_reminders(sb, repo, ask, old_owner, new_owner):
         for item in mine:
             item["to"] = new_owner
         sb.write_reminders(state, items)
+    if getattr(sb, "run_cloud", None):
+        try:
+            sb.run_cloud("sync_cloud_records_to_cluster", state)
+        except Exception as err:   # the local move stands; say that the cluster copy may be stale
+            sys.stderr.write("%s: reminders moved locally but the cluster sync failed (%s: %s)\n" % (sb.PROG, type(err).__name__, err))
     return "carried", before
 
 
@@ -288,6 +294,8 @@ def old_notice(plan, caller, new_owner, workers, reminder_text, tag):
 def send_notice(sb, caller, recipient, text, plan):
     """One message to `recipient`. None when delivered, else why not."""
     try:
+        if getattr(sb, "relay_cli_done", None) and sb.relay_cli_done("send", {"sender": caller or OPERATOR, "to": recipient, "text": text, "issue": plan["ask"], "repo": plan["repo"]}):
+            return None
         outcome = sb.engine.send(caller or OPERATOR, recipient, text, plan["ask"], plan["repo"])
     except Exception as err:   # a recipient that cannot be reached must not hide the rest of the report
         return sb._one_line("%s: %s" % (type(err).__name__, err), 160)
