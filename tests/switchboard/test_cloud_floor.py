@@ -942,6 +942,19 @@ class TestCloudAgents(FloorCase):
         sync_text = sync.read_text()
         self.assertIn('APP + ".stage"', sync_text)
         self.assertNotIn("rm -rf bin tools shims docs", sync_text)
+        import subprocess as _sp
+        with tempfile.TemporaryDirectory() as td:
+            app = Path(td) / "app"
+            (app / "docs").mkdir(parents=True)
+            (app / "docs" / "old.txt").write_text("old")
+            (Path(td) / "app.stage" / "tools").mkdir(parents=True)
+            (Path(td) / "app.stage" / "tools" / "in-cluster-switchboard-server").write_text("new")
+            script = sm.swap_script("t" * 40, "shadow", str(app), str(Path(td) / "st" / "mode.json"), str(Path(td) / "copy.py"))
+            _sp.run(["sh", "-c", script], check=True)
+            self.assertTrue((app / "tools" / "in-cluster-switchboard-server").is_file())
+            self.assertEqual((app / "CODE_SHA").read_text(), "t" * 40)
+            self.assertFalse((Path(td) / "app.old").exists())
+            self.assertFalse((Path(td) / "app.stage").exists())
         with tempfile.TemporaryDirectory() as cfgd:
             cfgp = Path(cfgd) / "config.json"
             self.assertEqual(sm.cluster_config_bytes(cfgp), b"")

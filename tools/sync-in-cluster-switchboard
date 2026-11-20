@@ -191,6 +191,17 @@ def rollback(pod):
     return 0
 
 
+def swap_script(tree, mode, app=APP, mode_file=MODE_FILE, server_copy="/run/home/in_cluster_switchboard_server.py"):
+    """Shell that finalises the staged tree and swaps it into place; restores the old tree if the swap fails."""
+    stage, old = app + ".stage", app + ".old"
+    return ("printf %%s %s > %s/CODE_SHA && mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"%s\"}' > %s && "
+            "cp %s/tools/in-cluster-switchboard-server %s && "
+            "if [ -d %s ]; then mv %s %s; fi && "
+            "{ mv %s %s || { [ -d %s ] && mv %s %s; exit 1; }; } && rm -rf %s"
+            % (tree, stage, mode_file, mode, mode_file, stage, server_copy,
+               app, app, old, stage, app, old, old, app, old))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pinned-sha", default="")
@@ -212,10 +223,7 @@ def main(argv=None):
         stage = APP + ".stage"
         old = APP + ".old"
         pod_exec(pod, "rm -rf %s %s && mkdir -p %s && tar -xf - -C %s" % (stage, old, stage, stage), archive)
-        pod_exec(pod, "printf %%s %s > %s/CODE_SHA && mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"%s\"}' > %s && "
-                      "cp %s/tools/in-cluster-switchboard-server /run/home/in_cluster_switchboard_server.py && "
-                      "if [ -d %s ]; then mv %s %s; fi && mv %s %s && rm -rf %s"
-                 % (tree, stage, MODE_FILE, mode, MODE_FILE, stage, APP, APP, old, stage, APP, old))
+        pod_exec(pod, swap_script(tree, mode))
     cfg_bytes = cluster_config_bytes()
     if not a.verify_only and cfg_bytes:
         pod_exec(pod, "mkdir -p /run/home/.config/fleet-switchboard && cat > /run/home/.config/fleet-switchboard/config.json", cfg_bytes)
