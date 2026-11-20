@@ -902,6 +902,8 @@ class TestCloudAgents(FloorCase):
         deployment = next(d for d in docs if d.get("kind") == "Deployment")
         container = next(c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "switchboard")
         self.assertEqual(container.get("command"), ["python3", "/run/home/app/tools/in-cluster-switchboard-server"])
+        env_map = {e["name"]: e.get("value") for e in container.get("env", [])}
+        self.assertEqual(env_map.get("SWITCHBOARD_MODE"), "active")
         server = REPO / "tools/in-cluster-switchboard-server"
         self.assertTrue(server.is_file())
         ast.parse(server.read_text())
