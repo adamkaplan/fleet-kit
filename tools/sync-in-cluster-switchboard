@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Sync a clean git archive of HEAD into the running fleet-switchboard pod, verify CODE_SHA, restart it."""
 import argparse
+import re
 import importlib.util
 import os
 import subprocess
@@ -91,6 +92,9 @@ def main(argv=None):
         archive = subprocess.check_output(["git", "archive", "--format=tar", "HEAD"] + PATHS)
         pod_exec(pod, "mkdir -p %s && tar -xf - -C %s" % (APP, APP), archive)
         pin_val = a.pinned_sha or head
+        if not re.fullmatch(r"[0-9a-f]{40}", pin_val):
+            print("error: pinned SHA must be 40 hex chars: %r" % pin_val, file=sys.stderr)
+            return 1
         pod_exec(pod, "printf %%s %s > %s/CODE_SHA && sed -i '/\"SWITCHBOARD_PINNED_SHA\"/{n;s/\"value\": \"[^\"]*\"/\"value\": \"%s\"/}' "
                       "%s/cloud/k8s/switchboard.yaml && cp %s/tools/in-cluster-switchboard-server "
                       "/run/home/in_cluster_switchboard_server.py" % (head, APP, pin_val, APP, APP))
