@@ -937,6 +937,18 @@ class TestCloudAgents(FloorCase):
         sl = importlib.machinery.SourceFileLoader("sync_pin_test", str(sync))
         sm = importlib.util.module_from_spec(importlib.util.spec_from_loader("sync_pin_test", sl))
         sl.exec_module(sm)
+        with tempfile.TemporaryDirectory() as cfgd:
+            cfgp = Path(cfgd) / "config.json"
+            self.assertEqual(sm.cluster_config_bytes(cfgp), b"")
+            self.assertEqual(sm.compute_config_hash(cfgp), "")
+            cfgp.write_text(json.dumps({"herdr": "/opt/herdr", "opencode": "/usr/bin/oc", "external_decisions": ["x"], "k": 1}))
+            cfg_out = json.loads(sm.cluster_config_bytes(cfgp))
+            self.assertEqual(cfg_out["herdr"], "/bin/true")
+            self.assertEqual(cfg_out["opencode"], "/bin/true")
+            self.assertNotIn("external_decisions", cfg_out)
+            self.assertEqual(cfg_out["k"], 1)
+            self.assertEqual(sm.compute_config_hash(cfgp), sm.compute_config_hash(cfgp))
+            self.assertRegex(sm.compute_config_hash(cfgp), r"^[0-9a-f]{40}$")
         h = "a" * 40
         self.assertEqual(sm.check_shas(h, h, ""), "")
         self.assertNotEqual(sm.check_shas(h, h, "UNPINNED"), "")

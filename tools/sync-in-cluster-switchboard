@@ -132,6 +132,28 @@ def pod_tree_hash(pod):
     return kubectl_out(["exec", pod, "--", "python3", "-c", script])
 
 
+def cluster_config_bytes(path=None):
+    p = pathlib.Path(path) if path else pathlib.Path.home() / ".config" / "fleet-switchboard" / "config.json"
+    if not p.exists():
+        return b""
+    cfg = dict(json.loads(p.read_text(encoding="utf-8")))
+    cfg["herdr"] = "/bin/true"
+    cfg["opencode"] = "/bin/true"
+    cfg.pop("external_decisions", None)
+    return (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def compute_config_hash(path=None):
+    data = cluster_config_bytes(path)
+    return hashlib.sha256(data).hexdigest()[:40] if data else ""
+
+
+def pod_config_hash(pod):
+    script = ("import hashlib, pathlib; p = pathlib.Path('/run/home/.config/fleet-switchboard/config.json'); "
+              "print(hashlib.sha256(p.read_bytes()).hexdigest()[:40] if p.exists() else '', end='')")
+    return kubectl_out(["exec", pod, "--", "python3", "-c", script])
+
+
 MODE_FILE = "/run/home/.local/state/fleet-switchboard/switchboard-mode.json"
 
 
@@ -191,6 +213,15 @@ def main(argv=None):
         pod_exec(pod, "printf %%s %s > %s/CODE_SHA && mkdir -p $(dirname %s) && printf '%%s' '{\"mode\": \"%s\"}' > %s && "
                       "cp %s/tools/in-cluster-switchboard-server /run/home/in_cluster_switchboard_server.py"
                  % (tree, APP, MODE_FILE, mode, MODE_FILE, APP))
+    cfg_bytes = cluster_config_bytes()
+    if not a.verify_only and cfg_bytes:
+        pod_exec(pod, "mkdir -p /run/home/.config/fleet-switchboard && cat > /run/home/.config/fleet-switchboard/config.json", cfg_bytes)
+    cfg_hash = compute_config_hash()
+    if cfg_hash:
+        pod_cfg = pod_config_hash(pod)
+        if pod_cfg != cfg_hash:
+            print("error: pod config.json hash %s != Mac config.json hash %s" % (pod_cfg, cfg_hash), file=sys.stderr)
+            return 1
     live_tree = pod_tree_hash(pod)
     pinned = a.pinned_sha or pod_pinned(pod)
     err = check_shas(tree, live_tree, pinned)
@@ -199,7 +230,7 @@ def main(argv=None):
         return 1
     if not a.verify_only:
         run(kubectl_base() + ["delete", "pod", pod, "--wait=false"])
-    print("ok head=%s tree=%s" % (head, tree))
+    print("ok head=%s tree=%s" % (head, tree) + (" config=%s" % cfg_hash[:12] if cfg_hash else ""))
     return 0
 
 
