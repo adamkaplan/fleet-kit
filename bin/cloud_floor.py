@@ -54,7 +54,6 @@ class UnavailableArtifactError(FloorError):
     def __init__(self, artifact, status=503):
         super().__init__("the artifact %s is unavailable" % artifact, status)
         self.artifact = artifact
-# settings, scrubbing, routing
 
 def env_of():
     return os.environ
@@ -122,7 +121,6 @@ def floor_who():
     if not CALLER_RE.fullmatch(who):
         raise D["Refusal"]("CW_FLOOR_CALLER is not a caller id (a-z, 0-9, _ and -, up to 32); nothing was created")
     return who
-# the HTTP transport
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
@@ -316,7 +314,6 @@ def _call(function, *args, **kwargs):
         raise D["CloudError"]("Floor: %s" % scrub(err)) from None
     except (OSError, ValueError, KeyError, TypeError) as err:
         raise D["CloudError"]("Floor: %s" % scrub("the call failed (%s)" % type(err).__name__)) from None
-# admission and the brief
 
 def verify_enabled(env=None):
     """True when Floor's verify workflows are on (CW_FLOOR_VERIFY_ENABLED is `1` or `true`)."""
@@ -391,7 +388,6 @@ def translate_brief(brief, repo, branch, base=None):
     lines = [REMOVED_LINE if DELIVERY_LINE.search(line) else line for line in text.splitlines()]
     body = "\n".join(lines).strip("\n")
     return FLOOR_AUTHOR_PREAMBLE % {"branch": branch, "base": base or "the default branch"} + body + "\n"
-# keys
 
 def _hash(*parts):
     return hashlib.sha256("\0".join(str(p) for p in parts).encode()).hexdigest()[:16]
@@ -411,7 +407,6 @@ def cancel_key(session_id, seq):
 def submit_work(who, cmd_id, **fields):
     """The one submit of a launch; a failure raises before any record is written."""
     return _call(transport().submit, who, cmd_id, **fields)
-# launch
 
 def _stamp(seconds, now):
     import time
@@ -518,7 +513,6 @@ def _launch_wrapper(inner):
             return inner(args, runner, now, reserve)
         return launch_floor(args, runner, now, reserve, repo, branch, inner)
     return _launch
-# send, read, status, retire
 
 def _send_floor(args, runner, now, record):
     LaunchError, H = D["H"]["LaunchError"], D["H"]
@@ -638,7 +632,6 @@ def rollback_to_pane(state, name, pane_id, cancel_fn=None):
             return {"worker": name, "pane": pane_id, "rolled_back": False}
         D["remove_record"](state, name)
     return {"worker": name, "pane": pane_id, "rolled_back": True}
-# the in-cluster switchboard (Cloud Agents)
 SESSION_RE = re.compile(r"ses_[0-9a-f]{16}")
 CHARTER_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+")
 REPORT_STATES = ("done", "failed", "blocked", "question", "working")
@@ -1065,8 +1058,7 @@ class PaneRelayMonitor:
         self.notify, self.down_after, self.canary_every, self.canary_wait = notify, down_after, canary_every, canary_wait
         self.unreachable_since = None
         self.reachability_alerted = self.authority_alerted = self.canary_alerted = False
-        self.canary_token = self.canary_sent_at = self.last_canary = None
-        self.failed_canaries = 0
+        self.canary_token = self.canary_sent_at = self.last_canary = None; self.failed_canaries = 0
     def tick(self, now, reachable, cluster_mode=None, mac_authority=None, mac_paused=None, canaries=()):
         """Returns {"restart": bool, "send_canary": token or None}."""
         out = {"restart": False, "send_canary": None, "rollback": False}
@@ -1264,8 +1256,7 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
                         try:
                             rc = subprocess.run([sys.executable, os.path.join(D["kit_root"](), "tools", "sync-in-cluster-switchboard"), "--rollback"], timeout=120, check=False).returncode
                             rc and _warn("rollback sync", rc)
-                        finally:
-                            rollback_switchboard_authority(state_dir, env=env)
+                        finally: rollback_switchboard_authority(state_dir, env=env)
                     if act["restart"]:
                         started = 0.0
                 except Exception as err:
@@ -1387,7 +1378,6 @@ def floor_watch_sync(state_dir, records, engine=None):
             continue
         records.append({"worker": name, "backend": "floor", "work_id": work_id, "session": found.get("session", work_id), "repo": repo, "floor_state": found.get("state"), "virtual": True})
     return records
-# the cutover, the drain and the pod launcher's retirement
 
 def drain_check(state, expected_workers):
     """{"lost": N, "twice": M} over the records of `state`: lost is an expected worker with no usable record; twice is a work that two records claim, or a Floor record that still carries what only a pod holds (its password file, its pod uid): two authorities for one worker."""
@@ -1421,7 +1411,6 @@ def retire_pod_launcher(state, env=None):
     if drained["lost"] or drained["twice"]:
         raise Refusal("the pod launcher stays: the drain found %d lost and %d run twice; nothing was changed" % (drained["lost"], drained["twice"]))
     return dict(drained, ready=True)
-# the binding
 
 def bind(namespace):
     """Wrap `_launch`, `cmd_send`, `cmd_read`, `status_lines` and `cmd_retire` of bin/cloud_worker.py. Each keeps `__wrapped__` and takes a pod record to the old code."""
