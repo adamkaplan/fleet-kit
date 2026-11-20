@@ -910,6 +910,15 @@ class TestCloudAgents(FloorCase):
         sync = REPO / "tools/sync-in-cluster-switchboard"
         self.assertTrue(sync.is_file())
         ast.parse(sync.read_text())
+        sl = importlib.machinery.SourceFileLoader("sync_pin_test", str(sync))
+        sm = importlib.util.module_from_spec(importlib.util.spec_from_loader("sync_pin_test", sl))
+        sl.exec_module(sm)
+        h = "a" * 40
+        self.assertEqual(sm.check_shas(h, h, ""), "")
+        self.assertEqual(sm.check_shas(h, h, "UNPINNED"), "")
+        self.assertNotEqual(sm.check_shas(h, "b" * 40, ""), "")
+        self.assertNotEqual(sm.check_shas(h, h, "c" * 40), "")
+        self.assertNotEqual(sm.check_shas("abc", "abc", ""), "")
 
     def test_pane_state_is_applied_to_discovery(self):
         obs = types.SimpleNamespace(status="idle", errored=False, turn_error="", turn_error_id=None, idle_at=None, permission_waiting=False, form_waiting=False)

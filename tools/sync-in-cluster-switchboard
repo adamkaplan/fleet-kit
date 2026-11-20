@@ -46,10 +46,7 @@ def check_shas(head, pod_sha, pinned=""):
 
 
 def pod_pinned(pod):
-    try:
-        return kubectl_out(["exec", pod, "--", "sh", "-c", 'printf %s "$SWITCHBOARD_PINNED_SHA"'])
-    except subprocess.CalledProcessError:
-        return ""
+    return kubectl_out(["exec", pod, "--", "sh", "-c", 'printf %s "$SWITCHBOARD_PINNED_SHA"'])
 
 
 def main(argv=None):
