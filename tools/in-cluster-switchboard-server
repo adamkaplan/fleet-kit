@@ -875,7 +875,7 @@ def main():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0") or "0")
-            body = self.rfile.read(min(length, 1 << 20)) if length > 0 else b""
+            body = self.rfile.read(min(length, 16 << 20)) if length > 0 else b""
             path = self.path.split("?", 1)[0]
             if path == "/v1/cloud-sync":
                 if self._auth_error() is not None:

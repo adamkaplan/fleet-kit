@@ -1100,6 +1100,15 @@ class TestFloorAuthority(FloorCase):
     def call(self, path, body, agent="cos", **kw):
         return self.floor.handle_switchboard_v1("POST", path, {"X-Switchboard-Auth": self.header(agent)}, json.dumps(body).encode(), self.SECRET, **kw)
 
+    def test_pane_state_observation_with_stayed_and_orchestrator_retire(self):
+        worker = sb.load_module("cloud_worker").bind(vars(sb))
+        with mock.patch.object(self.floor, "D", worker._Stayed()):
+            disc = types.SimpleNamespace(agents={})
+            self.floor.apply_pane_state_to_discovery({"widget-api": {"status": "idle", "pane": "%1"}}, disc)
+            self.assertIn("widget-api", disc.agents)
+        state = {}
+        self.assertEqual(self.call("/v1/retire", {"worker": "widget-api"}, agent="service-ops", state=state)[0], 200)
+
     def test_cluster_mode_persists_across_restart_and_delivers_canary(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

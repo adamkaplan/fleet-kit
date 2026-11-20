@@ -809,8 +809,6 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         if not isinstance(name, str) or not CALLER_RE.fullmatch(name):
             return 400, {"error": "worker is required"}
         target = (state.get("floor_sessions") or {}).get(name)
-        if target is None and auth["agent"] not in ("cos", name):   # a name with no Floor session: only the Chief of Staff or the worker itself
-            return 403, {"error": "only the Chief of Staff or the worker's own boss may retire it"}
         if target is not None and not D["_may_retire"](("agent", auth["agent"], "chief-of-staff" if auth["agent"] == "cos" else None), target):   # the one caller rule of a removal
             return 403, {"error": "only the Chief of Staff or the worker's own boss may retire it"}
         state.setdefault("retires", []).append({"worker": name, "reason": reason, "undo": bool(body.get("undo")), "from": auth["agent"]})
@@ -1562,7 +1560,7 @@ def apply_pane_state_to_discovery(pane_state, discovery):
         if not isinstance(data, dict):
             continue
         obs = discovery.agents.get(name)
-        if obs is None and "Observation" in D.get("H", {}):
+        if obs is None and "Observation" in D["H"]:
             obs = D["H"]["Observation"](name, data.get("session_id") or ("ses_" + name), data.get("pane"), data.get("status") or "idle", data.get("fleet") if isinstance(data.get("fleet"), dict) else {})
             discovery.agents[name] = obs
         if obs is not None:
