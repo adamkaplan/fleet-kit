@@ -7,6 +7,7 @@ Modes (SWITCHBOARD_MODE env var, or the persisted switchboard-mode.json):
     Mints GitHub App tokens from the token-mint service every 25 minutes, applies relayed pane
     state, executes relayed actions against the cluster Switchboard engine and runs
     `engine.run_pass()` every `poll_seconds`, recording planned deliveries.
+  Shadow passes fake mutating GitHub calls as success and never forward webhooks: a shadow pass is not a real one.
   - active: deliveries for local panes are queued into `pane_outbox` for the pane-relay.
 """
 import datetime as dt
@@ -66,6 +67,10 @@ SA_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 TOKEN_MINT_URL = os.environ.get("TOKEN_MINT_URL", "http://token-mint.cw.svc.cluster.local:8080/mint")
 
 
+def iso_now():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _load_account_repos():
     """Map each GitHub account to its repos, from config.json plus SWITCHBOARD_EXTRA_REPOS."""
     out = {}
@@ -79,8 +84,9 @@ def _load_account_repos():
             acct = gh_users.get(r) or gh_users.get(r.split("/")[0] + "/*")
             if acct and r not in out.setdefault(acct, []):
                 out[acct].append(r)
-    except Exception:
-        pass
+    except (OSError, ValueError, AttributeError) as err:
+        print(json.dumps({"ts": iso_now(), "event": "account_repos_error", "error": str(err)[:160],
+                          "hint": "fix config.json; no tokens will be minted"}), flush=True)
     return out
 
 
@@ -649,7 +655,8 @@ def run_pass_loop(sb_mod, cf_mod):
 
 
 def main():
-    mint_tokens()
+    if not mint_tokens():
+        log_line("startup_token_mint_failed", hint="check the ServiceAccount token, token-mint service and config.json accounts")
     sb_mod = load_switchboard_module()
     cf_mod = load_cloud_floor_module(sb_mod)
     expected_secret = os.environ.get("SWITCHBOARD_AUTH_SECRET", "").strip()
@@ -728,7 +735,10 @@ def main():
             if path == "/v1/cloud-sync":
                 if self._auth_error() is not None:
                     return None
-                data = json.loads(body.decode("utf-8") or "{}")
+                try:
+                    data = json.loads(body.decode("utf-8") or "{}")
+                except ValueError as err:
+                    return self._send(400, {"error": "invalid JSON: " + str(err)[:120]})
                 cloud_dir = STATE_DIR / "cloud"
                 cloud_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
                 for name, rec in (data.get("records") or {}).items():
