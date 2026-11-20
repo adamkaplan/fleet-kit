@@ -592,8 +592,10 @@ def _next_pass_sleep(sb_mod, state_dir, poll_sec, elapsed, now_ts):
     wait = max(5.0, poll_sec - elapsed)
     try:
         due_times = [float(i["at"]) for i in sb_mod.read_reminders(state_dir) if isinstance(i, dict) and isinstance(i.get("at"), (int, float))]
-    except Exception:
+    except Exception as err:
+        log_line("next_pass_sleep_error", error=str(err)[:200])
         due_times = []
+    due_times = [t for t in due_times if t > now_ts]   # a reminder already due and still held must not make the loop spin
     if due_times:
         wait = min(wait, max(1.0, min(due_times) - now_ts))
     return wait
