@@ -33,8 +33,8 @@ for _env_p in [Path("/run/home/.config/fleet-switchboard/cloud.env")]:
     if _env_p.exists():
         try:
             os.chmod(_env_p, 0o600)
-        except OSError:
-            pass
+        except OSError as _ce:
+            print("cloud.env chmod 0600 failed: %s" % _ce, file=sys.stderr)
         _et = _env_p.read_text()
         for _ln in _et.splitlines():
             if "_FILE=" in _ln and not _ln.strip().startswith("#"):
@@ -766,13 +766,11 @@ def main():
                 return self._send(200, {"synced": len(data.get("records") or {})})
             with STATE_LOCK:
                 code, ans = cf_mod.handle_switchboard_v1("POST", self.path, dict(self.headers), body, expected_secret, state=V1_STATE)
-                if path in ("/v1/send", "/v1/pane-ack"):
+                if path in ("/v1/send", "/v1/pane-ack") and code == 200:
                     try:
-                        _b = json.loads(body.decode("utf-8") or "{}")
-                    except ValueError:
-                        _b = {}
-                    _b = _b if isinstance(_b, dict) else {}
-                    caller = _b.get("agent") or _b.get("from")
+                        caller = cf_mod.verify_switchboard_auth(dict(self.headers).get("X-Switchboard-Auth"), expected_secret)["agent"]
+                    except Exception:
+                        caller = None
                     V1_STATE.setdefault("audit", []).append({"ts": iso_now(), "route": path, "agent": caller})
                     V1_STATE["audit"] = V1_STATE["audit"][-200:]
                 if path == "/v1/mode" and code == 200 and isinstance(ans, dict):
