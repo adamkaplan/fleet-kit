@@ -878,6 +878,16 @@ class TestCloudAgents(FloorCase):
     def sb_refusal(self):
         return self.m.D["Refusal"] if "D" in vars(self.m) else self.floor.D["Refusal"]
 
+    def test_persisted_mode_authority_and_canary(self):
+        import tempfile
+        cf = self.floor
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "switchboard-mode.json").write_text('{"mode": "active"}')
+            self.assertEqual(cf.cluster_switchboard_mode(tmp, env={}), "active")
+            self.assertEqual(cf.cluster_switchboard_mode(tmp, env={"SWITCHBOARD_MODE": "active"}), "active")
+            with self.assertRaises(cf.FloorError):
+                cf.cluster_switchboard_mode(tmp, env={"SWITCHBOARD_MODE": "shadow"})
+
     def test_switchboard_manifest_and_pane_rollback(self):
         import ast
         text = (REPO / "cloud/k8s/switchboard.yaml").read_text()
@@ -903,7 +913,16 @@ class TestCloudAgents(FloorCase):
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / "CODE_SHA").write_text("a" * 40 + "\n")
             mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "a" * 40})
-            mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "UNPINNED"})
+            with self.assertRaises(SystemExit) as cm:
+                mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "UNPINNED"})
+            self.assertEqual(cm.exception.code, 2)
+            (Path(td) / "switchboard-mode.json").write_text('{"mode": "active"}')
+            with self.assertRaises(SystemExit) as cm:
+                mod.verify_mode_agreement(td, {"SWITCHBOARD_MODE": "shadow"})
+            self.assertEqual(cm.exception.code, 2)
+            self.assertEqual(mod.verify_mode_agreement(td, {"SWITCHBOARD_MODE": "active"}), "active")
+            import re as _re
+            self.assertRegex(_re.search(r'"SWITCHBOARD_PINNED_SHA",\s*"value": "([^"]*)"', (REPO / "cloud/k8s/switchboard.yaml").read_text()).group(1), r"^[0-9a-f]{40}$")
             with self.assertRaises(SystemExit) as cm:
                 mod.verify_pinned_code_sha(td, {"SWITCHBOARD_PINNED_SHA": "b" * 40})
             self.assertEqual(cm.exception.code, 2)

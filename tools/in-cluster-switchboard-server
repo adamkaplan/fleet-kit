@@ -117,10 +117,7 @@ V1_STATE = {
 
 
 def _initial_mode():
-    try:
-        return json.loads((STATE_DIR / "switchboard-mode.json").read_text()).get("mode") or "shadow"
-    except Exception:
-        return os.environ.get("SWITCHBOARD_MODE", "shadow")
+    return (os.environ.get("SWITCHBOARD_MODE") or "shadow").strip() or "shadow"
 
 
 SHADOW_SUMMARY = {
@@ -624,7 +621,7 @@ def run_pass_loop(sb_mod, cf_mod):
         t0 = time.time()
         try:
             with STATE_LOCK:
-                SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+                SHADOW_SUMMARY["mode"] = verify_mode_agreement()
             report = engine.run_pass()
             elapsed_ms = int((time.time() - t0) * 1000)
             calls = list(engine.accounts.calls)
@@ -665,13 +662,30 @@ def verify_pinned_code_sha(app_root=APP_ROOT, env=None):
     pinned = ((env if env is not None else os.environ).get("SWITCHBOARD_PINNED_SHA") or "").strip()
     code_sha = Path(app_root) / "CODE_SHA"
     actual = code_sha.read_text(encoding="utf-8").strip() if code_sha.exists() else ""
-    if pinned and pinned != "UNPINNED" and actual != pinned:
-        print("refused: switchboard code SHA mismatch (expected %s, got %s)" % (pinned, actual or "missing"), file=sys.stderr)
+    if len(pinned) != 40 or pinned == "UNPINNED" or actual != pinned:
+        print("refused: switchboard code SHA mismatch (expected %s, got %s)" % (pinned or "missing", actual or "missing"), file=sys.stderr)
         raise SystemExit(2)
+
+
+def verify_mode_agreement(state_dir=STATE_DIR, env=None):
+    env_mode = ((env if env is not None else os.environ).get("SWITCHBOARD_MODE") or "").strip()
+    mode_file = Path(state_dir) / "switchboard-mode.json"
+    file_mode = ""
+    if mode_file.exists():
+        try:
+            file_mode = (json.loads(mode_file.read_text(encoding="utf-8")).get("mode") or "").strip()
+        except Exception as err:
+            print("refused: corrupt switchboard-mode.json (%s)" % err, file=sys.stderr)
+            raise SystemExit(2)
+    if env_mode and file_mode and env_mode != file_mode:
+        print("refused: switchboard mode mismatch (SWITCHBOARD_MODE=%s != switchboard-mode.json=%s)" % (env_mode, file_mode), file=sys.stderr)
+        raise SystemExit(2)
+    return file_mode or env_mode or "shadow"
 
 
 def main():
     verify_pinned_code_sha()
+    verify_mode_agreement()
     if not mint_tokens():
         log_line("startup_token_mint_failed", hint="check the ServiceAccount token, token-mint service and config.json accounts")
     sb_mod = load_switchboard_module()
