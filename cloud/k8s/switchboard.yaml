@@ -46,6 +46,10 @@
             "image": "registry.invalid/cw-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             "env": [
               {
+                "name": "SWITCHBOARD_MODE",
+                "value": "shadow"
+              },
+              {
                 "name": "CW_CLOUD_NAMESPACE",
                 "value": "cw"
               },

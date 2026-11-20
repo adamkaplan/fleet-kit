@@ -1010,7 +1010,6 @@ def cluster_switchboard_mode(state_dir, env=None):
             _warn("reading switchboard-mode.json (falling back to the environment)", err)
     return (env or os.environ).get("SWITCHBOARD_MODE") or "shadow"
 
-
 def write_cluster_switchboard_mode(state_dir, mode):
     if mode not in ("shadow", "active"):
         raise FloorError("mode must be shadow or active")
@@ -1023,7 +1022,6 @@ def write_cluster_switchboard_mode(state_dir, mode):
     os.replace(tmp, path)
     return {"mode": mode}
 
-
 def notify_macos_alarm(title, text, runner=subprocess.run):
     if sys.platform != "darwin" and runner is subprocess.run:
         return None
@@ -1032,7 +1030,6 @@ def notify_macos_alarm(title, text, runner=subprocess.run):
         return runner(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=10)
     except Exception as err:
         _warn("macOS notification", err)
-
 
 def mac_daemon_paused(state_dir, runner=subprocess.run):
     pid = None
@@ -1050,7 +1047,6 @@ def mac_daemon_paused(state_dir, runner=subprocess.run):
     done = runner(["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
     return done.returncode != 0 or (done.stdout or "").strip().startswith("T")
 
-
 def check_single_authority(cluster_mode, mac_authority, mac_paused):
     """None when exactly one side holds authority; else a description of the mismatch."""
     if cluster_mode == "active" and mac_authority == "cluster" and mac_paused is True:
@@ -1062,7 +1058,6 @@ def check_single_authority(cluster_mode, mac_authority, mac_paused):
     if cluster_mode == "active" and not mac_paused:
         return "split-brain authority: cluster is active and Mac daemon is running"
     return "authority mismatch: cluster=%s, mac_authority=%s, mac_paused=%s" % (cluster_mode, mac_authority, mac_paused)
-
 
 class PaneRelayMonitor:
     """Alarm state of the Mac relay: tunnel reachability (2 min), single authority, and a 10-minute end-to-end canary."""
@@ -1102,10 +1097,15 @@ class PaneRelayMonitor:
             out["send_canary"] = self.canary_token
         return out
 
-
 def fetch_cluster_mode(env=None):
     config = switchboard_relay_config(env)
-    ans = _parse(_request("GET", config["url"].rstrip("/") + "/v1/mode", None, [("Accept", "application/json"), ("X-Switchboard-Auth", _auth_header(config))])[1])
+    base, hdr = config["url"].rstrip("/"), [("Accept", "application/json"), ("X-Switchboard-Auth", _auth_header(config))]
+    try:
+        ans = _parse(_request("GET", base + "/v1/mode", None, hdr)[1])
+    except FloorError as err:
+        if err.status != 404:
+            raise
+        ans = _parse(_request("GET", base + "/healthz")[1])  # older pod
     return ans.get("mode") if isinstance(ans, dict) else None
 
 
