@@ -163,7 +163,15 @@ def watched_repos_from_snapshot(snap, cfg):
     """Sorted list of repos watched by live agents in `snap` that match a `gh_users` entry in `cfg`."""
     gh_users = (cfg or {}).get("gh_users") or {}
     watched = set()
-    active_sessions = {a.get("agent_session") for a in (snap or {}).get("agents") or [] if isinstance(a, dict) and a.get("agent_session")}
+    active_sessions = set()
+    for a in (snap or {}).get("agents") or []:
+        if isinstance(a, dict):
+            s = a.get("agent_session")
+            sid = s.get("value") if isinstance(s, dict) else s
+            if isinstance(sid, str) and sid:
+                active_sessions.add(sid)
+    if (snap or {}).get("agents") and not active_sessions:
+        return []  # agents present but none names a session: watch nothing, never widen to all
     for sid, sdata in ((snap or {}).get("sessions") or {}).items():
         if active_sessions and sid not in active_sessions:
             continue

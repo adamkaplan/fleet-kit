@@ -944,11 +944,13 @@ class TestCloudAgents(FloorCase):
         sl.exec_module(sm)
         for path in ("docs", "agents", "plugins", "skills", "templates"):
             self.assertIn(path, sm.PATHS)
-        snap = {"agents": [{"agent_session": "ses_example"}],
-                "sessions": {"ses_example": {"metadata": {"fleet": {"repo": "acme-org/widget-service"}}},
+        snap = {"agents": [{"agent_session": "ses_example"}, {"agent_session": {"value": "ses_live2", "kind": "id"}}],
+                "sessions": {"ses_live2": {"metadata": {"fleet": {"repo": "acme-org/live-service"}}},
+                             "ses_example": {"metadata": {"fleet": {"repo": "acme-org/widget-service"}}},
                              "ses_other": {"metadata": {"fleet": {"repo": "acme-org/floor-service"}}},
                              "ses_example2": {"metadata": {"fleet": {"repo": "other-org/widget-api"}}}}}
-        self.assertEqual(sm.watched_repos_from_snapshot(snap, {"gh_users": {"acme-org/*": "acct"}}), ["acme-org/widget-service"])
+        self.assertEqual(sm.watched_repos_from_snapshot(snap, {"gh_users": {"acme-org/*": "acct"}}), ["acme-org/live-service", "acme-org/widget-service"])
+        self.assertEqual(sm.watched_repos_from_snapshot({"agents": [{"agent_session": 123}], "sessions": snap["sessions"]}, {"gh_users": {"acme-org/*": "acct"}}), [])
         import urllib.error as _ue
         from unittest import mock as _mock
         err404 = _ue.HTTPError("u", 404, "Not Found", {}, None)
