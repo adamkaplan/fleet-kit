@@ -1092,7 +1092,7 @@ class PaneRelayMonitor:
             if not self.canary_alerted:
                 self.notify("fleet-switchboard canary failed", "End-to-end canary wake was not delivered and acked")
             self.canary_alerted, self.canary_token = True, None
-        if mac_authority == "cluster" and self.canary_token is None and (self.last_canary is None or now - self.last_canary >= self.canary_every):
+        if mac_authority in ("cluster", "shadow") and self.canary_token is None and (self.last_canary is None or now - self.last_canary >= self.canary_every):
             self.canary_token, self.canary_sent_at, self.last_canary = "canary:%d" % now, now, now
             out["send_canary"] = self.canary_token
         return out
