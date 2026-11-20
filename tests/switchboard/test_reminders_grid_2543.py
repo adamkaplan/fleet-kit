@@ -76,7 +76,7 @@ class TestReminderGridAndRecurring(unittest.TestCase):
             self.assertEqual(sb.read_reminders(tmp), [])
 
     def test_an_explicit_time_in_the_past_is_refused_for_a_keyed_reminder(self):
-        with self.assertRaises(sb.ReminderError):
+        with self.assertRaisesRegex(sb.ReminderError, r"is in the past \(now is 2030-01-02T05:07:31Z\)"):
             sb.grid_when("2030-01-02T05:00:00Z", self.NOW)
 
     def test_the_self_polling_chain_guard(self):

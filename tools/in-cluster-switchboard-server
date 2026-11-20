@@ -513,6 +513,9 @@ class ShadowV2:
                     "delivery": delivery,
                     "resume": bool(resume),
                 })
+        eng = ENGINE_REF.get("engine")
+        if eng is not None and getattr(eng, "audit", None) is not None and entry["mode"] == "active":
+            eng.audit.append("daemon", "v2.synthetic", recipient, {"keys": list(keys), "delivery": delivery, "resume": bool(resume)})
         log_line("planned_delivery", **entry)
         return {"id": message_id}
 
@@ -574,9 +577,26 @@ def handle_on_v1_action(route_path, auth, body, state):
                         if body.get(k):
                             cond[k] = body[k]
                     item = sb_mod.add_reminder(STATE_DIR, to, at, moment, text, body.get("issue"), sender, body.get("repo"), condition=cond or None, key=body.get("key"), ttl=ttl, every=every)
+                    if getattr(eng, "audit", None) is not None:
+                        eng.audit.append("cli", "reminder.add", to, {
+                            "id": item["id"], "at": sb_mod.iso(item["at"]), "from": sender,
+                            "issue": body.get("issue"), "repo": body.get("repo"),
+                            **({"key": str(body["key"])[:60]} if body.get("key") else {}),
+                        })
                     log_line("v1_remind_added", sender=sender, to=to, id=item["id"], at=item["at"])
     except Exception as err:
         log_line("v1_action_error", route=route_path, error=str(err)[:200])
+
+
+def _next_pass_sleep(sb_mod, state_dir, poll_sec, elapsed, now_ts):
+    wait = max(5.0, poll_sec - elapsed)
+    try:
+        due_times = [float(i["at"]) for i in sb_mod.read_reminders(state_dir) if isinstance(i, dict) and isinstance(i.get("at"), (int, float))]
+    except Exception:
+        due_times = []
+    if due_times:
+        wait = min(wait, max(1.0, min(due_times) - now_ts))
+    return wait
 
 
 def run_pass_loop(sb_mod, cf_mod):
@@ -674,7 +694,7 @@ def run_pass_loop(sb_mod, cf_mod):
             with STATE_LOCK:
                 SHADOW_SUMMARY["last_pass_error"] = str(err)[:240]
             log_line("shadow_pass_error", error=str(err)[:240])
-        sleep_for = max(5.0, poll_sec - (time.time() - t0))
+        sleep_for = _next_pass_sleep(sb_mod, state, poll_sec, time.time() - t0, time.time())
         time.sleep(sleep_for)
 
 

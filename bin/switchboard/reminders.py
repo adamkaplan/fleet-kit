@@ -817,9 +817,53 @@ def late_reminder_counts(state_dir, config, now):
     return counts
 
 
+def late_reminder_worst(state_dir, now):
+    """{lane: worst lateness in seconds (0 when on time)} for reminders delivered in the last 24 hours, from the audit tail."""
+    from datetime import datetime
+    parse = load_module("record_json").parse_bounded
+    def epoch(text):
+        try:
+            return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    added, delivered, worst = {}, {}, {}
+    try:
+        cap = 8 * 1024 * 1024
+        with open(str(state_dir) + "/audit.jsonl", "rb") as handle:
+            size = handle.seek(0, 2)
+            handle.seek(max(0, size - cap))
+            data = handle.read(cap)
+            if size > cap:
+                data = data.partition(b"\n")[2]
+        lines = data.decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return worst
+    for line in lines:
+        try:
+            entry = parse(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+        if entry.get("event") == "reminder.add" and detail.get("id") is not None:
+            added[str(detail["id"])] = (entry.get("subject"), epoch(detail.get("at")))
+        elif entry.get("event") == "v2.synthetic":
+            for key in detail.get("keys") or []:
+                if isinstance(key, str) and key.startswith("reminder:"):
+                    delivered.setdefault(key[len("reminder:"):], epoch(entry.get("ts")))
+    for item_id, (lane, due) in added.items():
+        sent = delivered.get(item_id)
+        if due is not None and sent is not None and sent >= now - 86400:
+            worst[lane] = max(worst.get(lane, 0), sent - due, 0)
+    return worst
+
+
 def late_reminder_lines(state_dir, config, now):
-    """One `status` line per lane: how many reminders came later than their bound in the last 24 hours."""
-    return ["      reminders  %s: %d later than the bound in 24h" % (lane, n) for lane, n in sorted(late_reminder_counts(state_dir, config, now).items())]
+    """One `status` line per lane: how many reminders came later than their bound in the last 24 hours, and the worst lateness."""
+    worst = late_reminder_worst(state_dir, now)
+    return ["      reminders  %s: %d later than the bound in 24h, worst %dm" % (lane, n, int(worst.get(lane, 0) // 60))
+            for lane, n in sorted(late_reminder_counts(state_dir, config, now).items())]
 
 
 # ---- #2544: recurring reminders sit on the 15-minute UTC grid; a one-off stays exact
@@ -836,7 +880,7 @@ def grid_when(text, now):
             raise ReminderError("a --key or --every reminder needs at least 15m (got %r): use 15m or more, or arm upfront one-shots without --key" % text[:40])
         return float((int(at // GRID_SECONDS) + (1 if at % GRID_SECONDS else 0)) * GRID_SECONDS)
     if at <= now:
-        raise ReminderError("a --key or --every reminder at an explicit time must be in the future, got %r" % text[:40])
+        raise ReminderError("a --key or --every reminder at an explicit time must be in the future: %r is in the past (now is %s)" % (text[:40], iso(now)))
     if at % GRID_SECONDS:
         raise ReminderError("a --key or --every reminder at an explicit time must fall on :00, :15, :30 or :45 UTC with :00 seconds, got %r" % text[:40])
     return at

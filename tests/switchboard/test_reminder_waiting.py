@@ -274,6 +274,7 @@ def build(PR4Base):
             self.assertEqual(counts["lane-a"], 3)
             self.assertEqual(counts["lane-b"], 1)
             self.assertEqual(len(lines), 2)
+            self.assertTrue(any("lane-a: 3 later than the bound in 24h, worst 25m" in l for l in lines), lines)
         def audit_window_fixture(self):
             """ONE audit file written once: a junk line, a late lane-a reminder OUTSIDE the window, a pad line, then the last 8 MiB, which start exactly at
             the first byte of a late lane-b `reminder.add` line. The window holds the lane-b delivery (last), two late lane-a reminders, an array and a
