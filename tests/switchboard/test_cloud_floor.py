@@ -1145,11 +1145,11 @@ class TestFloorAuthority(FloorCase):
         self.assertIn("fleet-switchboard relay recovered", sent)
         sent.clear()
         monitor = f.PaneRelayMonitor(notify=lambda title, text: sent.append(title))
-        self.assertIsNotNone(monitor.tick(0, True, "active", "cluster", False)["send_canary"])
-        self.assertFalse(monitor.tick(61, True, "active", "cluster", False)["rollback"])
+        self.assertIsNotNone(monitor.tick(0, True, "active", "cluster", True)["send_canary"])
+        self.assertFalse(monitor.tick(61, True, "active", "cluster", True)["rollback"])
         self.assertEqual(sent, ["fleet-switchboard canary failed"])
-        self.assertIsNotNone(monitor.tick(600, True, "active", "cluster", False)["send_canary"])
-        act = monitor.tick(661, True, "active", "cluster", False)
+        self.assertIsNotNone(monitor.tick(600, True, "active", "cluster", True)["send_canary"])
+        act = monitor.tick(661, True, "active", "cluster", True)
         self.assertIs(act["rollback"], True)
         self.assertEqual(sent[-1], "fleet-switchboard rolled back")
         calls = []
@@ -1378,14 +1378,15 @@ class TestFloorAuthority(FloorCase):
 
     def test_rollback_switchboard_authority_sets_shadow_and_resumes_pid(self):
         (self.home / "switchboard-relay.json").write_text('{"url": "https://sw.example", "authority": "cluster"}')
-        (self.home / "daemon.json").write_text('{"pid": 4242}')
+        pid = os.getpid()
+        (self.home / "daemon.json").write_text(json.dumps({"pid": pid}))
         kills = []
         with mock.patch.object(self.floor, "call_switchboard_v1") as post:
             out = self.floor.rollback_switchboard_authority(self.home, env={}, kill_fn=lambda *a: kills.append(a))
         post.assert_called_once_with("/v1/mode", {"mode": "shadow"}, env={})
         self.assertEqual(json.loads((self.home / "switchboard-relay.json").read_text())["authority"], "shadow")
-        self.assertEqual(kills, [(4242, signal.SIGCONT)])
-        self.assertEqual(out, {"authority": "shadow", "resumed_pid": 4242})
+        self.assertEqual(kills, [(pid, signal.SIGCONT)])
+        self.assertEqual(out, {"authority": "shadow", "resumed_pid": pid})
 
     def test_fetch_cluster_mode_falls_back_to_healthz_on_404_only(self):
         cfg = {"url": "https://sw.example/"}

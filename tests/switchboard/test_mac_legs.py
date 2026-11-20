@@ -381,6 +381,7 @@ class TestPlatformPaths(unittest.TestCase):
         "bin/fleet-switchboard": "left out on purpose: almost every change touches it; the push to main and the nightly catch a regression",
         "bin/switchboard/docker_reaper.py": "a part cut out of bin/fleet-switchboard (left out on purpose, see above); its \"ps\" is the docker subcommand `docker ps`, not the host tool",
         "bin/switchboard/job_runs.py": "a part cut out of bin/fleet-switchboard; portable ps -o ... -p PID call, which also exists on Linux",
+        "bin/cloud_floor.py": "portable ps -o ... -p PID call and guarded osascript notification, which also runs on Linux",
         "bin/cloud_cluster.py": "portable ps -o ... -p PID call, which also exists on Linux",
         "bin/guard_record_head_move.py": "portable ps -o ... -p PID call, which also exists on Linux",
         "bin/system_sender.py": "portable ps -ww -o ... -p PID fallback when /proc is absent, which also exists on Linux",

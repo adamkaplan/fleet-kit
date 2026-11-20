@@ -76076,7 +76076,7 @@ class TestBlockedReport(_cos_blocked_owner.BlockedReportOwnerAlarm, Base):
 
     def test_the_kind_of_block_for_each_open_request_and_when_it_was_not_read(self):
         observation = self.blocked_observation()
-        bare = mock.Mock(sources=[])
+        bare = mock.Mock(sources=[], pane_command_sink=None)
         self.assertIn("(not read)", sb.blocked_kind(bare, observation))
         source = sb.WorkerFacts()
         engine = mock.Mock(sources=[source])

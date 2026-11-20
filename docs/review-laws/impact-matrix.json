@@ -338,6 +338,8 @@
         "bin/queued_wait.py",
         "bin/unconsumed_record.py",
         "bin/work_sync.py",
+        "bin/caretaker_config.py",
+        "bin/switchboard_names.py",
         "bin/switchboard/plan_input.py",
         "bin/switchboard/observing.py",
         "bin/switchboard/v2_transport.py",
@@ -379,9 +381,7 @@
         "bin/switchboard/labels_ensure.py",
         "bin/switchboard/land.py",
         "bin/switchboard/land_gate.py",
-        "bin/switchboard/caretaker.py",
-        "bin/caretaker_config.py",
-        "bin/switchboard_names.py"
+        "bin/switchboard/caretaker.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {

@@ -81,7 +81,9 @@ COS_ALLOWING_FULL = cos_rules_text(("fleet-switchboard gates *", "allow"), ("fle
 
 class Base(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
+        td = Path(tempfile.gettempdir())
+        tmp_dir = "/var/tmp" if os.path.isdir("/var/tmp") and any((os.lstat(str(p)).st_mode & 0o022) and not (os.lstat(str(p)).st_mode & 0o1000) for p in [td, *td.parents]) else None
+        tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(remove_tree_patiently, tmp)
         self.home = Path(tmp.name).resolve()
         patcher = mock.patch.dict(os.environ, {

@@ -183,7 +183,7 @@ def render(text, per_part):
     chunks, current = [], []
     for line in lines[start + 1:end]:
         current.append(line)
-        if line.startswith("        ]"):
+        if line.startswith("        ]") or line.rstrip(",").endswith(": []"):
             chunks.append(current)
             current = []
     if current:
@@ -194,7 +194,10 @@ def render(text, per_part):
         chunks.append(['        "%s": [' % part] + ['          "%s"%s' % (n, "," if k < len(names) - 1 else "") for k, n in enumerate(names)] + ["        ]"])
     flat = []
     for k, c in enumerate(chunks):
-        c = c[:-1] + ["        ]" + ("," if k < len(chunks) - 1 else "")]
+        if c[-1].rstrip(",").endswith(": []"):
+            c = c[:-1] + [c[-1].rstrip(",") + ("," if k < len(chunks) - 1 else "")]
+        else:
+            c = c[:-1] + ["        ]" + ("," if k < len(chunks) - 1 else "")]
         flat += c
     lines[start + 1:end] = flat
     return "\n".join(lines)

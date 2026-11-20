@@ -41,6 +41,7 @@ rebuilt from another record.
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
 | `bin/tip_watch.py:218` | `discovery.agents` | the agents of the newest `discover()`, handed to `route_of` to find the lane of the merging pull request | nobody | the tip watch's tell | derived (reader) |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
+| `bin/cloud_floor.py:865` | `discovery.agents` | the pane relay and in-cluster switchboard read the discovered agents | `apply_pane_state_to_discovery` | pane relay and `/v1/pane-state` | derived (reader) |
 | `bin/switchboard/job_runs.py:348` | `discovery.agents` | the agents of the newest `discover()`: a dead job's starter is found among them by session and name | nobody | `JobFacts` | derived (reader) |
 | `bin/switchboard/job_runs.py:350` | `boss-resolution` | the starter's boss, by `boss_name` over the discovery | nobody | `JobFacts` | derived (reader) |
 | `bin/switchboard/shadow_classifier.py:32` | `discovery.agents` | the discovered agents, read to find the open asks of the chief of staff for the shadow classifier | nobody | `open_asks_of`, `run_shadow_classifier` | derived (reader) |
