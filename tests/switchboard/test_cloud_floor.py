@@ -1418,6 +1418,76 @@ class TestFloorAuthority(FloorCase):
             self.assertEqual(srv.V1_STATE["pane_state"], {"widget-api": {"status": "idle"}})
             srv.V1_STATE.pop("pane_state", None)
 
+    def test_synthetic_messages_persist_and_list(self):
+        import importlib.machinery, importlib.util
+        import tempfile
+        loader = importlib.machinery.SourceFileLoader("ics_server", str(REPO / "tools/in-cluster-switchboard-server"))
+        srv = importlib.util.module_from_spec(importlib.util.spec_from_loader("ics_server", loader))
+        loader.exec_module(srv)
+        with tempfile.TemporaryDirectory() as td:
+            srv.STATE_DIR = Path(td)
+            srv.SYNTHETIC_MESSAGES_FILE = Path(td) / "synthetic-messages.json"
+            srv.V1_STATE["synthetic_messages"] = {}
+            v2 = object.__new__(srv.ShadowV2)
+            v2.session_get = lambda sid: {"metadata": {"fleet": {"name": "cos"}}}
+            try:
+                for i, text in enumerate(["first", "question: widget-api needs a call"]):
+                    try:
+                        v2.synthetic("ses_example", text, {}, False, "immediate", "msg_%d" % i, "d")
+                    except Exception:
+                        pass  # shadow bookkeeping after recording is not under test
+                self.assertEqual(srv.SYNTHETIC_MESSAGES_FILE.stat().st_mode & 0o777, 0o600)
+                srv.V1_STATE["synthetic_messages"] = {}
+                srv.load_synthetic_messages()
+                listed = v2.message_list("ses_example", limit=10, type="synthetic")
+                self.assertEqual([m["id"] for m in listed], ["msg_1", "msg_0"])
+                self.assertEqual(v2.message_list("ses_example", type="other"), [])
+                pages = list(v2.message_pages("ses_example", 5, "synthetic", 2))
+                self.assertEqual([m["id"] for m in pages[0][0]], ["msg_1", "msg_0"])
+                self.assertIn("question:", listed[0]["text"])
+            finally:
+                srv.V1_STATE["synthetic_messages"] = {}
+
+    def test_report_send_and_decisions_refresh_decisions(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("ics_server", str(REPO / "tools/in-cluster-switchboard-server"))
+        srv = importlib.util.module_from_spec(importlib.util.spec_from_loader("ics_server", loader))
+        loader.exec_module(srv)
+        published = []
+
+        class Store:
+            def publish(self, decisions, errors, now_ts, provisional=False):
+                published.append(provisional)
+
+        class Eng:
+            discovery = object()
+            now = staticmethod(lambda: 1.0)
+            def report(self, *a, **k): return {}
+            def send(self, *a, **k): return {}
+
+        class SB:
+            derive_decisions = staticmethod(lambda eng, now: ([], []))
+            decision_store = staticmethod(lambda eng: Store())
+
+        saved = dict(srv.ENGINE_REF)
+        srv.ENGINE_REF.update(engine=Eng(), sb_mod=SB(), cf_mod=None)
+        try:
+            auth = {"agent": "widget-api"}
+            run = lambda route, body: srv.handle_on_v1_action(route, auth, body, {})
+            run("/v1/report", {"state": "question", "text": "q"})
+            self.assertEqual(published, [True])
+            run("/v1/report", {"state": "working", "text": "x"})
+            self.assertEqual(published, [True])
+            run("/v1/send", {"to": "cos", "text": "answer"})
+            run("/v1/decisions", {"action": "escalate"})
+            self.assertEqual(published, [True] * 3)
+            run("/v1/decisions", {"action": "list"})
+            self.assertEqual(len(published), 3)
+            SB.derive_decisions = staticmethod(lambda eng, now: 1 / 0)
+            run("/v1/send", {"to": "cos", "text": "answer"})  # a failing refresh never breaks the route
+        finally:
+            srv.ENGINE_REF.update(saved)
+
     def test_retire_orders_and_pane_commands(self):
         state = {}
         self.assertEqual(self.call("/v1/retire", {"worker": "widget-api", "reason": "done"}, state=state), (200, {"retired": True, "worker": "widget-api"}))

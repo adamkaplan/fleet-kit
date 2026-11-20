@@ -71,6 +71,7 @@ pwd.getpwuid = _safe_getpwuid
 CONFIG_DIR = HOME / ".config" / "fleet-switchboard"
 STATE_DIR = HOME / ".local" / "state" / "fleet-switchboard"
 PANE_STATE_FILE = STATE_DIR / "pane-state.json"
+SYNTHETIC_MESSAGES_FILE = STATE_DIR / "synthetic-messages.json"
 TOKENS_DIR = HOME / "tokens"
 APP_ROOT = HOME / "app"
 SNAPSHOT_FILE = HOME / "fleet_agents_snapshot.json"
@@ -110,6 +111,7 @@ V1_STATE = {
     "pane_commands": [],
     "pane_state": {},
     "pane_state_at": None,
+    "synthetic_messages": {},
     "reports": [],
     "reminders": [],
     "orders": [],
@@ -470,8 +472,20 @@ class ShadowV2:
     def inbox_list(self, session_id):
         return []
 
-    def message_list(self, session_id, limit=10, type=None, order="desc"):
-        return []
+    def message_list(self, session_id, limit=10, type=None, order="desc", cursor=None):
+        if type not in (None, "synthetic"):
+            return []
+        with STATE_LOCK:
+            msgs = list((V1_STATE.get("synthetic_messages") or {}).get(session_id) or [])
+        if order == "asc":
+            msgs = list(reversed(msgs))
+        return msgs[:limit] if isinstance(limit, int) and limit > 0 else msgs
+
+    def message_page(self, session_id, limit=None, type=None, cursor=None):
+        return self.message_list(session_id, limit=limit, type=type, order="desc"), None
+
+    def message_pages(self, session_id, limit, type=None, max_pages=1):
+        yield self.message_list(session_id, limit=limit, type=type, order="desc"), False
 
     def inbox_update(self, session_id, inbox_id, delivery):
         return {"id": inbox_id, "delivery": delivery}
@@ -486,6 +500,21 @@ class ShadowV2:
         return {}
 
     def synthetic(self, session_id, text, metadata, resume, delivery, message_id, description):
+        msg_rec = {
+            "id": message_id,
+            "type": "synthetic",
+            "text": text,
+            "metadata": metadata or {},
+            "delivery": delivery,
+            "resume": bool(resume),
+            "time": {"created": int(time.time() * 1000)},
+        }
+        with STATE_LOCK:
+            store = V1_STATE.setdefault("synthetic_messages", {})
+            msgs = [m for m in (store.get(session_id) or []) if m.get("id") != message_id]
+            msgs.insert(0, msg_rec)
+            store[session_id] = msgs[:200]
+            save_synthetic_messages(store)
         info = self.session_get(session_id)
         recipient = ((info.get("metadata") or {}).get("fleet") or {}).get("name") or session_id
         keys = ((metadata or {}).get("fleet") or {}).get("keys") or []
@@ -533,6 +562,16 @@ class ShadowV2:
         return {"id": message_id}
 
 
+def refresh_decisions(eng, sb_mod):
+    """Republish decisions.json now so a report or answer shows without waiting for the next pass."""
+    try:
+        now_ts = eng.now()
+        decisions, errors = sb_mod.derive_decisions(eng, now_ts)
+        sb_mod.decision_store(eng).publish(decisions, errors, now_ts, provisional=True)
+    except Exception as derr:
+        log_line("v1_decisions_refresh_error", error=str(derr)[:160])
+
+
 def handle_on_v1_action(route_path, auth, body, state):
     """Bridge `/v1/{send,report,remind,retire,orders}` into the in-cluster Switchboard engine."""
     eng = ENGINE_REF.get("engine")
@@ -557,6 +596,8 @@ def handle_on_v1_action(route_path, auth, body, state):
                 else:
                     reg.retire(STATE_DIR, name, auth.get("agent") or "cos", body.get("reason") or "finished")
         elif route_path == "/v1/decisions":
+            if body.get("action") in ("escalate", "batch"):
+                refresh_decisions(eng, sb_mod)
             dfile = STATE_DIR / "decisions.json"
             if dfile.is_file():
                 state["decisions_file"] = json.loads(dfile.read_text(encoding="utf-8"))
@@ -581,6 +622,7 @@ def handle_on_v1_action(route_path, auth, body, state):
                 if outcome.get("held") or outcome.get("action") == "hold":
                     SHADOW_SUMMARY["held_sends_events"].append({"ts": iso_now(), "from": sender, "to": to, "outcome": outcome})
                 log_line("v1_send_executed", sender=sender, to=to, outcome=outcome)
+                refresh_decisions(eng, sb_mod)
         elif route_path == "/v1/report":
             sender = body.get("sender") or body.get("from") or auth.get("agent")
             st = body.get("state") or body.get("status")
@@ -589,6 +631,8 @@ def handle_on_v1_action(route_path, auth, body, state):
             if sender and st and text:
                 outcome = eng.report(sender, st, text, issue=issue)
                 log_line("v1_report_executed", sender=sender, state=st, outcome=outcome)
+                if st in ("question", "blocked", "withdrawn") and getattr(eng, "discovery", None) is not None:
+                    refresh_decisions(eng, sb_mod)
         elif route_path == "/v1/remind":
             sender = body.get("sender") or body.get("from") or auth.get("agent")
             action = body.get("action")
@@ -649,6 +693,30 @@ def save_pane_state(agents):
         log_line("pane_state_not_saved", error=str(err)[:160])
 
 
+def save_synthetic_messages(messages_map):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SYNTHETIC_MESSAGES_FILE.with_name(SYNTHETIC_MESSAGES_FILE.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(messages_map, fh)
+        os.replace(str(tmp), str(SYNTHETIC_MESSAGES_FILE))
+    except OSError as err:
+        log_line("synthetic_messages_not_saved", error=str(err)[:160])
+
+
+def load_synthetic_messages():
+    if not SYNTHETIC_MESSAGES_FILE.is_file() or V1_STATE.get("synthetic_messages"):
+        return
+    try:
+        loaded = json.loads(SYNTHETIC_MESSAGES_FILE.read_text())
+    except (OSError, ValueError) as err:
+        log_line("synthetic_messages_not_loaded", error=str(err)[:160])
+        return
+    if isinstance(loaded, dict):
+        V1_STATE["synthetic_messages"] = loaded
+
+
 def load_pane_state():
     if not PANE_STATE_FILE.is_file() or V1_STATE.get("pane_state"):
         return
@@ -663,6 +731,7 @@ def load_pane_state():
 
 def run_pass_loop(sb_mod, cf_mod):
     load_pane_state()
+    load_synthetic_messages()
     real_gh = "/usr/bin/gh" if os.path.exists("/usr/bin/gh") else "gh"
     runner = make_runner(real_gh)
     now = time.time
