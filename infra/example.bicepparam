@@ -29,7 +29,6 @@ param agentPools = [
     vmSize: 'Standard_D32ads_v7'
     osDiskSizeGB: 1760
     osDiskType: 'Ephemeral'
-    workloadRuntime: 'KataVmIsolation'
     count: 0
     minCount: 0
     maxCount: 2

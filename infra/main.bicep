@@ -21,7 +21,7 @@ param sandboxGroupName string
 param sandboxGroupTags object = {}
 param connectorGatewayName string = ''
 param connectorGatewayId string = ''
-@description('Per-profile sandbox groups. Each: name, tags, identityId (optional).')
+@description('Per-profile sandbox groups. Each: name, tags, identityIds (optional array) or identityId (optional single id); identityIds wins if both are set.')
 param extraSandboxGroups array = []
 @description('Optional user-assigned identity resource ids attached to the primary sandboxGroupName.')
 param sandboxGroupIdentityIds array = []
