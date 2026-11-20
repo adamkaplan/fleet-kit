@@ -754,7 +754,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text:
             return 400, {"error": "to and text are required"}
         message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo")}
-        if to == "pane-relay" and (body.get("canary") is True or text.startswith("canary:")):
+        if is_canary(dict(message, canary=body.get("canary"))):
             if state.get("mode", "active") == "shadow":
                 return 200, {"queued": "shadow"}
             state["pane_outbox"].append(dict(message, id=len(state["pane_outbox"]) + 1 + len(state.get("acked", []))))
@@ -940,7 +940,7 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
         mid = m.get("id")
         if mid is None:
             continue
-        if m.get("to") == "pane-relay" or m.get("canary") is True or str(m.get("text") or "").startswith("canary:"):
+        if is_canary(m):
             canaries.append(m.get("text"))
             ack_ids.append(mid)
             continue
@@ -994,6 +994,10 @@ def pane_relay_pass(engine, sb_mod, env=None):
         _warn("pane state push", err)
     return drain_pane_outbox(engine, sb_mod=sb_mod, discovery=discovery, env=env)
 
+def is_canary(m):
+    return m.get("to") == "pane-relay" and (m.get("canary") is True or str(m.get("text") or "").startswith("canary:"))
+
+
 def cluster_switchboard_mode(state_dir, env=None):
     path = os.path.join(str(state_dir), "switchboard-mode.json")
     if os.path.exists(path):
@@ -1002,8 +1006,8 @@ def cluster_switchboard_mode(state_dir, env=None):
                 mode = D["parse_bounded"](handle.read()).get("mode")
             if mode in ("active", "shadow"):
                 return mode
-        except (OSError, ValueError, AttributeError):
-            pass
+        except (OSError, ValueError, AttributeError) as err:
+            _warn("reading switchboard-mode.json (falling back to the environment)", err)
     return (env or os.environ).get("SWITCHBOARD_MODE") or "shadow"
 
 
@@ -1304,7 +1308,6 @@ def _stayed_name(name):
 
 def _one_line_text(err):
     return " ".join(str(err).split())[:160]
-
 def floor_watch_sync(state_dir, records, engine=None):
     """Read the Floor controller's sessions (the source of truth for backend=floor): audit `cloud.stopped` once for a finished session and add a virtual record for a session no local file holds. Never raises: an offline pass is not broken by it."""
     try:
@@ -1388,7 +1391,6 @@ def drain_check(state, expected_workers):
                 twice += 1
     twice += sum(len(names) - 1 for names in claims.values() if len(names) > 1)
     return {"lost": lost, "twice": twice}
-
 def retire_pod_launcher(state, env=None):
     """Whether the pod launcher may be retired: only when the backend is `floor`, the rollback window is `closed`, no pod worker is live and no record is unreadable. It decides and changes nothing: a refusal says why (exit 2 through the command that asks)."""
     env = env_of() if env is None else env
@@ -1475,7 +1477,6 @@ def apply_pane_state_to_discovery(pane_state, discovery):
             obs.permission_waiting = bool(data.get("permission_waiting"))
             obs.form_waiting = bool(data.get("form_waiting"))
     return discovery
-
 def queue_pane_resume_command(state, agent, reason):
     cmd = {"action": "resume", "agent": agent, "reason": scrub(reason or "", 200), "from": "switchboard"}
     state.setdefault("pane_commands", []).append(cmd)
