@@ -620,8 +620,13 @@ def run_pass_loop(sb_mod, cf_mod):
             last_mint = time.time()
         t0 = time.time()
         try:
-            with STATE_LOCK:
-                SHADOW_SUMMARY["mode"] = verify_mode_agreement()
+            try:
+                with STATE_LOCK:
+                    SHADOW_SUMMARY["mode"] = verify_mode_agreement()
+            except SystemExit:
+                log_line("mode_mismatch", hint="SWITCHBOARD_MODE and switchboard-mode.json disagree; pass skipped")
+                time.sleep(5.0)
+                continue
             report = engine.run_pass()
             elapsed_ms = int((time.time() - t0) * 1000)
             calls = list(engine.accounts.calls)
@@ -697,7 +702,7 @@ def main():
             expected_secret = secret_file.read_text(encoding="utf-8").strip()
     V1_STATE["state_dir"] = STATE_DIR
     with STATE_LOCK:
-        SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+        SHADOW_SUMMARY["mode"] = verify_mode_agreement()
 
     pass_thread = threading.Thread(target=run_pass_loop, args=(sb_mod, cf_mod), daemon=True)
     pass_thread.start()
@@ -722,13 +727,19 @@ def main():
             path = self.path.split("?", 1)[0]
             if path == "/healthz":
                 with STATE_LOCK:
-                    SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+                    try:
+                        SHADOW_SUMMARY["mode"] = verify_mode_agreement()
+                    except SystemExit:
+                        return self._send(500, {"ok": False, "error": "switchboard mode mismatch"})
                     return self._send(200, {"ok": True, "mode": SHADOW_SUMMARY["mode"], "passes": SHADOW_SUMMARY["passes"]})
             if path == "/v1/mode":
                 if self._auth_error() is not None:
                     return None
                 with STATE_LOCK:
-                    SHADOW_SUMMARY["mode"] = cf_mod.cluster_switchboard_mode(STATE_DIR)
+                    try:
+                        SHADOW_SUMMARY["mode"] = verify_mode_agreement()
+                    except SystemExit:
+                        return self._send(500, {"ok": False, "error": "switchboard mode mismatch"})
                     return self._send(200, {"mode": SHADOW_SUMMARY["mode"]})
             if path == "/v1/shadow-status":
                 if self._auth_error() is not None:

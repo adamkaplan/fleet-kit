@@ -878,7 +878,7 @@ class TestCloudAgents(FloorCase):
     def sb_refusal(self):
         return self.m.D["Refusal"] if "D" in vars(self.m) else self.floor.D["Refusal"]
 
-    def test_persisted_mode_authority_and_canary(self):
+    def test_persisted_mode_authority(self):
         import tempfile
         cf = self.floor
         with tempfile.TemporaryDirectory() as tmp:

@@ -89,12 +89,12 @@ def main(argv=None):
         pod_exec(pod, "printf %%s %s > %s/CODE_SHA && cp %s/tools/in-cluster-switchboard-server "
                       "/run/home/in_cluster_switchboard_server.py" % (head, APP, APP))
     pod_sha = pod_exec(pod, "cat %s/CODE_SHA" % APP).decode().strip()
-    if not a.verify_only:
-        run(kubectl_base() + ["set", "env", "deployment/fleet-switchboard", "SWITCHBOARD_PINNED_SHA=" + head])
-    err = check_shas(head, pod_sha, a.pinned_sha or (head if not a.verify_only else pod_pinned(pod)))
+    err = check_shas(head, pod_sha, a.pinned_sha or (pod_pinned(pod) if a.verify_only else ""))
     if err:
         print("error: " + err, file=sys.stderr)
         return 1
+    if not a.verify_only:
+        run(kubectl_base() + ["set", "env", "deployment/fleet-switchboard", "SWITCHBOARD_PINNED_SHA=" + head])
     if not a.verify_only:
         run(kubectl_base() + ["delete", "pod", pod, "--wait=false"])
     print("ok %s" % head)
