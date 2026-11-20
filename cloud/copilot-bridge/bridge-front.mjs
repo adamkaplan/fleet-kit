@@ -2,7 +2,7 @@
 // (copilot-api 0.7.0) is bound to 127.0.0.1 and this front forwards to it. No secret is read, held or logged here.
 // Forwards only POST /chat/completions and POST /v1/chat/completions; answers GET /usage; every other path or method is 404.
 // Model policy: an id containing "opus" (any case) is refused 403; every other id becomes claude-haiku-5.5 (Fast class)
-// Budget: the day's spend in credits is read from each answer's copilot_usage (total_nano_aiu, else token_details), see spend().
+// Usage: the day's spend in credits is read from each answer's copilot_usage (total_nano_aiu, else token_details), see spend(); there is no daily cap.
 // with the caller's effort (council default low; omitted when the caller sends none). The bridge passes the whole body on to Copilot unchanged, so BOTH
 // reasoning.effort and reasoning_effort are set. Log: one count line per request, never a body, an answer, a header or a token.
 import http from "node:http";
@@ -15,7 +15,6 @@ const HOST = env.BRIDGE_FRONT_HOST || "0.0.0.0";
 const UP_HOST = "127.0.0.1";
 const UP_PORT = int(env.BRIDGE_UPSTREAM_PORT, 4141);
 const num = (v, d) => (/^[0-9]{1,9}(\.[0-9]{1,9})?$/.test(v || "") && Number(v) > 0 ? Number(v) : d);
-const BUDGET = num(env.BRIDGE_DAILY_CREDITS, 500);        // credits a UTC day: one AIU is one credit (one cent); the answer's total_nano_aiu is in billionths
 const FALLBACK = num(env.BRIDGE_FALLBACK_CREDITS, 1);     // counted for an answer that carries no usage at all
 const NANO = 1e9;
 const MAX_ANSWER = 16 * 1024 * 1024;
@@ -90,11 +89,11 @@ const server = http.createServer((req, res) => {
   const answer = (status, obj, served) => { send(res, status, obj); finish(status, served || "-", 0); };
 
   if (req.method === "GET" && path === "/usage") {
-    const out = { budget: BUDGET, day, days: {} };   // budget in credits
+    const out = { day, days: {} };
     for (const [d, row] of days) {
       const models = {};
       for (const [m, v] of Object.entries(row.models)) models[m] = { requests: v.requests, credits: Number((v.nano / NANO).toFixed(4)) };
-      out.days[d] = { credits: Number((row.nano / NANO).toFixed(4)), requests: row.requests, refused: row.refused, budget: BUDGET, models };
+      out.days[d] = { credits: Number((row.nano / NANO).toFixed(4)), requests: row.requests, refused: row.refused, models };
     }
     return answer(200, out);
   }
@@ -122,7 +121,6 @@ const server = http.createServer((req, res) => {
     const verdict = policy(body.model);
     const row = dayRow(day);
     if (verdict.refuse) { row.refused += 1; return answer(403, { error: BANNED_TEXT }, "refused"); }
-    if (row.nano / NANO >= BUDGET) { row.refused += 1; return answer(429, { error: "daily AI credit budget spent: " + Number((row.nano / NANO).toFixed(4)) + " of " + BUDGET + " credits" }, "budget"); }
     row.requests += 1;
     const mrow = row.models[verdict.model] || (row.models[verdict.model] = { requests: 0, nano: 0 });
     mrow.requests += 1;
@@ -165,4 +163,4 @@ server.requestTimeout = 30000;   // the time to RECEIVE a request; the upstream 
 server.maxConnections = 64;
 process.on("uncaughtException", () => logLine({ ts: new Date().toISOString(), event: "error" }));   // never the error text: it could hold a body
 server.headersTimeout = 30000;
-server.listen(PORT, HOST, () => logLine({ ts: new Date().toISOString(), event: "listening", port: PORT, budget: BUDGET, cap: MAX_BODY }));
+server.listen(PORT, HOST, () => logLine({ ts: new Date().toISOString(), event: "listening", port: PORT, cap: MAX_BODY }));

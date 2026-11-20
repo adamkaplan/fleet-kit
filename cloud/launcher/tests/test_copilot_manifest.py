@@ -74,7 +74,7 @@ class Manifest(unittest.TestCase):
         self.assertEqual((mounts["github-token"]["mountPath"], mounts["github-token"]["readOnly"]), ("/run/copilot", True))
         self.assertEqual(mounts["home"]["mountPath"], "/run/home")
         self.assertIn({"name": "HOME", "value": "/run/home"}, self.c["env"])
-        self.assertIn("BRIDGE_DAILY_CREDITS", [e["name"] for e in self.c["env"]])
+        self.assertNotIn("BRIDGE_DAILY_CREDITS", [e["name"] for e in self.c["env"]])
 
     def test_non_root_and_no_privilege(self):
         self.assertTrue(self.pod["securityContext"]["runAsNonRoot"])
@@ -92,7 +92,11 @@ class Manifest(unittest.TestCase):
         np = next(x for x in self.docs if x["kind"] == "NetworkPolicy")
         ing = np["spec"]["ingress"]
         self.assertEqual(len(ing), 1)
-        self.assertEqual(ing[0]["from"], [{"podSelector": {"matchLabels": {"app": label}}}])
+        self.assertEqual(ing[0]["from"], [
+            {"podSelector": {"matchLabels": {"app": label}}},
+            {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "cw-floor-kata"}},
+             "podSelector": {"matchLabels": {"app": label}}},
+        ])
         self.assertEqual(ing[0]["ports"], [{"protocol": "TCP", "port": 8080}])
         self.assertEqual(np["spec"]["policyTypes"], ["Ingress"])
 

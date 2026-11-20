@@ -804,18 +804,18 @@ every interface by default; its HTTP server reads the `HOST` variable, so the en
 (`cloud/copilot-bridge/bridge-front.mjs`, Node standard library only) is the only listener a pod can reach: it forwards `POST /chat/completions` and
 `POST /v1/chat/completions` only, answers `GET /usage`, refuses a body over `BRIDGE_MAX_BODY` (400000 bytes), refuses an id containing `opus` (any case) with
 403 and `model banned from the council: opus`, maps every non-`opus` model to `claude-haiku-5.5` with the caller's effort (council default `low`),
-answers 429 (`daily AI credit budget spent: <spent> of <budget> credits`) once the UTC day's spend reaches `BRIDGE_DAILY_CREDITS` (default 500), and logs one count line per request: never a body, an answer, a header or a token.
+has no bridge-enforced daily credit cap (`BRIDGE_DAILY_CREDITS` is removed; Copilot's own quota is the only limit), and logs one count line per request: never a body, an answer, a header or a token.
 Spend is the GitHub AI Credit (one credit is one cent, per GitHub's usage-based billing since 1 June 2026): each answer's
 `copilot_usage.total_nano_aiu` (billionths; one AIU is treated as one credit), else the sum of `token_count * cost_per_batch / batch_size` over
-`token_details`, else `BRIDGE_FALLBACK_CREDITS` (default 1) and one `unpriced` log line. A request that crosses the budget completes. `GET /usage` shows per
-day and per model the credits (four decimals), requests, refused and the budget. The owner checks the first day against the billing usage export.
+`token_details`, else `BRIDGE_FALLBACK_CREDITS` (default 1) and one `unpriced` log line. `GET /usage` shows per
+day and per model the credits (four decimals), requests and refused counts. The owner checks the first day against the billing usage export.
 The bridge forwards the whole body to Copilot unchanged, so the front sets both `reasoning.effort` and `reasoning_effort`.
 
 The owner's steps (nothing here is applied by the repository):
 
 1. Create the Secret from the vault: `kubectl -n cw create secret generic copilot-github-token --from-file=github_token=<the file>` (the key is `github_token`).
 2. Build and push the image from `cloud/copilot-bridge/`, and put its digest in place of `IMAGE_PLACEHOLDER` in `cloud/k8s/copilot-bridge.yaml`.
-3. Apply `cloud/k8s/copilot-bridge.yaml` (Deployment, Service `copilot-bridge`, NetworkPolicy admitting only pods labelled `app=cw-worker`).
+3. Apply `cloud/k8s/copilot-bridge.yaml` (Deployment, Service `copilot-bridge`, NetworkPolicy admitting only pods labelled `app=cw-worker`, from its own namespace and from the `cw-floor-kata` namespace).
 4. Set `CW_COUNCIL_URL=http://copilot-bridge.cw.svc:8080` in the launcher's settings file: a worker pod then carries `COUNCIL_MODEL_URL` with that value and no key.
 Rollback: unset the setting, delete the Deployment (`kubectl -n cw delete deployment,service,networkpolicy -l app.kubernetes.io/part-of=copilot-bridge`), revoke the sign-in at GitHub.
 

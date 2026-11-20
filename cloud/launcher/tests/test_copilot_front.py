@@ -222,23 +222,24 @@ def post(f):
 
 
 class Budget(Base):
-    def test_spend_adds_up_and_the_budget_answers_429_with_the_text(self):
+    def test_spend_adds_up_and_there_is_no_daily_cap(self):
         self.fake.usage = {"total_nano_aiu": 7400000}
-        f, clock = clock_front(self, BRIDGE_DAILY_CREDITS="0.02")
-        codes = [post(f)[0] for _ in range(3)]   # 0.0074 x 3 = 0.0222: the third crosses the budget and completes
-        self.assertEqual(codes, [200, 200, 200])
-        status, text = post(f)
-        self.assertEqual(status, 429)
-        self.assertEqual(json.loads(text)["error"], "daily AI credit budget spent: 0.0222 of 0.02 credits")
-        self.assertEqual(len(self.fake.seen), 3)
-        day = json.loads(f.request("GET", "/usage")[1])["days"]["2026-11-10"]
-        self.assertEqual((day["credits"], day["requests"], day["refused"], day["budget"]), (0.0222, 3, 1, 0.02))
-        self.assertEqual(day["models"], {"claude-haiku-5.5": {"requests": 3, "credits": 0.0222}})
+        f, clock = clock_front(self)
+        codes = [post(f)[0] for _ in range(4)]
+        self.assertEqual(codes, [200, 200, 200, 200])
+        self.assertEqual(len(self.fake.seen), 4)
+        usage = json.loads(f.request("GET", "/usage")[1])
+        self.assertNotIn("budget", usage)
+        day = usage["days"]["2026-11-10"]
+        self.assertNotIn("budget", day)
+        self.assertEqual((day["credits"], day["requests"], day["refused"]), (0.0296, 4, 0))
+        self.assertEqual(day["models"], {"claude-haiku-5.5": {"requests": 4, "credits": 0.0296}})
         with open(clock, "w") as fh:
             fh.write("2026-11-11")
         self.assertEqual(post(f)[0], 200)
         days = json.loads(f.request("GET", "/usage")[1])["days"]
-        self.assertEqual({d: v["requests"] for d, v in days.items()}, {"2026-11-10": 3, "2026-11-11": 1})
+        self.assertEqual({d: v["requests"] for d, v in days.items()}, {"2026-11-10": 4, "2026-11-11": 1})
+        self.assertEqual(days["2026-11-11"]["credits"], 0.0074)
 
     def test_spend_is_computed_from_token_details_when_the_total_is_absent(self):
         self.fake.usage = {"token_details": [
@@ -260,27 +261,29 @@ class Budget(Base):
 
 
 def count_budget_problems(script, test):
-    """Two answers of 0.0074 credits against a budget of 0.01: by credits the second completes and the third is refused."""
+    """Two answers of 0.0074 credits: the usage must add up to 0.0148."""
     fake = Fake()
     fake.usage = {"total_nano_aiu": 7400000}
     try:
-        tmp = tempfile.mkdtemp(prefix="front-b-")
-        test.addCleanup(shutil.rmtree, tmp, True)
-        f = Running(test, script, fake, BRIDGE_DAILY_CREDITS="0.01")
+        f = Running(test, script, fake)
         try:
-            codes = [post(f)[0] for _ in range(3)]
+            for _ in range(2):
+                post(f)
+            f.wait_for_counts(2)
+            usage = json.loads(f.request("GET", "/usage")[1])
         finally:
             f.stop()
     finally:
         fake.close()
-    if codes != [200, 200, 429]:
-        test.fail("the budget did not count credits: %s" % codes)
+    day = usage["days"][usage["day"]]
+    if day["credits"] != 0.0148:
+        test.fail("the budget did not count credits: %s" % day)
 
 
 @unittest.skipUnless(NODE, "node is not installed")
 class BudgetMutant(unittest.TestCase):
-    OLD = "if (row.nano / NANO >= BUDGET)"
-    NEW = "if (row.requests >= BUDGET)"
+    OLD = " row.nano += nano;"
+    NEW = " row.nano += 0;"
 
     def test_control_first_then_a_request_counting_mutant_fails_with_the_anchored_text(self):
         with open(FRONT, encoding="utf-8") as fh:
