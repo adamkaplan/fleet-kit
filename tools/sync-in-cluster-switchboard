@@ -159,6 +159,52 @@ def pod_config_hash(pod):
     return kubectl_out(["exec", pod, "--", "python3", "-c", script])
 
 
+def watched_repos_from_snapshot(snap, cfg):
+    """Sorted list of repos watched by live agents in `snap` that match a `gh_users` entry in `cfg`."""
+    gh_users = (cfg or {}).get("gh_users") or {}
+    watched = set()
+    active_sessions = {a.get("agent_session") for a in (snap or {}).get("agents") or [] if isinstance(a, dict) and a.get("agent_session")}
+    for sid, sdata in ((snap or {}).get("sessions") or {}).items():
+        if active_sessions and sid not in active_sessions:
+            continue
+        repo = (((sdata or {}).get("metadata") or {}).get("fleet") or {}).get("repo")
+        if isinstance(repo, str) and "/" in repo:
+            acct = gh_users.get(repo) or gh_users.get(repo.split("/", 1)[0] + "/*")
+            if acct:
+                watched.add(repo)
+    return sorted(watched)
+
+
+def check_watched_repos_readable(pod):
+    """Return an error string when a live agent's repo is missing from github_repos or unreadable on the pod."""
+    import inspect
+    script = (
+        "import importlib.machinery, importlib.util, json, os, pathlib\n"
+        + inspect.getsource(watched_repos_from_snapshot)
+        + "def load(p):\n"
+        "    try:\n        return json.loads(pathlib.Path(p).read_text())\n"
+        "    except (OSError, ValueError):\n        return {}\n"
+        "cfg = load('/run/home/.config/fleet-switchboard/config.json')\n"
+        "snap = load('/run/home/fleet_agents_snapshot.json')\n"
+        "l = importlib.machinery.SourceFileLoader('s', '/run/home/app/tools/in-cluster-switchboard-server')\n"
+        "sp = importlib.util.spec_from_loader('s', l); m = importlib.util.module_from_spec(sp); l.exec_module(m)\n"
+        "errs = []\n"
+        "gh_users = cfg.get('gh_users') or {}\n"
+        "listed = cfg.get('github_repos') or []\n"
+        "for r in watched_repos_from_snapshot(snap, cfg):\n"
+        "    if r not in listed:\n        errs.append('%s watched by a live agent but not in github_repos' % r)\n"
+        "    acct = gh_users.get(r) or gh_users.get(r.split('/', 1)[0] + '/*')\n"
+        "    tf = pathlib.Path('/run/home/tokens') / str(acct)\n"
+        "    if not tf.exists():\n        errs.append('%s has no token for account %s' % (r, acct)); continue\n"
+        "    tok = tf.read_text().strip()\n"
+        "    for ep in ('', '/issues?state=open&per_page=1', '/pulls?state=closed&per_page=1'):\n"
+        "        cp = m.inprocess_gh_api(['gh', 'api', 'repos/%s%s' % (r, ep)], {'GH_TOKEN': tok})\n"
+        "        if cp is None or cp.returncode != 0:\n            errs.append('%s unreadable: %s' % (r, ep))\n"
+        "print('; '.join(errs), end='')\n"
+    )
+    return kubectl_out(["exec", pod, "--", "python3", "-c", script])
+
+
 MODE_FILE = "/run/home/.local/state/fleet-switchboard/switchboard-mode.json"
 
 
@@ -245,6 +291,10 @@ def main(argv=None):
         print("error: " + err, file=sys.stderr)
         return 1
     if not a.verify_only:
+        err = check_watched_repos_readable(pod)
+        if err:
+            print("error: " + err, file=sys.stderr)
+            return 1
         run(kubectl_base() + ["delete", "pod", pod, "--wait=false"])
     print("ok head=%s tree=%s" % (head, tree) + (" config=%s" % cfg_hash[:12] if cfg_hash else ""))
     return 0

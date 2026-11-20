@@ -268,6 +268,11 @@ class FloorCase(Base):
         return len(self.fake.calls)
 
 
+def _sp_run(cmd):
+    import subprocess
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
 class TestCloudFloor(FloorCase):
 
     def test_the_relay_is_off_without_a_url_and_push_pane_state_reads_commands(self):
@@ -939,6 +944,32 @@ class TestCloudAgents(FloorCase):
         sl.exec_module(sm)
         for path in ("docs", "agents", "plugins", "skills", "templates"):
             self.assertIn(path, sm.PATHS)
+        snap = {"agents": [{"agent_session": "ses_example"}],
+                "sessions": {"ses_example": {"metadata": {"fleet": {"repo": "acme-org/widget-service"}}},
+                             "ses_other": {"metadata": {"fleet": {"repo": "acme-org/floor-service"}}},
+                             "ses_example2": {"metadata": {"fleet": {"repo": "other-org/widget-api"}}}}}
+        self.assertEqual(sm.watched_repos_from_snapshot(snap, {"gh_users": {"acme-org/*": "acct"}}), ["acme-org/widget-service"])
+        import urllib.error as _ue
+        from unittest import mock as _mock
+        err404 = _ue.HTTPError("u", 404, "Not Found", {}, None)
+        with _mock.patch.object(mod.urllib.request, "urlopen", side_effect=err404):
+            cp = mod.inprocess_gh_api(["gh", "api", "repos/acme-org/floor-service/pulls?state=closed&per_page=100"], {"GH_TOKEN": "x"})
+        self.assertEqual((cp.returncode, cp.stdout), (0, "[]\n"))
+        import tempfile as _tf, shutil as _sh, json as _js
+        captured = []
+        sm.kubectl_out = lambda args: captured.append(args[-1]) or ""
+        sm.check_watched_repos_readable("pod")
+        with _tf.TemporaryDirectory() as home:
+            (Path(home) / "app/tools").mkdir(parents=True)
+            _sh.copy(server, Path(home) / "app/tools/in-cluster-switchboard-server")
+            (Path(home) / ".config/fleet-switchboard").mkdir(parents=True)
+            (Path(home) / ".config/fleet-switchboard/config.json").write_text(_js.dumps(
+                {"gh_users": {"acme-org/*": "acct"}, "github_repos": []}))
+            (Path(home) / "fleet_agents_snapshot.json").write_text(_js.dumps(snap))
+            import subprocess as _s2, sys as _sys
+            out = _s2.run([_sys.executable, "-c", captured[0].replace("/run/home", home)], capture_output=True, text=True).stdout
+        self.assertIn("acme-org/widget-service watched by a live agent but not in github_repos", out)
+        self.assertIn("has no token for account acct", out)
         sync_text = sync.read_text()
         self.assertIn('APP + ".stage"', sync_text)
         self.assertNotIn("rm -rf bin tools shims docs", sync_text)

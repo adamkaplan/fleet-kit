@@ -292,6 +292,9 @@ def inprocess_gh_api(cmd, env, timeout=20, want_bytes=False):
         status = err.code
         resp_headers = err.headers or {}
         raw = err.read(65536) if err.fp else b""
+        if status == 404 and re.match(r"^repos/[^/]+/[^/]+/pulls(?:\?|$)", path):
+            out = "HTTP/2.0 200 OK\r\n\r\n[]\n" if include_headers else "[]\n"
+            return _cp(cmd, 0, out.encode("utf-8") if want_bytes else out, "", want_bytes)
         if status == 304:
             out = "HTTP/2.0 304 Not Modified\r\n\r\n" if include_headers else ""
             return _cp(cmd, 0, out, "", want_bytes)
