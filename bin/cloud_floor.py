@@ -103,7 +103,7 @@ def _matches(entry, repo):
     return bool(e_name) and e_owner == owner and e_name in ("*", name)
 
 def route_repo(repo, config, env=None):
-    """`floor` or `pod` for a repository. `CW_REMOTE_BACKEND=pod` is the rollback switch and wins; else `floor` when the backend is `floor` or the repository is in CW_FLOOR_REPOS; else `pod`. `config` is the switchboard's (it is not read here: the land gate is `check_floor_admission`)."""
+    """`floor` or `pod` for a repository. `CW_REMOTE_BACKEND=pod` is the rollback switch and wins; else `floor` when the backend is `floor` or the repository is in CW_FLOOR_REPOS; else `pod`. `config` is the switchboard's."""
     env = env_of() if env is None else env
     backend = (env.get("CW_REMOTE_BACKEND") or "").strip().lower()
     if backend == "pod":
@@ -129,7 +129,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 def _request(method, url, data=None, headers=(), missing_ok=False):
-    """(status, body bytes) of one request: no redirect followed, 30 s, the answer cut at 1 MiB. An HTTP error is a FloorError (a 503 that names `art-...` is an UnavailableArtifactError); a 404 is returned as (404, b"") when `missing_ok`. The text of an error holds no URL: callers scrub it again."""
+    """(status, body bytes) of one request: no redirect followed, 30 s, the answer cut at 1 MiB. An HTTP error is a FloorError (a 503 that names `art-...` is an UnavailableArtifactError); a 404 is returned as (404, b"") when `missing_ok`."""
     request = urllib.request.Request(url, data=data, method=method)
     for key, value in headers:
         request.add_header(key, value)
@@ -1060,7 +1060,7 @@ def check_single_authority(cluster_mode, mac_authority, mac_paused):
     return "authority mismatch: cluster=%s, mac_authority=%s, mac_paused=%s" % (cluster_mode, mac_authority, mac_paused)
 
 class PaneRelayMonitor:
-    """Alarm state of the Mac relay: tunnel reachability (2 min), single authority, and a 10-minute end-to-end canary."""
+    """Relay alarm state: reachability, single authority, end-to-end canary."""
     def __init__(self, notify=notify_macos_alarm, down_after=120, canary_every=600, canary_wait=60):
         self.notify, self.down_after, self.canary_every, self.canary_wait = notify, down_after, canary_every, canary_wait
         self.unreachable_since = None
@@ -1261,8 +1261,11 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
                     if act["send_canary"]:
                         call_switchboard_v1("/v1/send", {"to": "pane-relay", "text": act["send_canary"], "canary": True}, env=env)
                     if act.get("rollback"):
-                        subprocess.run([sys.executable, os.path.join(D["kit_root"](), "tools", "sync-in-cluster-switchboard"), "--rollback"], timeout=120, check=False)
-                        rollback_switchboard_authority(state_dir, env=env)
+                        try:
+                            rc = subprocess.run([sys.executable, os.path.join(D["kit_root"](), "tools", "sync-in-cluster-switchboard"), "--rollback"], timeout=120, check=False).returncode
+                            rc and _warn("rollback sync", rc)
+                        finally:
+                            rollback_switchboard_authority(state_dir, env=env)
                     if act["restart"]:
                         started = 0.0
                 except Exception as err:
