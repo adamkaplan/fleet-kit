@@ -83,9 +83,11 @@ class Base(unittest.TestCase):
     def setUp(self):
         td = Path(tempfile.gettempdir())
         tmp_dir = "/var/tmp" if os.path.isdir("/var/tmp") and any((os.lstat(str(p)).st_mode & 0o022) and not (os.lstat(str(p)).st_mode & 0o1000) for p in [td, *td.parents]) else None
+        tmp_env = {}
         if tmp_dir:
             self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
             tempfile.tempdir = tmp_dir
+            tmp_env["TMPDIR"] = tmp_dir
         tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
         self.addCleanup(remove_tree_patiently, tmp)
         self.home = Path(tmp.name).resolve()
@@ -101,8 +103,7 @@ class Base(unittest.TestCase):
             # the installed chief-of-staff definition: one that allows the way out of a refusal (the gate preflight reads it)
             sb.COS_DEFINITION_ENV: str(self.home / "cos-definition.md"),
         }
-        if tmp_dir:
-            env_patch["TMPDIR"] = tmp_dir
+        env_patch.update(tmp_env)
         patcher = mock.patch.dict(os.environ, env_patch)
         patcher.start()
         self.addCleanup(patcher.stop)
