@@ -885,26 +885,20 @@ def call_switchboard_v1(path, payload, env=None, sleep_fn=time.sleep):
     """POST `payload` to the in-cluster switchboard (CW_SWITCHBOARD_URL, header from the 0600 file CW_SWITCHBOARD_AUTH_FILE); None when no URL is set."""
     config = switchboard_relay_config(env)
     base = config["url"]
-    if not base:
-        return None
+    if not base: return None
     caller_agent = None
     if isinstance(payload, dict):
-        payload = dict(payload)
-        caller_agent = payload.pop("_caller_agent", None)
+        payload = dict(payload); caller_agent = payload.pop("_caller_agent", None)
     header = _auth_header(config)
-    if isinstance(caller_agent, str) and CALLER_RE.fullmatch(caller_agent):
-        header = re.sub(r"(^|;)agent=[^;]+", lambda m: m.group(1) + "agent=" + caller_agent, header)
+    if isinstance(caller_agent, str) and CALLER_RE.fullmatch(caller_agent): header = re.sub(r"(^|;)agent=[^;]+", lambda m: m.group(1) + "agent=" + caller_agent, header)
     data = json.dumps(payload, sort_keys=True).encode()
     headers = [("Accept", "application/json"), ("Content-Type", "application/json"), ("X-Switchboard-Auth", header)]
-    url = base.rstrip("/") + path
-    for attempt in range(3):
+    for delay in (1.5, 3.0, None):
         try:
-            return _parse(_request("POST", url, data, headers)[1])
+            return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
         except FloorError as err:
-            if attempt == 2 or (err.status is not None and err.status < 500):
-                raise
-            _warn("switchboard relay attempt %d of 3" % (attempt + 1), err)
-            sleep_fn(1.5 * (attempt + 1))
+            if delay is None or (err.status or 0) in range(1, 500): raise
+            _warn("switchboard relay (retrying in %ss)" % delay, err); sleep_fn(delay)
 PANE_RELAY_PORT = 18080   # the local end of the port-forward to the in-cluster switchboard
 
 def _warn(what, err):
@@ -995,7 +989,6 @@ def pane_relay_pass(engine, sb_mod, env=None):
 
 def is_canary(m):
     return m.get("to") == "pane-relay" and (m.get("canary") is True or str(m.get("text") or "").startswith("canary:"))
-
 
 def cluster_switchboard_mode(state_dir, env=None):
     env_mode = ((os.environ if env is None else env).get("SWITCHBOARD_MODE") or "").strip()
@@ -1112,7 +1105,6 @@ def fetch_cluster_mode(env=None):
             raise
         ans = _parse(_request("GET", base + "/healthz")[1])  # older pod
     return ans.get("mode") if isinstance(ans, dict) else None
-
 
 def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
     """Rehearsed rollback from cluster authority to the Mac daemon."""
