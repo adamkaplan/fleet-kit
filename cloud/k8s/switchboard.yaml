@@ -33,6 +33,12 @@
       },
       "spec": {
         "automountServiceAccountToken": false,
+        "tolerations": [
+          {
+            "key": "CriticalAddonsOnly",
+            "operator": "Exists"
+          }
+        ],
         "securityContext": {
           "runAsNonRoot": true,
           "runAsUser": 10001,
