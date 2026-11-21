@@ -1371,7 +1371,7 @@ def relay_cli_if_configured(command, payload, env=None):
             _write_private(os.path.join(str(D["H"]["state_dir_path"]()), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
         except Exception as err:
             _warn("decisions.json update", err)
-    if env is None and command in PASSTHROUGH_COMMANDS and isinstance(ans, dict) and (command == "orders" or (isinstance(payload, dict) and payload.get("action") in (None, "list", "show", "cos"))):
+    if env is None and command in PASSTHROUGH_COMMANDS and isinstance(ans, dict):
         _PASSTHROUGH_AUTH[:] = [os.environ.pop("CW_SWITCHBOARD_AUTHORITY", None)]
     if command == "remind" and isinstance(ans, dict):
         if isinstance(orig_payload, dict):

@@ -613,7 +613,7 @@ def handle_on_v1_action(route_path, auth, body, state):
                 else:
                     reg.retire(STATE_DIR, name, auth.get("agent") or "cos", body.get("reason") or "finished")
         elif route_path == "/v1/decisions":
-            if body.get("action") in ("escalate", "batch"):
+            if body.get("action") in ("escalate", "resolve", "answer", "supersede", "batch"):
                 refresh_decisions(eng, sb_mod)
             dfile = STATE_DIR / "decisions.json"
             if dfile.is_file():

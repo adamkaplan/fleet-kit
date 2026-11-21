@@ -1269,9 +1269,58 @@ class TestFloorAuthority(FloorCase):
                 self.assertTrue(isinstance(self.floor.relay_cli_if_configured("orders", {"action": "list"}), dict))
                 self.assertEqual(self.floor.switchboard_authority(), "local")
                 self.assertEqual(self.floor.switchboard_authority(), "cluster")
+                for cmd, payload in (("decisions", {"action": "resolve", "id": "d1"}), ("intent", {"action": "add"})):
+                    self.floor._PASSTHROUGH_AUTH[:] = []
+                    os.environ.update(env)
+                    self.assertTrue(isinstance(self.floor.relay_cli_if_configured(cmd, payload), dict))
+                    self.assertEqual(self.floor.switchboard_authority(), "local")
             finally:
                 os.environ.clear()
                 os.environ.update(saved)
+            # the CLI itself: the local GitHub/v2 writer runs after the cluster refresh, not just a 200
+            pod_state["decisions_file"] = {"decisions": []}
+            labels, comments, replies = [], [], []
+            def fake_engine(runner, now, writable=False):
+                eng = types.SimpleNamespace(
+                    config={}, state_dir=tmp, actor="cos", audit=types.SimpleNamespace(append=lambda *a, **k: None),
+                    now=lambda: 0, _note=lambda *a, **k: None,
+                    v2=types.SimpleNamespace(permission_reply=lambda *a: replies.append(a)))
+                import contextlib
+                eng._external = lambda *a, **k: contextlib.nullcontext()
+                rows = [{"id": "acme-org/widget-service#10", "kind": "issue", "tier": "cos", "repo": "acme-org/widget-service", "number": 10},
+                        {"id": "acme-org/widget-service#11", "kind": "issue", "tier": "cos", "repo": "acme-org/widget-service", "number": 11},
+                        {"id": "perm:ses_1:req_1", "kind": "permission", "tier": "cos", "session": "ses_1", "request": "req_1"}]
+                return eng, rows, None
+            saved = dict(os.environ)
+            try:
+                os.environ.update(env)
+                with mock.patch.object(sb, "fresh_engine_decisions", fake_engine), \
+                        mock.patch.object(sb, "decision_actor", lambda e, a: (None, None)), \
+                        mock.patch.object(sb, "decision_or_persisted", lambda e, rows, i, a, n: next((r for r in rows if r["id"] == i), None)), \
+                        mock.patch.object(sb, "_issue_target", lambda e, d: (d["repo"], d["number"])), \
+                        mock.patch.object(sb, "refuse_human_tier", lambda *a: None), \
+                        mock.patch.object(sb, "change_issue_labels", lambda e, r, repo, n, add, rem: labels.append((n, list(add), list(rem)))), \
+                        mock.patch.object(sb, "comment_as", lambda e, r, repo, n, text, who: comments.append((n, text))), \
+                        mock.patch.object(sb, "finish_decision_write", lambda *a: None), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    parser = sb.build_parser()
+                    for argv in (["decisions", "escalate", "acme-org/widget-service#10", "--reason", "needs owner"],
+                                 ["decisions", "resolve", "acme-org/widget-service#11", "--note", "covered by order"],
+                                 ["decisions", "answer", "perm:ses_1:req_1", "allow", "--note", "safe"]):
+                        self.floor._PASSTHROUGH_AUTH[:] = []
+                        os.environ.update(env)
+                        self.assertEqual(sb.cmd_decisions(parser.parse_args(argv), None, lambda: 0), 0)
+            finally:
+                os.environ.clear()
+                os.environ.update(saved)
+            self.assertEqual(labels[0][0], 10)
+            self.assertTrue(any(l.endswith("awaiting-user") for l in labels[0][1]))
+            self.assertTrue(any(l.endswith("awaiting-cos") for l in labels[0][2]))
+            self.assertIn("Escalated to the owner: needs owner", comments[0][1])
+            self.assertEqual(labels[1][0], 11)
+            self.assertEqual(sorted(l.split(":")[-1] for l in labels[1][2]), ["awaiting-cos", "awaiting-user"])
+            self.assertIn("covered by order", comments[1][1])
+            self.assertEqual(replies, [("ses_1", "req_1", "once", "safe")])
             # the oversize file lands where the recipient's drain wrote it, with the path rewritten
             home = os.path.join(tmp, "mac")
             sent = []
