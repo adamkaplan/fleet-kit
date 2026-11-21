@@ -372,6 +372,22 @@ Cause: the four manifest files `cloud/k8s/cloud-hub.yaml`, `cloud-hub-network.ya
 
 `cloud/k8s/render-namespace NAMESPACE_NAME` prints the documents on standard output with the namespace of every namespaced document and the hub's agent namespace value replaced. It reads only those four files, writes no file, makes no cluster call and opens no network connection. NAMESPACE_NAME must be a DNS label that is not `default` and does not start with `kube-` (the launcher's own rule); anything else gives one line on standard error, nothing on standard output and exit status 2. The names inside the namespace (`cw-operator`, `cw-worker`, `cw-minter`, `cw-agents`, `cloud-hub`, the pull secret `cw-pull`) are kept. The render for `cw` is byte-equal to the files after the 5-line header. The header of the output names the cluster-wide documents (kinds RuntimeClass, ClusterRole and ClusterRoleBinding: none are in these four files) and says that `runtimeclass.yaml` and `containerd-fix.yaml` are not rendered because they are already present, once per cluster.
 
+### Pre-apply checklist: Azure Conditional Access 12-hour token expiry
+
+If the tenant's Conditional Access policy sets a 12-hour sign-in window (the figure is the tenant's policy, so confirm it
+with the tenant administrator), an `az` session near expiry stalls an apply or cutover window part-way through. This
+is the check to run before step 1 below: at the start of the window, before any cluster or vault write, read the token expiry
+(with the same Azure config directory the settings table names for `CW_AZURE_CONFIG_DIR`):
+
+```
+az account get-access-token --query expiresOn -o tsv
+```
+
+`expiresOn` is the access token's own expiry, which is the earliest point the session can stall, so compare it with the
+length of the apply window. As an operator choice, keep at least 2 hours of margin beyond the window. If the token is
+expired or short of that, run `az login` first, so the fresh login happens at the start of the window and never midway.
+(This is a human step: the agents' permission lists deny `get-access-token`.)
+
 The steps, in order (the namespace `cwp` is the example):
 
 1. Step 1, render: `CW_HUB_IMAGE=REFERENCE cloud/k8s/render-namespace cwp > cwp.yaml`. Read the header and the file. REFERENCE is the settings' hub image reference, a `name@sha256:<64 hex>` value; the render refuses (exit status 2, nothing printed) without it, and the file to apply must not hold `IMAGE_DIGEST` as the image (the check chained in front of `kc create` in the apply block counts the image lines that still hold it and must print 0; the manifest's own comment line names the placeholder and stays).
