@@ -76,7 +76,7 @@ STATUS_SECONDS = 15
 MESSAGE_MAX = 20000
 RECORD_FIELDS = ("worker", "url", "runtime_id", "idle_deadline", "hard_deadline")
 EXIT_REASONS = {2: "bad usage or unknown worker", 3: "the cloud refused (quota, identity or cap)", 4: "timed out waiting for the worker",
-                5: "the spend cap is reached", 6: "refused (the end hook had not run, or the extension is past the maximum)"}
+                6: "refused (the end hook had not run, or the extension is past the maximum)"}
 
 
 class CloudError(Exception):

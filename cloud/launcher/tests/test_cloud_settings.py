@@ -16,7 +16,7 @@ GOOD = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": DIGEST,
         "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw"}
 OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_PULL_SECRET": "pull-example",
                     "CW_KUBECTL": "kubectl", "CW_OPENCODE_BIN": "/usr/local/bin/opencode", "CW_RUN_RECORD_DIR": "/home/user/runs",
-                    "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
+                    "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
                     "CW_TOKEN_SERVICE_URL": "https://token-service.cw.svc:8443", "CW_TOKEN_SERVICE_CALLER_TOKEN_CMD": "cat /home/user/cluster-token",
@@ -88,7 +88,6 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_KUBECTL": ["../kubectl", "/x/../y", "-x", "a b", "$(x)", "a/b"],
     "CW_OPENCODE_BIN": ["../opencode", "/a/../b", "-x", "a b", "$(x)", "a/b"],
     "CW_RUN_RECORD_DIR": ["runs", "/a/../b", "-x"],
-    "CW_CLOUD_SPEND_CAP_USD": ["0", "-1", "1e3", "100001", "1.2.3", "abc", "0.0"],
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_TOKEN_SERVICE_URL": ["http://example.com:8443", "ftp://token-service.cw.svc", "https://u:p@token-service.cw.svc", "https://token-service.cw.svc/x?q=1", "https://token-service.cw.svc/#f", "-x"],
@@ -492,7 +491,7 @@ class Reader(Dir):
         cases = {"not KEY=VALUE": "this is not a setting " + marker + "\n", "unknown": "CW_SOMETHING_ELSE=" + marker + "\n",
                  "twice": "CW_VAULT_NAME=a\nCW_VAULT_NAME=" + marker + "\n", "quoted": 'CW_VAULT_NAME="' + marker + '"\n',
                  "quoted single": "CW_VAULT_NAME='" + marker + "'\n", "lowercase": "cw_vault_name=" + marker + "\n",
-                 "spaces": "CW_VAULT_NAME = " + marker + "\n", "number": "CW_CLOUD_SPEND_CAP_USD=" + marker + "\n",
+                 "spaces": "CW_VAULT_NAME = " + marker + "\n", "number": "CW_FINAL_NOTE_MINUTES=" + marker + "\n",
                  "relative path": "CW_CLOUD_CA_FILE=" + marker + "\n"}
         for label, extra in cases.items():
             with self.subTest(label):

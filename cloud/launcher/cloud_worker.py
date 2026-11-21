@@ -419,7 +419,6 @@ SHAPE_DEFAULT_HARD = {"L": DEFAULT_MAX_HARD}   # the one table of a per-shape de
 # a running pod but never raised, so a value at the initial hard limit would make `extend` (within the cap) a lie. The
 # grace lets the reaper (which writes the run record and runs the end hook) normally act first.
 POD_DEADLINE_GRACE_SECONDS = 300
-DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND_CAP_USD is unset or empty
 LABEL = "cw-worker"
 # The node labels the summary reads: the POOL a node belongs to and its INSTANCE SIZE, in that order of preference. A label that is not there
 # reads "unknown" (never a guess). The size label is the Kubernetes one (`node.kubernetes.io/instance-type`); the pool label is the cloud's own
@@ -430,7 +429,7 @@ REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, writt
 REPORT_MAX = 2000
 # the worker owns the file, and `head` follows a link: refuse anything but a regular file BEFORE reading ($1 the path, $2 the byte limit)
 REPORT_READ = 'if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "not a regular file" >&2; exit 3; fi; head -c "$2" "$1"'
-EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_CAP, EXIT_REFUSED = 0, 1, 2, 3, 4, 5, 6
+EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_REFUSED = 0, 1, 2, 3, 4, 6
 EXIT_EXISTS = 7  # create found a worker of that name already there: this call made nothing and touched nothing
 
 CREDENTIAL_PATTERNS = [re.compile(p) for p in (
@@ -456,7 +455,6 @@ PERSISTENT_PATTERN = re.compile(r"[1-9][0-9]?")   # the ONE form of the value, u
 PERSISTENT_SETTING = "CW_MAX_PERSISTENT"   # the settings maximum of persistent orchestrators in the namespace
 PERSISTENT_DEFAULT_MAX = 2
 PERSISTENT_MAX_LIMIT = 20
-PERSISTENT_DAY_SECONDS = 24 * 3600          # the spend cap prices ONE DAY of the shape for a persistent launch
 WORKLOAD_DELETE_SECONDS = 120               # the bounded wait of a StatefulSet delete (kubectl's own --timeout)
 PERSISTENT_UNREADABLE = "persistent workload unreadable: left alone"   # the reaper's one report line
 
@@ -2245,20 +2243,6 @@ class ClusterTokenRefresher:
                                       "cost_estimate_usd": 0.0, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": text})
 
 
-def spend_cap(env):
-    """The cap in USD: the setting, else the default. Zero, negative, non-numeric, nan or inf refuse (fail closed)."""
-    raw = (env.get("CW_CLOUD_SPEND_CAP_USD") or "").strip()
-    if not raw:
-        return DEFAULT_SPEND_CAP_USD
-    try:
-        cap = float(raw)
-    except ValueError:
-        cap = float("nan")
-    if not math.isfinite(cap) or cap <= 0:
-        raise CloudError("CW_CLOUD_SPEND_CAP_USD must be a positive finite number of USD; refusing to create", EXIT_CAP)
-    return cap
-
-
 def max_persistent(env):
     """The settings maximum of persistent orchestrators in the namespace: the setting (an integer 1 to 20), else 2. A bad value refuses (exit 2)."""
     raw = env.get(PERSISTENT_SETTING) or ""
@@ -2267,13 +2251,6 @@ def max_persistent(env):
     if not PERSISTENT_PATTERN.fullmatch(raw) or not 1 <= int(raw) <= PERSISTENT_MAX_LIMIT:
         raise CloudError("%s must be an integer from 1 to %d; nothing was created" % (PERSISTENT_SETTING, PERSISTENT_MAX_LIMIT), EXIT_USAGE)
     return int(raw)
-
-
-def as_cost(x):
-    """A finite non-negative number, or refuse: a cost that cannot be read is not a cost of zero."""
-    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
-        raise CloudError("cost estimate unreadable; refusing to create (the spend cap cannot be checked)", EXIT_CAP)
-    return float(x)
 
 
 def parse_duration(text):
@@ -3275,20 +3252,6 @@ class Launcher:
     def estimate(self, shape, seconds):
         return SHAPES[shape]["usd_per_hour"] * seconds / 3600
 
-    def check_cap(self, shape, hard_seconds):
-        cap = spend_cap(self.env)
-        try:
-            spent = sum(as_cost(self.cost(p)) for p in self.kube.list_pods())
-            launch = as_cost(self.estimate(shape, hard_seconds))
-        except CloudError as e:
-            if e.code == EXIT_CAP:
-                raise
-            raise CloudError("could not read the running cost; refusing to create: %s" % e, EXIT_CAP)
-        except Exception as e:
-            raise CloudError("could not read the cost; refusing to create: %s" % str(e)[:200], EXIT_CAP)
-        if spent >= cap or spent + launch > cap:
-            raise CloudError("spend cap reached (cap USD %s, spent %.4f, this launch %.4f)" % (cap, spent, launch), EXIT_CAP)
-
     def _persistent_refusals(self, a, agent, run_values):
         """--persistent is for an orchestrator launched with the per-run git-token Secret, never a worker or a stack launch: each refusal names
         itself, exits 2 and happens before any cluster call."""
@@ -3354,7 +3317,6 @@ class Launcher:
                     raise CloudError("%s is the launcher's own key" % CHANNEL_SECRET_KEY, EXIT_USAGE)
                 run_values[CHANNEL_SECRET_KEY] = secrets.token_hex(32)
             self.kube.add_secrets(*run_values.values())  # known to scrub before the first kubectl call
-            self.check_cap(a.shape, PERSISTENT_DAY_SECONDS if persistent else int((hard - now).total_seconds()))
             if persistent:
                 self.check_persistent_count()
                 spec = render_workload(a, worker, name, now, self.env, sorted(run_values))
@@ -5309,7 +5271,6 @@ SETTINGS = (
     ("CW_KUBECTL", False, "path"),
     ("CW_OPENCODE_BIN", False, "path"),
     ("CW_RUN_RECORD_DIR", False, "path"),
-    ("CW_CLOUD_SPEND_CAP_USD", False, "number"),
     ("CW_CLUSTER_TOKEN_CMD", False, "command"),
     ("CW_CLUSTER_ADMIN_CMD", False, "command"),
     ("CW_GIT_TOKEN_CMD", False, "command"),
@@ -5365,7 +5326,6 @@ _VAULT_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,126}")   # the vault
 _DURATION = re.compile(r"([0-9]{1,3})([mh])")   # the grammar of the launch wiring's own parse of CW_CLUSTER_TOKEN_DURATION (bin/cloud_worker.py `_duration`)
 _REGISTRY_SUFFIXES = (".azurecr.io",)   # a small table: a sovereign cloud is one more row
 _REGISTRY_HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
-_NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _REFUSED_HOSTS = ("metadata.google.internal",)
 _REFUSED_SUFFIX = ".localhost"
 _MAX_HOST = 253
@@ -5456,9 +5416,6 @@ def _dir_ok(value):
     return _path_ok(value) and os.path.isdir(value)
 
 
-def _number_ok(value):
-    return bool(_NUMBER.fullmatch(value)) and 0 < float(value) <= 100000
-
 
 def _duration_ok(value):
     """Stricter than or equal to the launch wiring's `_duration` (a test holds it: whatever this accepts, the wiring accepts; the wiring also strips spaces and takes non-ASCII digits, this does not): 1 to 3 ASCII digits and m or h, from 1 minute to 60 minutes."""
@@ -5486,7 +5443,6 @@ VALIDATORS = {
     "CW_KUBECTL": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
     "CW_OPENCODE_BIN": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
     "CW_RUN_RECORD_DIR": ("an absolute path with no .. segment", _path_ok),
-    "CW_CLOUD_SPEND_CAP_USD": ("a number above 0 and at most 100000", _number_ok),
     "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_CLUSTER_ADMIN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_GIT_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),

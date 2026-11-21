@@ -433,12 +433,6 @@ class S4Audit(Base):
         self.assertIsNone(self.pod())
         self.assertFalse(self.audit_lines()[-1]["ok"])
 
-    def test_spend_cap_exit_5(self):
-        self.env["CW_CLOUD_SPEND_CAP_USD"] = "0.25"
-        self.create("coder7", "--shape", "S")   # S by name: the cost is the S rate (the unnamed default is XS, #1081)
-        self.clock.advance(hours=1)
-        self.assertEqual(self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m", "--shape", "S")[0], 5)
-
     def test_idempotent_stop_and_delete_of_gone_worker(self):
         self.assertEqual(self.run_cli("stop", "nobody")[0], 0)
         self.assertEqual(self.run_cli("delete", "nobody")[0], 0)
@@ -833,69 +827,6 @@ class S7Interrupt(Base):
         self.assertEqual(len([x for x in self.audit_lines() if x["action"] == "create"]), 1)
         self.assertIn("REMAINS", self.audit_lines()[-1]["reason"])
         self.assertEqual(self.st().get("secrets", {}), {})  # the secret delete still ran
-
-
-class S8Cap(Base):
-    def create_code(self):
-        return self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m")
-
-    def refused(self, value):
-        self.env["CW_CLOUD_SPEND_CAP_USD"] = value
-        code, _, err = self.create_code()
-        self.assertEqual(code, 5, value)
-        self.assertIn("CW_CLOUD_SPEND_CAP_USD", err)
-        self.assertEqual(self.st()["pods"], {})
-        self.assertEqual(self.st().get("applied", []), [])
-
-    def test_unset_and_empty_default_to_25(self):
-        for value in (None, "", " "):
-            if value is None:
-                self.env.pop("CW_CLOUD_SPEND_CAP_USD", None)
-            else:
-                self.env["CW_CLOUD_SPEND_CAP_USD"] = value
-            self.assertEqual(cw.spend_cap(self.env), 25.0)
-        self.assertEqual(self.create_code()[0], 0)  # a normal launch is under 25
-        self.run_cli("delete", "coder7", "--force")
-
-    def test_unset_cap_refuses_a_launch_estimated_above_25(self):
-        self.env.pop("CW_CLOUD_SPEND_CAP_USD", None)
-        real = cw.Launcher.estimate
-        cw.Launcher.estimate = lambda self_, shape, seconds: 25.01
-        self.addCleanup(setattr, cw.Launcher, "estimate", real)
-        self.assertEqual(self.create_code()[0], 5)
-        self.assertEqual(self.st()["pods"], {})
-
-    def test_unset_cap_refuses_when_running_pods_already_cost_25(self):
-        self.create("coder8", "--shape", "S")
-        self.clock.advance(hours=300)  # S: 0.10 USD/h (the unnamed default XS is 0.05)
-        self.assertEqual(self.create_code()[0], 5)
-
-    def test_zero_negative_and_junk_are_refused(self):
-        for v in ("0", "-5", "abc", "nan", "inf", "-inf", "NaN", "Infinity"):
-            self.refused(v)
-
-    def test_explicit_cap_is_honoured(self):
-        self.env["CW_CLOUD_SPEND_CAP_USD"] = "100"
-        self.assertEqual(self.create_code()[0], 0)
-
-    def test_unreadable_cost_is_refused(self):
-        real = cw.Launcher.estimate
-        self.addCleanup(setattr, cw.Launcher, "estimate", real)
-
-        def raises(self_, shape, seconds):
-            raise ValueError("no price")
-        for bad in (raises, lambda s_, sh, sec: "free", lambda s_, sh, sec: float("nan"), lambda s_, sh, sec: None):
-            cw.Launcher.estimate = bad
-            code, _, err = self.create_code()
-            self.assertEqual(code, 5)
-            self.assertEqual(self.st()["pods"], {})
-
-    def test_unreadable_running_pod_cost_is_refused(self):
-        self.create("coder8")
-        pod = self.pod("coder8")
-        pod["metadata"]["annotations"]["cw/started"] = "garbage"
-        self.patch_state(pods={cw.pod_name("coder8"): pod})
-        self.assertEqual(self.create_code()[0], 5)
 
 
 class U1Scope(unittest.TestCase):

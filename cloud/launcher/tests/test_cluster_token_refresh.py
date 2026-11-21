@@ -1007,7 +1007,7 @@ class MintGuards(Refresh):
         self.assertIn("def cluster_token(env=None, now=None, recovery=None):", launch)   # the launch entry has no such argument
         self.assertEqual(re.findall(r"cluster_token\(([^)]*)\)", launch.split("def cluster_token(env=None")[1].split("\ndef ")[0]).count("strict"), 0)
         self.assertNotIn("strict", launch.lower())
-        self.assertEqual(len(re.findall(r"strict=True", SOURCE.split("class ClusterTokenRefresher")[1].split("\ndef spend_cap")[0])), 1)
+        self.assertEqual(len(re.findall(r"strict=True", SOURCE.split("class ClusterTokenRefresher")[1].split("\ndef max_persistent")[0])), 1)
         self.assertEqual(len(re.findall(r"cluster_token\([^)]*strict=True", SOURCE)), 1)   # the one explicit call: the refresher's
         self.assertFalse(re.search(r"(environ|env)\.get\([^)]*[Ss][Tt][Rr][Ii][Cc][Tt]|environ\[[^]]*[Ss][Tt][Rr][Ii][Cc][Tt]", SOURCE))   # no setting is read for it
         with self.assertRaises(TypeError):

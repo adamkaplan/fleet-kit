@@ -17,7 +17,6 @@ NAMES = {
     P.upper() + "_KUBECTL": "CW_KUBECTL", P.upper() + "_KUBE_CONTEXT": "CW_KUBE_CONTEXT",
     P.upper() + "_KUBECONFIG": "CW_KUBECONFIG", P.upper() + "_CLOUD_NAMESPACE": "CW_CLOUD_NAMESPACE",
     P.upper() + "_CLOUD_IMAGE": "CW_CLOUD_IMAGE", P.upper() + "_CLOUD_AUDIT": "CW_CLOUD_AUDIT",
-    P.upper() + "_CLOUD_SPEND_CAP_USD": "CW_CLOUD_SPEND_CAP_USD",
     P.upper() + "_WORKER": "CW_WORKER", P.upper() + "_REPO": "CW_REPO", P.upper() + "_BRANCH": "CW_BRANCH",
     P.upper() + "_IDLE_SECONDS": "CW_IDLE_SECONDS", P.upper() + "_HARD_DEADLINE": "CW_HARD_DEADLINE",
     P.upper() + "_AUDIT_RUNTIME_ID": "CW_AUDIT_RUNTIME_ID", P.upper() + "_WORKDIR": "CW_WORKDIR",

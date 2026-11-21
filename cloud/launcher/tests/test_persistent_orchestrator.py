@@ -225,16 +225,6 @@ class S2Render(PBase):
         self.assertNotEqual(code, 0, err)
         self.created_nothing()
 
-    def test_s2_the_spend_cap_is_priced_for_one_day(self):
-        day = cw.SHAPES[cw.DEFAULT_ORCHESTRATOR_SHAPE]["usd_per_hour"] * 24
-        self.env["CW_CLOUD_SPEND_CAP_USD"] = "%.4f" % (day - 0.01)
-        code, _, err = self.run_cli("create", WORKER, "--repo", "acme-org/widget-service", "--branch", "main", "--agent", "orchestrator", "--boss", "b",
-                                    "--persistent", "--run-secret-fd", "git-token=%d" % self.fd())
-        self.assertEqual(code, cw.EXIT_CAP, err)
-        self.created_nothing()
-        self.env["CW_CLOUD_SPEND_CAP_USD"] = "%.4f" % (day + 0.01)
-        self.launch()   # the same launch fits a cap just above one day of the shape
-
     def test_s2_a_persistent_flag_that_does_not_fit_is_refused_and_nothing_is_made(self):
         cases = {"a worker": dict(agent=False), "a stack launch": dict(stack=True), "no per-run token route": dict(token=False)}
         for what, kw in cases.items():
