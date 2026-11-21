@@ -35,6 +35,30 @@ class TestPublicNamesGuard(unittest.TestCase):
                 with self.assertRaises(self.sb.IntentError):
                     self.write("acme/api", bad)
 
+    def test_user_fleet_label_exempt(self):
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "janedoe\n"}):
+            self.assertEqual(self.write("acme/api", "janedoe:awaiting-cos"), "ok")
+            self.assertEqual(self.write("acme/api", ["gh", "issue", "edit", "1", "--add-label", "janedoe:hold-security"]), "ok")
+            with self.assertRaises(self.sb.IntentError):
+                self.write("acme/api", "assigned to janedoe")
+
+    def test_builtin_namespace_patterns_refused(self):
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "unrelated-term\n"}):
+            for bad in ("cw-floor-" + "kata", "cw-floor-" + "kata-operator-binding", "jan" + "us-infra/repo"):
+                for repo in ("acme/api", "acme/" + bad):
+                    with self.assertRaises(self.sb.IntentError):
+                        self.write(repo, bad)
+            self.assertEqual(self.write("acme/api", "spire-floor"), "ok")
+            with self.assertRaises(self.sb.IntentError):
+                self.write("acme/api", "cw-floor-" + "kata:parked")
+
+    def test_direct_gh_path_blocked(self):
+        for cmd in ("/opt/homebrew/bin/gh issue comment 1 -b hi", "/usr/local/bin/gh api repos/acme/web/issues"):
+            self.assertTrue(self.sb.repo_commissioning_rule(cmd))
+        self.assertIsNone(self.sb.repo_commissioning_rule("gh issue comment 1 -b hi"))
+        self.assertIsNone(self.sb.repo_commissioning_rule("gh pr view 5 -R acme/api"))
+        self.assertIsNone(self.sb.repo_commissioning_rule("gh api repos/acme/web/issues"))
+
     def test_private_repo_skips_public_names_guard(self):
         with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "private-org\\b\nsecret-word\n"}):
             self.assertEqual(self.write("private-org/internal-repo", "body with secret-word"), "ok")

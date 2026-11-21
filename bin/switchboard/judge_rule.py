@@ -25,4 +25,6 @@ def repo_commissioning_rule(command):
         if positional[:1] == ["api"] and _API_REPOS.search(" " + words) \
                 and (_POST_FLAG.search(words) or (_FIELD_FLAG.search(words) and not re.search(r"(?:-X|--method)", words))):
             return "gh api POST to a repo-creating endpoint"
+        if found.group(0).startswith("/"):
+            return "direct gh binary path (use plain gh on PATH so the fleet shim runs)"
     return None

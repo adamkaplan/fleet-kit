@@ -360,17 +360,21 @@ def refuse_private_names(repo, values):
     terms = private_name_terms()
     if isinstance(repo, str) and repo and any(not _PUBLIC_WORDS.fullmatch(m.group(0)) for _, rx in terms for m in rx.finditer(repo)):
         terms = []  # a private repository may carry its own names; built-in private shapes are still refused
+    label_rx = re.compile(r"^[a-z0-9_-]+:(?:awaiting-user|awaiting-cos|orchestrator|chief-of-staff|parked|merge-captain|hold-[a-z-]+)$", re.IGNORECASE)
+    extra_rx = re.compile(r"\b(?:" + "cw-floor-" + "kata" + r"(?:-[a-z0-9-]+)?|" + "jan" + "us-infra" + r"(?:/[A-Za-z0-9_.-]+)?)\b", re.IGNORECASE)
     builtin = []
     if os.environ.get("FLEET_PRIVATE_NAMES", "").strip() or not os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
         builtin = [(1000 + n, rx) for n, rx in enumerate(BUILTIN_PRIVATE_TERMS, 1)]
+        builtin.append((1000 + len(BUILTIN_PRIVATE_TERMS) + 1, extra_rx))
     if not terms and not builtin:
         return
     for text in _strings_of(list(values)):
+        is_label = bool(label_rx.fullmatch(text.strip()))
         text = _FROM_MARKER.sub("", text)
         for number, line in enumerate(text.splitlines(), 1):
             for index, regex in builtin:
                 if regex.search(line):
                     raise PublicNamesRefused(repo, number, index)
-            for index, regex in terms:
+            for index, regex in ([] if is_label else terms):
                 if any(not _PUBLIC_WORDS.fullmatch(m.group(0)) for m in regex.finditer(line)):
                     raise PublicNamesRefused(repo, number, index)
