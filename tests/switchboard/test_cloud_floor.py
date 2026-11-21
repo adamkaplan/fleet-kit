@@ -1200,6 +1200,38 @@ class TestCloudAgents(FloorCase):
 
 
 class TestFloorAuthority(FloorCase):
+    def test_kata_remediation_rbac_manifest_is_narrow(self):
+        text = (REPO / "cloud/k8s/kata-remediation-rbac.yaml").read_text()
+        dec, docs, i = json.JSONDecoder(), [], 0
+        while True:
+            i = text.find("{", i)
+            if i < 0:
+                break
+            d, i = dec.raw_decode(text, i)
+            docs.append(d)
+        self.assertEqual(len(docs), 6)
+        for d in docs:
+            for r in d.get("rules", []):
+                for k in ("apiGroups", "resources", "verbs"):
+                    self.assertNotIn("*", r[k])
+        sa = [{"kind": "ServiceAccount", "name": "cw-operator", "namespace": "cw"}]
+        want = [
+            ("ClusterRole", None, "cw-operator-node-remediation", ("", "nodes", ["get", "list", "watch", "patch"])),
+            ("Role", "cw-floor-kata", "cw-operator-kata-pods", ("", "pods", ["get", "list", "delete"])),
+            ("Role", "cw", "cw-operator-deployments", ("apps", "deployments", ["get", "list", "watch", "patch"])),
+        ]
+        for kind, ns, name, (grp, res, verbs) in want:
+            m = [d for d in docs if d["kind"] == kind and d["metadata"]["name"] == name]
+            self.assertEqual(len(m), 1)
+            self.assertEqual(m[0]["metadata"].get("namespace"), ns)
+            self.assertEqual(m[0]["rules"], [{"apiGroups": [grp], "resources": [res], "verbs": verbs}])
+            b = [d for d in docs if d["kind"] == kind + "Binding" and d["metadata"]["name"] == name]
+            self.assertEqual(len(b), 1)
+            self.assertEqual(b[0]["metadata"].get("namespace"), ns)
+            self.assertEqual(b[0]["roleRef"], {"apiGroup": "rbac.authorization.k8s.io", "kind": kind, "name": name})
+            self.assertEqual(b[0]["subjects"], sa)
+        self.assertIn("never self-grant broader RBAC", (REPO / "docs/cloud-operator-quickstart.md").read_text())
+
     SECRET = "s3cr3t"
 
     def header(self, agent):

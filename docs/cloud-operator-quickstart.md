@@ -388,6 +388,8 @@ length of the apply window. As an operator choice, keep at least 2 hours of marg
 expired or short of that, run `az login` first, so the fresh login happens at the start of the window and never midway.
 (This is a human step: the agents' permission lists deny `get-access-token`.)
 
+If a login or key runs out mid-apply, stop and ask the owner for a fresh login; never self-grant broader RBAC to route around an expired login.
+
 The steps, in order (the namespace `cwp` is the example):
 
 1. Step 1, render: `CW_HUB_IMAGE=REFERENCE cloud/k8s/render-namespace cwp > cwp.yaml`. Read the header and the file. REFERENCE is the settings' hub image reference, a `name@sha256:<64 hex>` value; the render refuses (exit status 2, nothing printed) without it, and the file to apply must not hold `IMAGE_DIGEST` as the image (the check chained in front of `kc create` in the apply block counts the image lines that still hold it and must print 0; the manifest's own comment line names the placeholder and stays).
