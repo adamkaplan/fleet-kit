@@ -153,12 +153,7 @@ def submit_cloud_land(root, subcmd, app_id, app_key, transport=None, poll_interv
 
 
 NIGHTLY_SUITES = (
-    "bin/test-switchboard --shard 1/6",
-    "bin/test-switchboard --shard 2/6",
-    "bin/test-switchboard --shard 3/6",
-    "bin/test-switchboard --shard 4/6",
-    "bin/test-switchboard --shard 5/6",
-    "bin/test-switchboard --shard 6/6",
+    "bin/test-switchboard --shard 1/6 & p1=$!; bin/test-switchboard --shard 2/6 & p2=$!; bin/test-switchboard --shard 3/6 & p3=$!; bin/test-switchboard --shard 4/6 & p4=$!; bin/test-switchboard --shard 5/6 & p5=$!; bin/test-switchboard --shard 6/6 & p6=$!; wait $p1 && wait $p2 && wait $p3 && wait $p4 && wait $p5 && wait $p6",
     "bin/test-gh-hold",
     "bin/test-path-suites",
     "bin/test-cloud-neutral-names",
