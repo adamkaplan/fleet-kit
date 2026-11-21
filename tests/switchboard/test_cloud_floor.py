@@ -912,6 +912,9 @@ class TestCloudAgents(FloorCase):
         self.assertEqual(container.get("command"), ["python3", "/run/home/app/tools/in-cluster-switchboard-server"])
         env_map = {e["name"]: e.get("value") for e in container.get("env", [])}
         self.assertEqual(env_map.get("SWITCHBOARD_MODE"), "active")
+        for kind in ("requests", "limits"):
+            for res in ("cpu", "memory"):
+                self.assertTrue(container.get("resources", {}).get(kind, {}).get(res), f"{kind}.{res} missing")
         server = REPO / "tools/in-cluster-switchboard-server"
         self.assertTrue(server.is_file())
         ast.parse(server.read_text())
