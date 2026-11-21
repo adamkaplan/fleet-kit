@@ -869,6 +869,8 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
 OVERSIZE_RE = re.compile(r"(\[oversize send \(\d+ chars\) stored at )([^\]]+?/(oversize-sends/(send-[A-Za-z0-9_.-]+\.txt)))(\])")
 SYNC_STATE_FILES = ("registry.json", "retired.json", "boss-overrides.json", "escalated-requests.json", "pr-notices.json", "order-notices.json")
 _PASSTHROUGH_AUTH = []
+STATE_WRITING_COMMANDS = ("send", "report", "remind", "retire", "orders", "decisions", "move", "reassign", "resume", "notice", "intent")
+CLUSTER_ONLY_RELAY_COMMANDS = ("send", "report", "remind")
 PASSTHROUGH_COMMANDS = ("orders", "decisions", "intent", "retire")
 
 def _write_private(path, content):
@@ -1348,10 +1350,13 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
 
 def relay_cli_if_configured(command, payload, env=None):
     """Forward a Mac CLI action to the in-cluster switchboard; None when CW_SWITCHBOARD_URL is not set."""
-    if not switchboard_relay_config(env)["url"]:
+    cfg = switchboard_relay_config(env)
+    if not cfg["url"]:
         return None
+    if cfg["authority"] == "cluster" and command not in PASSTHROUGH_COMMANDS and command not in CLUSTER_ONLY_RELAY_COMMANDS:
+        raise FloorError("refused: %s is not in PASSTHROUGH_COMMANDS or CLUSTER_ONLY_RELAY_COMMANDS under cluster authority" % command)
     orig_payload = payload
-    if command in ("send", "report", "remind", "retire", "orders", "decisions", "intent") and isinstance(payload, dict):
+    if command in STATE_WRITING_COMMANDS and isinstance(payload, dict):
         payload = _resolve_local_caller_and_repo(payload, env=env)
     if command == "send" and isinstance(payload, dict) and isinstance(payload.get("text"), str):
         found = {}

@@ -1214,10 +1214,32 @@ class TestFloorAuthority(FloorCase):
         self.assertTrue(all(nested.values()))
         self.assertTrue({"escalate", "resolve", "answer", "supersede", "batch"} <= set(nested["decisions"].choices))
         self.assertTrue({"add", "remove", "copy"} <= set(nested["orders"].choices))
-        writers = {"send", "report", "remind", "retire", "orders", "decisions", "move", "reassign", "resume", "notice", "intent"}
-        self.assertTrue(writers <= set(parser.commands))
         for name in ("orders", "decisions", "intent", "retire"):
             self.assertIn(name, self.floor.PASSTHROUGH_COMMANDS)
+        fl = self.floor
+        relayed = set(fl.PASSTHROUGH_COMMANDS) | set(fl.CLUSTER_ONLY_RELAY_COMMANDS)
+        self.assertTrue(set(fl.STATE_WRITING_COMMANDS) <= set(parser.commands))
+        self.assertTrue(relayed <= set(fl.STATE_WRITING_COMMANDS))
+        self.assertTrue(set(fl.PASSTHROUGH_COMMANDS).isdisjoint(fl.CLUSTER_ONLY_RELAY_COMMANDS))
+        import ast
+        seen = 0
+        for src in ("bin/fleet-switchboard", "bin/switchboard/checkpoint_reminders.py"):
+            for node in ast.walk(ast.parse((REPO / src).read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", None) in ("relay_cli_done", "relay_cli_show"):
+                    seen += 1
+                    self.assertIsInstance(node.args[0], ast.Constant)
+                    self.assertIn(node.args[0].value, relayed)
+        self.assertTrue(seen)
+        loud_env = {"CW_SWITCHBOARD_URL": "http://127.0.0.1:1", "CW_SWITCHBOARD_AUTHORITY": "cluster"}
+        for cmd in set(fl.STATE_WRITING_COMMANDS) - relayed:
+            with self.assertRaises(fl.FloorError):
+                fl.relay_cli_if_configured(cmd, {}, env=loud_env)
+        with mock.patch.object(fl, "PASSTHROUGH_COMMANDS", tuple(c for c in fl.PASSTHROUGH_COMMANDS if c != "retire")):
+            with self.assertRaises(fl.FloorError):
+                fl.relay_cli_if_configured("retire", {}, env=loud_env)
+            with mock.patch.dict(os.environ, loud_env):
+                with self.assertRaises(sb.LaunchError):
+                    sb.relay_cli_done("retire", {})
         self._single_owner_checks()
         pod_state = {"pane_outbox": [], "reports": [], "reminders": [], "acked": []}
         floor, case = self.floor, self
