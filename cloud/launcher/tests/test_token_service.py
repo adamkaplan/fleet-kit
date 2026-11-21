@@ -269,6 +269,39 @@ class MultiRepo(unittest.TestCase):
         for role in ("worker", "lander"):
             self.assertEqual(self.call({"repo": "acme-org/widget-service", "role": role}, ctl)[0], 403)
 
+    def mint(self, body, user=OPERATOR_USER, token="x"):
+        raw = json.dumps(body).encode()
+        return token_service.handle({"X-Caller-Token": "Bearer t"}, len(raw), lambda n: raw[:n], lambda t: (True, user),
+                                    dict(self.ENV), lambda target, role: {"token": token})
+
+    def test_project_id_is_optional_and_validated(self):
+        repo = "acme-org/widget-service"
+        status, ans, _ = self.mint({"repo": repo, "role": "worker", "project_id": "fleetkit"}, token="tok-a")
+        self.assertEqual((status, ans["project_id"]), (200, "fleetkit"))
+        status, ans, _ = self.mint({"repo": repo, "role": "lander", "project_id": "fleetkit"}, "system:serviceaccount:cw:floor-heavy-executor", "tok-b")
+        self.assertEqual((status, ans["project_id"]), (200, "fleetkit"))
+        status, ans, _ = self.mint({"repos": [repo], "role": "reader", "project_id": "p2"}, token="tok-c")
+        self.assertEqual((status, ans["project_id"]), (200, "p2"))
+        status, ans, _ = self.mint({"repo": repo, "role": "worker"}, token="tok-d")
+        self.assertEqual((status, ans), (200, {"token": "tok-d"}))
+        for bad in ("", "../evil", "a/b", "a b", "a\x00b", "x" * 129, 123, None):
+            status, ans, reason = self.mint({"repo": repo, "role": "worker", "project_id": bad})
+            self.assertEqual((status, ans), (400, None), bad)
+            self.assertNotIn("\n", reason)
+
+    def test_a_token_bound_to_another_project_is_refused(self):
+        # A defensive path: a real mint gives a fresh token each time, so the stub replays one to drive the guard.
+        repo = "acme-org/widget-service"
+        self.assertEqual(self.mint({"repo": repo, "role": "worker", "project_id": "one"}, token="tok-shared")[0], 200)
+        self.assertEqual(self.mint({"repo": repo, "role": "worker", "project_id": "one"}, token="tok-shared")[0], 200)
+        self.assertEqual(self.mint({"repo": repo, "role": "worker", "project_id": "two"}, token="tok-shared")[0], 502)
+
+    def test_the_project_scope_record_is_bounded(self):
+        repo = "acme-org/widget-service"
+        for i in range(token_service.MAX_SCOPE_ENTRIES + 10):
+            self.mint({"repo": repo, "role": "worker", "project_id": "p"}, token="tok-%d" % i)
+        self.assertLessEqual(len(token_service._PROJECT_MINT_SCOPE), token_service.MAX_SCOPE_ENTRIES)
+
     def test_bad_repos_mint_nothing(self):
         for repos, want in ((["acme-org/widget-service", "evil-org/other"], 400), ([], 400), (["acme-org/not-allowed"], 403),
                             ("acme-org/widget-service", 400), ([1], 400)):

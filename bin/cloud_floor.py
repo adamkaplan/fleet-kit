@@ -28,6 +28,7 @@ TIMEOUT_SECONDS = 30
 RESPONSE_MAX = 1 << 20
 PAYLOAD_LIMIT = 60 * 1024   # a queue message whose base64 text is longer than this carries its brief or text in a payload blob
 TOKEN_MAX = 512
+DEFAULT_PROJECT_ID = "fleetkit"
 CALLER_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 NOT_AUTHORS = ("orchestrator",)   # an agent that is not a sandbox author
 AUTHORS = ("coder", "worker")
@@ -215,11 +216,12 @@ class QueueBlobTransport:
     def _blob(self, session_id):
         status, raw = _request("GET", self._url(self.blob, "/msg/%s.json" % urllib.parse.quote(session_id, safe=""), self.blob_sas), None, [("Accept", "application/json")], missing_ok=True)
         return {} if status == 404 else _parse(raw)
-    def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", mode=None, env=None, priority_class=None, preview=False, **ignored):
+    def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", mode=None, env=None, priority_class=None, preview=False, project_id=None, **ignored):
+        pid = project_id or DEFAULT_PROJECT_ID
         pclass = priority_class or "production"
         extras = {"class": pclass, "priority_class": pclass} if pclass != "production" else {}
-        command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main", **({"mode": mode} if mode else {}), **extras, **({"preview": True} if preview else {}))
-        self._enqueue(command, dict({"brief": brief}, **({"env": env} if env else {})))
+        command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main", project_id=pid, **({"mode": mode} if mode else {}), **extras, **({"preview": True} if preview else {}))
+        self._enqueue(command, dict({"brief": brief, "project_id": pid}, **({"env": env} if env else {})))
         return {"work_id": session_id, "session_id": session_id, "seq": 1}
     def message(self, caller, work_id, cmd_id, seq, text):
         self._enqueue(self._command("send", cmd_id, work_id, seq), {"text": text})

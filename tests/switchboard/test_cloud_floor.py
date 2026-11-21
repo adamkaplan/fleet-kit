@@ -794,6 +794,7 @@ class TestCloudFloorQueueBlob(FloorCase):
         launch = self.mini.commands[0]
         self.assertEqual({k: launch[k] for k in ("v", "op", "session_id", "seq", "ref", "repo")},
                          {"v": 1, "op": "launch", "session_id": sid, "seq": 1, "ref": "main", "repo": "https://github.com/%s.git" % REPO_NAME})
+        self.assertEqual(launch["project_id"], "fleetkit")
         self.assertRegex(launch["cmd_id"], r"^c-[0-9a-f]{16}$")
         self.assertRegex(launch["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertTrue(launch["brief"].startswith("Floor Author Contract"))
@@ -833,6 +834,8 @@ class TestCloudFloorQueueBlob(FloorCase):
         self.assertNotIn("brief", command)
         blob = self.mini.blobs[command["payload"]]
         self.assertEqual(blob["env"], {})
+        self.assertEqual(blob["project_id"], "fleetkit")
+        self.assertEqual(command["project_id"], "fleetkit")
         self.assertTrue(blob["brief"].startswith("Floor Author Contract") and blob["brief"].endswith("x\n"))
         self.assertEqual(next(iter(self.mini.sessions.values()))["brief"], blob["brief"])
 

@@ -14,8 +14,10 @@ import datetime as dt
 import http.server
 import json
 import os
+import re
 import ssl
 import sys
+import threading
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +29,15 @@ KEYS = {"repo", "role"}
 KEYS_MULTI = {"repos", "role"}
 MULTI_ROLES = ("orchestrator", "reader", "switchboard")
 MAX_REPOS = 20
+_PROJECT_MINT_SCOPE = {}   # token -> (project_id, repos, role): a token is never served under two project_ids
+_SCOPE_LOCK = threading.Lock()
+MAX_SCOPE_ENTRIES = 4096   # installation tokens expire within the hour: the oldest bindings are dropped past this bound
+
+
+def valid_project_id(value):
+    return (isinstance(value, str) and 0 < len(value) <= 128 and ".." not in value
+            and "/" not in value and "\x00" not in value and not any(c.isspace() for c in value)
+            and bool(re.fullmatch(r"[A-Za-z0-9_.-]+", value)))
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 REVIEW_URL = "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews"
 
@@ -113,8 +124,10 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
         body = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         return 400, None, "the body is not JSON"
-    if not isinstance(body, dict) or set(body) not in (KEYS, KEYS_MULTI):
+    if not isinstance(body, dict) or set(body) - {"project_id"} not in (KEYS, KEYS_MULTI):
         return 400, None, "the body must carry exactly repo and role, or repos and role"
+    if "project_id" in body and not valid_project_id(body["project_id"]):
+        return 400, None, "invalid project_id"
     multi = "repos" in body
     repo, role = (body["repos"] if multi else body["repo"]), body["role"]
     if not isinstance(role, str) or role not in app_token.PERMISSIONS_BY_ROLE:
@@ -148,6 +161,17 @@ def handle(headers, body_length, read_body, review, env=None, mint_fn=None):
         ans = mint_fn(repo, role)
     except SystemExit:
         return 502, None, "GitHub could not be asked or refused the mint"
+    if "project_id" in body and isinstance(ans, dict):
+        project_id, tok = body["project_id"], ans.get("token")
+        with _SCOPE_LOCK:
+            bound = _PROJECT_MINT_SCOPE.get(tok)
+            if bound is not None and bound[0] != project_id:
+                return 502, None, "token already bound to another project_id"
+            _PROJECT_MINT_SCOPE.pop(tok, None)
+            _PROJECT_MINT_SCOPE[tok] = (project_id, tuple(checks), role)
+            while len(_PROJECT_MINT_SCOPE) > MAX_SCOPE_ENTRIES:
+                del _PROJECT_MINT_SCOPE[next(iter(_PROJECT_MINT_SCOPE))]
+        ans = dict(ans, project_id=project_id)
     return 200, ans, "served"
 
 
