@@ -869,7 +869,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
 OVERSIZE_RE = re.compile(r"(\[oversize send \(\d+ chars\) stored at )([^\]]+?/(oversize-sends/(send-[A-Za-z0-9_.-]+\.txt)))(\])")
 SYNC_STATE_FILES = ("registry.json", "retired.json", "boss-overrides.json", "escalated-requests.json", "pr-notices.json", "order-notices.json")
 _PASSTHROUGH_AUTH = []
-PASSTHROUGH_COMMANDS = ("orders", "decisions", "intent")
+PASSTHROUGH_COMMANDS = ("orders", "decisions", "intent", "retire")
 
 def _write_private(path, content):
     tmp = "%s.tmp%d" % (path, os.getpid())

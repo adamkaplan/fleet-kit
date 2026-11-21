@@ -1216,9 +1216,8 @@ class TestFloorAuthority(FloorCase):
         self.assertTrue({"add", "remove", "copy"} <= set(nested["orders"].choices))
         writers = {"send", "report", "remind", "retire", "orders", "decisions", "move", "reassign", "resume", "notice", "intent"}
         self.assertTrue(writers <= set(parser.commands))
-        for name in ("orders", "decisions", "intent"):
+        for name in ("orders", "decisions", "intent", "retire"):
             self.assertIn(name, self.floor.PASSTHROUGH_COMMANDS)
-        self.assertNotIn("retire", self.floor.PASSTHROUGH_COMMANDS)
         self._single_owner_checks()
         pod_state = {"pane_outbox": [], "reports": [], "reminders": [], "acked": []}
         floor, case = self.floor, self
@@ -1269,7 +1268,12 @@ class TestFloorAuthority(FloorCase):
                 self.assertTrue(isinstance(self.floor.relay_cli_if_configured("orders", {"action": "list"}), dict))
                 self.assertEqual(self.floor.switchboard_authority(), "local")
                 self.assertEqual(self.floor.switchboard_authority(), "cluster")
-                for cmd, payload in (("decisions", {"action": "resolve", "id": "d1"}), ("intent", {"action": "add"})):
+                n_retires = len(pod_state["retires"])
+                self.floor._PASSTHROUGH_AUTH[:] = []
+                self.assertFalse(sb.relay_cli_done("retire", {"name": "local-pane", "worker": "local-pane", "reason": "done", "undo": False}))
+                self.assertEqual(len(pod_state["retires"]), n_retires + 1)
+                for cmd, payload in (("decisions", {"action": "resolve", "id": "d1"}), ("intent", {"action": "add"}),
+                                     ("retire", {"name": "local-pane", "worker": "local-pane", "reason": "done", "undo": False})):
                     self.floor._PASSTHROUGH_AUTH[:] = []
                     os.environ.update(env)
                     self.assertTrue(isinstance(self.floor.relay_cli_if_configured(cmd, payload), dict))
