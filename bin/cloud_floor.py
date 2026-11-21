@@ -83,10 +83,8 @@ def scrub(text, limit=200):
                 pass
     token_file = env.get("CW_FLOOR_TOKEN_FILE")
     if token_file:
-        try:
-            forms.append(open(token_file).read(TOKEN_MAX).strip())
-        except OSError:
-            pass
+        try: forms.append(open(token_file).read(TOKEN_MAX).strip())
+        except OSError: pass
     for form in sorted((f for f in forms if f), key=len, reverse=True):
         text = text.replace(form, "<floor>")
     text = re.sub(r"https?://\S+", "<url>", text)
@@ -150,10 +148,8 @@ def _request(method, url, data=None, headers=(), missing_ok=False):
     return status, raw
 
 def _parse(raw):
-    try:
-        parsed = D["parse_bounded"](raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        raise FloorError("Floor's answer is not JSON") from None
+    try: parsed = D["parse_bounded"](raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError): raise FloorError("Floor's answer is not JSON") from None
     if not isinstance(parsed, dict):
         raise FloorError("Floor's answer is not an object")
     return parsed
@@ -228,10 +224,8 @@ class QueueBlobTransport:
         return {"id": cmd_id, "seq": int(seq)}
     def cancel(self, caller, work_id, cmd_id, seq):
         self._enqueue(self._command("retire", cmd_id, work_id, seq))
-        try:
-            state = self._state()
-        except FloorError:
-            return {"cancelled": True, "reserved": True}   # sent, not yet seen applied: custody is not confirmed
+        try: state = self._state()
+        except FloorError: return {"cancelled": True, "reserved": True}   # sent, not yet seen applied: custody is not confirmed
         ack = state["acks"].get(cmd_id)
         if isinstance(ack, str) and ack.startswith("rejected"):
             raise FloorError("Floor rejected the retire (%s)" % scrub(ack, 80))
@@ -308,10 +302,8 @@ def transport():
 
 def _call(function, *args, **kwargs):
     """One call of the transport; a failure is a CloudError whose text holds no URL, host or token."""
-    try:
-        return function(*args, **kwargs)
-    except UnavailableArtifactError:
-        raise
+    try: return function(*args, **kwargs)
+    except UnavailableArtifactError: raise
     except FloorError as err:
         raise D["CloudError"]("Floor: %s" % scrub(err)) from None
     except (OSError, ValueError, KeyError, TypeError) as err:
@@ -415,10 +407,8 @@ def _stamp(seconds, now):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + seconds))
 
 def _seconds(value, default):
-    try:
-        return int(value) if value and int(value) > 0 else default
-    except (TypeError, ValueError):
-        return default
+    try: return int(value) if value and int(value) > 0 else default
+    except (TypeError, ValueError): return default
 
 def check_priority_tier(args, engine, runner, now, repo=None, config=None):
     """The class and preview of a Floor launch, checked before anything is sent."""
@@ -623,10 +613,8 @@ def _retire_floor(args, runner, now, record):
     D["_keep_boss"](state, record)
     D["remove_record"](state, args.name)
     if switchboard_authority() == "cluster":
-        try:
-            call_switchboard_v1("/v1/cloud-record", {"worker": args.name, "delete": True, "reason": reason})
-        except FloorError as err:
-            _warn("cluster copy of the %s record was not deleted" % args.name, err)
+        try: call_switchboard_v1("/v1/cloud-record", {"worker": args.name, "delete": True, "reason": reason})
+        except FloorError as err: _warn("cluster copy of the %s record was not deleted" % args.name, err)
     print("%s is retired (Floor session %s cancelled)" % (args.name, record.get("session")))
     return H["EXIT_OK"]
 
@@ -703,10 +691,8 @@ def ensure_switchboard_auth_file(env=None, fetch_secret=None):
 
 def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, state=None, artifact_put=None):
     """One request to the in-cluster switchboard: returns (status, body). The sender is the proxy-injected header's agent, never a body field."""
-    try:
-        auth = verify_switchboard_auth((headers or {}).get("X-Switchboard-Auth"), expected_secret)
-    except FloorError as err:
-        return err.status, {"error": str(err)}
+    try: auth = verify_switchboard_auth((headers or {}).get("X-Switchboard-Auth"), expected_secret)
+    except FloorError as err: return err.status, {"error": str(err)}
     state = state if state is not None else {}
     for key in ("pane_outbox", "reports", "reminders", "audit"):
         state.setdefault(key, [])
@@ -719,10 +705,8 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"messages": [m for m in state["pane_outbox"] if m.get("to") == auth["agent"] or auth["agent"] in ("cos", "pane-relay")]}
     body = {}
     if route[0] == "POST":
-        try:
-            body = D["parse_bounded"](body_bytes.decode("utf-8")) if body_bytes else {}
-        except ValueError:
-            return 400, {"error": "bad request body"}
+        try: body = D["parse_bounded"](body_bytes.decode("utf-8")) if body_bytes else {}
+        except ValueError: return 400, {"error": "bad request body"}
         if not isinstance(body, dict):
             return 400, {"error": "bad request body"}
     if route[0] == "POST" and route[1] in ("/v1/send", "/v1/report", "/v1/remind", "/v1/retire", "/v1/orders", "/v1/intent", "/v1/decisions", "/v1/pane-state", "/v1/pane-command") \
@@ -804,10 +788,8 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         name = body.get("name")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", name) or artifact_put is None:
             return 400, {"error": "a plain name is required"}
-        try:
-            data = base64.b64decode(body.get("data_b64") or "", validate=True)
-        except ValueError:
-            return 400, {"error": "data_b64 is not base64"}
+        try: data = base64.b64decode(body.get("data_b64") or "", validate=True)
+        except ValueError: return 400, {"error": "data_b64 is not base64"}
         digest = hashlib.sha256(data).hexdigest()
         url = artifact_put(auth["session"], "%s-%s" % (digest, name), data)
         if not isinstance(url, str) or not url.startswith("https://"):
@@ -891,10 +873,8 @@ def switchboard_relay_config(env=None):
            "authority": (env.get("CW_SWITCHBOARD_AUTHORITY") or "").strip()}
     if all(got.values()):
         return got
-    try:
-        path = os.path.join(str(D["H"]["state_dir_path"]()), "switchboard-relay.json")
-    except Exception:
-        return got   # no state directory bound: no file to read
+    try: path = os.path.join(str(D["H"]["state_dir_path"]()), "switchboard-relay.json")
+    except Exception: return got   # no state directory bound: no file to read
     try:
         with open(path, encoding="utf-8") as handle:
             data = D["parse_bounded"](handle.read(65536))
@@ -954,6 +934,14 @@ def _auth_header(config):
     except OSError:
         raise FloorError("CW_SWITCHBOARD_AUTH_FILE cannot be read") from None
 
+def _stale_disk_alert(engine, keys, text):
+    """True when a disk.low alert is stale: the local state volume has at least min_free_gb free."""
+    if not (any(str(k).startswith("disk.low:") for k in keys) or (not keys and "disk low:" in str(text or ""))):
+        return False
+    try: st = os.statvfs(str(getattr(engine, "state_dir", None) or D["H"]["state_dir_path"]()))
+    except Exception: return False
+    return st.f_bavail * st.f_frsize / 1e9 >= ((getattr(engine, "config", None) or {}).get("disk_guard") or {}).get("min_free_gb", 50)
+
 def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
     """Fetch the cluster's pane outbox, deliver what the Mac owns (cluster authority only), and ack."""
     config = switchboard_relay_config(env)
@@ -990,10 +978,8 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
             if isinstance(m.get("oversize_files"), dict) and m["oversize_files"]:
                 sdir = getattr(engine, "state_dir", None)
                 if not isinstance(sdir, (str, os.PathLike)):
-                    try:
-                        sdir = D["H"]["state_dir_path"]()
-                    except Exception:
-                        sdir = None
+                    try: sdir = D["H"]["state_dir_path"]()
+                    except Exception: sdir = None
                 if sdir:
                     try:
                         ov_dir = os.path.join(str(sdir), "oversize-sends")
@@ -1006,6 +992,10 @@ def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
                         _warn("oversize files of outbox message %s" % mid, err)
             if discovery is not None and recipient in getattr(discovery, "agents", {}):
                 session_id = discovery.agents[recipient].session_id
+            if _stale_disk_alert(engine, keys, text):
+                getattr(engine, "audit", None) is not None and engine.audit.append("daemon", "disk.recovered_at_delivery", recipient, {"keys": list(keys)})
+                ack_ids.append(mid)
+                continue
             try:
                 engine.v2.synthetic(session_id, text, {"fleet": {"keys": keys, "from": "switchboard"}}, resume, delivery, message_id, description)
             except Exception as err:
@@ -1037,14 +1027,10 @@ def pane_relay_pass(engine, sb_mod, env=None):
     facts = getattr(sb_mod, "WorkerFacts", None)
     for source in getattr(engine, "sources", ()):
         if facts is not None and isinstance(source, facts):
-            try:
-                source()   # WorkerFacts is callable and reads engine.discovery, the one discover() just took
-            except Exception as err:
-                _warn("worker fact collection", err)
-    try:
-        sb_mod.cloud_push_pane_state(engine, discovery)
-    except Exception as err:
-        _warn("pane state push", err)
+            try: source()   # WorkerFacts is callable and reads engine.discovery, the one discover() just took
+            except Exception as err: _warn("worker fact collection", err)
+    try: sb_mod.cloud_push_pane_state(engine, discovery)
+    except Exception as err: _warn("pane state push", err)
     return drain_pane_outbox(engine, sb_mod=sb_mod, discovery=discovery, env=env)
 
 def is_canary(m):
@@ -1080,10 +1066,8 @@ def notify_macos_alarm(title, text, runner=subprocess.run):
     if sys.platform != "darwin" and runner is subprocess.run:
         return None
     script = 'display notification %s with title %s sound name "Sosumi"' % (json.dumps(str(text)[:240]), json.dumps(str(title)[:80]))
-    try:
-        return runner(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=10)
-    except Exception as err:
-        _warn("macOS notification", err)
+    try: return runner(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    except Exception as err: _warn("macOS notification", err)
 
 def mac_daemon_paused(state_dir, runner=subprocess.run):
     pid = None
@@ -1168,10 +1152,8 @@ def fetch_cluster_mode(env=None):
 
 def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
     """Rehearsed rollback from cluster authority to the Mac daemon."""
-    try:
-        call_switchboard_v1("/v1/mode", {"mode": "shadow"}, env=env)
-    except Exception as err:
-        _warn("cluster mode switch to shadow (the cluster may still hold authority)", err)
+    try: call_switchboard_v1("/v1/mode", {"mode": "shadow"}, env=env)
+    except Exception as err: _warn("cluster mode switch to shadow (the cluster may still hold authority)", err)
     relay_path = os.path.join(str(state_dir), "switchboard-relay.json")
     if os.path.exists(relay_path):
         with open(relay_path, encoding="utf-8") as handle:
@@ -1199,10 +1181,8 @@ def rollback_switchboard_authority(state_dir, env=None, kill_fn=os.kill):
         if pid is not None:
             break
     if isinstance(pid, int) and pid > 1:
-        try:
-            kill_fn(pid, signal.SIGCONT)
-        except (ProcessLookupError, OSError):
-            pass
+        try: kill_fn(pid, signal.SIGCONT)
+        except (ProcessLookupError, OSError): pass
     return {"authority": "shadow", "resumed_pid": pid}
 
 def fleetkit_azure_dir(home_dir):
@@ -1245,10 +1225,8 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
     if switchboard_authority(env) == "cluster":
         ans = call_switchboard_v1("/v1/cloud-sync", {"mirror_only": True}, env=env)
         if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict):
-            try:
-                _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
-            except OSError as err:
-                _warn("decisions.json sync", err)
+            try: _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
+            except OSError as err: _warn("decisions.json sync", err)
         return {"synced": 0}
     records, reminders = {}, None
     cloud = os.path.join(str(state_dir), "cloud")
@@ -1270,25 +1248,42 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
         payload["state_files"] = state_files
     ans = call_switchboard_v1("/v1/cloud-sync", payload, env=env)
     if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict) and switchboard_authority(env) == "cluster":
-        try:
-            _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
-        except OSError as err:
-            _warn("decisions.json sync", err)
+        try: _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
+        except OSError as err: _warn("decisions.json sync", err)
     return {"synced": len(records)}
 
 def _healthy(url="http://127.0.0.1:%d/healthz" % PANE_RELAY_PORT):
-    try:
-        return urllib.request.urlopen(url, timeout=3).status == 200
-    except Exception:
-        return False
+    try: return urllib.request.urlopen(url, timeout=3).status == 200
+    except Exception: return False
 
-def _start_port_forward(lib):
-    namespace = os.environ.get("CW_CLOUD_NAMESPACE") or "cw"
+def _kube_base(lib):
     base = ["kubectl"]
     for flag, name in (("--server", "CW_CLOUD_SERVER"), ("--certificate-authority", "CW_CLOUD_CA_FILE")):
         if os.environ.get(name):
             base += [flag, os.environ[name]]
-    base += ["--token", lib.cluster_token(os.environ, duration="30m"), "-n", namespace]
+    return base + ["--token", lib.cluster_token(os.environ, duration="30m")]
+
+def remediate_wedged_kata_nodes(base_cmd, runner=subprocess.run, notify_fn=None):
+    """Backstop: taint a Kata node reporting ContainerRuntimeProblem=True and gracefully evict its pods."""
+    kw, k = dict(capture_output=True, text=True, timeout=30), list(base_cmd)
+    nodes = json.loads(runner(k + ["get", "nodes", "-l", "spire-floor-pool=heavy-kata", "-o", "json"], check=True, **kw).stdout)
+    done = []
+    for item in nodes.get("items", []):
+        name = item["metadata"]["name"]
+        wedged = any(c.get("type") == "ContainerRuntimeProblem" and c.get("status") == "True" for c in (item.get("status") or {}).get("conditions") or [])
+        if not wedged or any(t.get("key") == "spire-floor/runtime-wedged" for t in (item.get("spec") or {}).get("taints") or []):
+            continue
+        if runner(k + ["taint", "nodes", name, "spire-floor/runtime-wedged=true:NoSchedule", "--overwrite"], check=False, **kw).returncode != 0:
+            _warn("kata node %s taint failed; its pods were not evicted" % name, "nonzero exit"); continue
+        got = runner(k + ["-n", "cw-floor-kata", "get", "pods", "--field-selector=spec.nodeName=" + name, "-o", "json"], check=False, **kw)
+        for pod in json.loads(got.stdout or "{}").get("items", []):
+            runner(k + ["-n", "cw-floor-kata", "delete", "pod", pod["metadata"]["name"], "--wait=false"], check=False, **kw)
+        notify_fn and notify_fn(name, "ContainerRuntimeProblem=True")
+        done.append(name)
+    return done
+
+def _start_port_forward(lib):
+    base = _kube_base(lib) + ["-n", os.environ.get("CW_CLOUD_NAMESPACE") or "cw"]
     pods = json.loads(subprocess.run(base + ["get", "pods", "-o", "json"], capture_output=True, text=True, timeout=60, check=True).stdout)
     for item in pods.get("items", []):
         if item["metadata"]["name"].startswith("fleet-switchboard") and item.get("status", {}).get("phase") == "Running":
@@ -1318,14 +1313,13 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
                 except Exception as err:
                     child = None
                     _warn("port-forward start (check kubectl and the cluster settings)", err)
-            try:
-                sync_cloud_records_to_cluster(state_dir, env=env)
-            except Exception as err:
-                _warn("cloud record sync", err)
-            try:
-                canaries = (pane_relay_pass(engine, sb_mod, env=env) or {}).get("canaries") or []
-            except Exception as err:
-                _warn("pane relay pass", err)
+            try: sync_cloud_records_to_cluster(state_dir, env=env)
+            except Exception as err: _warn("cloud record sync", err)
+            try: canaries = (pane_relay_pass(engine, sb_mod, env=env) or {}).get("canaries") or []
+            except Exception as err: _warn("pane relay pass", err)
+            if max_passes is None and passes % 12 == 1:
+                try: remediate_wedged_kata_nodes(_kube_base(lib), notify_fn=lambda node, why: _warn("kata node %s tainted and evicted" % node, why))
+                except Exception as err: _warn("kata node remediation", err)
             if max_passes is None:
                 try:
                     reachable = _healthy()
@@ -1372,10 +1366,8 @@ def relay_cli_if_configured(command, payload, env=None):
             payload = dict(payload, oversize_files=found)
     ans = call_switchboard_v1("/v1/" + command, payload, env=env)
     if command == "decisions" and isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict):
-        try:
-            _write_private(os.path.join(str(D["H"]["state_dir_path"]()), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
-        except Exception as err:
-            _warn("decisions.json update", err)
+        try: _write_private(os.path.join(str(D["H"]["state_dir_path"]()), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
+        except Exception as err: _warn("decisions.json update", err)
     if env is None and command in PASSTHROUGH_COMMANDS and isinstance(ans, dict):
         _PASSTHROUGH_AUTH[:] = [os.environ.pop("CW_SWITCHBOARD_AUTHORITY", None)]
     if command == "remind" and isinstance(ans, dict):
@@ -1422,10 +1414,8 @@ def push_pane_state(observations, env=None, now=None):
 
 def _stayed_name(name):
     """D[name], or an unmatchable class when the name is not there (`D` has no `get` and no membership test)."""
-    try:
-        return D[name]
-    except KeyError:
-        return ()
+    try: return D[name]
+    except KeyError: return ()
 
 def _one_line_text(err):
     return " ".join(str(err).split())[:160]
@@ -1502,10 +1492,8 @@ def floor_watch_sync(state_dir, records, engine=None):
                 except Exception as err:
                     record.pop("terminal_woken", None)
                     woken.pop("%s:%s" % (record["worker"], s_state), None)
-                    try:
-                        _write_private(wakes_path, json.dumps(woken, sort_keys=True))
-                    except OSError:
-                        pass
+                    try: _write_private(wakes_path, json.dumps(woken, sort_keys=True))
+                    except OSError: pass
                     print("floor_watch_sync: terminal wake for %s failed (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
     for work_id, found in sessions.items():
         name, repo = found.get("worker") or found.get("title"), found.get("repo")

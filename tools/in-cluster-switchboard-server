@@ -762,8 +762,11 @@ def run_pass_loop(sb_mod, cf_mod):
     v2 = ShadowV2(SNAPSHOT_FILE, sb_mod)
     herdr = ShadowHerdr(SNAPSHOT_FILE)
     audit = sb_mod.AuditLog(state / "audit.jsonl")
+    sources = sb_mod.fact_sources(state)
+    if str(STATE_DIR).startswith("/run/"):  # tmpfs: statvfs reports an unrelated volume
+        sources = [s for s in sources if getattr(s, "__name__", "") != "disk_facts"]
     engine = sb_mod.Switchboard(
-        config, v2, herdr, audit, sb_mod.fact_sources(state), now, "daemon",
+        config, v2, herdr, audit, sources, now, "daemon",
         intents=sb_mod.intent_reader_for(config, runner, now), state_dir=state,
     )
     engine.accounts = sb_mod.GhAccounts(config, runner, now)

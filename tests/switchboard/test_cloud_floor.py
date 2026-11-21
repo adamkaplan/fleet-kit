@@ -1740,6 +1740,40 @@ class TestFloorAuthority(FloorCase):
             post.assert_called_once_with("/v1/pane-ack", {"ids": acked}, env=env)
             self.assertEqual(engine.v2.synthetic.call_count, delivered)
 
+    def test_stale_disk_low_alert_is_dropped_and_acked_at_delivery(self):
+        auth = self.home / "auth"
+        auth.write_text("agent=cos;session=ses_example;secret=x")
+        auth.chmod(0o600)
+        env = {"CW_SWITCHBOARD_URL": "https://sw.example", "CW_SWITCHBOARD_AUTH_FILE": str(auth), "CW_SWITCHBOARD_AUTHORITY": "cluster"}
+        msgs = [{"id": 1, "from": "switchboard", "to": "w", "session": "ses_a", "text": "disk low: x", "keys": ["disk.low:123"]}]
+        for free_gb, delivered in ((80, 0), (5, 1)):
+            engine = mock.Mock(state_dir=str(self.home), config={"disk_guard": {"min_free_gb": 50}})
+            st = types.SimpleNamespace(f_bavail=int(free_gb * 1e9), f_frsize=1)
+            with mock.patch.object(self.floor, "_request", return_value=(200, json.dumps({"messages": msgs}).encode())), \
+                    mock.patch.object(self.floor.os, "statvfs", return_value=st), mock.patch.object(self.floor, "call_switchboard_v1") as post:
+                self.floor.drain_pane_outbox(engine, env=env)
+            self.assertEqual(engine.v2.synthetic.call_count, delivered)
+            post.assert_called_once_with("/v1/pane-ack", {"ids": [1]}, env=env)
+
+    def test_remediate_wedged_kata_nodes_taints_and_gracefully_evicts(self):
+        def node(name, bad, tainted=False):
+            return {"metadata": {"name": name}, "status": {"conditions": [{"type": "ContainerRuntimeProblem", "status": "True" if bad else "False"}]},
+                    "spec": {"taints": [{"key": "spire-floor/runtime-wedged"}] if tainted else []}}
+        nodes = {"items": [node("n1", True), node("n2", True, True), node("n3", False)]}
+        calls = []
+        def runner(cmd, **kw):
+            calls.append(cmd)
+            out = nodes if "nodes" in cmd and "get" in cmd else {"items": [{"metadata": {"name": "pod-a"}}]}
+            return types.SimpleNamespace(stdout=json.dumps(out), returncode=0)
+        notes = []
+        got = self.floor.remediate_wedged_kata_nodes(["kubectl"], runner, lambda n, r: notes.append(n))
+        self.assertEqual((got, notes), (["n1"], ["n1"]))
+        flat = [" ".join(c) for c in calls]
+        self.assertTrue(any("taint nodes n1 spire-floor/runtime-wedged=true:NoSchedule" in c for c in flat))
+        self.assertTrue(any("delete pod pod-a --wait=false" in c for c in flat))
+        self.assertFalse(any("--force" in c or "--grace-period" in c for c in flat))
+        self.assertFalse(any("n2" in c or "n3" in c for c in flat))
+
     def test_relayed_remind_prints_the_stored_receipt(self):
         state = {"on_v1_action": lambda route, auth, body, st: st.update(last_remind={"id": "rem_abc12345", "at": 1700000900.0, "at_iso": "2023-11-14T22:28:20Z"})}
         status, got = self.call("/v1/remind", {"to": "widget-api", "when": "15m", "text": "check"}, state=state)
