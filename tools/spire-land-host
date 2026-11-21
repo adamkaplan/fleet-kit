@@ -171,7 +171,7 @@ def run_floor_nightly(root, transport=None, poll_interval=5, timeout=1800):
     cmd_id = cf.launch_key(who, session_id)
     tp.submit(who, cmd_id, session_id=session_id, repo=repo, ref="main",
               brief=" && ".join(NIGHTLY_SUITES),
-              mode="verify-only", env={"FLOOR_WORKFLOW": "verify-only"}, priority_class="background")
+              mode="verify-only", env={"FLOOR_WORKFLOW": "verify-only", "FLEET_HEAVY": "off"}, priority_class="background")
     seen = _wait_floor(tp, who, session_id, poll_interval, timeout)
     print(json.dumps({"session_id": session_id, "repo": repo, "state": seen.get("state"),
                       "manifest": seen.get("manifest"), "error": seen.get("error")}))
