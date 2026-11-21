@@ -28,7 +28,6 @@ TIMEOUT_SECONDS = 30
 RESPONSE_MAX = 1 << 20
 PAYLOAD_LIMIT = 60 * 1024   # a queue message whose base64 text is longer than this carries its brief or text in a payload blob
 TOKEN_MAX = 512
-DEFAULT_PROJECT_ID = "fleetkit"
 CALLER_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 NOT_AUTHORS = ("orchestrator",)   # an agent that is not a sandbox author
 AUTHORS = ("coder", "worker")
@@ -58,6 +57,13 @@ class UnavailableArtifactError(FloorError):
 
 def env_of():
     return os.environ
+
+def floor_project_id(env=None, project_id=None):
+    """The Floor project id from the explicit argument or CW_FLOOR_PROJECT_ID / CW_FLOOR_CALLER in configuration."""
+    source = env_of() if env is None else env
+    pid = (project_id or source.get("CW_FLOOR_PROJECT_ID") or source.get("CW_FLOOR_CALLER") or "").strip()
+    if not D["valid_name"](pid): raise FloorError("Floor project_id is not configured: pass project_id or set CW_FLOOR_PROJECT_ID (or CW_FLOOR_CALLER in cloud.env)")
+    return pid
 
 def scrub(text, limit=200):
     """One line of `text` with every URL, host, bearer token, signature and long opaque string of the settings taken out."""
@@ -206,7 +212,7 @@ class QueueBlobTransport:
         status, raw = _request("GET", self._url(self.blob, "/msg/%s.json" % urllib.parse.quote(session_id, safe=""), self.blob_sas), None, [("Accept", "application/json")], missing_ok=True)
         return {} if status == 404 else _parse(raw)
     def submit(self, caller, cmd_id, session_id=None, repo=None, ref=None, brief="", mode=None, env=None, priority_class=None, preview=False, project_id=None, **ignored):
-        pid = project_id or DEFAULT_PROJECT_ID
+        pid = floor_project_id(project_id=project_id)
         pclass = priority_class or "production"
         extras = {"class": pclass, "priority_class": pclass} if pclass != "production" else {}
         command = self._command("launch", cmd_id, session_id, 1, repo="https://github.com/%s.git" % repo, ref=ref or "main", project_id=pid, **({"mode": mode} if mode else {}), **extras, **({"preview": True} if preview else {}))

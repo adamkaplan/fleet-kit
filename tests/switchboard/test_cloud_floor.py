@@ -200,7 +200,7 @@ class FloorCase(Base):
         self.audits, self.pod_calls, self.notes, self.finals = [], [], [], []
         self.brief, self.kind = BRIEF, ("person", "operator")
         self.engine = mock.Mock()
-        env = mock.patch.dict(os.environ, {"CW_ALLOWED_REPOS": "%s,%s" % (REPO_NAME, OTHER_REPO), "CW_REMOTE_BACKEND": "floor", "CW_FLOOR_CALLER": "fleet"})
+        env = mock.patch.dict(os.environ, {"CW_ALLOWED_REPOS": "%s,%s" % (REPO_NAME, OTHER_REPO), "CW_REMOTE_BACKEND": "floor", "CW_FLOOR_CALLER": "fleet", "CW_FLOOR_PROJECT_ID": "fleetkit"})
         env.start()
         self.addCleanup(env.stop)
         self.addCleanup(setattr, self.floor, "TRANSPORT", self.floor.TRANSPORT)
@@ -848,6 +848,20 @@ class TestCloudFloorQueueBlob(FloorCase):
                            "CW_FLOOR_BLOB_URL": self.mini.base + "/b", "CW_FLOOR_BLOB_SAS": MiniFloor.BLOB_SAS})
         for name in ("CW_FLOOR_TRANSPORT", "CW_FLOOR_URL"):
             os.environ.pop(name, None)
+
+    def test_project_id_comes_from_configuration_not_a_default(self):
+        self.assertFalse(hasattr(self.floor, "DEFAULT_PROJECT_ID"))
+        transport = self.floor.QueueBlobTransport("https://q.example/q", "sig=1", "https://b.example/b", "sig=2")
+        sent = []
+        transport._enqueue = lambda command, body=None: sent.append(command)
+        with mock.patch.dict(os.environ, {"CW_FLOOR_PROJECT_ID": "proj-a", "CW_FLOOR_CALLER": "caller-b"}):
+            transport.submit("fleet", "c1", session_id="s1", repo="acme-org/widget-service")
+        with mock.patch.dict(os.environ, {"CW_FLOOR_PROJECT_ID": "", "CW_FLOOR_CALLER": "caller-b"}):
+            transport.submit("fleet", "c2", session_id="s2", repo="acme-org/widget-service")
+        self.assertEqual([c["project_id"] for c in sent], ["proj-a", "caller-b"])
+        with mock.patch.dict(os.environ, {"CW_FLOOR_PROJECT_ID": "", "CW_FLOOR_CALLER": ""}):
+            with self.assertRaises(self.floor.FloorError):
+                transport.submit("fleet", "c3", session_id="s3", repo="acme-org/widget-service")
 
     def test_the_whole_life_of_a_worker_over_the_wire(self):
         self.assertEqual(self.launch()[0], 0)
