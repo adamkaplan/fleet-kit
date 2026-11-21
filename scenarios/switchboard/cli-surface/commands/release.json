@@ -1,0 +1,4 @@
+{
+ "command": "release",
+ "help": "usage: fleet-switchboard release [-h] name positional arguments: name The Floor worker's fleet name options: -h, --help show this help message and exit"
+}

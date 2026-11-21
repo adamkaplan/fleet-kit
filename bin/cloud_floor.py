@@ -2,7 +2,7 @@
 
 Loaded by bin/cloud_inspect.py: its `bind` wraps `_launch`, `cmd_send`, `cmd_read`, `status_lines` and `cmd_retire` of bin/cloud_worker.py. Every wrapper
 decides by the RECORD (`backend` is `floor` or a pod), never by the setting of the day. Settings (CW_REMOTE_BACKEND, CW_FLOOR_*, CW_POD_ROLLBACK_WINDOW)
-live in cloud.env or the environment. The transport has five calls (submit, message, cancel, observe, result); commands are idempotent by key.
+live in cloud.env or the environment. The transport has six calls (submit, message, act, cancel, observe, result); commands are idempotent by key.
 """
 import base64
 import hashlib
@@ -94,8 +94,7 @@ def scrub(text, limit=200):
 
 def _matches(entry, repo):
     entry, repo = entry.strip().lower(), repo.lower()
-    if entry == "*":
-        return True
+    if entry == "*": return True
     owner, _, name = repo.partition("/")
     e_owner, _, e_name = entry.partition("/")
     return bool(e_name) and e_owner == owner and e_name in ("*", name)
@@ -104,10 +103,8 @@ def route_repo(repo, config, env=None):
     """`floor` or `pod` for a repository. `CW_REMOTE_BACKEND=pod` is the rollback switch and wins; else `floor` when the backend is `floor` or the repository is in CW_FLOOR_REPOS; else `pod`. `config` is the switchboard's."""
     env = env_of() if env is None else env
     backend = (env.get("CW_REMOTE_BACKEND") or "").strip().lower()
-    if backend == "pod":
-        return "pod"
-    if backend == "floor":
-        return "floor"
+    if backend == "pod": return "pod"
+    if backend == "floor": return "floor"
     listed = [e for e in (env.get("CW_FLOOR_REPOS") or "").split(",") if e.strip()]
     return "floor" if isinstance(repo, str) and any(_matches(e, repo) for e in listed) else "pod"
 
@@ -117,8 +114,7 @@ def is_floor(record):
 
 def floor_who():
     who = (env_of().get("CW_FLOOR_CALLER") or "fleet").strip()
-    if not CALLER_RE.fullmatch(who):
-        raise D["Refusal"]("CW_FLOOR_CALLER is not a caller id (a-z, 0-9, _ and -, up to 32); nothing was created")
+    if not CALLER_RE.fullmatch(who): raise D["Refusal"]("CW_FLOOR_CALLER is not a caller id (a-z, 0-9, _ and -, up to 32); nothing was created")
     return who
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -134,29 +130,25 @@ def _request(method, url, data=None, headers=(), missing_ok=False):
         with urllib.request.build_opener(_NoRedirect).open(request, timeout=TIMEOUT_SECONDS) as answer:
             status, raw = answer.status, answer.read(RESPONSE_MAX + 1)
     except urllib.error.HTTPError as err:
-        if err.code == 404 and missing_ok:
-            return 404, b""
+        if err.code == 404 and missing_ok: return 404, b""
         raw = err.read(RESPONSE_MAX + 1) if err.fp else b""
         found = re.search(r"\bart-[A-Za-z0-9]{1,40}\b", raw[:RESPONSE_MAX].decode("utf-8", "replace"))
-        if err.code == 503 and found:
-            raise UnavailableArtifactError(found.group(0)) from None
+        if err.code == 503 and found: raise UnavailableArtifactError(found.group(0)) from None
         raise FloorError("Floor answered HTTP %d" % err.code, err.code) from None
     except (urllib.error.URLError, OSError, ValueError) as err:
         raise FloorError("Floor could not be reached (%s)" % scrub(type(err).__name__, 60)) from None
-    if len(raw) > RESPONSE_MAX:
-        raise FloorError("Floor's answer is larger than %d bytes" % RESPONSE_MAX)
+    if len(raw) > RESPONSE_MAX: raise FloorError("Floor's answer is larger than %d bytes" % RESPONSE_MAX)
     return status, raw
 
 def _parse(raw):
     try: parsed = D["parse_bounded"](raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError): raise FloorError("Floor's answer is not JSON") from None
-    if not isinstance(parsed, dict):
-        raise FloorError("Floor's answer is not an object")
+    if not isinstance(parsed, dict): raise FloorError("Floor's answer is not an object")
     return parsed
 FINISHED_STATES = ("retired", "done", "failed")
 
 class HttpTransport:
-    """The five calls of the Floor caller API over HTTP: a JSON body in, a bounded JSON answer out. Paths are under /v1/callers/<caller>/."""
+    """The six calls of the Floor caller API over HTTP: a JSON body in, a bounded JSON answer out. Paths are under /v1/callers/<caller>/."""
     def __init__(self, base, token=None):
         self.base, self.token = base.rstrip("/"), token
     def _call(self, method, path, body=None):
@@ -171,6 +163,8 @@ class HttpTransport:
         return self._call("POST", self._root(caller) + "/submissions", dict(fields, cmd_id=cmd_id))
     def message(self, caller, work_id, cmd_id, seq, text):
         return self._call("POST", "%s/works/%s/messages" % (self._root(caller), urllib.parse.quote(work_id, safe="")), {"cmd_id": cmd_id, "seq": seq, "text": text})
+    def act(self, caller, work_id, op, cmd_id, seq):
+        return self._call("POST", "%s/works/%s/%s" % (self._root(caller), urllib.parse.quote(work_id, safe=""), op), {"cmd_id": cmd_id, "seq": seq})
     def cancel(self, caller, work_id, cmd_id, seq):
         return self._call("POST", "%s/works/%s/cancel" % (self._root(caller), urllib.parse.quote(work_id, safe="")), {"cmd_id": cmd_id, "seq": seq})
     def observe(self, caller, work_id):
@@ -204,8 +198,7 @@ class QueueBlobTransport:
     def _state(self):
         state = _parse(_request("GET", self._url(self.blob, "/state.json", self.blob_sas), None, [("Accept", "application/json")])[1])
         sessions, acks = state.get("sessions"), state.get("acks")
-        if state.get("v") != 1 or not isinstance(sessions, dict):
-            raise FloorError("the published state is not v1")
+        if state.get("v") != 1 or not isinstance(sessions, dict): raise FloorError("the published state is not v1")
         state["floor_seq"] = state.get("seq", state.get("state_seq"))
         state["acks"] = acks if isinstance(acks, dict) else {}
         return state
@@ -222,13 +215,15 @@ class QueueBlobTransport:
     def message(self, caller, work_id, cmd_id, seq, text):
         self._enqueue(self._command("send", cmd_id, work_id, seq), {"text": text})
         return {"id": cmd_id, "seq": int(seq)}
+    def act(self, caller, work_id, op, cmd_id, seq):
+        self._enqueue(self._command(op, cmd_id, work_id, seq))
+        return {"id": cmd_id, "seq": int(seq)}
     def cancel(self, caller, work_id, cmd_id, seq):
         self._enqueue(self._command("retire", cmd_id, work_id, seq))
         try: state = self._state()
         except FloorError: return {"cancelled": True, "reserved": True}   # sent, not yet seen applied: custody is not confirmed
         ack = state["acks"].get(cmd_id)
-        if isinstance(ack, str) and ack.startswith("rejected"):
-            raise FloorError("Floor rejected the retire (%s)" % scrub(ack, 80))
+        if isinstance(ack, str) and ack.startswith("rejected"): raise FloorError("Floor rejected the retire (%s)" % scrub(ack, 80))
         finished = (state["sessions"].get(work_id) or {}).get("state") in FINISHED_STATES
         return {"cancelled": True, "reserved": not finished}
     def observe(self, caller, work_id):
@@ -245,8 +240,7 @@ class QueueBlobTransport:
 
 def _private_file(setting):
     path = (env_of().get(setting) or "").strip()
-    if not path:
-        return None
+    if not path: return None
     try:
         found = os.lstat(path)
         if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
@@ -270,34 +264,28 @@ def _base_problem(value):
         parts.port
     except ValueError:
         return "not a URL"
-    if parts.query or parts.fragment:
-        return "it must not carry a query or fragment (the SAS is a separate setting)"
+    if parts.query or parts.fragment: return "it must not carry a query or fragment (the SAS is a separate setting)"
     return D["endpoint_problem"]("%s://%s" % (parts.scheme, parts.netloc))
 
 def transport():
     """The transport: the test seam, else an HTTP client of CW_FLOOR_URL (read from the private settings)."""
-    if TRANSPORT is not None:
-        return TRANSPORT
+    if TRANSPORT is not None: return TRANSPORT
     D["use_settings"]()
     env = env_of()
     queue, blob = (env.get("CW_FLOOR_QUEUE_URL") or "").strip(), (env.get("CW_FLOOR_BLOB_URL") or "").strip()
     mode = (env.get("CW_FLOOR_TRANSPORT") or "").strip().lower() or ("queue" if queue and blob else "http")
-    if mode not in ("queue", "http"):
-        raise D["Refusal"]("CW_FLOOR_TRANSPORT is not queue or http; nothing was created")
+    if mode not in ("queue", "http"): raise D["Refusal"]("CW_FLOOR_TRANSPORT is not queue or http; nothing was created")
     if mode == "queue":
         if not queue or not blob:
             raise D["Refusal"]("the queue transport needs CW_FLOOR_QUEUE_URL and CW_FLOOR_BLOB_URL in the private settings; nothing was created")
         for value in (queue, blob):
             problem = _base_problem(value)
-            if problem:
-                raise D["Refusal"]("a Floor queue or blob URL is refused: %s; nothing was created" % problem)
+            if problem: raise D["Refusal"]("a Floor queue or blob URL is refused: %s; nothing was created" % problem)
         return QueueBlobTransport(queue, _sas("CW_FLOOR_QUEUE_SAS", "CW_FLOOR_QUEUE_SAS_FILE"), blob, _sas("CW_FLOOR_BLOB_SAS", "CW_FLOOR_BLOB_SAS_FILE"))
     url = (env.get("CW_FLOOR_URL") or "").strip()
-    if not url:
-        raise D["Refusal"]("a repository routes to Floor but CW_FLOOR_URL is not set in the private settings; nothing was created")
+    if not url: raise D["Refusal"]("a repository routes to Floor but CW_FLOOR_URL is not set in the private settings; nothing was created")
     problem = D["endpoint_problem"](url)
-    if problem:
-        raise D["Refusal"]("CW_FLOOR_URL is refused: %s; nothing was created" % problem)
+    if problem: raise D["Refusal"]("CW_FLOOR_URL is refused: %s; nothing was created" % problem)
     return HttpTransport(url, _token())
 
 def _call(function, *args, **kwargs):
@@ -322,18 +310,14 @@ def verify_mode(args, brief):
     """`research-assistant` or `orchestrator` for those profiles (agents enabled), `verify-only` for a tester, `rehearse` for --no-commit or a rehearsal brief, else None (an author launch)."""
     if agents_enabled():
         for profile in AGENT_MODES:
-            if getattr(args, "role", None) == profile or getattr(args, "agent", None) == profile:
-                return profile
-    if getattr(args, "role", None) == "tester":
-        return "verify-only"
-    if getattr(args, "no_commit", False) or str(brief or "").lstrip().startswith("REHEARSAL BRIEF"):
-        return "rehearse"
+            if getattr(args, "role", None) == profile or getattr(args, "agent", None) == profile: return profile
+    if getattr(args, "role", None) == "tester": return "verify-only"
+    if getattr(args, "no_commit", False) or str(brief or "").lstrip().startswith("REHEARSAL BRIEF"): return "rehearse"
     return None
 
 def check_floor_admission(args, repo, brief, config):
     """Refuse (exit 2, nothing created) what Floor cannot work: a repository outside `land_repos`, and every role that is not a coder or worker author. With CW_FLOOR_VERIFY_ENABLED a tester, --no-commit or rehearsal launch is admitted as a verify mode (see `verify_mode`)."""
-    if route_repo(repo, config) != "floor":
-        return
+    if route_repo(repo, config) != "floor": return
     Refusal = D["Refusal"]
     if not D["H"]["uses_spire_land"](config, repo):
         raise Refusal("refused: %s lands through pull requests and gates (not in land_repos): Floor only supports spire land repositories until a "
@@ -398,6 +382,23 @@ def send_key(session_id, seq, text):
 def cancel_key(session_id, seq):
     return "c-" + _hash(session_id, "cancel", seq)
 
+def act_key(session_id, op, seq):
+    return "c-" + _hash(session_id, op, seq)
+
+def _wait_ack(held, cmd_id, initial=None, sleep_fn=time.sleep, timeout=15.0):
+    if isinstance(initial, dict) and isinstance(initial.get("ack"), str): return initial["ack"]
+    if not hasattr(held, "_state"): return None   # no ack and no state to read: nothing shows Floor applied it
+    deadline = time.time() + timeout
+    while True:
+        try:
+            ack = held._state()["acks"].get(cmd_id)
+            if isinstance(ack, str):
+                return ack
+        except FloorError:
+            pass
+        if time.time() >= deadline: return None
+        sleep_fn(0.5)
+
 def submit_work(who, cmd_id, **fields):
     """The one submit of a launch; a failure raises before any record is written."""
     return _call(transport().submit, who, cmd_id, **fields)
@@ -459,8 +460,7 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     answer = submit_work(who, launch_key(who, session_id), session_id=session_id, repo=repo, ref=base, branch=branch, title=name,
                          brief=str(brief or "") if mode else translate_brief(brief, repo, branch, base), **extra)
     work_id = answer.get("work_id") if isinstance(answer, dict) else None
-    if not isinstance(work_id, str) or not work_id:
-        raise D["CloudError"]("Floor: the answer to the submit names no work")
+    if not isinstance(work_id, str) or not work_id: raise D["CloudError"]("Floor: the answer to the submit names no work")
     if existing is not None:   # a second launch of the name: the same work, nothing new
         D["cloud_launch_again"].RETURNED.add(name)
         print("exists: returned worker %s (Floor session %s)" % (name, session_id), file=sys.stderr)
@@ -529,12 +529,19 @@ def _send_floor(args, runner, now, record):
     sender = "operator" if kind[0] == "person" else kind[1]
     who, session_id = floor_who(), record["session"]
     seq = int(record.get("seq", 1)) + 1   # a send that failed before the record moved is asked again with the same seq and the same key
-    receipt = _call(transport().message, who, record["work_id"], send_key(session_id, seq, text), seq, text)
+    held, key = transport(), send_key(session_id, seq, text)
+    receipt = _call(held.message, who, record["work_id"], key, seq, text)
     record["seq"] = seq
     D["save_record"](state, record)
-    D["_audit"](engine, "cloud.send", args.name, {"from": sender, "chars": len(text), "backend": "floor", "seq": seq})
+    ack = _wait_ack(held, key, receipt)
+    D["_audit"](engine, "cloud.send", args.name, {"from": sender, "chars": len(text), "backend": "floor", "seq": seq, "ack": ack})
+    if ack is None: raise LaunchError("send to %s was queued (Floor seq %d) but not acknowledged within 15s; state is unknown" % (args.name, seq))
+    if str(ack).startswith(("refused", "rejected")):
+        sys.stderr.write("%s: not sent to %s: %s\n" % (H["PROG"], args.name, scrub(ack, 120)))
+        return H["EXIT_HELD"]
     print((receipt.get("id") or receipt.get("message_id") or "sent") if isinstance(receipt, dict) else "sent")
-    sys.stderr.write("%s: delivered to %s (Floor seq %d)\n" % (H["PROG"], args.name, seq))
+    note = scrub(ack, 80) if str(ack).startswith("delivered-into-turn") else "delivered"
+    sys.stderr.write("%s: %s to %s (Floor seq %d)\n" % (H["PROG"], note, args.name, seq))
     return H["EXIT_OK"]
 
 def _name_artifact(err, name):
@@ -545,8 +552,7 @@ def _observe(record):
     return _call(transport().observe, who, record["work_id"])
 
 def _line(message):
-    if not isinstance(message, dict):
-        return scrub(message, 400)
+    if not isinstance(message, dict): return scrub(message, 400)
     return scrub("%s: %s" % (str(message.get("role") or message.get("type") or "?")[:20], message.get("text") or ""), 400)
 
 def _read_floor(args, record):
@@ -596,8 +602,7 @@ def _retire_floor(args, runner, now, record):
     if not D["_may_retire"](kind, record):
         D["_audit"](engine, "cloud.retire_refused", args.name, {"why": scrub(kind[1], 120)})
         raise LaunchError("refused: only the operator, the Chief of Staff or %s's own boss may retire it" % args.name)
-    if args.undo:
-        raise LaunchError("a Floor worker's session is cancelled once retired: there is nothing to undo")
+    if args.undo: raise LaunchError("a Floor worker's session is cancelled once retired: there is nothing to undo")
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200] or "finished"
     seq = int(record.get("cancel_seq") or int(record.get("seq", 1)) + 1)   # a retire that waited is asked again with the same seq and key
     answer = _call(transport().cancel, floor_who(), record["work_id"], cancel_key(record["session"], seq), seq)
@@ -618,6 +623,27 @@ def _retire_floor(args, runner, now, record):
     print("%s is retired (Floor session %s cancelled)" % (args.name, record.get("session")))
     return H["EXIT_OK"]
 
+def _act_floor(op, args, runner, now):
+    H, LaunchError = D["H"], D["H"]["LaunchError"]
+    record = D["route"](args.name) if D["valid_name"](getattr(args, "name", None)) else None
+    if not is_floor(record): raise LaunchError("%s has no Floor session record" % getattr(args, "name", "?"))
+    engine, state, _ = H["build_engine"](runner, now, "cli")
+    kind = H["gates_caller_kind"](runner, now)
+    if not D["_may_retire"](kind, record):
+        D["_audit"](engine, "cloud.%s_denied" % op, args.name, {"why": scrub(kind[1], 120)})
+        raise LaunchError("only the operator, the Chief of Staff or %s's own boss may %s it" % (args.name, op))
+    seq, held = int(record.get("seq", 1)) + 1, transport()
+    key = act_key(record["session"], op, seq)
+    receipt = _call(held.act, floor_who(), record["work_id"], op, key, seq)
+    record["seq"] = seq
+    D["save_record"](state, record)
+    ack = _wait_ack(held, key, receipt)
+    D["_audit"](engine, "cloud." + op, args.name, {"seq": seq, "backend": "floor", "ack": ack})
+    if ack is None or str(ack).startswith(("refused", "rejected")):
+        raise LaunchError("%s: %s" % (args.name, scrub(ack or ("%s was not acknowledged within 15s" % op), 120)))
+    print("%s: %s (Floor session %s)" % (args.name, scrub(ack, 80), record.get("session")))
+    return H["EXIT_OK"]
+
 def rollback_to_pane(state, name, pane_id, cancel_fn=None):
     """Rollback of a cloud orchestrator to a local pane: cancel its Floor session, remove the record once retired, name the pane."""
     record = D["load_record"](state, name)
@@ -625,8 +651,7 @@ def rollback_to_pane(state, name, pane_id, cancel_fn=None):
         cancel = cancel_fn or (lambda rec: _call(transport().cancel, floor_who(), rec["work_id"], cancel_key(rec["session"], int(rec.get("seq", 1)) + 1),
                                                  int(rec.get("seq", 1)) + 1))
         answer = cancel(record)
-        if isinstance(answer, dict) and answer.get("reserved"):
-            return {"worker": name, "pane": pane_id, "rolled_back": False}
+        if isinstance(answer, dict) and answer.get("reserved"): return {"worker": name, "pane": pane_id, "rolled_back": False}
         D["remove_record"](state, name)
     return {"worker": name, "pane": pane_id, "rolled_back": True}
 SESSION_RE = re.compile(r"ses_[0-9a-f]{16}")
@@ -636,19 +661,15 @@ REPORT_STATES = ("done", "failed", "blocked", "question", "working")
 def verify_switchboard_auth(header_value, expected_secret):
     """The sender identity from the egress proxy's X-Switchboard-Auth header; anything else raises FloorError 401."""
     bad = FloorError("unauthenticated switchboard request", 401)
-    if not isinstance(header_value, str) or not header_value or not expected_secret or len(header_value) > 512:
-        raise bad
+    if not isinstance(header_value, str) or not header_value or not expected_secret or len(header_value) > 512: raise bad
     fields = {}
     for part in header_value.split(";"):
         key, sep, value = part.partition("=")
-        if not sep or key in fields:
-            raise bad
+        if not sep or key in fields: raise bad
         fields[key.strip()] = value
     agent, session, charter, secret = fields.get("agent"), fields.get("session"), fields.get("charter"), fields.get("secret")
-    if set(fields) - {"agent", "session", "charter", "secret"} or secret is None:
-        raise bad
-    if not (agent and CALLER_RE.fullmatch(agent) and session and SESSION_RE.fullmatch(session)):
-        raise bad
+    if set(fields) - {"agent", "session", "charter", "secret"} or secret is None: raise bad
+    if not (agent and CALLER_RE.fullmatch(agent) and session and SESSION_RE.fullmatch(session)): raise bad
     if charter is not None and not CHARTER_RE.fullmatch(charter):
         raise bad
     if not hmac.compare_digest(secret.encode("utf-8"), str(expected_secret).encode("utf-8")):

@@ -304,3 +304,20 @@ def add_pins_parsers(sub):
                           description="Reads `git diff` against the base and `git grep` over the existing tests; prints one line per test with the term it matched, "
                                       "never a test the diff adds, bounded to %d lines. It writes nothing and calls no network. Run the listed classes before you push." % PINS_MAX_LINES)
     pins.add_argument("--base", default="origin/integration", help="The ref to diff against (default origin/integration)")
+
+
+def cmd_hold(args, runner, now):
+    """`hold <name>`: stop a running Floor worker at its next land or push point until release or retire."""
+    return cmd_pins.__globals__["run_cloud"]("_act_floor", "hold", args, runner, now)
+
+
+def cmd_release(args, runner, now):
+    """`release <name>`: release a held Floor worker so it may land or push."""
+    return cmd_pins.__globals__["run_cloud"]("_act_floor", "release", args, runner, now)
+
+
+def add_hold_parsers(sub):
+    hold = sub.add_parser("hold", help="Hold a running Floor worker at its next land or push point until release or retire")
+    hold.add_argument("name", help="The Floor worker's fleet name")
+    rel = sub.add_parser("release", help="Release a held Floor worker so it may land or push")
+    rel.add_argument("name", help="The Floor worker's fleet name")

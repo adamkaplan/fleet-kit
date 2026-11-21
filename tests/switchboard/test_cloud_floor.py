@@ -73,6 +73,7 @@ class FakeFloor:
         self.works, self.keys = {}, {}
         self.down = self.reserved = self.bad_artifact = False
         self.landed = self.manifest = self.log_tail = None
+        self.turn, self.send_refused = 2, None
 
     def _fail(self, verb):
         self.calls.append(verb)
@@ -90,7 +91,7 @@ class FakeFloor:
 
         def make():
             work_id = "w-" + hashlib.sha256((caller + fields["session_id"]).encode()).hexdigest()[:10]
-            self.works[work_id] = {"session": fields["session_id"], "seq": 1, "messages": [], "cancelled": False}
+            self.works[work_id] = {"session": fields["session_id"], "seq": 1, "messages": [], "cancelled": False, "held": False, "state": "running"}
             return {"work_id": work_id, "session_id": fields["session_id"], "seq": 1}
         return self._once(cmd_id, make)
 
@@ -108,7 +109,26 @@ class FakeFloor:
                 raise self.floor.FloorError("seq conflict", 409)
             work["seq"] = seq
             work["messages"].append({"role": "user", "seq": seq, "text": text})
-            return {"id": "m-%d" % seq, "seq": seq}
+            if self.send_refused or work.get("state") in ("done", "failed", "retired"):
+                return {"id": "m-%d" % seq, "seq": seq, "ack": self.send_refused or ("refused: session %s" % work.get("state"))}
+            return {"id": "m-%d" % seq, "seq": seq, "ack": "delivered-into-turn %d" % self.turn}
+        return self._once(cmd_id, make)
+
+    def act(self, caller, work_id, op, cmd_id, seq):
+        self._fail(op)
+        work = self._work(work_id)
+
+        def make():
+            if seq != work["seq"] + 1:
+                raise self.floor.FloorError("seq conflict", 409)
+            work["seq"] = seq
+            if work.get("state") in ("done", "failed", "retired"):
+                return {"id": "a-%d" % seq, "seq": seq, "ack": "refused: session %s" % work["state"]}
+            if op == "hold":
+                work["held"], work["state"] = True, "held"
+                return {"id": "a-%d" % seq, "seq": seq, "ack": "held"}
+            work["held"], work["state"] = False, "running"
+            return {"id": "a-%d" % seq, "seq": seq, "ack": "released"}
         return self._once(cmd_id, make)
 
     def cancel(self, caller, work_id, cmd_id, seq):
@@ -251,6 +271,12 @@ class FloorCase(Base):
         record = self.m.route(name)
         return self.run_cmd(self.m.cmd_retire, argparse.Namespace(name=name, undo=False, reason="done"), None, lambda: 1000.0, record)
 
+    def hold_cmd(self, *a):
+        return self.m.cloud_floor._act_floor("hold", *a)
+
+    def release_cmd(self, *a):
+        return self.m.cloud_floor._act_floor("release", *a)
+
     def status(self):
         return self.m.status_lines(None, str(self.state))
 
@@ -312,7 +338,9 @@ class TestCloudFloor(FloorCase):
     def test_sends_are_ordered_and_a_retry_is_the_same_command(self):
         self.launch()
         work = next(iter(self.fake.works.values()))
-        self.assertEqual(self.send("f1", "first note")[0], 0)
+        code, _, err = self.send("f1", "first note")
+        self.assertEqual(code, 0)
+        self.assertIn("delivered-into-turn 2", err)
         with mock.patch.object(self.m, "save_record", side_effect=OSError("disk")):   # accepted by Floor, record not moved
             with self.assertRaises(OSError):
                 self.send("f1", "second note")
@@ -322,6 +350,29 @@ class TestCloudFloor(FloorCase):
         self.assertEqual(self.record("f1")["seq"], 3)
         self.assertEqual(self.pod_calls, [])
         self.assertEqual(self.audits.count(("cloud.send", "f1")), 2)
+        work["state"] = "done"
+        code, _, err = self.send("f1", "too late")
+        self.assertEqual(code, self.m.H["EXIT_HELD"])
+        self.assertIn("refused: session done", err)
+
+    def test_hold_and_release_a_floor_worker(self):
+        self.launch()
+        work = next(iter(self.fake.works.values()))
+        args = argparse.Namespace(name="f1")
+        code, out, _ = self.run_cmd(self.hold_cmd, args, None, lambda: 1000.0)
+        self.assertEqual((code, work["state"], work["held"]), (0, "held", True))
+        self.assertIn("held", out)
+        code, out, _ = self.run_cmd(self.release_cmd, args, None, lambda: 1000.0)
+        self.assertEqual((code, work["state"], work["held"]), (0, "running", False))
+        self.kind = ("agent", "other")
+        with self.assertRaises(sb.LaunchError):
+            self.run_cmd(self.hold_cmd, args, None, lambda: 1000.0)
+        self.assertEqual(work["state"], "running")
+        self.kind = ("person", "operator")
+        work["state"] = "done"
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.run_cmd(self.hold_cmd, args, None, lambda: 1000.0)
+        self.assertIn("refused", str(raised.exception))
 
     def test_read_and_status_show_the_work(self):
         self.launch()
@@ -770,6 +821,16 @@ class MiniFloor:
             self.acks[key] = "duplicate"
             return
         self.acks[key] = "applied"
+        done = self.sessions.get(sid, {}).get("state") in ("done", "failed", "retired")
+        if command["op"] == "send":
+            self.acks[key] = ("refused: session " + self.sessions[sid]["state"]) if done else "delivered-into-turn %d" % self.sessions.get(sid, {}).get("rounds", 1)
+        elif command["op"] in ("hold", "release"):
+            if done:
+                self.acks[key] = "refused: session " + self.sessions[sid]["state"]
+            else:
+                held = command["op"] == "hold"
+                self.sessions[sid]["held"], self.sessions[sid]["state"] = held, "held" if held else "running"
+                self.acks[key] = "held" if held else "released"
         if command["op"] == "launch":
             brief = command.get("brief") if "brief" in command else self.blobs[command["payload"]]["brief"]
             self.sessions.setdefault(sid, {"state": "running", "busy": True, "last_update": "2030-01-01T00:00:00Z", "rounds": 2, "landed_sha": None, "error": None, "brief": brief})
@@ -805,6 +866,13 @@ class TestCloudFloorQueueBlob(FloorCase):
         self.assertEqual(self.send("f1", "please continue")[0], 0)
         send = self.mini.commands[-1]
         self.assertEqual((send["op"], send["seq"], send["text"], send["session_id"]), ("send", 2, "please continue", sid))
+        self.assertIn("delivered-into-turn 2", self.mini.acks[send["cmd_id"]])
+        args = argparse.Namespace(name="f1")
+        self.assertEqual(self.run_cmd(self.hold_cmd, args, None, lambda: 1000.0)[0], 0)
+        self.assertEqual((self.mini.commands[-1]["op"], self.mini.commands[-1]["seq"]), ("hold", 3))
+        self.assertEqual((self.mini.acks[self.mini.commands[-1]["cmd_id"]], self.mini.sessions[sid]["state"]), ("held", "held"))
+        self.assertEqual(self.run_cmd(self.release_cmd, args, None, lambda: 1000.0)[0], 0)
+        self.assertEqual((self.mini.commands[-1]["op"], self.mini.acks[self.mini.commands[-1]["cmd_id"]], self.mini.sessions[sid]["state"]), ("release", "released", "running"))
         self.mini.texts[sid], self.mini.sessions[sid]["landed_sha"] = "all done here", "d" * 40
         code, out, err = self.read("f1")
         self.assertEqual(code, 0, err)
@@ -817,7 +885,7 @@ class TestCloudFloorQueueBlob(FloorCase):
         self.assertEqual(code, self.m.H["EXIT_ERROR"])
         self.assertIn("waiting for heavy-job custody", out)
         retire = self.mini.commands[-1]
-        self.assertEqual((retire["op"], retire["seq"]), ("retire", 3))
+        self.assertEqual((retire["op"], retire["seq"]), ("retire", 5))
         self.assertNotIn("text", retire)
         self.mini.sessions[sid]["state"] = "retired"
         self.assertEqual(self.retire("f1")[0], 0)

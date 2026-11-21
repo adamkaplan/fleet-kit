@@ -1,0 +1,4 @@
+{
+ "command": "hold",
+ "help": "usage: fleet-switchboard hold [-h] name positional arguments: name The Floor worker's fleet name options: -h, --help show this help message and exit"
+}
