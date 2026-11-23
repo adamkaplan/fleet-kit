@@ -242,3 +242,24 @@ To change one line of an issue body, run `fleet-switchboard issue-line owner/rep
 To change one of your own comments that is not your last (a plan, a receipt), use
 `fleet-switchboard comment --edit COMMENT_URL --body-file FILE` (never a `gh api` call); an
 approved plan also needs `--approval ID`, and the approval lapses with the new hash.
+
+## 6. Caretaker charters (10 clauses, 5 fidelity rules, and direct decision promotion)
+
+A Caretaker (`agents/caretaker.md`) holds a charter with 10 clauses:
+
+- `Scope & intent`, `Consequence ceiling`, `Clocked watch` (1 digest line per day), `Decide within intent` and `Reserved classes` (credentials, identity, authority, irreversible data, spend, product contract).
+- `Delegate with a done-test`, `Report outcomes only`, `Record interpretations as facts before Go`, `Earned authority via shadow calibration` and `Handover via record, not process`.
+
+It follows 5 fidelity rules from meeting to work:
+
+- Bind the plain-word symptom and source link into the brief.
+- Record interpretations as facts before `Go`, and ask when two readings exist.
+- Return `cannot reproduce` to the interpreter as `incomplete`.
+- Translate every ruling into a checkable statement.
+- Promote decisions directly.
+
+A Caretaker promotes a `<user>:awaiting-user` decision straight to the shared record and the principal's Decisions panel (`/v1/decisions` with `action="promote"`), without waiting for `cos` to relay it. Each promoted decision carries shadow calibration: `proposal`, `predicted_ruling` and `date`.
+
+Ruling translation law: write a principal's ruling into the record as `reading`, `what it leaves out` and `what would change it`, never as a raw chat quote.
+
+Speak to a Caretaker with `fleet-switchboard talk <caretaker>`; the message and any `--ruling` are recorded in the shared record.

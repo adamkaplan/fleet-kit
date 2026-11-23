@@ -29,7 +29,7 @@ RESPONSE_MAX = 1 << 20
 PAYLOAD_LIMIT = 60 * 1024   # a queue message whose base64 text is longer than this carries its brief or text in a payload blob
 TOKEN_MAX = 512
 CALLER_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
-NOT_AUTHORS = ("orchestrator",)   # an agent that is not a sandbox author
+NOT_AUTHORS = ("orchestrator", "caretaker")   # an agent that is not a sandbox author
 AUTHORS = ("coder", "worker")
 FLOOR_AUTHOR_PREAMBLE = """Floor Author Contract (brief in, commit out):
 - Work in the repository checkout on branch %(branch)s (created from %(base)s).
@@ -307,13 +307,13 @@ def verify_enabled(env=None):
 def agents_enabled(env=None):
     """True when the Cloud Agents profiles are on (CW_FLOOR_AGENTS_ENABLED is `1`, `true` or `yes`)."""
     return ((env_of() if env is None else env).get("CW_FLOOR_AGENTS_ENABLED") or "").strip().lower() in ("1", "true", "yes")
-AGENT_MODES = ("research-assistant", "orchestrator")
+AGENT_MODES = ("research-assistant", "orchestrator", "caretaker")
 
 def verify_mode(args, brief):
     """`research-assistant` or `orchestrator` for those profiles (agents enabled), `verify-only` for a tester, `rehearse` for --no-commit or a rehearsal brief, else None (an author launch)."""
     if agents_enabled():
         for profile in AGENT_MODES:
-            if getattr(args, "role", None) == profile or getattr(args, "agent", None) == profile: return profile
+            if getattr(args, "role", None) == profile or getattr(args, "agent", None) == profile: return "orchestrator" if profile == "caretaker" else profile
     if getattr(args, "role", None) == "tester": return "verify-only"
     if getattr(args, "no_commit", False) or str(brief or "").lstrip().startswith("REHEARSAL BRIEF"): return "rehearse"
     return None
@@ -617,6 +617,16 @@ def _retire_floor(args, runner, now, record):
     print("%s is retired (Floor session %s cancelled)" % (args.name, record.get("session")))
     return H["EXIT_OK"]
 
+def _talk_floor(args, runner, now):
+    H, ruling = D["H"], getattr(args, "ruling", None)
+    text = (" ".join(args.text or []) + ("\n[ruling] " + ruling if ruling else "")).strip()
+    record = D["route"](args.name) if D["valid_name"](args.name) else None
+    if switchboard_relay_config()["url"]: relay_cli_if_configured("talk", {"to": args.name, "text": text, "issue": getattr(args, "issue", None), "ruling": ruling})
+    elif not is_floor(record): raise H["LaunchError"]("%s has no Floor session record" % args.name)
+    else: args.text, args.interrupt = [text], False; _send_floor(args, runner, now, record)
+    print("%s: talk recorded" % args.name)
+    return H["EXIT_OK"]
+
 def _act_floor(op, args, runner, now):
     H, LaunchError = D["H"], D["H"]["LaunchError"]
     record = D["route"](args.name) if D["valid_name"](getattr(args, "name", None)) else None
@@ -716,7 +726,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         try: body = D["parse_bounded"](body_bytes.decode("utf-8")) if body_bytes else {}
         except ValueError: return 400, {"error": "bad request body"}
         if not isinstance(body, dict): return 400, {"error": "bad request body"}
-    if route[0] == "POST" and route[1] in ("/v1/send", "/v1/report", "/v1/remind", "/v1/retire", "/v1/orders", "/v1/intent", "/v1/decisions", "/v1/pane-state", "/v1/pane-command") \
+    if route[0] == "POST" and route[1] in ("/v1/send", "/v1/report", "/v1/remind", "/v1/retire", "/v1/orders", "/v1/intent", "/v1/decisions", "/v1/talk", "/v1/pane-state", "/v1/pane-command") \
             and callable(state.get("on_v1_action")):
         state["on_v1_action"](route[1], auth, body, state)
     for spoof in ("sender", "from"):
@@ -733,9 +743,25 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
             if isinstance(state.get("decisions_file"), dict): out["decisions_file"] = state["decisions_file"]
             return 200, out
         title = body.get("title", "")
-        state.setdefault("decisions", []).append({"action": body.get("action") or "batch", "id": body.get("id"), "title": scrub(title, 200) if isinstance(title, str) else "",
-                                                  "rows": body.get("rows") if isinstance(body.get("rows"), list) else [], "from": auth["agent"]})
-        return 200, {"recorded": True, "decisions": state["decisions"]}
+        cal = {k: scrub(body.get(k) or (body["calibration"] if isinstance(body.get("calibration"), dict) else {}).get(k) or "", 400) for k in ("proposal", "predicted_ruling", "date")}
+        entry = {"action": body.get("action") or "batch", "id": body.get("id"), "issue": body.get("issue"), "repo": body.get("repo"),
+                 "title": scrub(title, 200) if isinstance(title, str) else "", "rows": body.get("rows") if isinstance(body.get("rows"), list) else [], "from": auth["agent"]}
+        if cal["proposal"] or cal["predicted_ruling"] or body.get("action") == "promote": entry["calibration"] = dict(cal, date=cal["date"] or rfc3339())
+        state.setdefault("decisions", []).append(entry)
+        return 200, dict({"recorded": True, "decisions": state["decisions"]}, **({"decisions_file": state["decisions_file"]} if isinstance(state.get("decisions_file"), dict) else {}))
+    if route == ("POST", "/v1/talk"):
+        to, ruling = body.get("to") or body.get("name"), body.get("ruling")
+        if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text: return 400, {"error": "to and text are required"}
+        state.setdefault("talks", []).append({"from": auth["agent"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo"),
+                                              **({"ruling": ruling} if isinstance(ruling, (dict, str)) and ruling else {}), "at": rfc3339()})
+        target = (state.get("floor_sessions") or {}).get(to)
+        if not (isinstance(target, dict) and target.get("work_id")):
+            state["pane_outbox"].append({"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo")})
+            return 200, {"queued": "pane", "recorded": True}
+        seq = int(target.get("seq", 1)) + 1
+        _call(transport().message, floor_who(), target["work_id"], send_key(target.get("session", to), seq, text), seq, text)
+        target["seq"] = seq
+        return 200, {"queued": "floor", "recorded": True}
     if route == ("POST", "/v1/mode"):
         if body.get("mode") not in ("shadow", "active"): return 400, {"error": "mode must be shadow or active"}
         state["mode"] = body["mode"]
@@ -844,8 +870,8 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
 OVERSIZE_RE = re.compile(r"(\[oversize send \(\d+ chars\) stored at )([^\]]+?/(oversize-sends/(send-[A-Za-z0-9_.-]+\.txt)))(\])")
 SYNC_STATE_FILES = ("registry.json", "retired.json", "boss-overrides.json", "escalated-requests.json", "pr-notices.json", "order-notices.json")
 _PASSTHROUGH_AUTH = []
-STATE_WRITING_COMMANDS = ("send", "report", "remind", "retire", "orders", "decisions", "move", "reassign", "resume", "notice", "intent")
-CLUSTER_ONLY_RELAY_COMMANDS = ("send", "report", "remind")
+STATE_WRITING_COMMANDS = ("talk", "send", "report", "remind", "retire", "orders", "decisions", "move", "reassign", "resume", "notice", "intent")
+CLUSTER_ONLY_RELAY_COMMANDS = ("send", "report", "remind", "talk")
 PASSTHROUGH_COMMANDS = ("orders", "decisions", "intent", "retire")
 
 def _write_private(path, content):

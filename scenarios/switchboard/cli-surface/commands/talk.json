@@ -1,0 +1,4 @@
+{
+ "command": "talk",
+ "help": "usage: fleet-switchboard talk [-h] [--issue ISSUE] [--ruling RULING] name [text ...] positional arguments: name The Caretaker's fleet name text The message or ruling for the Caretaker options: -h, --help show this help message and exit --issue ISSUE The charter or issue reference (owner/repo#N or #N) --ruling RULING Checkable ruling statement (reading, what it leaves out, what would change it)"
+}

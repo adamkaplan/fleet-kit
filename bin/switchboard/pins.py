@@ -321,3 +321,16 @@ def add_hold_parsers(sub):
     hold.add_argument("name", help="The Floor worker's fleet name")
     rel = sub.add_parser("release", help="Release a held Floor worker so it may land or push")
     rel.add_argument("name", help="The Floor worker's fleet name")
+
+
+def cmd_talk(args, runner, now):
+    """`talk <name> [text ...]`: speak directly to a Caretaker and record the ruling or message in the shared record."""
+    return cmd_pins.__globals__["run_cloud"]("_talk_floor", args, runner, now)
+
+
+def add_talk_parsers(sub):
+    talk = sub.add_parser("talk", help="Speak directly to a Caretaker and record the ruling or message in the shared record")
+    talk.add_argument("name", help="The Caretaker's fleet name")
+    talk.add_argument("text", nargs="*", help="The message or ruling for the Caretaker")
+    talk.add_argument("--issue", help="The charter or issue reference (owner/repo#N or #N)")
+    talk.add_argument("--ruling", help="Checkable ruling statement (reading, what it leaves out, what would change it)")

@@ -1025,6 +1025,74 @@ class TestCloudAgents(FloorCase):
     def sb_refusal(self):
         return self.m.D["Refusal"] if "D" in vars(self.m) else self.floor.D["Refusal"]
 
+    def test_floor_controller_rbac_is_narrow(self):
+        text = (REPO / "cloud/azure/floor-controller-rbac.bicep").read_text()
+        for var in ("acrPullRoleId", "storageBlobDelegatorRoleId", "sandboxGroupDataOwnerRoleId", "kvSecretsUserRoleId"):
+            self.assertRegex(text, r"var %s = subscriptionResourceId" % var)
+        self.assertNotRegex(text, r"(?i)var (contributor|owner)\w*")   # no broad Contributor role variable
+        self.assertNotIn("AcrPush", text.replace("no AcrPush", ""))
+
+    def test_caretaker_definition_and_skill(self):
+        agent = (REPO / "agents/caretaker.md").read_text()
+        skill = (REPO / "skills/fleet-charter/SKILL.md").read_text()
+        for clause in ("Scope & intent", "Consequence ceiling", "Clocked watch", "Decide within intent", "Reserved classes", "Delegate with a done-test",
+                       "Report outcomes only", "Record interpretations as facts before Go", "Earned authority via shadow calibration", "Handover via record, not process"):
+            self.assertIn("`%s`" % clause, agent)
+        self.assertEqual(agent.count("## The 5 Fidelity Rules"), 1)
+        for phrase in ("what it leaves out", "what would change it", "cannot reproduce"):
+            self.assertIn(phrase, agent)
+        self.assertIn("## 6. Caretaker charters", skill)
+        self.assertIn("fleet-switchboard talk <caretaker>", skill)
+        self.assertIn("predicted_ruling", skill)
+
+    def test_decisions_promote_records_calibration(self):
+        state = {}
+        code, ans = self.call("POST", "/v1/decisions", {"action": "promote", "id": "d1", "title": "pick one", "proposal": "A", "predicted_ruling": "A", "date": "2025-01-01"}, state=state)
+        self.assertEqual(code, 200)
+        self.assertEqual(ans["decisions"][-1]["calibration"], {"proposal": "A", "predicted_ruling": "A", "date": "2025-01-01"})
+
+    def test_talk_routes_to_floor_or_pane_and_records_ruling(self):
+        cf = self.floor
+        held = mock.Mock()
+        state = {"floor_sessions": {"care-taker": {"work_id": "w1", "session": "ses_x", "seq": 1}}}
+        with mock.patch.object(cf, "transport", return_value=held), mock.patch.object(cf, "floor_who", return_value="floor-ctl"), \
+                mock.patch.object(cf, "_call") as call:
+            code, ans = self.call("POST", "/v1/talk", {"to": "care-taker", "text": "hello", "ruling": {"reading": "r"}}, state=state)
+            self.assertEqual((code, ans["queued"]), (200, "floor"))
+            self.assertEqual(call.call_args[0][0], held.message)
+            self.assertEqual(state["floor_sessions"]["care-taker"]["seq"], 2)
+            code, ans = self.call("POST", "/v1/talk", {"to": "local-pane", "text": "hi"}, state=state)
+            self.assertEqual(ans["queued"], "pane")
+        self.assertEqual(state["talks"][0]["ruling"], {"reading": "r"})
+        self.assertEqual(state["pane_outbox"][-1]["to"], "local-pane")
+        self.assertEqual(self.call("POST", "/v1/talk", {"to": "x"}, state=state)[0], 400)
+
+    def test_shadow_synthetic_routes_floor_caretaker_directly(self):
+        import importlib.machinery, importlib.util, tempfile
+        loader = importlib.machinery.SourceFileLoader("ics_t", str(REPO / "tools/in-cluster-switchboard-server"))
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("ics_t", loader))
+        loader.exec_module(mod)
+        held = mock.Mock()
+        fake = types.SimpleNamespace(OVERSIZE_RE=re.compile(r"(?!x)x"), _call=mock.Mock(), transport=lambda: held, floor_who=lambda: "floor-ctl",
+                                     send_key=lambda *a: "k")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mod, "STATE_DIR", Path(tmp)), \
+                mock.patch.object(mod, "save_synthetic_messages"), mock.patch.object(mod, "log_line"):
+            mod.V1_STATE["floor_sessions"] = {"care-taker": {"work_id": "w1", "session": "ses_x", "seq": 1}}
+            mod.V1_STATE["pane_outbox"] = []
+            mod.ENGINE_REF["cf_mod"] = fake
+            mod.SHADOW_SUMMARY["mode"] = "active"
+            v2 = mod.ShadowV2.__new__(mod.ShadowV2)
+            v2.session_get = lambda sid: {"metadata": {"fleet": {"name": "care-taker"}}}
+            try:
+                v2.synthetic("ses_x", "wake", {}, False, "queue", "m1", "d")
+                self.assertEqual(mod.V1_STATE["pane_outbox"], [])
+                self.assertEqual(fake._call.call_args[0][0], held.message)
+                self.assertEqual(mod.V1_STATE["floor_sessions"]["care-taker"]["seq"], 2)
+            finally:
+                mod.ENGINE_REF.pop("cf_mod", None)
+                mod.SHADOW_SUMMARY["mode"] = "shadow"
+                mod.V1_STATE["floor_sessions"] = {}
+
     def test_persisted_mode_authority(self):
         import tempfile
         cf = self.floor

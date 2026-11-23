@@ -345,6 +345,32 @@ def make_runner(real_gh):
     return runner
 
 
+def sync_floor_sessions_from_disk():
+    """Mirror Floor-backed cloud records (STATE_DIR/cloud/*.json) into V1_STATE["floor_sessions"], keeping the highest seq."""
+    found, unreadable = {}, set()
+    try:
+        files = sorted((STATE_DIR / "cloud").glob("*.json"))
+    except OSError:
+        return
+    for fp in files:
+        try:
+            rec = json.loads(fp.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as err:
+            log_line("floor_session_unreadable", record=fp.stem, error=str(err)[:120])
+            unreadable.add(fp.stem)
+            continue
+        if isinstance(rec, dict) and rec.get("backend") == "floor" and rec.get("work_id"):
+            found[fp.stem] = rec
+    with STATE_LOCK:
+        sessions = V1_STATE.setdefault("floor_sessions", {})
+        for name in [n for n in sessions if n not in found and n not in unreadable]:
+            del sessions[name]
+        for name, rec in found.items():
+            cur = sessions.get(name) or {}
+            seq = max(int(cur.get("seq", 1) or 1), int(rec.get("seq", 1) or 1))
+            sessions[name] = dict(rec, seq=seq)
+
+
 class ShadowHerdr:
     def __init__(self, snap_path):
         self.snap_path = Path(snap_path)
@@ -360,7 +386,10 @@ class ShadowHerdr:
         snap_agents = {a.get("pane_id"): dict(a) for a in self._snap().get("agents", []) if isinstance(a, dict)}
         with STATE_LOCK:
             ps = dict(V1_STATE.get("pane_state") or {})
+            floor = set(V1_STATE.get("floor_sessions") or {})
         for name, data in ps.items():
+            if name in floor:
+                continue
             pane = data.get("pane") or ("pane_" + name)
             entry = snap_agents.get(pane, {"pane_id": pane})
             entry["agent_session"] = data.get("session_id") or entry.get("agent_session") or ("ses_" + name)
@@ -543,7 +572,21 @@ class ShadowV2:
                         fp = STATE_DIR / "oversize-sends" / match.group(4)
                         if fp.is_file():
                             oversize[match.group(4)] = fp.read_text(encoding="utf-8", errors="replace")
-                V1_STATE["pane_outbox"].append({
+                target = (V1_STATE.get("floor_sessions") or {}).get(recipient)
+                if cf is not None and isinstance(target, dict) and target.get("work_id"):
+                    seq = int(target.get("seq", 1)) + 1
+                    cf._call(cf.transport().message, cf.floor_who(), target["work_id"], cf.send_key(target.get("session", recipient), seq, text), seq, text)
+                    target["seq"] = seq
+                    rp = STATE_DIR / "cloud" / (recipient + ".json")
+                    if rp.is_file():
+                        try:
+                            rrec = json.loads(rp.read_text(encoding="utf-8"))
+                            rrec["seq"] = seq
+                            rp.write_text(json.dumps(rrec, sort_keys=True) + "\n", encoding="utf-8")
+                        except (OSError, ValueError) as err:
+                            log_line("floor_seq_persist_error", recipient=recipient, error=str(err)[:120])
+                else:
+                  V1_STATE["pane_outbox"].append({
                     **({"oversize_files": oversize} if oversize else {}),
                     "id": len(V1_STATE["pane_outbox"]) + 1 + len(V1_STATE.get("acked", [])),
                     "from": "switchboard",
@@ -613,11 +656,28 @@ def handle_on_v1_action(route_path, auth, body, state):
                 else:
                     reg.retire(STATE_DIR, name, auth.get("agent") or "cos", body.get("reason") or "finished")
         elif route_path == "/v1/decisions":
-            if body.get("action") in ("escalate", "resolve", "answer", "supersede", "batch"):
+            if body.get("action") in ("escalate", "resolve", "answer", "supersede", "batch", "promote"):
                 refresh_decisions(eng, sb_mod)
             dfile = STATE_DIR / "decisions.json"
+            if body.get("action") == "promote" and dfile.is_file():
+                cal = body.get("calibration") if isinstance(body.get("calibration"), dict) else {}
+                promoted = {"id": body.get("id"), "issue": body.get("issue"), "repo": body.get("repo"), "title": str(body.get("title") or "")[:200],
+                            "from": auth.get("agent"), "status": "awaiting-user",
+                            "calibration": {"proposal": str(body.get("proposal") or cal.get("proposal") or "")[:400],
+                                            "predicted_ruling": str(body.get("predicted_ruling") or cal.get("predicted_ruling") or "")[:400],
+                                            "date": str(body.get("date") or cal.get("date") or iso_now())[:40]}}
+                cur = json.loads(dfile.read_text(encoding="utf-8"))
+                items = cur.get("decisions") if isinstance(cur, dict) and isinstance(cur.get("decisions"), list) else None
+                if items is not None:
+                    items[:] = [d for d in items if not (isinstance(d, dict) and promoted["id"] and d.get("id") == promoted["id"])] + [promoted]
+                    dfile.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             if dfile.is_file():
                 state["decisions_file"] = json.loads(dfile.read_text(encoding="utf-8"))
+        elif route_path == "/v1/talk":
+            sender = auth.get("agent") or "cos"
+            to = body.get("to") or body.get("name")
+            text = body.get("text") or ""
+            log_line("v1_talk_executed", sender=sender, to=to)   # delivery: handle_switchboard_v1 sends to Floor or queues the pane outbox
         elif route_path == "/v1/orders":
             if body.get("action") in ("add", "remove") and body.get("charter"):
                 eng.audit.append(auth.get("agent") or "cos", "orders." + body["action"], str(body.get("name") or body.get("charter"))[:60], {"charter": str(body["charter"])[:200]})
@@ -751,6 +811,7 @@ def load_pane_state():
 
 
 def run_pass_loop(sb_mod, cf_mod):
+    sync_floor_sessions_from_disk()
     load_pane_state()
     load_synthetic_messages()
     real_gh = "/usr/bin/gh" if os.path.exists("/usr/bin/gh") else "gh"
@@ -787,7 +848,8 @@ def run_pass_loop(sb_mod, cf_mod):
     def wrapped_discover(moment, entries=None):
         disc = real_discover(moment, entries)
         with STATE_LOCK:
-            ps = dict(V1_STATE.get("pane_state") or {})
+            floor = set(V1_STATE.get("floor_sessions") or {})
+            ps = {k: v for k, v in (V1_STATE.get("pane_state") or {}).items() if k not in floor}
         if ps:
             cf_mod.apply_pane_state_to_discovery(ps, disc)
         return disc
@@ -1037,6 +1099,7 @@ def main():
                         tmp.write_text(content, encoding="utf-8")
                         os.chmod(tmp, 0o600)
                         os.replace(tmp, STATE_DIR / fname)
+                sync_floor_sessions_from_disk()
                 out = {"synced": len(data.get("records") or {})}
                 dfile = STATE_DIR / "decisions.json"
                 if dfile.is_file():
@@ -1056,6 +1119,7 @@ def main():
                 if data.get("delete"):
                     if p.is_file():
                         p.unlink()
+                    sync_floor_sessions_from_disk()
                     return self._send(200, {"deleted": True})
                 if isinstance(data.get("record"), dict):
                     rec = dict(data["record"])
@@ -1063,6 +1127,7 @@ def main():
                     merge_preserved(p, rec)
                     p.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
                     os.chmod(p, 0o600)
+                    sync_floor_sessions_from_disk()
                     return self._send(200, {"recorded": True})
                 return self._send(400, {"error": "record or delete required"})
             with STATE_LOCK:
