@@ -53,7 +53,7 @@
           "cmd": [
             "sh",
             "-c",
-            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSpireLandCutover2570 TestDirectToMainCutover TestTipWatch"
+            "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/test-switchboard TestSpireLandCutover2570 TestDirectToMainCutover TestTipWatch TestCloudFloor TestCloudFloorCutover TestCloudFloorPublicSafe"
           ]
         },
         {

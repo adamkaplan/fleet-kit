@@ -91,8 +91,7 @@ def scrub(text, limit=200):
     if token_file:
         try: forms.append(open(token_file).read(TOKEN_MAX).strip())
         except OSError: pass
-    for form in sorted((f for f in forms if f), key=len, reverse=True):
-        text = text.replace(form, "<floor>")
+    for form in sorted((f for f in forms if f), key=len, reverse=True): text = text.replace(form, "<floor>")
     text = re.sub(r"https?://\S+", "<url>", text)
     text = re.sub(r"(?i)\b(sig|sv|se|sp|sas|token|access_token|key|bearer)([=:\s]+)[^&\s]+", r"\1\2<hidden>", text)
     text = re.sub(r"\b(?![0-9a-f]{40}\b|[0-9a-f]{64}\b)[A-Za-z0-9_+/=-]{40,}\b", "<hidden>", text)
@@ -130,8 +129,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _request(method, url, data=None, headers=(), missing_ok=False):
     """(status, body bytes) of one request: no redirect followed, 30 s, the answer cut at 1 MiB. An HTTP error is a FloorError (a 503 that names `art-...` is an UnavailableArtifactError); a 404 is returned as (404, b"") when `missing_ok`."""
     request = urllib.request.Request(url, data=data, method=method)
-    for key, value in headers:
-        request.add_header(key, value)
+    for key, value in headers: request.add_header(key, value)
     try:
         with urllib.request.build_opener(_NoRedirect).open(request, timeout=TIMEOUT_SECONDS) as answer:
             status, raw = answer.status, answer.read(RESPONSE_MAX + 1)
@@ -160,8 +158,7 @@ class HttpTransport:
     def _call(self, method, path, body=None):
         data = None if body is None else json.dumps(body, sort_keys=True).encode()
         headers = [("Accept", "application/json")] + ([("Content-Type", "application/json")] if data is not None else [])
-        if self.token:
-            headers.append(("Authorization", "Bearer " + self.token))
+        if self.token: headers.append(("Authorization", "Bearer " + self.token))
         return _parse(_request(method, self.base + path, data, headers)[1])
     def _root(self, caller):
         return "/v1/callers/" + urllib.parse.quote(caller, safe="")
@@ -358,8 +355,7 @@ def translate_brief(brief, repo, branch, base=None):
     text = str(brief or "")
     held = D["H"]
     header = D["POD_HEADER"]
-    if text.startswith(header):
-        text = text[len(header):]
+    if text.startswith(header): text = text[len(header):]
     values = {"repo": repo, "branch": branch}
     for setup in (D["H"]["setup_with_land"](D["SETUP_PREAMBLE"], {"land_repos": [repo]}, repo) % values, D["SETUP_PREAMBLE"] % values,
                   D["SETUP_PREAMBLE"][len(header):] % values):
@@ -367,8 +363,7 @@ def translate_brief(brief, repo, branch, base=None):
             text = text[len(setup):]
             break
     land_line = held.get("LAND_SETUP_LINE")
-    if land_line:
-        text = text.replace(land_line, "")
+    if land_line: text = text.replace(land_line, "")
     lines = [REMOVED_LINE if DELIVERY_LINE.search(line) else line for line in text.splitlines()]
     body = "\n".join(lines).strip("\n")
     return FLOOR_AUTHOR_PREAMBLE % {"branch": branch, "base": base or "the default branch"} + body + "\n"
@@ -398,8 +393,7 @@ def _wait_ack(held, cmd_id, initial=None, sleep_fn=time.sleep, timeout=15.0):
     while True:
         try:
             ack = held._state()["acks"].get(cmd_id)
-            if isinstance(ack, str):
-                return ack
+            if isinstance(ack, str): return ack
         except FloorError:
             pass
         if time.time() >= deadline: return None
@@ -476,19 +470,15 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     record = {"worker": name, "backend": "floor", "session": session_id, "work_id": work_id, "runtime_id": "floor/" + session_id, "url": ENDPOINT_URL,
               "seq": 1, "repo": repo, "branch": branch, "base": base, "agent": args.agent, **({"mode": mode} if mode else {}), "priority_class": pclass, **({"preview": True} if preview else {}),
               "idle_deadline": _stamp(_seconds(getattr(args, "idle", None), 3600), stamp), "hard_deadline": _stamp(_seconds(getattr(args, "hard", None), 8 * 3600), stamp)}
-    if getattr(args, "reports_to", None):
-        record.update(reports_to=args.reports_to)
-    if isinstance(getattr(args, "shape", None), str) and args.shape:
-        record["shape"] = args.shape
+    if getattr(args, "reports_to", None): record.update(reports_to=args.reports_to)
+    if isinstance(getattr(args, "shape", None), str) and args.shape: record["shape"] = args.shape
     issue = getattr(args, "issue", None)
     record["issue"] = None if issue is None else int(issue)
     labels = D["cloud_pr_labels"].labels_of(args)   # the labels only: the base is already in the record, and the setup text of the pods is not touched
-    if labels:
-        record["pr_labels"] = labels
+    if labels: record["pr_labels"] = labels
     try:
         D["save_record"](state, record)
-        if switchboard_authority() == "cluster":
-            call_switchboard_v1("/v1/cloud-record", {"worker": record["worker"], "record": record})
+        if switchboard_authority() == "cluster": call_switchboard_v1("/v1/cloud-record", {"worker": record["worker"], "record": record})
     except (D["CloudError"], FloorError, OSError) as err:
         raise LaunchError("Floor accepted the work %s but its record could not be stored (%s); launch again to finish: the same work is returned" % (work_id, scrub(err, 80))) from None
     D["_audit"](engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "backend": "floor", "idle_deadline": record["idle_deadline"], "hard_deadline": record["hard_deadline"]})
@@ -573,12 +563,10 @@ def _read_floor(args, record):
         print(_line(message))
     print(scrub("floor: state %s, landed_sha %s" % (done.get("state", seen.get("state")), done.get("landed_sha", seen.get("landed_sha")))))
     manifest = done.get("manifest", seen.get("manifest"))
-    if manifest is not None:
-        print(scrub("manifest: " + json.dumps(manifest, sort_keys=True), 2000))
+    if manifest is not None: print(scrub("manifest: " + json.dumps(manifest, sort_keys=True), 2000))
     tail = done.get("log_tail", seen.get("log_tail"))
     tail = tail.splitlines() if isinstance(tail, str) else tail if isinstance(tail, list) else []
-    for line in tail[-40:]:
-        print(scrub("log_tail: " + str(line), 400))
+    for line in tail[-40:]: print(scrub("log_tail: " + str(line), 400))
     return D["H"]["EXIT_OK"]
 
 def _status_floor(records):
@@ -676,22 +664,18 @@ def verify_switchboard_auth(header_value, expected_secret):
     agent, session, charter, secret = fields.get("agent"), fields.get("session"), fields.get("charter"), fields.get("secret")
     if set(fields) - {"agent", "session", "charter", "secret"} or secret is None: raise bad
     if not (agent and CALLER_RE.fullmatch(agent) and session and SESSION_RE.fullmatch(session)): raise bad
-    if charter is not None and not CHARTER_RE.fullmatch(charter):
-        raise bad
-    if not hmac.compare_digest(secret.encode("utf-8"), str(expected_secret).encode("utf-8")):
-        raise bad
+    if charter is not None and not CHARTER_RE.fullmatch(charter): raise bad
+    if not hmac.compare_digest(secret.encode("utf-8"), str(expected_secret).encode("utf-8")): raise bad
     return {"agent": agent, "session": session, "charter": charter}
 
 def ensure_switchboard_auth_file(env=None, fetch_secret=None):
     """The relay credential file: the configured 0600 file when present, else fetched from Key Vault and written atomically (0600). Returns its path, or None."""
     env = os.environ if env is None else env
     auth_file = (env.get("CW_SWITCHBOARD_AUTH_FILE") or "").strip()
-    if auth_file and os.path.isfile(auth_file) and stat.S_IMODE(os.stat(auth_file).st_mode) == 0o600:
-        return auth_file
+    if auth_file and os.path.isfile(auth_file) and stat.S_IMODE(os.stat(auth_file).st_mode) == 0o600: return auth_file
     vault = (env.get("CW_SWITCHBOARD_KEYVAULT") or "").strip()
     secret_name = (env.get("CW_SWITCHBOARD_SECRET_NAME") or "switchboard-relay-auth").strip()
-    if not vault:
-        return None
+    if not vault: return None
     if fetch_secret is None:
         def fetch_secret(vault_name, name):
             import subprocess
@@ -704,8 +688,7 @@ def ensure_switchboard_auth_file(env=None, fetch_secret=None):
                 raise FloorError(502, "could not read secret %s from vault %s (az exit %d): check az login and access" % (name, vault_name, done.returncode))
             return done.stdout.strip()
     value = fetch_secret(vault, secret_name)
-    if not isinstance(value, str) or not value.strip():
-        return None
+    if not isinstance(value, str) or not value.strip(): return None
     path = auth_file or os.path.join(os.path.expanduser("~"), ".config", "fleet-switchboard", "switchboard-relay.auth")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     import tempfile
@@ -721,12 +704,10 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
     try: auth = verify_switchboard_auth((headers or {}).get("X-Switchboard-Auth"), expected_secret)
     except FloorError as err: return err.status, {"error": str(err)}
     state = state if state is not None else {}
-    for key in ("pane_outbox", "reports", "reminders", "audit"):
-        state.setdefault(key, [])
+    for key in ("pane_outbox", "reports", "reminders", "audit"): state.setdefault(key, [])
     route = (method.upper(), path.split("?", 1)[0])
     if route == ("GET", "/v1/mode"):
-        if "mode" not in state and state.get("state_dir"):
-            state["mode"] = cluster_switchboard_mode(state["state_dir"])
+        if "mode" not in state and state.get("state_dir"): state["mode"] = cluster_switchboard_mode(state["state_dir"])
         return 200, {"mode": state.get("mode") or "shadow"}
     if route == ("GET", "/v1/pane-outbox"):
         return 200, {"messages": [m for m in state["pane_outbox"] if m.get("to") == auth["agent"] or auth["agent"] in ("cos", "pane-relay")]}
@@ -734,8 +715,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
     if route[0] == "POST":
         try: body = D["parse_bounded"](body_bytes.decode("utf-8")) if body_bytes else {}
         except ValueError: return 400, {"error": "bad request body"}
-        if not isinstance(body, dict):
-            return 400, {"error": "bad request body"}
+        if not isinstance(body, dict): return 400, {"error": "bad request body"}
     if route[0] == "POST" and route[1] in ("/v1/send", "/v1/report", "/v1/remind", "/v1/retire", "/v1/orders", "/v1/intent", "/v1/decisions", "/v1/pane-state", "/v1/pane-command") \
             and callable(state.get("on_v1_action")):
         state["on_v1_action"](route[1], auth, body, state)
@@ -744,31 +724,26 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
             state["audit"].append({"event": "spoofed_sender", "agent": auth["agent"], "session": auth["session"], "claimed": scrub(body[spoof], 40)})
     text = scrub(body.get("text", ""), 4000) if isinstance(body.get("text", ""), str) else ""
     if route in (("POST", "/v1/intent"), ("GET", "/v1/intent")):
-        if route[0] == "GET" or body.get("action") in ("list", "show"):
-            return 200, {"intents": state.get("intents") or []}
+        if route[0] == "GET" or body.get("action") in ("list", "show"): return 200, {"intents": state.get("intents") or []}
         state.setdefault("intents", []).append({"action": body.get("action") or "set", "issue": body.get("issue"), "text": text, "from": auth["agent"]})
         return 200, {"recorded": True, "intents": state["intents"]}
     if route in (("POST", "/v1/decisions"), ("GET", "/v1/decisions")):
         if route[0] == "GET" or body.get("action") in ("list", "show"):
             out = {"decisions": state.get("decisions") or []}
-            if isinstance(state.get("decisions_file"), dict):
-                out["decisions_file"] = state["decisions_file"]
+            if isinstance(state.get("decisions_file"), dict): out["decisions_file"] = state["decisions_file"]
             return 200, out
         title = body.get("title", "")
         state.setdefault("decisions", []).append({"action": body.get("action") or "batch", "id": body.get("id"), "title": scrub(title, 200) if isinstance(title, str) else "",
                                                   "rows": body.get("rows") if isinstance(body.get("rows"), list) else [], "from": auth["agent"]})
         return 200, {"recorded": True, "decisions": state["decisions"]}
     if route == ("POST", "/v1/mode"):
-        if body.get("mode") not in ("shadow", "active"):
-            return 400, {"error": "mode must be shadow or active"}
+        if body.get("mode") not in ("shadow", "active"): return 400, {"error": "mode must be shadow or active"}
         state["mode"] = body["mode"]
-        if state.get("state_dir"):
-            write_cluster_switchboard_mode(state["state_dir"], body["mode"])
+        if state.get("state_dir"): write_cluster_switchboard_mode(state["state_dir"], body["mode"])
         return 200, {"mode": state["mode"]}
     if route == ("POST", "/v1/send"):
         to = body.get("to")
-        if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text:
-            return 400, {"error": "to and text are required"}
+        if not isinstance(to, str) or not CALLER_RE.fullmatch(to) or not text: return 400, {"error": "to and text are required"}
         message = {"from": auth["agent"], "session": auth["session"], "to": to, "text": text, "issue": body.get("issue"), "repo": body.get("repo")}
         if isinstance(body.get("oversize_files"), dict):
             message["oversize_files"] = {k: str(v) for k, v in body["oversize_files"].items() if isinstance(k, str) and re.fullmatch(r"send-[A-Za-z0-9_.-]+\.txt", k)}
@@ -785,19 +760,16 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"queued": "pane"}
     if route == ("POST", "/v1/report"):
         status = body.get("state") or body.get("status")
-        if status not in REPORT_STATES:
-            return 400, {"error": "status must be one of " + ", ".join(REPORT_STATES)}
+        if status not in REPORT_STATES: return 400, {"error": "status must be one of " + ", ".join(REPORT_STATES)}
         state["reports"].append({"from": auth["agent"], "session": auth["session"], "status": status, "text": text, "repo": body.get("repo")})
         return 200, {"recorded": True}
     if route == ("POST", "/v1/remind"):
         when = body.get("when")
         action = body.get("action")
         manage = action in ("list", "cancel", "cancel_key")
-        if not manage and (not isinstance(when, (str, int, float)) or not text):
-            return 400, {"error": "when and text are required"}
+        if not manage and (not isinstance(when, (str, int, float)) or not text): return 400, {"error": "when and text are required"}
         to = body.get("to") or body.get("name") or auth["agent"]
-        if not isinstance(to, str) or not CALLER_RE.fullmatch(to):
-            return 400, {"error": "bad recipient"}
+        if not isinstance(to, str) or not CALLER_RE.fullmatch(to): return 400, {"error": "bad recipient"}
         if action == "list":
             return 200, {"recorded": False, "reminders": [r for r in state["reminders"] if auth["agent"] in (r.get("to"), r.get("from"))]}
         if manage:
@@ -819,13 +791,11 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         except ValueError: return 400, {"error": "data_b64 is not base64"}
         digest = hashlib.sha256(data).hexdigest()
         url = artifact_put(auth["session"], "%s-%s" % (digest, name), data)
-        if not isinstance(url, str) or not url.startswith("https://"):
-            return 502, {"error": "artifact store refused"}
+        if not isinstance(url, str) or not url.startswith("https://"): return 502, {"error": "artifact store refused"}
         return 200, {"url": url, "sha256": digest, "sp": "r"}
     if route == ("POST", "/v1/retire"):
         name, reason = body.get("worker") or body.get("name"), scrub(body.get("reason", ""), 200) if isinstance(body.get("reason", ""), str) else ""
-        if not isinstance(name, str) or not CALLER_RE.fullmatch(name):
-            return 400, {"error": "worker is required"}
+        if not isinstance(name, str) or not CALLER_RE.fullmatch(name): return 400, {"error": "worker is required"}
         target = (state.get("floor_sessions") or {}).get(name)
         if target is not None and not D["_may_retire"](("agent", auth["agent"], "chief-of-staff" if auth["agent"] == "cos" else None), target):   # the one caller rule of a removal
             return 403, {"error": "only the Chief of Staff or the worker's own boss may retire it"}
@@ -837,18 +807,15 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"retired": True, "worker": name}
     if route == ("POST", "/v1/orders"):
         action = body.get("action")
-        if action not in ("list", "add", "remove", "copy", "cos", None):
-            return 400, {"error": "action must be list, add, remove or copy"}
+        if action not in ("list", "add", "remove", "copy", "cos", None): return 400, {"error": "action must be list, add, remove or copy"}
         orders = state.setdefault("orders", [])
         if action != "list":
             orders.append({"action": action or "cos", "charter": body.get("charter"), "source": body.get("source"), "text": text, "number": body.get("number"), "from": auth["agent"]})
         return 200, {"recorded": True, "orders": orders}
     if route == ("POST", "/v1/pane-state"):
-        if auth["agent"] not in ("pane-relay", "cos"):
-            return 403, {"error": "pane-state is for the pane relay"}
+        if auth["agent"] not in ("pane-relay", "cos"): return 403, {"error": "pane-state is for the pane relay"}
         agents = body.get("agents")
-        if not isinstance(agents, dict):
-            return 400, {"error": "agents is required"}
+        if not isinstance(agents, dict): return 400, {"error": "agents is required"}
         wanted = ("status", "errored", "turn_error", "turn_error_id", "idle_at", "permission_waiting", "form_waiting", "pane", "session_id", "fleet")
         state["pane_state"] = {k: {f: v[f] for f in wanted if f in v} for k, v in agents.items() if isinstance(v, dict)}
         state["pane_state_at"] = body.get("at")
@@ -866,8 +833,7 @@ def handle_switchboard_v1(method, path, headers, body_bytes, expected_secret, st
         return 200, {"queued": True}
     if route == ("POST", "/v1/pane-ack"):
         ids = body.get("ids")
-        if not isinstance(ids, list):
-            return 400, {"error": "ids is required"}
+        if not isinstance(ids, list): return 400, {"error": "ids is required"}
         mine = lambda m: m.get("id") in ids and (m.get("to") == auth["agent"] or auth["agent"] == "pane-relay")   # an agent acks only its own messages
         keep = [m for m in state["pane_outbox"] if not mine(m)]
         state.setdefault("acked", []).extend(m for m in state["pane_outbox"] if mine(m))
@@ -893,13 +859,11 @@ def switchboard_relay_config(env=None):
     """url, auth_file and authority from the environment, else from the state file switchboard-relay.json (never raises)."""
     if env is None and _PASSTHROUGH_AUTH:
         prev = _PASSTHROUGH_AUTH.pop()
-        if prev is not None:
-            os.environ["CW_SWITCHBOARD_AUTHORITY"] = prev
+        if prev is not None: os.environ["CW_SWITCHBOARD_AUTHORITY"] = prev
     env = os.environ if env is None else env
     got = {"url": (env.get("CW_SWITCHBOARD_URL") or "").strip(), "auth_file": (env.get("CW_SWITCHBOARD_AUTH_FILE") or "").strip(),
            "authority": (env.get("CW_SWITCHBOARD_AUTHORITY") or "").strip()}
-    if all(got.values()):
-        return got
+    if all(got.values()): return got
     try: path = os.path.join(str(D["H"]["state_dir_path"]()), "switchboard-relay.json")
     except Exception: return got   # no state directory bound: no file to read
     try:
@@ -909,19 +873,16 @@ def switchboard_relay_config(env=None):
         return got
     except Exception as err:   # a present but unreadable or corrupt file must not silently turn into local writes
         raise FloorError("switchboard-relay.json cannot be read (%s); fix or remove it" % type(err).__name__) from None
-    if not isinstance(data, dict):
-        return got
+    if not isinstance(data, dict): return got
     for key, names in (("url", ("url", "switchboard_url")), ("auth_file", ("auth_file", "switchboard_auth_file")), ("authority", ("authority", "switchboard_authority"))):
         for name in names:
-            if not got[key] and isinstance(data.get(name), str):
-                got[key] = data[name].strip()
+            if not got[key] and isinstance(data.get(name), str): got[key] = data[name].strip()
     return got
 
 def switchboard_authority(env=None):
     if env is None and _PASSTHROUGH_AUTH:
         prev = _PASSTHROUGH_AUTH.pop()
-        if prev is not None:
-            os.environ["CW_SWITCHBOARD_AUTHORITY"] = prev
+        if prev is not None: os.environ["CW_SWITCHBOARD_AUTHORITY"] = prev
         return "local"
     return switchboard_relay_config(env)["authority"]
 
@@ -931,8 +892,7 @@ def call_switchboard_v1(path, payload, env=None, sleep_fn=time.sleep):
     base = config["url"]
     if not base: return None
     caller_agent = None
-    if isinstance(payload, dict):
-        payload = dict(payload); caller_agent = payload.pop("_caller_agent", None)
+    if isinstance(payload, dict): payload = dict(payload); caller_agent = payload.pop("_caller_agent", None)
     header = _auth_header(config)
     if isinstance(caller_agent, str) and CALLER_RE.fullmatch(caller_agent): header = re.sub(r"(^|;)agent=[^;]+", lambda m: m.group(1) + "agent=" + caller_agent, header)
     data = json.dumps(payload, sort_keys=True).encode()
@@ -942,6 +902,9 @@ def call_switchboard_v1(path, payload, env=None, sleep_fn=time.sleep):
             return _parse(_request("POST", base.rstrip("/") + path, data, headers)[1])
         except FloorError as err:
             if delay is None or (err.status or 0) in range(1, 500): raise
+            if err.status is None and "127.0.0.1" in base and env is None and delay == 1.5:
+                try: _start_port_forward(D["_lib"]()); sleep_fn(1.5)
+                except Exception as pf_err: _warn("port-forward restart", pf_err)
             _warn("switchboard relay (retrying in %ss)" % delay, err); sleep_fn(delay)
 PANE_RELAY_PORT = 18080   # the local end of the port-forward to the in-cluster switchboard
 
@@ -950,8 +913,7 @@ def _warn(what, err):
 
 def _auth_header(config):
     auth_file = config["auth_file"]
-    if not auth_file:
-        raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not set")
+    if not auth_file: raise FloorError("CW_SWITCHBOARD_AUTH_FILE is not set")
     try:
         info = os.stat(auth_file)
         if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
@@ -963,8 +925,7 @@ def _auth_header(config):
 
 def _stale_disk_alert(engine, keys, text):
     """True when a disk.low alert is stale: the local state volume has at least min_free_gb free."""
-    if not (any(str(k).startswith("disk.low:") for k in keys) or (not keys and "disk low:" in str(text or ""))):
-        return False
+    if not (any(str(k).startswith("disk.low:") for k in keys) or (not keys and "disk low:" in str(text or ""))): return False
     try: st = os.statvfs(str(getattr(engine, "state_dir", None) or D["H"]["state_dir_path"]()))
     except Exception: return False
     return st.f_bavail * st.f_frsize / 1e9 >= ((getattr(engine, "config", None) or {}).get("disk_guard") or {}).get("min_free_gb", 50)
@@ -972,19 +933,16 @@ def _stale_disk_alert(engine, keys, text):
 def drain_pane_outbox(engine, sb_mod=None, discovery=None, env=None):
     """Fetch the cluster's pane outbox, deliver what the Mac owns (cluster authority only), and ack."""
     config = switchboard_relay_config(env)
-    if not config["url"]:
-        return {"delivered": 0, "acked": 0}
+    if not config["url"]: return {"delivered": 0, "acked": 0}
     header = _auth_header(config)
     ans = _parse(_request("GET", config["url"].rstrip("/") + "/v1/pane-outbox", None, [("Accept", "application/json"), ("X-Switchboard-Auth", header)])[1])
     messages = (ans.get("messages") if isinstance(ans, dict) else None) or []
-    if not messages:
-        return {"delivered": 0, "acked": 0}
+    if not messages: return {"delivered": 0, "acked": 0}
     authority = config.get("authority") or "shadow"
     ack_ids, delivered, canaries = [], 0, []
     for m in messages:
         mid = m.get("id")
-        if mid is None:
-            continue
+        if mid is None: continue
         if is_canary(m):
             canaries.append(m.get("text"))
             ack_ids.append(mid)
@@ -1128,12 +1086,19 @@ class PaneRelayMonitor:
     """Relay alarm state: reachability, single authority, end-to-end canary."""
     def __init__(self, notify=notify_macos_alarm, down_after=120, canary_every=600, canary_wait=60):
         self.notify, self.down_after, self.canary_every, self.canary_wait = notify, down_after, canary_every, canary_wait
-        self.unreachable_since = None
+        self.unreachable_since = self.azure_warned_exp = self.azure_expired_exp = None
         self.reachability_alerted = self.authority_alerted = self.canary_alerted = False
         self.canary_token = self.canary_sent_at = self.last_canary = None; self.failed_canaries = 0
-    def tick(self, now, reachable, cluster_mode=None, mac_authority=None, mac_paused=None, canaries=()):
+    def tick(self, now, reachable, cluster_mode=None, mac_authority=None, mac_paused=None, canaries=(), azure_expiry=None, work_waiting=False):
         """Returns {"restart": bool, "send_canary": token or None}."""
         out = {"restart": False, "send_canary": None, "rollback": False}
+        if azure_expiry is not None:
+            if 0 < azure_expiry - now <= 7200 and self.azure_warned_exp != azure_expiry:
+                self.notify("fleet-kit Azure login expiring", "AZURE_CONFIG_DIR=~/.azure-fleetkit expires in %dm; run az login" % max(1, int((azure_expiry - now) // 60)))
+                self.azure_warned_exp, out["azure_notice"] = azure_expiry, "expiring"
+            elif now >= azure_expiry and work_waiting and self.azure_expired_exp != azure_expiry:
+                self.notify("fleet-kit Azure login expired", "AZURE_CONFIG_DIR=~/.azure-fleetkit expired with work waiting; run az login")
+                self.azure_expired_exp, out["azure_notice"] = azure_expiry, "expired"
         if not reachable:
             self.unreachable_since = self.unreachable_since if self.unreachable_since is not None else now
             if now - self.unreachable_since >= self.down_after and not self.reachability_alerted:
@@ -1239,6 +1204,32 @@ def render_pane_relay_plist(python_bin, kit_root, home_dir, state_dir, path_env)
         "  <key>StandardErrorPath</key>\n  <string>" + e(os.path.join(str(state_dir), "pane-relay-stderr.log")) + "</string>\n"
         "</dict>\n</plist>\n"
     )
+def azure_login_expiry(home_dir=None):
+    """Epoch when the 12h Conditional Access session of ~/.azure-fleetkit ends, or None."""
+    try:
+        with open(os.path.join(home_dir or os.path.expanduser("~"), ".azure-fleetkit", "msal_token_cache.json"), encoding="utf-8") as h: tokens = (D["parse_bounded"](h.read()).get("RefreshToken") or {}).values()
+        return max(float(e["last_modification_time"]) for e in tokens) + 12 * 3600
+    except Exception: return None
+
+def _azure_work_waiting(state_dir, decisions_file=None):
+    if decisions_file is None:
+        try:
+            with open(os.path.join(str(state_dir), "decisions.json"), encoding="utf-8") as h: decisions_file = D["parse_bounded"](h.read())
+        except Exception: decisions_file = {}
+    cloud = os.path.join(str(state_dir), "cloud")
+    return any(".azure-fleetkit" in json.dumps(d) or "az login" in json.dumps(d) for d in decisions_file.get("decisions") or [] if d.get("id") != "azure:fleetkit-login") or (os.path.isdir(cloud) and any(n.endswith(".json") for n in os.listdir(cloud)))
+
+def _write_decisions(state_dir, df):
+    try:
+        exp, now = azure_login_expiry(), time.time()
+        if exp is not None and (0 < exp - now <= 7200 or (now >= exp and _azure_work_waiting(state_dir, df))):
+            what = "expires in %dm" % max(1, int((exp - now) // 60)) if exp > now else "expired"
+            title = "AZURE_CONFIG_DIR=~/.azure-fleetkit az login (%s)" % what
+            df["decisions"] = [d for d in df.get("decisions") or [] if d.get("id") != "azure:fleetkit-login"] + [{"id": "azure:fleetkit-login", "kind": "notice", "tier": "human", "title": title, "headline": title}]
+    except Exception as err: _warn("azure login notice", err)
+    try: _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(df, indent=2))
+    except OSError as err: _warn("decisions.json sync", err)
+
 def sync_cloud_records_to_cluster(state_dir, env=None):
     """Push the Mac's cloud records (and, while not cluster authority, reminders) to the cluster."""
     def read(path):
@@ -1252,8 +1243,7 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
     if switchboard_authority(env) == "cluster":
         ans = call_switchboard_v1("/v1/cloud-sync", {"mirror_only": True}, env=env)
         if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict):
-            try: _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
-            except OSError as err: _warn("decisions.json sync", err)
+            _write_decisions(state_dir, ans["decisions_file"])
         return {"synced": 0}
     records, reminders = {}, None
     cloud = os.path.join(str(state_dir), "cloud")
@@ -1275,8 +1265,7 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
         payload["state_files"] = state_files
     ans = call_switchboard_v1("/v1/cloud-sync", payload, env=env)
     if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict) and switchboard_authority(env) == "cluster":
-        try: _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(ans["decisions_file"], indent=2))
-        except OSError as err: _warn("decisions.json sync", err)
+        _write_decisions(state_dir, ans["decisions_file"])
     return {"synced": len(records)}
 
 def _healthy(url="http://127.0.0.1:%d/healthz" % PANE_RELAY_PORT):
@@ -1288,6 +1277,7 @@ def _kube_base(lib):
     for flag, name in (("--server", "CW_CLOUD_SERVER"), ("--certificate-authority", "CW_CLOUD_CA_FILE")):
         if os.environ.get(name):
             base += [flag, os.environ[name]]
+    D["use_settings"]()
     return base + ["--token", lib.cluster_token(os.environ, duration="30m")]
 
 def remediate_wedged_kata_nodes(base_cmd, runner=subprocess.run, notify_fn=None):
@@ -1351,7 +1341,7 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
                 try:
                     reachable = _healthy()
                     mode = fetch_cluster_mode(env) if reachable else None
-                    act = monitor.tick(time.time(), reachable, mode, switchboard_authority(env), mac_daemon_paused(state_dir), canaries)
+                    act = monitor.tick(time.time(), reachable, mode, switchboard_authority(env), mac_daemon_paused(state_dir), canaries, azure_login_expiry(), _azure_work_waiting(state_dir))
                     if act["send_canary"]:
                         call_switchboard_v1("/v1/send", {"to": "pane-relay", "text": act["send_canary"], "canary": True}, env=env)
                     if act.get("rollback"):

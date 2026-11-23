@@ -491,6 +491,63 @@ class TestCloudFloor(FloorCase):
 
 class TestCloudFloorCutover(FloorCase):
 
+    def _msal_home(self, stamps):
+        home = self.tmp_path("azhome") if hasattr(self, "tmp_path") else __import__("tempfile").mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, home, True)
+        os.makedirs(os.path.join(home, ".azure-fleetkit"))
+        cache = {"RefreshToken": {"k%d" % i: {"last_modification_time": str(t)} for i, t in enumerate(stamps)}}
+        Path(home, ".azure-fleetkit", "msal_token_cache.json").write_text(json.dumps(cache))
+        return home
+
+    def test_azure_login_expiry_is_newest_refresh_token_plus_12h(self):
+        self.assertEqual(self.floor.azure_login_expiry(self._msal_home([1000, 5000, 3000])), 5000 + 12 * 3600)
+        self.assertIsNone(self.floor.azure_login_expiry(self._msal_home([])))
+        self.assertIsNone(self.floor.azure_login_expiry(os.path.join(self._msal_home([1]), "missing")))
+
+    def test_monitor_warns_once_before_expiry_and_once_when_expired_with_work(self):
+        sent = []
+        monitor = self.floor.PaneRelayMonitor(notify=lambda title, text: sent.append(title))
+        self.assertEqual(monitor.tick(1000, True, azure_expiry=1000 + 7000)["azure_notice"], "expiring")
+        self.assertNotIn("azure_notice", monitor.tick(1100, True, azure_expiry=8000))
+        self.assertEqual(sent, ["fleet-kit Azure login expiring"])
+        self.assertNotIn("azure_notice", monitor.tick(9000, True, azure_expiry=8000, work_waiting=False))
+        self.assertEqual(monitor.tick(9000, True, azure_expiry=8000, work_waiting=True)["azure_notice"], "expired")
+        monitor.tick(9100, True, azure_expiry=8000, work_waiting=True)
+        self.assertEqual(sent, ["fleet-kit Azure login expiring", "fleet-kit Azure login expired"])
+
+    def test_sync_injects_azure_login_notice_into_decisions(self):
+        import time as _t
+        state = self.tmp_path("st") if hasattr(self, "tmp_path") else __import__("tempfile").mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, state, True)
+        for exp, work, expect in ((_t.time() + 3600, False, True), (_t.time() - 5, False, False), (_t.time() - 5, True, True)):
+            ans = {"decisions_file": {"decisions": [{"id": "x", "title": "az login needed"}] if work else []}}
+            with mock.patch.object(self.floor, "switchboard_authority", lambda env=None: "cluster"), \
+                    mock.patch.object(self.floor, "call_switchboard_v1", lambda *a, **k: ans), \
+                    mock.patch.object(self.floor, "azure_login_expiry", lambda home_dir=None: exp):
+                self.floor.sync_cloud_records_to_cluster(state)
+            ids = [d["id"] for d in json.loads(Path(state, "decisions.json").read_text())["decisions"]]
+            self.assertEqual("azure:fleetkit-login" in ids, expect)
+
+    def test_call_switchboard_restarts_tunnel_once_on_connection_failure(self):
+        f, started, calls = self.floor, [], []
+        def request(*a, **k):
+            calls.append(1)
+            if len(calls) == 1: raise f.FloorError("refused")
+            return 200, b"{}"
+        cfg = {"url": "http://127.0.0.1:18080", "auth_file": "x", "authority": "mac"}
+        with mock.patch.object(f, "switchboard_relay_config", lambda env=None: cfg), mock.patch.object(f, "_auth_header", lambda c: "h"), \
+                mock.patch.object(f, "_request", request), mock.patch.object(f, "_start_port_forward", lambda lib: started.append(1)), \
+                mock.patch.object(f, "D", {"_lib": lambda: None, "parse_bounded": json.loads}):
+            f.call_switchboard_v1("/v1/send", {}, sleep_fn=lambda s: None)
+        self.assertEqual(started, [1])
+
+    def test_kube_base_loads_settings_first(self):
+        f, order = self.floor, []
+        lib = types.SimpleNamespace(cluster_token=lambda env, duration: order.append("token") or "t")
+        with mock.patch.object(f, "D", {"use_settings": lambda: order.append("settings")}):
+            f._kube_base(lib)
+        self.assertEqual(order, ["settings", "token"])
+
     def test_class_defaults_to_production_and_background_is_recorded(self):
         self.assertEqual(self.launch("c0")[0], 0)
         self.assertNotIn("priority_class", self.fake.submitted)
