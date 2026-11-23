@@ -42,6 +42,10 @@ rebuilt from another record.
 | `bin/tip_watch.py:218` | `discovery.agents` | the agents of the newest `discover()`, handed to `route_of` to find the lane of the merging pull request | nobody | the tip watch's tell | derived (reader) |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/cloud_floor.py:865` | `discovery.agents` | the pane relay and in-cluster switchboard read the discovered agents | `apply_pane_state_to_discovery` | pane relay and `/v1/pane-state` | derived (reader) |
+| `bin/cloud_floor.py:879` | `registry.json` | synced in `SYNC_STATE_FILES` during `/v1/cloud-sync` | `/v1/cloud-sync` (when not cluster authority) | `sync_cloud_records_to_cluster` | derived (sync mirror) |
+| `bin/cloud_floor.py:879` | `retired.json` | synced in `SYNC_STATE_FILES` during `/v1/cloud-sync` | `/v1/cloud-sync` (when not cluster authority) | `sync_cloud_records_to_cluster` | derived (sync mirror) |
+| `bin/cloud_floor.py:879` | `boss-overrides.json` | synced in `SYNC_STATE_FILES` during `/v1/cloud-sync` | `/v1/cloud-sync` (when not cluster authority) | `sync_cloud_records_to_cluster` | derived (sync mirror) |
+| `bin/cloud_floor.py:1255` | `decisions.json` | mirrors the in-cluster switchboard's `decisions.json` back to the local state dir for the TUI | `sync_cloud_records_to_cluster` and `_wrap_passthrough` | the local Decisions TUI | derived (sync mirror) |
 | `bin/switchboard/job_runs.py:348` | `discovery.agents` | the agents of the newest `discover()`: a dead job's starter is found among them by session and name | nobody | `JobFacts` | derived (reader) |
 | `bin/switchboard/job_runs.py:350` | `boss-resolution` | the starter's boss, by `boss_name` over the discovery | nobody | `JobFacts` | derived (reader) |
 | `bin/switchboard/shadow_classifier.py:32` | `discovery.agents` | the discovered agents, read to find the open asks of the chief of staff for the shadow classifier | nobody | `open_asks_of`, `run_shadow_classifier` | derived (reader) |

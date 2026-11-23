@@ -116,7 +116,7 @@ class Rig:
         if self.in_process(no_whoami):
             done = self.run_in_process(args, stdin, env)
         else:
-            done = subprocess.run([sys.executable, str(self.shims / "gh"), *args], input=stdin, capture_output=True, text=True, env=env, timeout=60)
+            done = subprocess.run([sys.executable, str(self.shims / "gh"), *args], input=stdin, stdin=subprocess.DEVNULL if stdin is None else None, capture_output=True, text=True, env=env, timeout=60)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return done, calls
 
