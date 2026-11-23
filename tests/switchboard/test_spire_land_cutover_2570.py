@@ -54,6 +54,7 @@ class TestSpireLandCutover2570(Base):
         self.assertEqual(nightly.submits[0]["priority_class"], "background")
         self.assertEqual(nightly.submits[0]["env"].get("FLEET_HEAVY"), "off")
         self.assertEqual(nightly.submits[0]["brief"], " && ".join(host.NIGHTLY_SUITES))
+        self.assertIn("export FLEET_HEAVY=off", nightly.submits[0]["brief"])
         self.assertFalse(nightly.submits[0]["brief"].startswith("Nightly"))
         for suite in host.NIGHTLY_SUITES:
             self.assertIn(suite, nightly.submits[0]["brief"])
