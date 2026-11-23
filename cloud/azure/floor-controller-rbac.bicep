@@ -19,7 +19,7 @@ param sandboxGroupNames array = [
   'sbxg-floor-orch-service'
 ]
 
-@description('Blob containers accessed by floor-controller at runtime')
+@description('Blob containers accessed by floor-controller at runtime (floor-f1-fleet, floor-bundles, floor-sessions, floor-artifacts)')
 param blobContainerNames array = [
   'floor-f1-fleet'
   'floor-bundles'
