@@ -172,8 +172,8 @@ class TestLostWorker(unittest.TestCase):
         mod = load()
         real = mod._losses
 
-        def every(state, sb, engine, discovery, now, records):
-            out = real(state, sb, engine, discovery, now, records)
+        def every(state, sb, engine, discovery, now, records, state_dir=None):
+            out = real(state, sb, engine, discovery, now, records, state_dir=state_dir)
             for name, c in state.get("created", {}).items():
                 out.append({"key": "x:%s" % name, "kind": "pod_no_stop", "name": name, "ask": "a", "at": c["at"], "lane": None, "line": "all"})
             return out

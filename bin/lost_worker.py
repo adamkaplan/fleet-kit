@@ -354,7 +354,24 @@ def _ask_of(name, record):
     return name   # the worker's own full name: never stripped, so pods of one prefix are never one ask
 
 
-def _losses(state, sb, engine, alive, now, records):
+def _load_unseen_record(sb, state_dir, name, engine=None):
+    if not state_dir or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", str(name or "")):
+        return {}
+    try:
+        with open(os.path.join(state_dir, "cloud", name + ".json"), "r", encoding="utf-8") as handle:
+            got = sb.parse_bounded(handle.read(65536))
+        return got if isinstance(got, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as err:
+        try:
+            engine.audit.append(engine.actor, "lost_worker.record_unreadable", None, {"worker": name, "error": type(err).__name__})
+        except Exception:
+            pass
+        return {}
+
+
+def _losses(state, sb, engine, alive, now, records, state_dir=None):
     _sanitize(state)
     out = []
     longest = _longest_slow(state, now)
@@ -370,7 +387,10 @@ def _losses(state, sb, engine, alive, now, records):
         newest = max(c["at"], last_active if last_active <= now else 0)   # a sign of life dated after now (clock skew, damaged memory) is no sign: it cannot hold the notice back
         if now - newest <= GRACE and newest > c["at"]:
             continue   # a launcher action or a push within the grace: the pod still answers
-        record = records.get(name, {})
+        if engine_retired(engine, sb, name):
+            state.setdefault("stop", {})[name] = now
+            continue
+        record = records.get(name) or _load_unseen_record(sb, state_dir, name, engine)
         if record.get("backend") == "floor" and (record.get("stopped_audited") or getattr(sb, "floor_session_finished", lambda *a: False)(name, record)):
             state.setdefault("stop", {})[name] = now   # Floor says the session ended: it is no lost pod
             continue
@@ -493,7 +513,7 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
             records[r["worker"]] = r
     alerted = state.setdefault("alerted", {})
     alerted.update({k: v for k, v in _PROC_ALERTED.get(path, {}).items() if k not in alerted})   # what this process already alerted is never skipped or repeated
-    losses = [x for x in _losses(state, sb, engine, alive, now, records) if x["key"] not in alerted]
+    losses = [x for x in _losses(state, sb, engine, alive, now, records, state_dir=state_dir) if x["key"] not in alerted]
     alerted = state.setdefault("alerted", {})   # #2017: _losses cleaned the memory and replaced the table: the marks of this pass go in the live one
     losses.sort(key=lambda x: (x["at"], x["key"]))
     state.pop("_gap_ready", None)

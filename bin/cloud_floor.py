@@ -1356,7 +1356,7 @@ def run_pane_relay_loop(poll_seconds=5.0, max_passes=None, env=None):
                         call_switchboard_v1("/v1/send", {"to": "pane-relay", "text": act["send_canary"], "canary": True}, env=env)
                     if act.get("rollback"):
                         try:
-                            rc = subprocess.run([sys.executable, os.path.join(D["kit_root"](), "tools", "sync-in-cluster-switchboard"), "--rollback"], timeout=120, check=False).returncode
+                            rc = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "sync-in-cluster-switchboard"), "--rollback"], timeout=120, check=False).returncode
                             rc and _warn("rollback sync", rc)
                         finally: rollback_switchboard_authority(state_dir, env=env)
                     if act["restart"]:

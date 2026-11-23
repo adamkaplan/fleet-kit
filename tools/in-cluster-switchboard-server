@@ -758,6 +758,11 @@ def run_pass_loop(sb_mod, cf_mod):
     now = time.time
     config = sb_mod.load_config(CONFIG_DIR / "config.json")
     config["gh"] = real_gh
+    try:
+        STATE_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)
+    except OSError as err:
+        log_line("state_dir_chmod_error", error=str(err)[:160])
     state = sb_mod.ensure_state_dir(STATE_DIR)
     v2 = ShadowV2(SNAPSHOT_FILE, sb_mod)
     herdr = ShadowHerdr(SNAPSHOT_FILE)

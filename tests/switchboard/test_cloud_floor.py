@@ -1614,8 +1614,45 @@ class TestFloorAuthority(FloorCase):
         created = {"w": {"at": 1000, "deadline": 2000, "line": "l"}}
         for record, expect in (({"backend": "floor", "floor_state": "done"}, 0), ({"backend": "floor"}, 1)):
             state = {"created": dict(created)}
-            out = lw._losses(state, mock.Mock(floor_session_finished=lambda n, r: r.get("floor_state") in self.floor.FINISHED_STATES), mock.Mock(), {}, 10 ** 7, {"w": record})
+            out = lw._losses(state, mock.Mock(retired=lambda e, n: False, floor_session_finished=lambda n, r: r.get("floor_state") in self.floor.FINISHED_STATES), mock.Mock(), {}, 10 ** 7, {"w": record})
             self.assertEqual(len(out), expect)
+
+    def test_lost_worker_uses_unseen_record_and_retired_worker(self):
+        import importlib.util
+        import tempfile
+        spec = importlib.util.spec_from_file_location("lost_worker", str(REPO / "bin" / "lost_worker.py"))
+        lw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lw)
+        created = {"widget-api": {"at": 1000, "deadline": 2000, "line": "l"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "cloud"))
+            with open(os.path.join(tmp, "cloud", "widget-api.json"), "w") as handle:
+                json.dump({"backend": "floor", "stopped_audited": True}, handle)
+            sbm = mock.Mock(retired=lambda e, n: False, parse_bounded=json.loads)
+            state = {"created": dict(created)}
+            self.assertEqual(lw._losses(state, sbm, mock.Mock(), {}, 10 ** 7, {}, state_dir=tmp), [])
+            sbm = mock.Mock(retired=lambda e, n: True, parse_bounded=json.loads)
+            state = {"created": dict(created)}
+            self.assertEqual(lw._losses(state, sbm, mock.Mock(), {}, 10 ** 7, {}), [])
+
+    def test_lost_worker_corrupt_record_is_audited(self):
+        import importlib.util
+        import tempfile
+        spec = importlib.util.spec_from_file_location("lost_worker", str(REPO / "bin" / "lost_worker.py"))
+        lw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lw)
+        engine = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "cloud"))
+            with open(os.path.join(tmp, "cloud", "widget-api.json"), "w") as handle:
+                handle.write("{not json")
+            got = lw._load_unseen_record(mock.Mock(parse_bounded=json.loads), tmp, "widget-api", engine)
+        self.assertEqual(got, {})
+        self.assertEqual(engine.audit.append.call_args[0][1], "lost_worker.record_unreadable")
+
+    def test_rollback_sync_tool_resolves_from_module_path(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(self.floor.__file__)))
+        self.assertTrue(os.path.isfile(os.path.join(root, "tools", "sync-in-cluster-switchboard")))
 
     def test_lost_worker_never_flags_a_floor_worker_as_local(self):
         import importlib.util
