@@ -65,6 +65,8 @@ class TestSpireLandCutover2570(Base):
             cf = host._load_floor_transport(str(REPO))
             with self.assertRaises(ValueError):
                 cf.transport()
+        cf = host._load_floor_transport(str(REPO))
+        self.assertEqual(cf.floor_project_id({"CW_FLOOR_PROJECT_ID": "fleetkit"}), "fleetkit")
         stuck = Tp({"state": "running"})
         with self.assertRaises(RuntimeError):
             host.run_floor_nightly(str(REPO), transport=stuck, poll_interval=0, timeout=0)

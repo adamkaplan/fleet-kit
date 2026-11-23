@@ -115,6 +115,7 @@ def _load_floor_transport(root):
         "parse_bounded": json.loads,
         "use_settings": lambda: None,
         "endpoint_problem": cw.endpoint_problem,
+        "valid_name": lambda s: isinstance(s, str) and bool(cf.CALLER_RE.fullmatch(s)),
     }
     spec.loader.exec_module(cf)
     cf.env_of = lambda: dict(_cloud_env_map(), **os.environ)
