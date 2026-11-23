@@ -154,7 +154,7 @@ def submit_cloud_land(root, subcmd, app_id, app_key, transport=None, poll_interv
 
 
 NIGHTLY_SUITES = (
-    "export FLEET_HEAVY=off; export TEST_SWITCHBOARD_WORKERS=2; bin/test-switchboard --shard 1/6 & p1=$!; bin/test-switchboard --shard 2/6 & p2=$!; bin/test-switchboard --shard 3/6 & p3=$!; bin/test-switchboard --shard 4/6 & p4=$!; bin/test-switchboard --shard 5/6 & p5=$!; bin/test-switchboard --shard 6/6 & p6=$!; wait $p1 && wait $p2 && wait $p3 && wait $p4 && wait $p5 && wait $p6",
+    "export FLEET_HEAVY=off; bin/test-switchboard --shard 1/6 && bin/test-switchboard --shard 2/6 && bin/test-switchboard --shard 3/6 && bin/test-switchboard --shard 4/6 && bin/test-switchboard --shard 5/6 && bin/test-switchboard --shard 6/6",
     "bin/test-gh-hold",
     "bin/test-path-suites",
     "bin/test-cloud-neutral-names",
@@ -172,7 +172,7 @@ def run_floor_nightly(root, transport=None, poll_interval=5, timeout=1800):
     cmd_id = cf.launch_key(who, session_id)
     tp.submit(who, cmd_id, session_id=session_id, repo=repo, ref="main",
               brief=" && ".join(NIGHTLY_SUITES),
-              mode="verify-only", env={"FLOOR_WORKFLOW": "verify-only", "FLEET_HEAVY": "off", "TEST_SWITCHBOARD_WORKERS": "2"}, priority_class="background")
+              mode="verify-only", env={"FLOOR_WORKFLOW": "verify-only", "FLEET_HEAVY": "off"}, priority_class="background")
     seen = _wait_floor(tp, who, session_id, poll_interval, timeout)
     print(json.dumps({"session_id": session_id, "repo": repo, "state": seen.get("state"),
                       "manifest": seen.get("manifest"), "error": seen.get("error")}))
