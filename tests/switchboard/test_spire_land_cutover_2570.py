@@ -56,8 +56,8 @@ class TestSpireLandCutover2570(Base):
         self.assertEqual(nightly.submits[0]["brief"], " && ".join(host.NIGHTLY_SUITES))
         self.assertIn("export FLEET_HEAVY=off", nightly.submits[0]["brief"])
         self.assertNotIn("TEST_SWITCHBOARD_WORKERS", nightly.submits[0]["env"])
-        shards = " && ".join(f"bin/test-switchboard --shard {i}/6" for i in range(1, 7))
-        self.assertIn(shards, nightly.submits[0]["brief"])
+        self.assertIn("export FLEET_HEAVY=off; bin/test-switchboard", nightly.submits[0]["brief"])
+        self.assertNotIn("--shard", nightly.submits[0]["brief"])
         self.assertFalse(nightly.submits[0]["brief"].startswith("Nightly"))
         for suite in host.NIGHTLY_SUITES:
             self.assertIn(suite, nightly.submits[0]["brief"])
