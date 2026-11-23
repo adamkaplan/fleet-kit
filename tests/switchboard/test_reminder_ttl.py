@@ -72,4 +72,27 @@ def build(PR4Base):
             code, err = self.arm("platform", "1h", "--ttl", "24h", "--from", "coder", "x")
             self.assertEqual(code, 0, err)
             self.assertEqual(len(sb.read_reminders(self.world.state)), 1)
+        def test_a_reminder_without_ttl_is_dropped_after_24h_with_a_notice(self):
+            item = self.remind(delay=10)
+            sent, engine = [], self.world.engine
+            engine.send = lambda sender, to, text, **kw: sent.append((to, text))
+            self.world.tick(10 + sb.REMINDER_TTL_MAX + 60)
+            self.assertEqual(self.reminder_facts(), [])
+            self.assertEqual(sb.read_reminders(self.world.state), [])
+            (drop,) = self.drops()
+            self.assertEqual(drop["detail"]["ttl"], 86400)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0], "platform")
+            self.assertIn("dropped unsent", sent[0][1])
+            self.assertIn(item["id"], sent[0][1])
+        def test_a_failing_drop_notice_is_audited_and_the_drop_completes(self):
+            self.remind(delay=10)
+            def boom(*a, **k):
+                raise OSError("down")
+            self.world.engine.send = boom
+            self.world.tick(10 + sb.REMINDER_TTL_MAX + 60)
+            self.assertEqual(self.reminder_facts(), [])
+            self.assertEqual(sb.read_reminders(self.world.state), [])
+            self.assertEqual(len(self.drops()), 1)
+            self.assertEqual(len([e for e in self.world.audit() if e["event"] == "reminder.ttl_notice_error"]), 1)
     return TestReminderTtlMore

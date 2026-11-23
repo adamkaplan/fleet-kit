@@ -715,11 +715,15 @@ class ReminderFacts:
         facts = []
         everything = read_reminders(self.state_dir)
         for item in self.due():
-            ttl = item.get("ttl")
-            if _is_number(ttl) and ttl > 0 and (self.engine.now() if self.engine else time.time()) - item["at"] > ttl:
+            raw_ttl, now_ts = item.get("ttl"), (self.engine.now() if self.engine else time.time())
+            ttl = int(raw_ttl) if _is_number(raw_ttl) and raw_ttl > 0 else REMINDER_TTL_MAX
+            if now_ts - item["at"] > ttl:
+                kept = self.superseded(item, everything)
                 if remove_reminders(self.state_dir, {item["id"]}) and self.engine is not None and self.engine.audit is not None:
-                    self.engine.audit.append(self.engine.actor, "reminder.drop_ttl", item["to"],
-                                             {"id": item["id"], "due": iso(item["at"]), "ttl": int(ttl)})
+                    self.engine.audit.append(self.engine.actor, "reminder.drop_ttl", item["to"], {"id": item["id"], "due": iso(item["at"]), "ttl": ttl})
+                    if raw_ttl is None and kept is None and hasattr(self.engine, "send"):
+                        try: self.engine.send("switchboard", item["to"], "Reminder %s (due %s) was dropped unsent after 24h stale: %s" % (item["id"], iso(item["at"]), _clean_line(item["text"])[:200]), issue=item.get("issue"), repo=item.get("repo"))
+                        except Exception as err: self.engine.audit.append(self.engine.actor, "reminder.ttl_notice_error", item["to"], {"id": item["id"], "error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
                 continue
             kept = self.superseded(item, everything)
             if kept is not None and kept.get("condition") and self.verdict(kept) not in ("deliver", None):
@@ -1108,7 +1112,6 @@ def ci_queue_lines(report):
     out.extend("    %s: %s = %d" % (c["kind"], c["what"], c["job_minutes_per_day"]) for c in report["candidates"])
     return out
 
-
 def ci_queue_get(runner, gh, path, timeout):
     """ONE `gh api` GET (no method flag, no field flag: gh sends GET); the JSON object, or None when the call failed. Never prints the output."""
     try:
@@ -1116,7 +1119,6 @@ def ci_queue_get(runner, gh, path, timeout):
         return json.loads(done.stdout) if done.returncode == 0 else None
     except Exception:   # a timeout, a missing gh or a body that is not JSON: the read failed, nothing else is said (never the output: it could carry a credential)
         return None
-
 
 def ci_queue_fetch(runner, gh, repo, since, patterns=(), timeout=60):
     """(runs, jobs_by_run, docs_only run ids) of the repository since `since`: one list call per page and one jobs call per run, GET only."""
@@ -1150,7 +1152,6 @@ def ci_queue_fetch(runner, gh, repo, since, patterns=(), timeout=60):
             docs_only.update(ids)
     return runs, jobs_by_run, docs_only
 
-
 def ci_queue_platform_paths(path):
     """The globs of a macos-platform-paths.txt file (`*` crosses a `/`); [] when the file cannot be read (then no run is a `move` candidate)."""
     try:
@@ -1158,7 +1159,6 @@ def ci_queue_platform_paths(path):
     except (OSError, UnicodeError):
         return []
     return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
-
 
 def ci_queue_workflow_jobs(directory):
     """The job names the workflow files in `directory` give their checks, a literal matrix list (`key: [1, 2]`) expanded one name per value (#2197: a gate
