@@ -151,13 +151,13 @@ class FakeFloor:
         self._artifact()
         work = self._work(work_id)
         return {"state": "cancelled" if work["cancelled"] else "running", "busy": True, "landed_sha": self.landed, "rounds": 2, "messages": list(work["messages"]),
-                "manifest": self.manifest, "log_tail": self.log_tail}
+                "manifest": self.manifest, "log_tail": self.log_tail, "error": getattr(self, "error", None), "findings": getattr(self, "findings", None)}
 
     def result(self, caller, work_id):
         self._fail("result")
         self._artifact()
         self._work(work_id)
-        return {"state": "landed" if self.landed else "running", "landed_sha": self.landed, "manifest": self.manifest, "log_tail": self.log_tail}
+        return {"state": "landed" if self.landed else "running", "landed_sha": self.landed, "manifest": self.manifest, "log_tail": self.log_tail, "error": getattr(self, "error", None), "findings": getattr(self, "findings", None)}
 
 
 class Quiet:
@@ -428,6 +428,24 @@ class TestCloudFloor(FloorCase):
         self.fake.down = False
         self.assertEqual(self.launch("o1")[0], 0)
         self.assertEqual(len(self.fake.works), 1)
+
+    def test_read_shows_untrimmed_failure_and_findings(self):
+        self.launch()
+        long_text = "go-test FAIL " + "line of failure output " * 30 + "END-OF-FINDING"
+        self.fake.error, self.fake.findings = long_text, {"unanswered": ["council finding " * 40 + "TAIL"]}
+        code, out, err = self.read("f1")
+        self.assertEqual(code, 0, err)
+        self.assertIn(long_text, out)
+        self.assertIn("findings: ", out)
+        self.fake.log_tail = "tail " * 300 + "LOGEND"
+        self.fake.error = None
+        self.assertIn("tail " * 300 + "LOGEND", self.read("f1")[1])
+        self.fake.log_tail = None
+        for bad in ("#", "acme/x", "abc"):
+            with mock.patch.dict(os.environ, {"CW_FLOOR_AGENTS_ENABLED": "1"}):
+                with self.assertRaises(self.m.cloud_floor.FloorError):
+                    self.launch(name="o3", agent="orchestrator", role="orchestrator", charter=bad)
+        self.assertIn("council finding " * 40 + "TAIL", out)
 
     def test_an_unreadable_artifact_is_named_and_the_record_is_untouched(self):
         self.launch("a1")
@@ -1329,7 +1347,13 @@ class TestCloudAgents(FloorCase):
             for over in (dict(agent="orchestrator", stack=True), dict(role="research-assistant")):
                 with self.assertRaises(self.sb_refusal()):
                     self.floor.check_floor_admission(self.args("r1", **over), REPO_NAME, "NEEDS: docker\n" if "role" in over else BRIEF, CONFIG)
-            self.launch(name="o1", agent="orchestrator", role="orchestrator")
+            self.launch(name="o1", agent="orchestrator", role="orchestrator", charter=595)
+        self.assertEqual(self.fake.submitted["env"]["FLOOR_CHARTER"], "%s#595" % REPO_NAME)
+        for given, over in (("%s#7" % REPO_NAME, dict(charter="#7")), ("%s#8" % REPO_NAME, dict(charter="%s#8" % REPO_NAME)), ("%s#9" % REPO_NAME, dict(issue=9))):
+            with mock.patch.dict(os.environ, {"CW_FLOOR_AGENTS_ENABLED": "1"}):
+                self.launch(name="o2", agent="orchestrator", role="orchestrator", **over)
+            self.assertEqual(self.fake.submitted["env"]["FLOOR_CHARTER"], given)
+            self.m.cloud_floor.rollback_to_pane(str(self.state), "o2", "1-3", cancel_fn=lambda rec: {"cancelled": True})
         self.assertEqual(self.fake.submitted["mode"], "orchestrator")
         self.assertEqual(self.fake.submitted["env"]["FLOOR_PROFILE"], "orchestrator")
         cancelled = []

@@ -235,11 +235,11 @@ class QueueBlobTransport:
         found = found if isinstance(found, dict) else {}
         blob = self._blob(work_id)
         text = blob.get("text") if isinstance(blob.get("text"), str) else ""
-        return {"manifest": blob.get("manifest"), "log_tail": blob.get("log_tail"), "state": found.get("state", "queued"), "busy": bool(found.get("busy")), "landed_sha": found.get("landed_sha"), "rounds": found.get("rounds", 0),
+        return {"manifest": blob.get("manifest"), "log_tail": blob.get("log_tail"), "findings": blob.get("findings"), "state": found.get("state", "queued"), "busy": bool(found.get("busy")), "landed_sha": found.get("landed_sha"), "rounds": found.get("rounds", 0),
                 "error": found.get("error"), "last_update": found.get("last_update"), "messages": [{"role": "assistant", "text": text}] if text else []}
     def result(self, caller, work_id):
         seen = self.observe(caller, work_id)
-        return {"state": seen["state"], "landed_sha": seen["landed_sha"], "error": seen["error"], "manifest": seen["manifest"], "log_tail": seen["log_tail"]}
+        return {"state": seen["state"], "landed_sha": seen["landed_sha"], "error": seen["error"], "manifest": seen["manifest"], "log_tail": seen["log_tail"], "findings": seen.get("findings")}
 
 def _private_file(setting):
     path = (env_of().get(setting) or "").strip()
@@ -453,8 +453,11 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     extra = {"mode": mode, "env": {"FLOOR_WORKFLOW": mode}} if mode else {}
     if mode in AGENT_MODES:
         extra["env"]["FLOOR_PROFILE"] = mode
-        if mode == "orchestrator" and getattr(args, "charter", None):
-            extra["env"]["FLOOR_CHARTER"] = str(args.charter)   # a verify launch: Floor runs it on the heavy executor, nothing is translated to author commits
+        cval = getattr(args, "charter", None) or getattr(args, "issue", None)
+        if mode == "orchestrator" and cval is not None:
+            cs = str(cval).strip().lstrip("#")
+            if not (cs.isdigit() or re.fullmatch(r"[^/#\s]+/[^/#\s]+#\d+", cs)): raise FloorError("charter must be an issue number or owner/repo#N, not %s" % scrub(cs, 60))
+            extra["env"]["FLOOR_CHARTER"] = cs if "#" in cs else "%s#%s" % (repo, cs)   # a verify launch: Floor runs it on the heavy executor, nothing is translated to author commits
     preview = bool(getattr(args, "preview", False))
     extra.update(**({"priority_class": pclass} if pclass != "production" else {}), **({"preview": True} if preview else {}))
     answer = submit_work(who, launch_key(who, session_id), session_id=session_id, repo=repo, ref=base, branch=branch, title=name,
@@ -547,9 +550,9 @@ def _observe(record):
     who = floor_who()
     return _call(transport().observe, who, record["work_id"])
 
-def _line(message):
-    if not isinstance(message, dict): return scrub(message, 400)
-    return scrub("%s: %s" % (str(message.get("role") or message.get("type") or "?")[:20], message.get("text") or ""), 400)
+def _line(message, limit=4000):
+    if not isinstance(message, dict): return scrub(message, limit)
+    return scrub("%s: %s" % (str(message.get("role") or message.get("type") or "?")[:20], message.get("text") or ""), limit)
 
 def _read_floor(args, record):
     limit = max(1, min(int(args.limit), 200))
@@ -562,11 +565,13 @@ def _read_floor(args, record):
     for message in [m for m in (seen.get("messages") or []) if isinstance(m, dict) or isinstance(m, str)][-limit:]:
         print(_line(message))
     print(scrub("floor: state %s, landed_sha %s" % (done.get("state", seen.get("state")), done.get("landed_sha", seen.get("landed_sha")))))
+    if done.get("error") or seen.get("error"): print(scrub("error: " + str(done.get("error") or seen.get("error")), 4000))
+    if done.get("findings") or seen.get("findings"): print("findings: " + scrub(json.dumps(done.get("findings") or seen.get("findings"), sort_keys=True), 16000))
     manifest = done.get("manifest", seen.get("manifest"))
     if manifest is not None: print(scrub("manifest: " + json.dumps(manifest, sort_keys=True), 2000))
     tail = done.get("log_tail", seen.get("log_tail"))
     tail = tail.splitlines() if isinstance(tail, str) else tail if isinstance(tail, list) else []
-    for line in tail[-40:]: print(scrub("log_tail: " + str(line), 400))
+    for line in tail[-40:]: print(scrub("log_tail: " + str(line), 2000))
     return D["H"]["EXIT_OK"]
 
 def _status_floor(records):
