@@ -85,7 +85,7 @@ class Manifest(unittest.TestCase):
         svc = next(x for x in self.docs if x["kind"] == "Service")
         self.assertEqual(svc["spec"]["type"], "LoadBalancer")
         self.assertEqual(svc["metadata"]["annotations"], {"service.beta.kubernetes.io/azure-load-balancer-internal": "true"})
-        self.assertEqual([(p["port"], p["targetPort"]) for p in svc["spec"]["ports"]], [(8080, 8080)])
+        self.assertEqual([(p["port"], p["targetPort"]) for p in svc["spec"]["ports"]], [(8080, 8080), (443, 8443)])
 
     def test_the_policy_admits_only_the_launchers_worker_label(self):
         label = re.search(r'^LABEL = "([^"]+)"', read("cloud", "launcher", "cloud_worker.py"), re.M).group(1)
@@ -98,7 +98,7 @@ class Manifest(unittest.TestCase):
             {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "cw-floor-kata"}},
              "podSelector": {"matchLabels": {"app": label}}},
         ])
-        self.assertEqual(ing[0]["ports"], [{"protocol": "TCP", "port": 8080}])
+        self.assertEqual(ing[0]["ports"], [{"protocol": "TCP", "port": 8080}, {"protocol": "TCP", "port": 8443}])
         self.assertEqual(np["spec"]["policyTypes"], ["Ingress"])
 
     def test_the_policy_also_admits_the_private_vnet_for_the_internal_load_balancer(self):

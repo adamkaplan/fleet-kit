@@ -6,6 +6,7 @@
 // Usage: tokens, nano_aiu (copilot_usage, see spendOf()) and cost_microdollars per day, model and (X-Floor-Session/Repo/Role) session; no daily cap.
 // The caller's effort is set as BOTH reasoning.effort and reasoning_effort. Log: one count line per request, never a body, an answer, a header or a token.
 import http from "node:http";
+import https from "node:https";
 import fs from "node:fs";
 
 const env = process.env;
@@ -96,7 +97,7 @@ const refused = (id) => {
   return BLOCKED.some((b) => norm.includes(b)) || (ALLOWED.length > 0 && !ALLOWED.includes(norm));
 };
 
-const server = http.createServer((req, res) => {
+const handle = (req, res) => {
   const started = Date.now();
   const day = today();
   const path = (req.url || "").split("?")[0];
@@ -207,9 +208,23 @@ const server = http.createServer((req, res) => {
     up.on("error", () => { if (!res.headersSent) send(res, 502, { error: "the bridge is not reachable" }); finish(502, verdict.model, payload.length); });
     up.end(payload);
   });
-});
+};
+const server = http.createServer(handle);
 server.requestTimeout = 30000;   // the time to RECEIVE a request; the upstream wait has its own 160 s timeout
 server.maxConnections = 64;
 process.on("uncaughtException", () => logLine({ ts: new Date().toISOString(), event: "error" }));   // never the error text: it could hold a body
 server.headersTimeout = 30000;
 server.listen(PORT, HOST, () => logLine({ ts: new Date().toISOString(), event: "listening", port: PORT, cap: MAX_BODY }));
+
+// Optional TLS listener: only when both a certificate and a key file are set and readable.
+if (env.BRIDGE_TLS_CERT_FILE && env.BRIDGE_TLS_KEY_FILE) {
+  try {
+    const tls = https.createServer({ cert: fs.readFileSync(env.BRIDGE_TLS_CERT_FILE), key: fs.readFileSync(env.BRIDGE_TLS_KEY_FILE) }, handle);
+    const TLS_PORT = int(env.BRIDGE_TLS_PORT, 8443);
+    tls.requestTimeout = 30000;
+    tls.headersTimeout = 30000;
+    tls.maxConnections = 64;
+    tls.on("error", (e) => logLine({ ts: new Date().toISOString(), event: "tls_listen_failed", port: TLS_PORT, code: e && e.code }));   // the code only, never the message
+    tls.listen(TLS_PORT, HOST, () => logLine({ ts: new Date().toISOString(), event: "listening", port: TLS_PORT, tls: true }));
+  } catch (e) { logLine({ ts: new Date().toISOString(), event: "tls_unavailable", code: e && e.code }); }   // the error code only, never a path or content
+}

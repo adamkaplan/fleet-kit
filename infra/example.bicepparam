@@ -120,3 +120,6 @@ param budgets = [
   }
 ]
 param legacyVm = {}
+param sandboxVnetSubnetId = ''
+param sandboxVnetConnectionName = 'floor-vnet'
+param privateDns = {}

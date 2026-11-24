@@ -19,6 +19,20 @@ resource vnet 'Microsoft.Network/virtualNetworks@2025-09-01' = if (contains(lega
   dependsOn: [ nsg ]
 }
 
+resource peerings 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2025-09-01' = [for p in (legacyVm.?vnetPeerings ?? []): if (contains(legacyVm, 'vnet')) {
+  parent: vnet
+  name: p.name
+  properties: {
+    allowVirtualNetworkAccess: p.?allowVirtualNetworkAccess ?? true
+    allowForwardedTraffic: p.?allowForwardedTraffic ?? true
+    allowGatewayTransit: p.?allowGatewayTransit ?? false
+    useRemoteGateways: p.?useRemoteGateways ?? false
+    remoteVirtualNetwork: {
+      id: p.remoteVnetId
+    }
+  }
+}]
+
 resource pip 'Microsoft.Network/publicIPAddresses@2025-09-01' = if (contains(legacyVm, 'publicIp')) {
   name: legacyVm.publicIp.name
   location: location

@@ -69,6 +69,12 @@ param vmRoleAssignments array
 
 param budgets array
 param legacyVm object = {}
+@description('Optional subnet resource id to connect all sandboxGroups to via Microsoft.App/sandboxGroups/vnetConnections.')
+param sandboxVnetSubnetId string = ''
+@description('Name of the vnetConnections child resource when sandboxVnetSubnetId is set.')
+param sandboxVnetConnectionName string = 'floor-vnet'
+@description('Optional Private DNS zone configuration: { zoneName, tags?, vnetLinks: [{ name, vnetId, registrationEnabled? }], aRecords: [{ name, ipv4Address, ttl? }] }.')
+param privateDns object = {}
 
 module aks 'modules/aks.bicep' = {
   name: 'aks'
@@ -94,6 +100,8 @@ module sandbox 'modules/sandbox-group.bicep' = {
     sandboxGroupName: sandboxGroupName
     sandboxGroupTags: sandboxGroupTags
     sandboxGroupIdentityIds: sandboxGroupIdentityIds
+    sandboxVnetSubnetId: sandboxVnetSubnetId
+    sandboxVnetConnectionName: sandboxVnetConnectionName
     connectorGatewayName: connectorGatewayName
     connectorGatewayId: connectorGatewayId
     extraSandboxGroups: extraSandboxGroups
@@ -182,3 +190,8 @@ module legacyVmMonitoring 'modules/legacy-vm-monitoring.bicep' = if (!empty(lega
 
 output readerIdentityPrincipalId string = identities.outputs.readerIdentityPrincipalId
 output connectorIdentityId string = identities.outputs.connectorIdentityId
+
+module privateDnsZone 'modules/private-dns.bicep' = if (!empty(privateDns)) {
+  name: 'private-dns'
+  params: { privateDns: privateDns }
+}

@@ -9,6 +9,11 @@ param extraSandboxGroups array = []
 @description('Optional user-assigned identity resource ids attached to the primary sandboxGroupName.')
 param sandboxGroupIdentityIds array = []
 
+@description('Optional subnet resource id to connect all sandboxGroups to via Microsoft.App/sandboxGroups/vnetConnections.')
+param sandboxVnetSubnetId string = ''
+@description('Name of the vnetConnections child resource when sandboxVnetSubnetId is set.')
+param sandboxVnetConnectionName string = 'floor-vnet'
+
 resource sandbox 'Microsoft.App/sandboxGroups@2026-07-01' = {
   name: sandboxGroupName
   location: location
@@ -44,5 +49,21 @@ resource extra 'Microsoft.App/sandboxGroups@2026-07-01' = [for g in extraSandbox
   properties: {
     enableDetailedMetrics: false
     managementEndpoint: 'https://management.${location}.azuredevcompute.io'
+  }
+}]
+
+resource sandboxVnetConn 'Microsoft.App/sandboxGroups/vnetConnections@2026-07-01' = if (!empty(sandboxVnetSubnetId)) {
+  parent: sandbox
+  name: sandboxVnetConnectionName
+  properties: {
+    subnetId: sandboxVnetSubnetId
+  }
+}
+
+resource extraVnetConn 'Microsoft.App/sandboxGroups/vnetConnections@2026-07-01' = [for (g, i) in extraSandboxGroups: if (!empty(g.?vnetSubnetId ?? sandboxVnetSubnetId)) {
+  parent: extra[i]
+  name: g.?vnetConnectionName ?? sandboxVnetConnectionName
+  properties: {
+    subnetId: g.?vnetSubnetId ?? sandboxVnetSubnetId
   }
 }]

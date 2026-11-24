@@ -16,6 +16,9 @@ TYPES = [
     "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials",
     "Microsoft.Authorization/roleAssignments", "Microsoft.Consumption/budgets",
     "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules",
+    "Microsoft.App/sandboxGroups/vnetConnections", "Microsoft.Network/privateDnsZones",
+    "Microsoft.Network/privateDnsZones/virtualNetworkLinks", "Microsoft.Network/privateDnsZones/A",
+    "Microsoft.Network/virtualNetworks/virtualNetworkPeerings",
 ]
 
 
@@ -101,6 +104,13 @@ class TestPerProfile(unittest.TestCase):
         self.assertIn("extraSandboxGroups", sbx)
         self.assertIn("output readerIdentityPrincipalId string", main)
         self.assertIn("output readerIdentityPrincipalId string", ids)
+        self.assertEqual(missing_params(main, slurp(os.path.join(INFRA, "example.bicepparam"))), [])
+
+    def test_vnet_and_private_dns(self):
+        main, sbx = (slurp(os.path.join(INFRA, n)) for n in ("main.bicep", "modules/sandbox-group.bicep"))
+        self.assertIn("param sandboxVnetSubnetId string = ''", main)
+        self.assertIn("sandboxVnetSubnetId", sbx)
+        self.assertIn("param privateDns object = {}", main)
         self.assertEqual(missing_params(main, slurp(os.path.join(INFRA, "example.bicepparam"))), [])
 
     def test_connector_identity(self):
