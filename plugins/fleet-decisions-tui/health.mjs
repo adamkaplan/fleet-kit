@@ -109,9 +109,12 @@ export function workerBlocks(inputs, now) {
     const name = clean(x.name, 40)
     if (!name) continue
     const at = isNum(x.started_at) ? x.started_at : null
+    // Guard for floor-live.json rows written before the writer (brief_summary in bin/cloud_floor.py) kept header lines out.
+    const rawSum = clean(x.summary, 120)
+    const summary = /^ISSUE\s*:/i.test(rawSum) ? "" : rawSum
     out.push({
       kind: "worker", name, repo: clean(x.repo, 60), issue: isNum(x.issue) ? x.issue : null, branch: clean(x.branch, 60), state: clean(x.state, 12) || "running",
-      rounds: isNum(x.rounds) ? x.rounds : 1, elapsed: at === null ? null : Math.max(0, Math.floor(now / 1000 - at)), summary: clean(x.summary, 120),
+      rounds: isNum(x.rounds) ? x.rounds : 1, elapsed: at === null ? null : Math.max(0, Math.floor(now / 1000 - at)), summary,
     })
   }
   return out.sort((a, b) => a.name.localeCompare(b.name))

@@ -308,6 +308,22 @@ class TestCloudFloor(FloorCase):
         with mock.patch.object(self.floor, "call_switchboard_v1", return_value=None):
             self.assertEqual(self.floor.push_pane_state({}, env={}, now=1), [])
 
+    def test_brief_summary_takes_the_task_line_and_skips_header_lines(self):
+        brief = "ISSUE: https://example.com/acme-org/widget-service/issues/2\nREPO: acme-org/widget-service\nBRANCH: b\nPLAN: p\nCHECKPOINT: c\nTASK: Fix the widget cache\n"
+        self.assertEqual(self.floor.brief_summary(brief, "fb"), "Fix the widget cache")
+        self.assertEqual(self.floor.brief_summary("ISSUE: x\nREPO: y\nAdd a retry", "fb"), "Add a retry")
+        self.assertEqual(self.floor.brief_summary("ISSUE: x", "widget-branch"), "widget-branch")
+
+    def test_watch_sync_never_keeps_an_issue_header_as_the_summary(self):
+        class T:
+            works = {"w-1": {"state": "running"}}
+        self.floor.TRANSPORT = T()
+        rec = {"worker": "a", "backend": "floor", "work_id": "w-1", "summary": "ISSUE: https://example.com/i/1", "branch": "widget-branch"}
+        with mock.patch.object(self.m, "save_record", lambda *a: None):
+            self.floor.floor_watch_sync(self.state, [rec], mock.Mock(audit=mock.Mock(), actor="sw"))
+        body = json.loads((Path(str(self.state)) / "floor-live.json").read_text())
+        self.assertEqual([r["summary"] for r in body["sessions"]], ["widget-branch"])
+
     def test_a_stayed_name_that_is_missing_matches_nothing(self):
         self.assertIs(self.floor._stayed_name("Refusal"), self.floor.D["Refusal"])
         self.assertEqual(self.floor._stayed_name("NoSuchName"), ())

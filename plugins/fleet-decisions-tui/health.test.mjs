@@ -67,6 +67,12 @@ test("a worker without a summary is one line; a long summary is cut to the width
   assert.equal(workerLines({ ...w, summary: "" }, 30).length, 1)
 })
 
+test("a worker whose summary is an ISSUE header line shows no summary", () => {
+  const [w] = workerBlocks({ floor: { sessions: [{ name: "w-1-x", repo: "acme/api", issue: 1, state: "running", summary: "ISSUE: https://example.com/acme/api/issues/1" }] } }, NOW)
+  assert.equal(w.summary, "")
+  assert.equal(workerLines(w, 60).length, 1)
+})
+
 test("nothing to show draws nothing, and no legend or workspace text is drawn", () => {
   assert.deepEqual(healthRows({}, NOW, 40), [])
   const rows = all(healthRows({ floor, pane, decisions }, NOW, 60)).join("\n")

@@ -97,6 +97,23 @@ def scrub(text, limit=200):
     text = re.sub(r"\b(?![0-9a-f]{40}\b|[0-9a-f]{64}\b)[A-Za-z0-9_+/=-]{40,}\b", "<hidden>", text)
     return " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text).split())[:limit]
 
+BRIEF_SKIP_HEADER = re.compile(
+    r"^\s*(?:CANONICAL\s+ISSUE|ISSUE|REPO|BRANCH|BASE|WORKTREE|PLAN|CHECKPOINT|OVERDUE|ASK|DONE(?:\s+WHEN)?|ACCEPTANCE|STOP|NEXT|AUTH|AUTHORITY|VERIFY|NEEDS|ROLE|AGENT|REPORTS[_-]TO|FILES)\s*:",
+    re.I,
+)
+BRIEF_TASK_HEADER = re.compile(r"^(?:GOAL|TASK|INTENT|SUMMARY|OBJECTIVE|SCOPE)\s*:\s*(.*)$", re.I)
+
+def brief_summary(brief, fallback=""):
+    raw = [l for l in str(brief or "").splitlines() if l.strip()]
+    for line in raw[:15]:
+        if not line[:1].isspace():
+            m = BRIEF_TASK_HEADER.match(line)
+            if m and m.group(1).strip(): return scrub(m.group(1).strip(), 120)
+    for line in raw:
+        s = line.strip()
+        if not (BRIEF_SKIP_HEADER.match(s) or BRIEF_TASK_HEADER.match(s) or s.startswith("#")): return scrub(s, 120)
+    return scrub(fallback or "", 120)
+
 def _matches(entry, repo):
     entry, repo = entry.strip().lower(), repo.lower()
     if entry == "*": return True
@@ -473,7 +490,7 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     record = {"worker": name, "backend": "floor", "session": session_id, "work_id": work_id, "runtime_id": "floor/" + session_id, "url": ENDPOINT_URL,
               "seq": 1, "repo": repo, "branch": branch, "base": base, "agent": args.agent, **({"mode": mode} if mode else {}), "priority_class": pclass, **({"preview": True} if preview else {}),
               "idle_deadline": _stamp(_seconds(getattr(args, "idle", None), 3600), stamp), "hard_deadline": _stamp(_seconds(getattr(args, "hard", None), 8 * 3600), stamp),
-              "started_at": int(stamp), "summary": scrub((brief or "").strip().splitlines()[0] if (brief or "").strip() else name, 120),
+              "started_at": int(stamp), "summary": brief_summary(brief, name),
               **({"stopped_audited": True} if mode in AGENT_MODES else {})}
     if getattr(args, "reports_to", None): record.update(reports_to=args.reports_to)
     if isinstance(getattr(args, "shape", None), str) and args.shape: record["shape"] = args.shape
@@ -1556,7 +1573,7 @@ def floor_watch_sync(state_dir, records, engine=None):
                 "agent": record.get("agent"), "state": s_state or record.get("floor_state") or "running",
                 "busy": bool(found.get("busy", True)), "rounds": found["rounds"] if isinstance(found.get("rounds"), int) else 1,
                 "started_at": found.get("started_at") or record.get("started_at"),
-                "summary": scrub(found.get("title") or record.get("summary") or record.get("branch") or "", 120),
+                "summary": brief_summary(found.get("title") or record.get("summary"), record.get("branch") or ""),
             })
             continue
         if getattr(engine, "audit", None) and not record.get("stopped_audited"):
