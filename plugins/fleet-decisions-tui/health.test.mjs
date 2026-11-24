@@ -4,7 +4,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { blockLines, caretakerBlocks, workerBlocks, workerLines, healthRows, loadInputs, concernsHealth, FLOOR_LIVE_FILE } from "./health.mjs"
+import { abbrevRepo, blockLines, caretakerBlocks, workerBlocks, workerLines, healthRows, loadInputs, concernsHealth, FLOOR_LIVE_FILE } from "./health.mjs"
 import "./alarm.test.mjs" // the owner-alarm panel tests run with this file (CI names health.test.mjs)
 
 const NOW = Date.UTC(2026, 9, 14, 12, 30, 0)
@@ -53,7 +53,9 @@ test("Active Cloud Workers: one or two lines, finished workers excluded", () => 
   const rows = all(healthRows({ floor }, NOW, 60))
   const at = rows.indexOf("Active Cloud Workers (1)")
   assert.ok(at >= 0)
-  assert.equal(rows[at + 1], "● api-42-auth acme/api#42 running r1 4m")
+  assert.equal(rows[at + 1], "● api-42-auth ap#42 running r1 4m")
+  assert.equal(abbrevRepo("acme/widget-service"), "wi-se")
+  assert.equal(abbrevRepo("org/alpha-beta"), "al-be")
   assert.equal(rows[at + 2], "  Fix the auth flow")
   assert.ok(!rows.some((r) => r.includes("api-43") || r.includes("api-44")))
   assert.ok(!rows.includes("Active Cloud Workers (0)"))

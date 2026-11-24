@@ -120,7 +120,11 @@ export function workerBlocks(inputs, now) {
   return out.sort((a, b) => a.name.localeCompare(b.name))
 }
 
-const target = (repo, issue) => (repo ? repo + (issue !== null && issue !== undefined ? `#${issue}` : "") : "")
+export function abbrevRepo(repo) {
+  const r = String(repo || "").split("/").pop() || ""
+  return r ? r.split(/[-_]+/).filter(Boolean).map((w) => w.slice(0, 2)).join("-") : ""
+}
+const target = (repo, issue) => (repo ? abbrevRepo(repo) + (issue !== null && issue !== undefined ? `#${issue}` : "") : "")
 export function elapsedText(sec) {
   if (sec === null) return ""
   return sec < 60 ? `${sec}s` : sec < 3600 ? `${Math.floor(sec / 60)}m` : `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`
