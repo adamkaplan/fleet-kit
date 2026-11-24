@@ -155,7 +155,7 @@ const server = http.createServer((req, res) => {
     if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.model !== "string" || !Array.isArray(body.messages)) {
       return answer(400, { error: "the body needs a string model and a messages array" });
     }
-    const model = body.model.trim();
+    const model = body.model.trim().split("/").pop().trim();
     if (!model) return answer(400, { error: "the body needs a string model and a messages array" });
     const verdict = { model };
     const row = dayRow(day);

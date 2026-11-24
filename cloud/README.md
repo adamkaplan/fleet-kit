@@ -802,8 +802,8 @@ dependency by integrity and the image installs with `npm ci --ignore-scripts --o
 `github_token` (mode 0600) under the data directory and prints a token only with `--show-token`, which is never passed. It has no bind option and listens on
 every interface by default; its HTTP server reads the `HOST` variable, so the entrypoint sets `HOST=127.0.0.1` for it. The policy front
 (`cloud/copilot-bridge/bridge-front.mjs`, Node standard library only) is the only listener a pod can reach: it forwards `POST /chat/completions` and
-`POST /v1/chat/completions`, forwards `GET /models` and `GET /v1/models` to the bridge's model list, answers `GET /usage`, and answers 404 to anything else.
-It refuses a body over `BRIDGE_MAX_BODY` (400000 bytes). The requested model passes through unchanged (an optional `<provider>/` prefix is kept).
+`POST /v1/chat/completions`, forwards `GET /models` and `GET /v1/models` to the bridge's model list, answers `GET /usage`, and answers 404 to anything else. `bridge-front.mjs` strips a leading `<provider>/` prefix from `model` before the policy check and forwarding.
+It refuses a body over `BRIDGE_MAX_BODY` (400000 bytes). List entries (`BRIDGE_ALLOWED_MODELS`, `BRIDGE_BLOCKED_MODELS`) are matched against the stripped name, so write them without a prefix.
 `BRIDGE_BLOCKED_MODELS` (comma-separated substrings, case-insensitive, default `opus`) and `BRIDGE_ALLOWED_MODELS` (comma-separated names; when set, any other model is refused)
 refuse with 403 and `model banned from the council: opus`. Streaming (`text/event-stream`) answers are piped straight through. There is no bridge-enforced
 daily credit cap (Copilot's own quota is the only limit). The front logs one count line per request (with session, repo, role and token counters): never a body, an answer, a header or a token.

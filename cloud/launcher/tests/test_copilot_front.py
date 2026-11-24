@@ -164,7 +164,7 @@ class ModelPolicy(Base):
             self.assertEqual(status, 200, text)
             self.assertIn(ANSWER, text)
         got = [(s["body"]["model"], s["body"].get("reasoning", {}).get("effort"), s["body"].get("reasoning_effort")) for s in self.fake.seen]
-        self.assertEqual(got, [("anthropic/claude-sonnet-5.5", "high", "high"), ("gpt-4o", None, None), ("claude-haiku-5.5", "low", "low")])
+        self.assertEqual(got, [("claude-sonnet-5.5", "high", "high"), ("gpt-4o", None, None), ("claude-haiku-5.5", "low", "low")])
         for banned in ("anthropic/claude-opus-5.5", "Claude-OPUS-5", "OPUS"):
             status, text = f.request("POST", "/v1/chat/completions", chat(banned, "low"))
             self.assertEqual(status, 403)
@@ -185,6 +185,9 @@ class ModelPolicy(Base):
             self.assertEqual(status, 403)
             self.assertEqual(json.loads(text)["error"], BANNED)
         self.assertEqual(len(self.fake.seen), 1)
+        status, _ = f.request("POST", "/chat/completions", chat("anthropic/gpt-4o"))   # prefix stripped before the list check
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.seen[-1]["body"]["model"], "gpt-4o")
 
     def test_haiku_without_effort_and_odd_bodies(self):
         f = self.run_front()
