@@ -55,6 +55,7 @@ resource extra 'Microsoft.App/sandboxGroups@2026-07-01' = [for g in extraSandbox
 resource sandboxVnetConn 'Microsoft.App/sandboxGroups/vnetConnections@2026-07-01' = if (!empty(sandboxVnetSubnetId)) {
   parent: sandbox
   name: sandboxVnetConnectionName
+  location: location
   properties: {
     subnetId: sandboxVnetSubnetId
   }
@@ -63,6 +64,7 @@ resource sandboxVnetConn 'Microsoft.App/sandboxGroups/vnetConnections@2026-07-01
 resource extraVnetConn 'Microsoft.App/sandboxGroups/vnetConnections@2026-07-01' = [for (g, i) in extraSandboxGroups: if (!empty(g.?vnetSubnetId ?? sandboxVnetSubnetId)) {
   parent: extra[i]
   name: g.?vnetConnectionName ?? sandboxVnetConnectionName
+  location: location
   properties: {
     subnetId: g.?vnetSubnetId ?? sandboxVnetSubnetId
   }

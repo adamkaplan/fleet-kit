@@ -106,9 +106,7 @@ module sandbox 'modules/sandbox-group.bicep' = {
     connectorGatewayId: connectorGatewayId
     extraSandboxGroups: extraSandboxGroups
   }
-  dependsOn: [
-    identities
-  ]
+  dependsOn: [ identities, legacyVmMonitoring ]
 }
 
 module acr 'modules/acr.bicep' = {

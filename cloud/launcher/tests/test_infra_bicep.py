@@ -110,6 +110,10 @@ class TestPerProfile(unittest.TestCase):
         main, sbx = (slurp(os.path.join(INFRA, n)) for n in ("main.bicep", "modules/sandbox-group.bicep"))
         self.assertIn("param sandboxVnetSubnetId string = ''", main)
         self.assertIn("sandboxVnetSubnetId", sbx)
+        blocks = [b for b in re.split(r"(?m)^resource ", sbx) if "vnetConnections@" in b.split("\n", 1)[0]]
+        self.assertTrue(blocks)
+        for b in blocks:
+            self.assertRegex(b, r"(?m)^  location: location$")
         self.assertIn("param privateDns object = {}", main)
         self.assertEqual(missing_params(main, slurp(os.path.join(INFRA, "example.bicepparam"))), [])
 
@@ -121,7 +125,7 @@ class TestPerProfile(unittest.TestCase):
         self.assertIn("output connectorIdentityId string", main)
         self.assertIn("output connectorIdentityId string", ids)
         self.assertIn("g.?identityIds", sbx)
-        self.assertRegex(main, r"module sandbox 'modules/sandbox-group\.bicep' = \{[\s\S]*?dependsOn:\s*\[\s*identities\s*\]")
+        self.assertRegex(main, r"module sandbox 'modules/sandbox-group\.bicep' = \{[\s\S]*?dependsOn:\s*\[\s*identities\s*,\s*legacyVmMonitoring\s*\]")
         self.assertIn("g.?identityId ", sbx)
 
     def test_acr_cache_rules(self):
