@@ -1,0 +1,4 @@
+{
+ "command": "acp",
+ "help": "usage: fleet-switchboard acp [-h] name [acp_args ...] positional arguments: name The Caretaker or Floor agent's fleet name acp_args Extra arguments forwarded to floor-acp options: -h, --help show this help message and exit"
+}

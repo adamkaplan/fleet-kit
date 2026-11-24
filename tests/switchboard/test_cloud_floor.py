@@ -1043,6 +1043,25 @@ class TestCloudAgents(FloorCase):
     def sb_refusal(self):
         return self.m.D["Refusal"] if "D" in vars(self.m) else self.floor.D["Refusal"]
 
+    def test_acp_resolves_session_and_execs_floor_acp(self):
+        args = types.SimpleNamespace(name="care-taker", acp_args=["--flag"])
+        record = {"backend": "floor", "session": "ses_care1", "work_id": "ses_care1"}
+        with mock.patch.dict(os.environ, {"FLOOR_ACP_BIN": "/custom/floor-acp"}), mock.patch.object(self.m, "route", lambda name: record), \
+                mock.patch("os.execvp") as run:
+            self.floor._acp_floor(args, None, None)
+        run.assert_called_once_with("/custom/floor-acp", ["/custom/floor-acp", "--session", "ses_care1", "--flag"])
+        (self.state / "registry.json").write_text(json.dumps({"agents": {"care-taker": {"kind": "cloud", "session": "ses_reg2"}}}))
+        args.acp_args = []
+        env = {k: v for k, v in os.environ.items() if k != "FLOOR_ACP_BIN"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(self.m, "route", lambda name: None), mock.patch("os.execvp") as run:
+            self.floor._acp_floor(args, None, None)
+        run.assert_called_once_with("floor-acp", ["floor-acp", "--session", "ses_reg2"])
+        with mock.patch.object(self.m, "route", lambda name: None), mock.patch("os.execvp") as run:
+            with self.assertRaises(self.floor.D["H"]["LaunchError"]) as caught:
+                self.floor._acp_floor(types.SimpleNamespace(name="unknown-agent", acp_args=[]), None, None)
+        self.assertIn("unknown-agent has no Floor session record", str(caught.exception))
+        run.assert_not_called()
+
     def test_floor_controller_rbac_is_narrow(self):
         text = (REPO / "cloud/azure/floor-controller-rbac.bicep").read_text()
         for var in ("acrPullRoleId", "storageBlobDelegatorRoleId", "sandboxGroupDataOwnerRoleId", "kvSecretsUserRoleId"):

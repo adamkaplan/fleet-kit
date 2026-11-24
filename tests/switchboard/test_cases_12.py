@@ -1439,7 +1439,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
     def test_help_order_is_the_registration_order_and_the_docs_say_so(self):
         _, choices = self.commands()
         registered = [n for n in choices if n not in ("status", "run", "send", "report", "notice", "ensure", "poke", "launch", "pending", "remind", "whoami", "comment", "handoff", "version")]
-        self.assertEqual(registered[0], "agents")
+        self.assertEqual(registered[0], "acp")
         self.assertIn("alphabetical by function name", (REPO / "docs" / "switchboard.md").read_text())
 
 

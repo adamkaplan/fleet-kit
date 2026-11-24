@@ -334,3 +334,14 @@ def add_talk_parsers(sub):
     talk.add_argument("text", nargs="*", help="The message or ruling for the Caretaker")
     talk.add_argument("--issue", help="The charter or issue reference (owner/repo#N or #N)")
     talk.add_argument("--ruling", help="Checkable ruling statement (reading, what it leaves out, what would change it)")
+
+
+def cmd_acp(args, runner, now):
+    """`acp <name> [acp_args ...]`: resolve a Floor agent's session id and exec `floor-acp --session <sid>`."""
+    return cmd_pins.__globals__["run_cloud"]("_acp_floor", args, runner, now)
+
+
+def add_acp_parsers(sub):
+    acp = sub.add_parser("acp", help="Start an ACP stdio bridge for a Floor Caretaker or agent session")
+    acp.add_argument("name", help="The Caretaker or Floor agent's fleet name")
+    acp.add_argument("acp_args", nargs="*", help="Extra arguments forwarded to floor-acp")

@@ -632,6 +632,26 @@ def _talk_floor(args, runner, now):
     print("%s: talk recorded" % args.name)
     return H["EXIT_OK"]
 
+def _acp_floor(args, runner, now):
+    H, LaunchError = D["H"], D["H"]["LaunchError"]
+    record = D["route"](args.name) if D["valid_name"](getattr(args, "name", None)) else None
+    sid = record.get("session") if is_floor(record) else None
+    if not sid:
+        try:
+            with open(os.path.join(str(H["state_dir_path"]()), "registry.json"), encoding="utf-8") as handle:
+                row = ((D["parse_bounded"](handle.read()).get("agents") or {}) if D["valid_name"](getattr(args, "name", None)) else {}).get(args.name)
+            sid = row.get("session") if isinstance(row, dict) and row.get("kind") == "cloud" else None
+        except (OSError, ValueError):
+            sid = None
+    if not isinstance(sid, str) or not sid.startswith("ses_"):
+        raise LaunchError("%s has no Floor session record" % getattr(args, "name", "?"))
+    bin_path = (env_of().get("FLOOR_ACP_BIN") or "floor-acp").strip() or "floor-acp"
+    argv = [bin_path, "--session", sid] + list(getattr(args, "acp_args", None) or [])
+    try:
+        os.execvp(bin_path, argv)
+    except OSError as err:
+        raise LaunchError("cannot exec %s for %s (%s): %s" % (bin_path, args.name, sid, scrub(err, 80))) from None
+
 def _act_floor(op, args, runner, now):
     H, LaunchError = D["H"], D["H"]["LaunchError"]
     record = D["route"](args.name) if D["valid_name"](getattr(args, "name", None)) else None
