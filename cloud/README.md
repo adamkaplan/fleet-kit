@@ -796,26 +796,30 @@ launcher's allowed list and one role, and answers with GitHub's own token, repos
 
 ## The Copilot bridge (ask #2341)
 
-A council model endpoint for the worker pods, built from the open-source bridge `copilot-api` 0.7.0 (npm tarball sha1
+A harness-agnostic OpenAI-compatible metering proxy for the worker pods, built from the open-source bridge `copilot-api` 0.7.0 (npm tarball sha1
 `cdc6b4973c8c014f90c3df8fdbe1e9f5c4d00b9d`, tag commit `36847c22741f2b397ecb29a001105085fe14b545`; `cloud/copilot-bridge/package-lock.json` pins every
 dependency by integrity and the image installs with `npm ci --ignore-scripts --omit=dev`). The bridge keeps the owner's GitHub token in a file
 `github_token` (mode 0600) under the data directory and prints a token only with `--show-token`, which is never passed. It has no bind option and listens on
 every interface by default; its HTTP server reads the `HOST` variable, so the entrypoint sets `HOST=127.0.0.1` for it. The policy front
 (`cloud/copilot-bridge/bridge-front.mjs`, Node standard library only) is the only listener a pod can reach: it forwards `POST /chat/completions` and
-`POST /v1/chat/completions` only, answers `GET /usage`, refuses a body over `BRIDGE_MAX_BODY` (400000 bytes), refuses an id containing `opus` (any case) with
-403 and `model banned from the council: opus`, maps every non-`opus` model to `claude-haiku-5.5` with the caller's effort (council default `low`),
-has no bridge-enforced daily credit cap (`BRIDGE_DAILY_CREDITS` is removed; Copilot's own quota is the only limit), and logs one count line per request: never a body, an answer, a header or a token.
-Spend is the GitHub AI Credit (one credit is one cent, per GitHub's usage-based billing since 1 June 2026): each answer's
-`copilot_usage.total_nano_aiu` (billionths; one AIU is treated as one credit), else the sum of `token_count * cost_per_batch / batch_size` over
-`token_details`, else `BRIDGE_FALLBACK_CREDITS` (default 1) and one `unpriced` log line. `GET /usage` shows per
-day and per model the credits (four decimals), requests and refused counts. The owner checks the first day against the billing usage export.
-The bridge forwards the whole body to Copilot unchanged, so the front sets both `reasoning.effort` and `reasoning_effort`.
+`POST /v1/chat/completions`, forwards `GET /models` and `GET /v1/models` to the bridge's model list, answers `GET /usage`, and answers 404 to anything else.
+It refuses a body over `BRIDGE_MAX_BODY` (400000 bytes). The requested model passes through unchanged (an optional `<provider>/` prefix is kept).
+`BRIDGE_BLOCKED_MODELS` (comma-separated substrings, case-insensitive, default `opus`) and `BRIDGE_ALLOWED_MODELS` (comma-separated names; when set, any other model is refused)
+refuse with 403 and `model banned from the council: opus`. Streaming (`text/event-stream`) answers are piped straight through. There is no bridge-enforced
+daily credit cap (Copilot's own quota is the only limit). The front logs one count line per request (with session, repo, role and token counters): never a body, an answer, a header or a token.
+Metering reads both non-streaming JSON answers and streaming `data:` chunks: `prompt_tokens`, `completion_tokens`, `cached_tokens`, `nano_aiu`
+(`copilot_usage.total_nano_aiu`, else the sum of `token_count * cost_per_batch / batch_size` over `token_details`) and `cost_microdollars`.
+Credits (one credit is one cent) are `nano_aiu`, else `cost_microdollars`, else `BRIDGE_FALLBACK_CREDITS` (default 1) and one `unpriced` log line.
+The safe request headers `X-Floor-Session`, `X-Floor-Repo` and `X-Floor-Role` (`[A-Za-z0-9._:/#-]`, up to 128 characters; otherwise `-`) attribute usage:
+`GET /usage` shows per day, per model and per session/repo/role/model the credits, requests, refused count and these counters.
+The Service `copilot-bridge` is an Azure internal LoadBalancer (`service.beta.kubernetes.io/azure-load-balancer-internal: "true"`, no public IP), and the
+NetworkPolicy admits the private VNet range `10.0.0.0/8` on port 8080 besides the worker pods. The front sets both `reasoning.effort` and `reasoning_effort`.
 
 The owner's steps (nothing here is applied by the repository):
 
 1. Create the Secret from the vault: `kubectl -n cw create secret generic copilot-github-token --from-file=github_token=<the file>` (the key is `github_token`).
 2. Build and push the image from `cloud/copilot-bridge/`, and put its digest in place of `IMAGE_PLACEHOLDER` in `cloud/k8s/copilot-bridge.yaml`.
-3. Apply `cloud/k8s/copilot-bridge.yaml` (Deployment, Service `copilot-bridge`, NetworkPolicy admitting only pods labelled `app=cw-worker`, from its own namespace and from the `cw-floor-kata` namespace).
+3. Apply `cloud/k8s/copilot-bridge.yaml` (Deployment, Service `copilot-bridge`, NetworkPolicy admitting pods labelled `app=cw-worker` from its own namespace and from the `cw-floor-kata` namespace, plus the private VNet range `10.0.0.0/8` for the internal LoadBalancer).
 4. Set `CW_COUNCIL_URL=http://copilot-bridge.cw.svc:8080` in the launcher's settings file: a worker pod then carries `COUNCIL_MODEL_URL` with that value and no key.
 Rollback: unset the setting, delete the Deployment (`kubectl -n cw delete deployment,service,networkpolicy -l app.kubernetes.io/part-of=copilot-bridge`), revoke the sign-in at GitHub.
 

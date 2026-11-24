@@ -1,4 +1,4 @@
-# The Copilot bridge (ask #2341): one Deployment (1 replica: copilot-api 0.7.0 on the loopback plus the policy front), a ClusterIP Service
+# The Copilot bridge (ask #2341): one Deployment (1 replica: copilot-api 0.7.0 on the loopback plus the policy front), an internal-LoadBalancer Service
 # (the front's port only) and a NetworkPolicy that admits only worker pods (app=cw-worker) from its own namespace and from the cw-floor-kata namespace. Image: cloud/copilot-bridge/Dockerfile.
 # NO Secret value is here. The owner's steps are in cloud/README.md ("The Copilot bridge"): create the Secret copilot-github-token (key
 # github_token) from the vault, build and push the image, replace IMAGE_PLACEHOLDER with name@sha256:..., apply this file, set CW_COUNCIL_URL.
@@ -144,10 +144,13 @@
     "labels": {
       "app": "copilot-bridge",
       "app.kubernetes.io/part-of": "copilot-bridge"
+    },
+    "annotations": {
+      "service.beta.kubernetes.io/azure-load-balancer-internal": "true"
     }
   },
   "spec": {
-    "type": "ClusterIP",
+    "type": "LoadBalancer",
     "selector": {
       "app": "copilot-bridge"
     },
@@ -202,6 +205,11 @@
               "matchLabels": {
                 "app": "cw-worker"
               }
+            }
+          },
+          {
+            "ipBlock": {
+              "cidr": "10.0.0.0/8"
             }
           }
         ],

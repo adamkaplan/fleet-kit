@@ -30,16 +30,43 @@ class Fake:
     def __init__(self):
         self.seen = []
         self.usage = None   # the copilot_usage block of every answer; None: no block
+        self.usage_tokens = None   # a usage block (tokens) of every answer; None: none
+        self.cost = None   # a cost_microdollars value of every answer; None: none
+        self.stream_chunks = None   # when a list of dicts and the request asks to stream: these are sent as SSE "data:" chunks
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 n = int(self.headers.get("content-length") or 0)
                 outer.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": json.loads(self.rfile.read(n))})
+                if outer.stream_chunks is not None and outer.seen[-1]["body"].get("stream"):
+                    out = "".join("data: %s\n\n" % json.dumps(c) for c in outer.stream_chunks) + "data: [DONE]\n\n"
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                    self.end_headers()
+                    self.wfile.write(out.encode())
+                    return
                 ans = {"choices": [{"message": {"role": "assistant", "content": ANSWER}}]}
                 if outer.usage is not None:
                     ans["copilot_usage"] = outer.usage
+                if outer.usage_tokens is not None:
+                    ans["usage"] = outer.usage_tokens
+                if outer.cost is not None:
+                    ans["cost_microdollars"] = outer.cost
                 out = json.dumps(ans).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def do_GET(self):
+                outer.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": None})
+                if self.path != "/v1/models":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                out = json.dumps({"object": "list", "data": [{"id": "claude-haiku-5.5"}, {"id": "claude-sonnet-5.5"}]}).encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(out)))
@@ -137,7 +164,7 @@ class ModelPolicy(Base):
             self.assertEqual(status, 200, text)
             self.assertIn(ANSWER, text)
         got = [(s["body"]["model"], s["body"].get("reasoning", {}).get("effort"), s["body"].get("reasoning_effort")) for s in self.fake.seen]
-        self.assertEqual(got, [("claude-haiku-5.5", "high", "high"), ("claude-haiku-5.5", None, None), ("claude-haiku-5.5", "low", "low")])
+        self.assertEqual(got, [("anthropic/claude-sonnet-5.5", "high", "high"), ("gpt-4o", None, None), ("claude-haiku-5.5", "low", "low")])
         for banned in ("anthropic/claude-opus-5.5", "Claude-OPUS-5", "OPUS"):
             status, text = f.request("POST", "/v1/chat/completions", chat(banned, "low"))
             self.assertEqual(status, 403)
@@ -149,6 +176,15 @@ class ModelPolicy(Base):
             self.assertNotIn("authorization", s["headers"])
             self.assertEqual(s["body"]["messages"], [{"role": "user", "content": "hello"}])
             self.assertEqual(s["body"]["stream"], False)
+
+    def test_allow_and_block_lists(self):
+        f = self.run_front(BRIDGE_ALLOWED_MODELS="gpt-4o, claude-haiku-5.5", BRIDGE_BLOCKED_MODELS="haiku")
+        self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o"))[0], 200)
+        for m in ("claude-sonnet-5.5", "claude-haiku-5.5", "claude-opus-5"):
+            status, text = f.request("POST", "/chat/completions", chat(m))
+            self.assertEqual(status, 403)
+            self.assertEqual(json.loads(text)["error"], BANNED)
+        self.assertEqual(len(self.fake.seen), 1)
 
     def test_haiku_without_effort_and_odd_bodies(self):
         f = self.run_front()
@@ -162,7 +198,13 @@ class ModelPolicy(Base):
 class Paths(Base):
     def test_s3_refused_paths_and_cap(self):
         f = self.run_front(BRIDGE_MAX_BODY=1000)
-        self.assertEqual(f.request("GET", "/models")[0], 404)
+        status, text = f.request("GET", "/models")
+        self.assertEqual(status, 200)
+        self.assertIn("claude-sonnet-5.5", text)
+        self.assertEqual(f.request("GET", "/v1/models")[0], 200)
+        self.assertEqual(f.request("GET", "/other")[0], 404)
+        self.assertEqual([s["path"] for s in self.fake.seen], ["/v1/models", "/v1/models"])
+        self.fake.seen.clear()
         self.assertEqual(f.request("POST", "/embeddings", chat("gpt-4o"))[0], 404)
         self.assertEqual(f.request("GET", "/chat/completions")[0], 404)
         self.assertEqual(f.request("POST", "/chat/completions", chat("gpt-4o", text="x" * 2000))[0], 413)
@@ -173,7 +215,7 @@ class Paths(Base):
         usage = json.loads(text)
         day = usage["day"]
         self.assertEqual(usage["days"][day]["requests"], 1)
-        self.assertEqual(list(usage["days"][day]["models"]), ["claude-haiku-5.5"])
+        self.assertEqual(list(usage["days"][day]["models"]), ["gpt-4o"])
         for s in (ANSWER, "hello", "messages", "xxxx"):
             self.assertNotIn(s, text)
 
@@ -233,7 +275,7 @@ class Budget(Base):
         day = usage["days"]["2026-11-10"]
         self.assertNotIn("budget", day)
         self.assertEqual((day["credits"], day["requests"], day["refused"]), (0.0296, 4, 0))
-        self.assertEqual(day["models"], {"claude-haiku-5.5": {"requests": 4, "credits": 0.0296}})
+        self.assertEqual((day["models"]["gpt-4o"]["requests"], day["models"]["gpt-4o"]["credits"], day["nano_aiu"]), (4, 0.0296, 29600000))
         with open(clock, "w") as fh:
             fh.write("2026-11-11")
         self.assertEqual(post(f)[0], 200)
@@ -258,6 +300,49 @@ class Budget(Base):
         f.wait_for_counts(1)
         self.assertEqual(json.loads(f.request("GET", "/usage")[1])["days"]["2026-11-10"]["credits"], 2)
         self.assertEqual(sum('"unpriced"' in l for l in f.lines), 1)
+
+
+class Metering(Base):
+    HEADERS = {"X-Floor-Session": "ses_example1", "X-Floor-Repo": "acme-org/widget-service", "X-Floor-Role": "author"}
+
+    def test_streaming_is_piped_and_the_final_chunk_is_metered_per_session(self):
+        self.fake.stream_chunks = [
+            {"choices": [{"delta": {"content": ANSWER}}]},
+            {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 3}},
+             "copilot_usage": {"total_nano_aiu": 5000000}, "cost_microdollars": 42}]
+        f, _ = clock_front(self)
+        b = chat("gpt-4o")
+        b["stream"] = True
+        b["stream_options"] = {"include_usage": True}
+        c = http.client.HTTPConnection("127.0.0.1", f.port, timeout=20)
+        c.request("POST", "/chat/completions", json.dumps(b), dict(self.HEADERS, **{"Authorization": "Bearer " + TOKEN}))
+        r = c.getresponse()
+        text = r.read().decode()
+        c.close()
+        self.assertEqual(r.getheader("content-type"), "text/event-stream")
+        self.assertIn(ANSWER, text)
+        self.assertEqual(self.fake.seen[0]["body"]["stream_options"], {"include_usage": True})
+        f.wait_for_counts(1)
+        day = json.loads(f.request("GET", "/usage")[1])["days"]["2026-11-10"]
+        self.assertEqual((day["prompt_tokens"], day["completion_tokens"], day["cached_tokens"], day["nano_aiu"], day["cost_microdollars"]), (11, 5, 3, 5000000, 42))
+        self.assertEqual(day["credits"], 0.005)
+        sess = day["sessions"]["ses_example1|acme-org/widget-service|author|gpt-4o"]
+        self.assertEqual((sess["session"], sess["repo"], sess["role"], sess["model"], sess["requests"], sess["prompt_tokens"]), ("ses_example1", "acme-org/widget-service", "author", "gpt-4o", 1, 11))
+        log = "".join(f.lines)
+        self.assertIn('"session":"ses_example1"', log)
+        self.assertNotIn(TOKEN, log)
+
+    def test_json_usage_and_cost_without_copilot_usage(self):
+        self.fake.usage_tokens = {"input_tokens": 7, "output_tokens": 2}
+        self.fake.cost = 1500
+        f, _ = clock_front(self)
+        f.request("POST", "/chat/completions", chat("gpt-4o"), {"X-Floor-Role": "bad value!"})
+        f.wait_for_counts(1)
+        day = json.loads(f.request("GET", "/usage")[1])["days"]["2026-11-10"]
+        self.assertEqual((day["prompt_tokens"], day["completion_tokens"], day["cost_microdollars"], day["nano_aiu"]), (7, 2, 1500, 0))
+        self.assertEqual(day["credits"], 0.0015)
+        self.assertEqual(day["sessions"], {})   # an unsafe header value is "-": no attribution
+        self.assertNotIn("unpriced", "".join(f.lines))
 
 
 def count_budget_problems(script, test):
