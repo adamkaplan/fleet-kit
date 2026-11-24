@@ -472,7 +472,9 @@ def launch_floor(args, runner, now, reserve, repo, branch, inner):
     stamp = now()
     record = {"worker": name, "backend": "floor", "session": session_id, "work_id": work_id, "runtime_id": "floor/" + session_id, "url": ENDPOINT_URL,
               "seq": 1, "repo": repo, "branch": branch, "base": base, "agent": args.agent, **({"mode": mode} if mode else {}), "priority_class": pclass, **({"preview": True} if preview else {}),
-              "idle_deadline": _stamp(_seconds(getattr(args, "idle", None), 3600), stamp), "hard_deadline": _stamp(_seconds(getattr(args, "hard", None), 8 * 3600), stamp)}
+              "idle_deadline": _stamp(_seconds(getattr(args, "idle", None), 3600), stamp), "hard_deadline": _stamp(_seconds(getattr(args, "hard", None), 8 * 3600), stamp),
+              "started_at": int(stamp), "summary": scrub((brief or "").strip().splitlines()[0] if (brief or "").strip() else name, 120),
+              **({"stopped_audited": True} if mode in AGENT_MODES else {})}
     if getattr(args, "reports_to", None): record.update(reports_to=args.reports_to)
     if isinstance(getattr(args, "shape", None), str) and args.shape: record["shape"] = args.shape
     issue = getattr(args, "issue", None)
@@ -1281,6 +1283,14 @@ def _write_decisions(state_dir, df):
     try: _write_private(os.path.join(str(state_dir), "decisions.json"), json.dumps(df, indent=2))
     except OSError as err: _warn("decisions.json sync", err)
 
+def _write_floor_live(state_dir, body):
+    try: _write_private(os.path.join(str(state_dir), "floor-live.json"), json.dumps(body, indent=2))
+    except OSError as err: _warn("floor-live.json sync", err)
+
+def _mirror_floor_live(state_dir, ans):
+    if isinstance(ans, dict) and isinstance(ans.get("floor_live"), dict):
+        _write_floor_live(state_dir, ans["floor_live"])
+
 def sync_cloud_records_to_cluster(state_dir, env=None):
     """Push the Mac's cloud records (and, while not cluster authority, reminders) to the cluster."""
     def read(path):
@@ -1295,6 +1305,7 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
         ans = call_switchboard_v1("/v1/cloud-sync", {"mirror_only": True}, env=env)
         if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict):
             _write_decisions(state_dir, ans["decisions_file"])
+        _mirror_floor_live(state_dir, ans)
         return {"synced": 0}
     records, reminders = {}, None
     cloud = os.path.join(str(state_dir), "cloud")
@@ -1317,6 +1328,7 @@ def sync_cloud_records_to_cluster(state_dir, env=None):
     ans = call_switchboard_v1("/v1/cloud-sync", payload, env=env)
     if isinstance(ans, dict) and isinstance(ans.get("decisions_file"), dict) and switchboard_authority(env) == "cluster":
         _write_decisions(state_dir, ans["decisions_file"])
+        _mirror_floor_live(state_dir, ans)   # only the cluster's copy is mirrored; here this machine's own floor_watch_sync owns the file
     return {"synced": len(records)}
 
 def _healthy(url="http://127.0.0.1:%d/healthz" % PANE_RELAY_PORT):
@@ -1515,6 +1527,7 @@ def floor_watch_sync(state_dir, records, engine=None):
     except (OSError, ValueError):
         woken = {}
     known = set()
+    live_rows = []
     for record in list(records):
         if not isinstance(record, dict) or record.get("backend") != "floor":
             continue
@@ -1534,6 +1547,17 @@ def floor_watch_sync(state_dir, records, engine=None):
         record["landed_sha"] = found.get("landed_sha")
         record["floor_error"] = found.get("error")
         if s_state not in FINISHED_STATES:
+            if record.get("mode") in AGENT_MODES or record.get("agent") in NOT_AUTHORS:
+                record["stopped_audited"] = True
+            live_rows.append({
+                "name": record.get("worker"), "session": record.get("session"), "repo": record.get("repo"),
+                "issue": record.get("issue"), "branch": record.get("branch"),
+                "mode": record.get("mode") or ("orchestrator" if record.get("agent") in NOT_AUTHORS else "author"),
+                "agent": record.get("agent"), "state": s_state or record.get("floor_state") or "running",
+                "busy": bool(found.get("busy", True)), "rounds": found["rounds"] if isinstance(found.get("rounds"), int) else 1,
+                "started_at": found.get("started_at") or record.get("started_at"),
+                "summary": scrub(found.get("title") or record.get("summary") or record.get("branch") or "", 120),
+            })
             continue
         if getattr(engine, "audit", None) and not record.get("stopped_audited"):
             try:
@@ -1563,6 +1587,7 @@ def floor_watch_sync(state_dir, records, engine=None):
                     try: _write_private(wakes_path, json.dumps(woken, sort_keys=True))
                     except OSError: pass
                     print("floor_watch_sync: terminal wake for %s failed (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
+    _write_floor_live(state_dir, {"sessions": live_rows})
     for work_id, found in sessions.items():
         name, repo = found.get("worker") or found.get("title"), found.get("repo")
         if work_id in known or not name or not repo or any(isinstance(r, dict) and r.get("worker") == name for r in records):

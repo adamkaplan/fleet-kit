@@ -1104,6 +1104,12 @@ def main():
                 dfile = STATE_DIR / "decisions.json"
                 if dfile.is_file():
                     out["decisions_file"] = json.loads(dfile.read_text(encoding="utf-8"))
+                lfile = STATE_DIR / "floor-live.json"
+                if lfile.is_file():
+                    try:
+                        out["floor_live"] = json.loads(lfile.read_text(encoding="utf-8"))
+                    except ValueError as err:
+                        print("floor-live.json is unreadable (%s)" % type(err).__name__, file=sys.stderr)
                 return self._send(200, out)
             if path == "/v1/cloud-record":
                 if self._auth_error() is not None:

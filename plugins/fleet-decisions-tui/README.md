@@ -68,35 +68,13 @@ a terminal wide enough to show it.
 
 A `MERGE: captain` PR row is linked and named like an issue row: it links to its pull request (built from its repo and number with the same checks as an issue link) and shows the short ref `repo#N` (the repo's full name when another repo shares the short one), never the internal key `pr:org/repo#N`, so its age stays on the line.
 
-## The workspace health block (ask #357)
+## The Caretakers and Active Cloud Workers block
 
-Above the Decisions rows, one dense block per workspace that has an orchestrator (or the Chief of Staff), hottest first, two lines each:
+Above the Decisions rows, two compact sections, one or two lines per entry:
 
-```
-●! alpha     work ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁≈
-▁▂▃▅▂▇▄█ q6 s3 d1 c2/3 p2 ctx45%
-```
-
-- **Line 1:** a state dot and word, `!` when the load alert (#348) is on for it, the name, and the tool calls per minute over 15 minutes as a sparkline
-  (`≈`: approximate, permission evaluations). State words: `work`, `idle`, `wait` (a decision waits on the owner), `dead`, `?` when it cannot be told.
-  An attached pane is `work` or `idle` from the tool calls when they are recorded, else from the load record (coders busy, or asks moved this hour).
-- **Line 2:** asks moved per hour so far today (UTC; `·` is an hour with no record), then `q` open asks, `s` stalled over 2 h, `d` decisions waiting on it,
-  `c` coders busy/total, `p` pushes this hour, `ctx` context use. A figure whose source is missing, unreadable or too old reads `not recorded`.
-  A line is cut at 34 characters, so a row with several missing figures shows the first ones. The Chief of Staff has no load row: its row carries its state word
-  (`wait` while anything waits on the owner) and `dN waiting on you`, the open owner-tier decisions.
-- **Legend:** four dim lines under the heading name `q s d c p ctx moved` and the state words.
-- **Activity series:** tool calls from the `fleet-hooks` counter where it has the workspace's sessions (`≈`), else steps ended per minute from the step
-  events the daemon already receives (`≈steps`: no plugin, no restart of any session). With neither the row says why: `no calls in 15 min` (the counter runs and has no row: the counter drops a quiet session's row), or
-  `restart for counter` when the load record shows a coder working in that workspace yet the counter has no row and no step was seen (the session predates the counter). `ctx no step seen yet` means the usage source is on but that session has not ended a step
-  since the daemon started. `cN/M` counts a workspace's coders without the retired and those that made their final `done`/`failed` report.
-- **Why a figure is absent:** `tool calls: plugin not installed` (no `tool-rate.json`: the installed `fleet-hooks` copy predates the counter; the kit's
-  own install step, which copies `plugins/fleet-hooks`, puts it in the profile; this block only reads) or `plugin not running` (the file is stale);
-  `ctx` under `v2_light`: usage comes from the `session.step.ended` events the daemon already receives (their token and cost figures; no read of history), and reads `ctx: off: v2_light` only while no event has carried figures; `p 0` for a repository whose forwarder is running (`github-watch.json`) with no push in the
-  hour, `p not recorded` only for one with no running forwarder. `health-records.json` carries these as `sources` and `pushes_watched`.
-- **Sources (all read from the state directory; nothing polled, nothing spawned):** `health-records.json` (bin/health_records.py: tool calls, tokens, context,
-  pushes), `load.json` (the load alert's figures and today's hourly series), `pane-health.json` (which agents sit in which workspace, and whether the pane
-  is alive) and `decisions.json` (what waits on the person). Hottest = alert, then stalled asks, open asks, recent tool calls.
-- **The producers are separate changes:** `bin/health_records.py` (#373) and the load alert's `load.json` (#348) land on their own; until they do, the figures they carry read `not recorded`.
-- **Not drawn:** a workspace with no orchestrator; the whole block when none of those files can be read. `FLEET_SWITCHBOARD_HEALTH=off` hides it.
-  A fault while drawing it draws nothing: the Decisions never depend on it. It is a separate file (`health.mjs`) that the installer copies with the other two.
-- Tests: `node --test plugins/fleet-decisions-tui/health.test.mjs`.
+- **Caretakers:** `● name repo · mode work|sleep rN`, then `qN open · dN waiting` when known. Read from the live Floor sessions
+  (`floor-live.json`) and the pane agents (`pane-health.json`); a pane agent found dead is not drawn. The state word comes before the repo so a cut line keeps it. A Caretaker whose activity no source records says `state unknown`.
+- **Active Cloud Workers (n):** `● name repo#issue state rN elapsed`, then its one-line summary. Finished workers are not drawn.
+- **Sources (all read from the state directory; nothing polled, nothing started):** `floor-live.json` (kept by the Floor sync and mirrored from the cluster),
+  `pane-health.json`, `load.json` (open asks), `decisions.json` (what waits on the person) and `owner-alarm.json`. A missing, unreadable or stale file is a missing source.
+- **Not drawn:** a section with no entries; the whole block when none of those files can be read. `FLEET_SWITCHBOARD_HEALTH=off` hides it.

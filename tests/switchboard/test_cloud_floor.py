@@ -1735,6 +1735,40 @@ class TestFloorAuthority(FloorCase):
         self.assertEqual(reasons, [("done", 0), ("failed", 1)])
         self.assertIn("widget-api", [r["worker"] for r in records])
 
+    def test_watch_sync_writes_only_live_sessions_to_floor_live(self):
+        class T:
+            works = {"w-1": {"state": "done"}, "w-2": {"state": "running", "title": "Fix the auth flow", "busy": True},
+                     "w-3": {"state": "running", "busy": False, "rounds": 3}}
+        self.floor.TRANSPORT = T()
+        records = [{"worker": "done-one", "backend": "floor", "work_id": "w-1"},
+                   {"worker": "widget-api-1-auth", "backend": "floor", "work_id": "w-2", "repo": "acme-org/widget-service", "issue": 1, "agent": "coder", "mode": "author"},
+                   {"worker": "widget-care", "backend": "floor", "work_id": "w-3", "repo": "acme-org/widget-service", "agent": "caretaker", "mode": "caretaker"}]
+        with mock.patch.object(self.m, "save_record", lambda *a: None):
+            self.floor.floor_watch_sync(self.state, records, None)
+        body = json.loads((Path(str(self.state)) / "floor-live.json").read_text())
+        names = sorted(r["name"] for r in body["sessions"])
+        self.assertEqual(names, ["widget-api-1-auth", "widget-care"])
+        self.assertTrue(records[2].get("stopped_audited"))
+        self.assertFalse(records[1].get("stopped_audited"))
+
+    def test_arm_cloud_checkpoints_skips_a_caretaker_without_a_checkpoint(self):
+        from types import SimpleNamespace
+        import switchboard.checkpoint_reminders as cr
+        args = SimpleNamespace(role="caretaker", agent="caretaker", checkpoint=None, overdue=None, brief_text="hold the line")
+        with mock.patch.object(cr, "build_engine", side_effect=RuntimeError("reached")) as built:
+            self.assertEqual(cr.arm_cloud_checkpoints(args, None, lambda: 0), cr.EXIT_OK)
+            self.assertFalse(built.called)   # the skip returns before any engine is built
+
+    def test_arm_cloud_checkpoints_still_arms_a_caretaker_with_a_checkpoint(self):
+        from types import SimpleNamespace
+        import switchboard.checkpoint_reminders as cr
+        args = SimpleNamespace(role="caretaker", agent="caretaker", checkpoint="25m", overdue=None, brief_text="x")
+        with mock.patch.object(cr, "build_engine", side_effect=RuntimeError("reached")):
+            cr.arm_cloud_checkpoints(args, None, lambda: 0)   # never raises; build_engine was reached, so it did not skip
+        with mock.patch.object(cr, "build_engine", side_effect=RuntimeError("reached")) as built:
+            cr.arm_cloud_checkpoints(args, None, lambda: 0)
+            self.assertTrue(built.called)
+
     def test_watch_sync_sends_one_terminal_wake_to_the_boss(self):
         class T:
             works = {"w-1": {"state": "done", "landed_sha": "abc123"}, "w-2": {"state": "failed", "error": "build broke"}}

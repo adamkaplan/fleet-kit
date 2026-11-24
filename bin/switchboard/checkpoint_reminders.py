@@ -124,6 +124,10 @@ CLOUD_DEFAULT_CHECKPOINT = ("25m", "40m")   # #1790: a cloud launch with no CHEC
 def arm_cloud_checkpoints(args, runner, now):
     """#1790: after a cloud launch that succeeded, what a local launch arms (set_checkpoint_reminders), else the default 25m/40m.
     One line on stderr; never raises and always returns EXIT_OK: the pod already exists."""
+    if (getattr(args, "role", None) in ("orchestrator", "caretaker") or getattr(args, "agent", None) in ("orchestrator", "caretaker")) \
+            and getattr(args, "checkpoint", None) is None and getattr(args, "overdue", None) is None \
+            and parse_checkpoint(getattr(args, "brief_text", None)) is None:
+        return EXIT_OK
     try:
         engine, state, _ = build_engine(runner, now, "cli")
         boss = args.reports_to
