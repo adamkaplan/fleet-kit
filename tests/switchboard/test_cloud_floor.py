@@ -301,6 +301,46 @@ def _sp_run(cmd):
 
 class TestCloudFloor(FloorCase):
 
+    def _clear(self, healthy, pids, pf):
+        f, killed = self.floor, []
+        with mock.patch.object(f, "_warn", lambda *a: None):
+            try:
+                out = f.clear_stale_port_forward(healthy_fn=lambda: healthy, pids_fn=lambda port: pids, is_pf_fn=lambda pid: pf,
+                                                 kill_fn=lambda pid, sig: killed.append(pid), sleep_fn=lambda s: None)
+            except f.FloorError as err:
+                return killed, err
+        return killed, out
+
+    def test_listener_lookup_and_port_forward_gate_use_real_parsing(self):
+        f = self.floor
+        out = lambda text: (lambda *a, **k: types.SimpleNamespace(stdout=text))
+        self.assertEqual(f._listener_pids(18080, runner=out("12\n34\n")), [12, 34])
+        self.assertEqual(f._listener_pids(18080, runner=out("")), [])
+        def missing(*a, **k): raise FileNotFoundError("lsof")
+        with self.assertRaises(f.FloorError): f._listener_pids(18080, runner=missing)
+        with self.assertRaises(f.FloorError): f._is_port_forward(1, runner=missing)
+        self.assertTrue(f._is_port_forward(1, 18080, runner=out("/usr/bin/kubectl -n cw port-forward pod/x 18080:8080\n")))
+        self.assertFalse(f._is_port_forward(1, 18080, runner=out("/usr/bin/kubectl port-forward pod/x 19000:8080\n")))
+        self.assertFalse(f._is_port_forward(1, 18080, runner=out("python3 -m http.server 18080\n")))
+        self.assertFalse(f._is_port_forward(1, 18080, runner=out("")))
+
+    def test_stale_port_forward_cleanup(self):
+        self.assertEqual(self._clear(True, [42], True), ([], []))
+        self.assertEqual(self._clear(False, [42], True), ([42], [42]))
+        killed, err = self._clear(False, [42], False)
+        self.assertEqual(killed, [])
+        self.assertIsInstance(err, self.floor.FloorError)
+        self.assertEqual(self._clear(False, [], False), ([], []))
+
+    def test_start_port_forward_clears_before_spawning(self):
+        f, order = self.floor, []
+        with mock.patch.object(f, "clear_stale_port_forward", lambda: order.append("clear")), \
+                mock.patch.object(f, "_kube_base", lambda lib: ["kubectl"]), \
+                mock.patch.object(f.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout='{"items":[{"metadata":{"name":"fleet-switchboard-1"},"status":{"phase":"Running"}}]}')), \
+                mock.patch.object(f.subprocess, "Popen", lambda *a, **k: order.append("spawn")):
+            f._start_port_forward(None)
+        self.assertEqual(order, ["clear", "spawn"])
+
     def test_the_relay_is_off_without_a_url_and_push_pane_state_reads_commands(self):
         self.assertIsNone(self.floor.relay_cli_if_configured("send", {"to": "a"}, env={}))
         with mock.patch.object(self.floor, "call_switchboard_v1", return_value={"commands": [{"action": "resume", "agent": "w"}]}):

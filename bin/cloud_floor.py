@@ -1379,7 +1379,24 @@ def remediate_wedged_kata_nodes(base_cmd, runner=subprocess.run, notify_fn=None)
         done.append(name)
     return done
 
+def _out(cmd, what, runner):
+    try: return runner(cmd, capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError) as err: raise FloorError("cannot %s (%s is needed to clear a stale port-forward): %s" % (what, cmd[0], err)) from None
+def _listener_pids(port=PANE_RELAY_PORT, runner=subprocess.run):
+    return [int(x) for x in _out(["lsof", "-nP", "-t", "-iTCP:%d" % port, "-sTCP:LISTEN"], "look up port %d" % port, runner).split() if x.isdigit()]
+def _is_port_forward(pid, port=PANE_RELAY_PORT, runner=subprocess.run):
+    return bool(argv := _out(["ps", "-o", "command=", "-p", str(pid)], "read pid %d" % pid, runner).split()) and os.path.basename(argv[0]) == "kubectl" and "port-forward" in argv and any(a.startswith("%d:" % port) for a in argv)
+def clear_stale_port_forward(port=PANE_RELAY_PORT, healthy_fn=None, pids_fn=None, is_pf_fn=None, kill_fn=os.kill, sleep_fn=time.sleep):  # healthz fails: kill an orphaned kubectl port-forward on the port, refuse any other listener
+    pids = [] if (healthy_fn or _healthy)() else (pids_fn or _listener_pids)(port)
+    for pid in pids:
+        if not (is_pf_fn or (lambda p: _is_port_forward(p, port)))(pid): raise FloorError("port %d is held by pid %d, not a kubectl port-forward; not killing it" % (port, pid))
+    for pid in pids:
+        try: kill_fn(pid, signal.SIGTERM); _warn("killed stale kubectl port-forward", "pid %d on port %d" % (pid, port)); sleep_fn(1)
+        except ProcessLookupError: pass  # it exited on its own between the lookup and the kill
+    return pids
+
 def _start_port_forward(lib):
+    clear_stale_port_forward()
     base = _kube_base(lib) + ["-n", os.environ.get("CW_CLOUD_NAMESPACE") or "cw"]
     pods = json.loads(subprocess.run(base + ["get", "pods", "-o", "json"], capture_output=True, text=True, timeout=60, check=True).stdout)
     for item in pods.get("items", []):
