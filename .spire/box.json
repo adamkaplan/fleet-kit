@@ -1,0 +1,11 @@
+{
+  "box": 1,
+  "rewriteFlags": ["--fix", "--write"],
+  "setup": [
+    {
+      "name": "eslint-fix",
+      "when": "files=$( { git diff --name-only HEAD --diff-filter=d && git ls-files --others --exclude-standard; } ) || exit 2; printf '%s\\n' \"$files\" | grep -Eq '\\.(js|jsx|mjs|cjs|ts|tsx)$'",
+      "run": "{ git diff --name-only HEAD --diff-filter=d; git ls-files --others --exclude-standard; } | grep -E '\\.(js|jsx|mjs|cjs|ts|tsx)$' | xargs npx --no-install eslint --fix"
+    }
+  ]
+}

@@ -18,7 +18,8 @@
         "shims/**",
         "tests/**",
         "tools/**",
-        "docs/guard-set.json"
+        "docs/guard-set.json",
+        ".spire/box.json"
       ],
       "exclude": [
         "**/*.md"
@@ -31,6 +32,10 @@
             "-c",
             "export FLEET_HEAVY=off; export PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"; python3 bin/check-public-names && git log --format=%B {base}..HEAD | python3 bin/check-public-names --stdin commit-messages"
           ]
+        },
+        {
+          "id": "box-json",
+          "cmd": ["python3", "tools/box_precheck.py"]
         },
         {
           "id": "size-and-role-ceilings",
