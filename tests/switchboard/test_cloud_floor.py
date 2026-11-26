@@ -1367,6 +1367,14 @@ class TestCloudAgents(FloorCase):
             self.assertEqual(ctx.exception.status, 401)
         self.assertEqual(self.call("GET", "/v1/pane-outbox", header="x")[0], 401)
 
+    def test_auth_session_shapes(self):
+        for ok in ("ses_0123456789abcdef", "ct-x-p3ok"):
+            self.assertTrue(self.floor.SESSION_RE.fullmatch(ok), ok)
+        for bad in ("ct-", "CT-x", "ses_ABC", "ses_abc1", "../x", "ct-x/../y", "ses_"):
+            self.assertIsNone(self.floor.SESSION_RE.fullmatch(bad), bad)
+        auth = self.floor.verify_switchboard_auth(self.HEADER.replace("ses_0123456789abcdef", "ct-x-p3ok"), self.SECRET)
+        self.assertEqual(auth["session"], "ct-x-p3ok")
+
     def test_intent_and_decisions_are_recorded_and_listed(self):
         state = {}
         code, out = self.call("POST", "/v1/intent", {"action": "set", "issue": "acme-org/widget-service#2", "text": "ship it", "from": "service-ops"}, state=state)

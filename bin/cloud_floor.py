@@ -702,7 +702,7 @@ def rollback_to_pane(state, name, pane_id, cancel_fn=None):
         if isinstance(answer, dict) and answer.get("reserved"): return {"worker": name, "pane": pane_id, "rolled_back": False}
         D["remove_record"](state, name)
     return {"worker": name, "pane": pane_id, "rolled_back": True}
-SESSION_RE = re.compile(r"ses_[0-9a-f]{16}")
+SESSION_RE = re.compile(r"ses_[0-9a-f]{16}|ct-[a-z0-9-]+")  # ses_+16 hex = session_key; ct-<slug> = Caretaker /v1/report, a deliberate second shape owned here (hook-event checks stay ses_-only)
 CHARTER_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+")
 REPORT_STATES = ("done", "failed", "blocked", "question", "working")
 
