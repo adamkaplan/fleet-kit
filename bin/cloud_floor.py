@@ -1533,6 +1533,13 @@ def _stayed_name(name):
 
 def _one_line_text(err):
     return " ".join(str(err).split())[:160]
+def _not_author(mode, agent): return mode in AGENT_MODES or agent in NOT_AUTHORS
+def _live_row(record, found, state):
+    g, r = found.get, record.get
+    return {"name": r("worker"), "session": r("session"), "repo": r("repo"), "issue": r("issue") or g("issue"), "branch": r("branch") or g("branch"),
+            "mode": r("mode") or ("orchestrator" if r("agent") in NOT_AUTHORS else "author"), "agent": r("agent") or g("agent"),
+            "state": state or r("floor_state") or "running", "busy": bool(g("busy", True)), "rounds": g("rounds") if isinstance(g("rounds"), int) else 1,
+            "started_at": g("started_at") or r("started_at"), "summary": brief_summary(g("title") or r("summary"), r("branch") or g("branch") or "")}
 def floor_watch_sync(state_dir, records, engine=None):
     """Read the Floor controller's sessions (the source of truth for backend=floor): audit `cloud.stopped` once for a finished session and add a virtual record for a session no local file holds. Never raises: an offline pass is not broken by it."""
     try:
@@ -1581,17 +1588,8 @@ def floor_watch_sync(state_dir, records, engine=None):
         record["landed_sha"] = found.get("landed_sha")
         record["floor_error"] = found.get("error")
         if s_state not in FINISHED_STATES:
-            if record.get("mode") in AGENT_MODES or record.get("agent") in NOT_AUTHORS:
-                record["stopped_audited"] = True
-            live_rows.append({
-                "name": record.get("worker"), "session": record.get("session"), "repo": record.get("repo"),
-                "issue": record.get("issue"), "branch": record.get("branch"),
-                "mode": record.get("mode") or ("orchestrator" if record.get("agent") in NOT_AUTHORS else "author"),
-                "agent": record.get("agent"), "state": s_state or record.get("floor_state") or "running",
-                "busy": bool(found.get("busy", True)), "rounds": found["rounds"] if isinstance(found.get("rounds"), int) else 1,
-                "started_at": found.get("started_at") or record.get("started_at"),
-                "summary": brief_summary(found.get("title") or record.get("summary"), record.get("branch") or ""),
-            })
+            if _not_author(record.get("mode"), record.get("agent")): record["stopped_audited"] = True
+            live_rows.append(_live_row(record, found, s_state))
             continue
         if getattr(engine, "audit", None) and not record.get("stopped_audited"):
             try:
@@ -1621,12 +1619,14 @@ def floor_watch_sync(state_dir, records, engine=None):
                     try: _write_private(wakes_path, json.dumps(woken, sort_keys=True))
                     except OSError: pass
                     print("floor_watch_sync: terminal wake for %s failed (%s)" % (scrub(record.get("worker"), 40), type(err).__name__), file=sys.stderr)
-    _write_floor_live(state_dir, {"sessions": live_rows})
-    for work_id, found in sessions.items():
+    for work_id, found in sessions.items():   # one pass: a session no local record tracks (a Caretaker's direct launch) gets a virtual record and, when active, a live row
         name, repo = found.get("worker") or found.get("title"), found.get("repo")
         if work_id in known or not name or not repo or any(isinstance(r, dict) and r.get("worker") == name for r in records):
             continue
         records.append({"worker": name, "backend": "floor", "work_id": work_id, "session": found.get("session", work_id), "repo": repo, "floor_state": found.get("state"), "virtual": True})
+        if found.get("state") not in (None,) + FINISHED_STATES and not _not_author(found.get("mode"), found.get("agent")):
+            live_rows.append(_live_row(records[-1], found, found["state"]))
+    _write_floor_live(state_dir, {"sessions": live_rows})
     return records
 
 def drain_check(state, expected_workers):

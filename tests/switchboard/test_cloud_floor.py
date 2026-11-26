@@ -364,6 +364,22 @@ class TestCloudFloor(FloorCase):
         body = json.loads((Path(str(self.state)) / "floor-live.json").read_text())
         self.assertEqual([r["summary"] for r in body["sessions"]], ["widget-branch"])
 
+    def test_watch_sync_lists_untracked_active_author_sessions_once(self):
+        class T:
+            works = {"w-1": {"state": "running"},
+                     "w-2": {"state": "running", "worker": "child-1", "repo": "acme-org/widget-service", "title": "Fix cache"},
+                     "w-4": {"state": "running", "worker": "ra", "repo": "acme-org/widget-service", "mode": "research-assistant"},
+                     "w-5": {"state": "running", "worker": "boss", "repo": "acme-org/widget-service", "agent": "orchestrator"},
+                     "w-6": {"state": "running", "worker": "a", "repo": "acme-org/widget-service"},
+                     "w-3": {"state": "done", "worker": "old", "repo": "acme-org/widget-service"}}
+        self.floor.TRANSPORT = T()
+        rec = {"worker": "a", "backend": "floor", "work_id": "w-1", "branch": "widget-branch"}
+        with mock.patch.object(self.m, "save_record", lambda *a: None):
+            for _ in range(2):
+                self.floor.floor_watch_sync(self.state, [dict(rec)], mock.Mock(audit=mock.Mock(), actor="sw"))
+        body = json.loads((Path(str(self.state)) / "floor-live.json").read_text())
+        self.assertEqual(sorted(r["name"] for r in body["sessions"]), ["a", "child-1"])
+
     def test_a_stayed_name_that_is_missing_matches_nothing(self):
         self.assertIs(self.floor._stayed_name("Refusal"), self.floor.D["Refusal"])
         self.assertEqual(self.floor._stayed_name("NoSuchName"), ())
