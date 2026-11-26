@@ -98,7 +98,8 @@ def run_copy(sb, repo, source, target, caller, role, out, err, watched=None):
         try:
             sb.edit_charter_orders(engine, repo, target, "orders.copy", detail,
                                    lambda body, b=bullet: insert_bullet(sb, body, b),
-                                   lambda body, b=bullet, n=before: sb.section_orders(body).count(b) > n)
+                                   lambda body, b=bullet, n=before: sb.section_orders(body).count(b) > n,
+                                   added=bullet)
         except (sb.OrdersError, sb.IntentError) as problem:
             failed.append(number)
             out("order %d/%d FAILED: %s (%s)" % (number, len(orders), shown(sb, bullet), sb._one_line(str(problem), 200)))

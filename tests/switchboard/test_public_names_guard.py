@@ -93,3 +93,43 @@ class TestPublicNamesGuard(unittest.TestCase):
             with self.assertRaises(self.sb.IntentError):
                 write(["gh", "issue", "comment", "--body", "Foo"])
         self.assertEqual(self.calls, [])
+
+    def scoped_write(self):
+        return self.sb.github_audited(lambda body, check_only=None: (self.audit, "cli", "PATCH", "repos/acme/api/issues/1", "acme/api", 1), scope_kw="check_only")(
+            lambda body, check_only=None: self.calls.append(body) or "ok")
+
+    def test_a_scoped_write_checks_only_the_new_text_so_old_flagged_text_does_not_block_it(self):
+        write = self.scoped_write()
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "widgetcorp-legacy\n"}):
+            self.assertEqual(write("old note: widgetcorp-legacy\n- new order", check_only="- new order"), "ok")
+            with self.assertRaises(self.sb.IntentError) as ctx:
+                write("old note: widgetcorp-legacy\n- ask widgetcorp-legacy", check_only="- ask widgetcorp-legacy")
+        self.assertNotIn("widgetcorp-legacy", str(ctx.exception))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_an_empty_or_missing_scope_still_checks_the_whole_body(self):
+        write = self.scoped_write()
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "widgetcorp-legacy\n"}):
+            for kwargs in ({"check_only": ""}, {}):
+                with self.assertRaises(self.sb.IntentError):
+                    write("see widgetcorp-legacy", **kwargs)
+        self.assertEqual(self.calls, [])
+
+    def test_the_real_issue_body_writer_scopes_only_when_told_and_other_writers_never_narrow(self):
+        import subprocess
+        import types
+        sent = []
+        reader = types.SimpleNamespace(gh="gh", timeout=5, accounts=None, env_for=lambda repo: None,
+                                       runner=lambda argv, **kw: sent.append(kw["input"]) or subprocess.CompletedProcess(argv, 0, "", ""))
+        body = "old note: widgetcorp-legacy\n- new order"
+        with mock.patch.dict(os.environ, {"FLEET_PRIVATE_NAMES": "widgetcorp-legacy\n"}), mock.patch.object(self.sb, "github_state_audit", return_value=self.audit):
+            self.sb.write_issue_body(reader, "acme/api", 1, body, check_only="- new order")
+            self.assertEqual(len(sent), 1)
+            with self.assertRaises(self.sb.IntentError):
+                self.sb.write_issue_body(reader, "acme/api", 1, body)
+            with self.assertRaises(self.sb.IntentError):
+                self.sb.write_issue_body(reader, "acme/api", 1, body, check_only="- ask widgetcorp-legacy")
+            with self.assertRaises(self.sb.IntentError):  # a writer that did not opt in is never narrowed by the keyword
+                self.sb.github_audited(lambda body, check_only=None: (self.audit, "cli", "POST", "repos/acme/api/issues/1/comments", "acme/api", 1))(
+                    lambda body, check_only=None: None)(body, check_only="- new order")
+        self.assertEqual(len(sent), 1)

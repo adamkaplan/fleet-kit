@@ -555,11 +555,12 @@ def state_dir_path(guard=True):
     return refuse_real_location(path, "state") if guard else path
 
 
-def github_audited(resolve, ok_of=None, refused=None):
+def github_audited(resolve, ok_of=None, refused=None, scope_kw=None):
     """(#2260) The decorator of a function that makes ONE GitHub write: the audit line is written by `github_write` (switchboard/audit.py) before the function runs, and its outcome after;
     when the line cannot be written the function does not run. `resolve(*args, **kwargs)` returns (audit or None, actor, verb, endpoint, repo, number) or None for a call that is no write
     (a GET). `ok_of(result)` says whether a returned value is a success (a call that raises is a failure). `refused(err, *args, **kwargs)` returns the function's own failure value for
-    a refusal (default: the refusal is raised)."""
+    a refusal (default: the refusal is raised). `scope_kw` names the one keyword a function opts in with to narrow the public-names scan to that non-empty string (the text it adds; the rest was
+    already published); only `write_issue_body` uses it, and without it, or with it empty, every argument is scanned."""
     def wrap(fn):
         @functools.wraps(fn)
         def inner(*args, **kwargs):
@@ -567,7 +568,8 @@ def github_audited(resolve, ok_of=None, refused=None):
             if known is None:
                 return fn(*args, **kwargs)
             try:
-                refuse_private_names(known[4], list(args) + list(kwargs.values()))
+                scoped = kwargs.get(scope_kw) if scope_kw else None  # a write that changes part of a text names that part: the rest was already public
+                refuse_private_names(known[4], [scoped] if isinstance(scoped, str) and scoped else list(args) + list(kwargs.values()))
                 guard = github_write(*known)
                 outcome = guard.__enter__()
             except (GithubAuditRefused, PublicNamesRefused) as err:
@@ -24078,11 +24080,11 @@ class OrdersFacts:
                     orders=True)
 
 
-@github_audited(lambda reader, repo, number, body: (github_state_audit(), "cli", "PATCH", "repos/%s/issues/%d" % (repo, number), repo, number))
-def write_issue_body(reader, repo, number, body):
+@github_audited(lambda reader, repo, number, body, check_only=None: (github_state_audit(), "cli", "PATCH", "repos/%s/issues/%d" % (repo, number), repo, number), scope_kw="check_only")
+def write_issue_body(reader, repo, number, body, check_only=None):
     """The one writer of an issue's body: `gh api repos/R/issues/N --method PATCH --input -` with
     {"body": ...} as its input and nothing else, through the reader's injected runner. IntentError when
-    gh fails."""
+    gh fails. `check_only`, when a non-empty string, is the only text the public-names check reads (the text this write adds), not the whole body."""
     path = "repos/%s/issues/%d" % (repo, number)
     env = reader.env_for(repo)  # PR 17 on PR 15: the repo's own gh account, in the child's environment only
     extra = {"env": env} if env is not None else {}
@@ -24116,13 +24118,13 @@ def _sleep(seconds):
         time.sleep(seconds)
 
 
-def edit_charter_orders(engine, repo, charter, event, detail, change, done):
+def edit_charter_orders(engine, repo, charter, event, detail, change, done, added=None):
     """Edit the charter's orders safely. `change(body)` is the edit; `done(body)` says whether that edit is already in `body`
     (an add: the exact bullet is there; a remove: that bullet's text has one occurrence fewer than before). Read the body; when
     `done` already holds there is nothing to write. Otherwise read it AGAIN just before the write and refuse (nothing written)
     if it moved since; write; then look at the issue (a few times: a read can lag a write). A write whose outcome is unknown is
     never repeated blind: only after a fresh read still lacks the change is it made once more, from that fresh body.
-    Audited before and after. Returns the orders after the change."""
+    Audited before and after. The public-names check reads `added` (the new text) when given, never the orders already there; without it, the whole body. Returns the orders after the change."""
     reader = engine.intents
     body = _charter_body(reader, repo, charter)
     if done(body):
@@ -24143,7 +24145,7 @@ def edit_charter_orders(engine, repo, charter, event, detail, change, done):
                     return parse_orders(body)  # the first write had landed after all: do not write again
                 new_body = change(body)
             try:
-                write_issue_body(reader, repo, charter, new_body)
+                write_issue_body(reader, repo, charter, new_body, check_only=added)
             except IntentError as err:
                 if err.reason != "unavailable":
                     raise  # gh answered with a refusal: the write did not happen
@@ -24282,7 +24284,7 @@ def orders_write(engine, args, caller, role, repo, charter):
             bullet = order_bullet(args.text, by, date)
             orders = edit_charter_orders(engine, repo, charter, "orders.add", detail,
                                          lambda body: add_order_to_body(body, args.text, by, date),
-                                         lambda body: bullet in section_orders(body))  # the same order, by and day twice is one order
+                                         lambda body: bullet in section_orders(body), added=bullet)  # the same order, by and day twice is one order
         else:
             now_body = _charter_body(engine.intents, repo, charter)
             current = parse_orders(now_body)

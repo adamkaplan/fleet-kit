@@ -45781,10 +45781,10 @@ class TestOrdersCopy(OrdersCase):
     def test_s19_a_failed_order_is_named_and_exits_1_and_the_rest_are_copied(self):
         real = sb.edit_charter_orders
 
-        def flaky(engine, repo, charter, event, detail, change, done):
+        def flaky(engine, repo, charter, event, detail, change, done, **more):
             if detail["number"] == 5:
                 raise sb.OrdersError("the write to #20 ended without an answer")
-            return real(engine, repo, charter, event, detail, change, done)
+            return real(engine, repo, charter, event, detail, change, done, **more)
         with mock.patch.object(sb, "edit_charter_orders", flaky):
             code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
         self.assertEqual(code, 1)
