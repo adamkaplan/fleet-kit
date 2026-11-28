@@ -66981,7 +66981,7 @@ TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamp
 TestIndependentImpactNoPaths, TestNoPathsMutants = importlib.import_module("test_1041").build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD)
 TestMacosReader = _census.TestMacosReader   # #1847
 TestNewModuleDemands = importlib.import_module("test_new_module_demands").TestNewModuleDemands
-TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet; TestBoxPrecheck = importlib.import_module("test_box_precheck").TestBoxPrecheck   # #2055
+TestGuardSet = importlib.import_module("test_guard_set").TestGuardSet; TestBoxPrecheck = importlib.import_module("test_box_precheck").TestBoxPrecheck; TestSwitchboardHealth = importlib.import_module("test_switchboard_health").TestSwitchboardHealth   # #2055
 TestTriageParkedDigest = importlib.import_module("test_triage_parked_digest").build(Base, TestTriageDigest, sb)   # #2090
 TestDirectToMainCutover = importlib.import_module("test_direct_to_main_cutover_2548").TestDirectToMainCutover   # #2548
 TestTipWatch = importlib.import_module("test_tip_watch").build(Base, World, FAKE_GH, EjectionHub, sb)   # #2247
@@ -80326,7 +80326,7 @@ NOT_ISOLATED_BY_BASE = {
     "ReviewCommentIsolationTests", "Rig", "TestReminderGridAndRecurring", "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory",
     "TestAgentsVerify", "TestAges", "TestAlertConfig", "TestApprovalExemptionGuard", "TestApprovalReadsFresh", "TestArchTools",
     "TestArchitectureDocument", "TestArchitectureDocumentFailurePaths", "TestArchitectureSafetyNet", "TestAskIssueSubject", "TestAskWaive",
-    "TestAssembler", "TestAuditRotation", "TestAuthorityModulesGuard", "TestBatchingDocs", "TestBellMigration", "TestBigRegistrarFile", "TestBoxPrecheck",
+    "TestAssembler", "TestAuditRotation", "TestAuthorityModulesGuard", "TestBatchingDocs", "TestBellMigration", "TestBigRegistrarFile", "TestBoxPrecheck", "TestSwitchboardHealth",
     "TestBranches", "TestBriefParsing", "TestBuilderChecklist", "TestCallerWorkspace", "TestCapsAndScrub", "TestCensus", "TestCharterEditGuard",
     "TestCharterNoParent", "TestChatClearJudge", "TestChatClearOffers", "TestChiefLanesRoleFilter", "TestChecklistAndFamilyTexts", "TestChiefOfStaffNativePermissions", "TestChiefOfStaffSed",
     "TestCiOutsideBin", "TestCiTestFileList", "TestClaimMutants", "TestClaimPlacement", "TestClaimReaders", "TestClaimsNoteDocumentation",
